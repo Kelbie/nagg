@@ -1,159 +1,163 @@
-# nagg GraphQL — schema reference
+# nagg GraphQL Schema Reference
 
-Authoritative vocabulary for the nagg GraphQL API. Source: `internal/graphqlapi/schema.go`
-(types/resolvers) and `internal/clickhouse/read.go` (SQL semantics).
+Authoritative vocabulary for the current generic nagg GraphQL API. Source:
+`internal/graphqlapi/schema.go` and `internal/clickhouse/read.go`.
 
 ## Transport
 
-`POST $NAGG_GRAPHQL_ENDPOINT` (default `http://127.0.0.1:8080/graphql`), body
-`{"query": "...", "variables": {...}}`. **POST only** (GET returns 405). 10s
-server timeout per request.
+`POST $NAGG_GRAPHQL_ENDPOINT` with body `{"query":"...","variables":{...}}`.
+Default endpoint: `http://127.0.0.1:8080/graphql`. `GET` returns 405. The server
+uses a 10 second request context timeout.
 
-## Query roots
+## Query Roots
 
 | Root | Args | Returns |
 |---|---|---|
-| `event` | `id: String!` | `Event` |
-| `profile` | `pubkey: String!` | `Profile` |
-| `thread` | `rootEventId: String!` | `Thread` |
+| `event` | `id: String!` | `NostrEvent` |
+| `events` | `input: EventQueryInput!` | `EventConnection!` |
+| `eventContext` | `id: String!`, `limit: Int = 1000` | `EventContext` |
 | `aggregateEvents` | `input: EventAggregationInput!` | `AggregationResult!` |
 
-`id` / `pubkey` / `rootEventId` MUST be lowercase 64-char hex (regex-validated;
-bech32 `npub`/`note`/`nevent` are rejected — decode with `scripts/to-hex.py`).
-A missing event/profile still returns an object with empty fields, not an error.
+`id` and `pubkeys` filters must be lowercase 64-character hex. Bech32 values
+are rejected; decode with `scripts/to-hex.py` before querying.
 
-## Event
-
-| Field | Type | Meaning |
-|---|---|---|
-| `id` | String! | event id (hex) |
-| `pubkey` | String | author pubkey (null if event unknown) |
-| `kind` | Int | nostr kind |
-| `createdAt` | DateTime | event timestamp |
-| `content` | String | raw content |
-| `tags` | [[String]] | raw tag arrays |
-| `sig` | String | signature |
-| `author` | Profile | resolved from latest kind-0 |
-| `likes` | Int! | kind-7 reactions with content `''` or `'+'` |
-| `reposts` | Int! | kinds 6, 16 referencing this event |
-| `commentCount` | Int! | kinds 1, 1111 replies referencing this event |
-| `reactionsByContent(first)` | [ReactionTally!]! | `{content, count}` emoji tallies, desc |
-| `likers(first)` | ReactionConnection! | edges `{node: Profile, content, reactedAt, cursor}` |
-| `reposters(first)` | RepostConnection! | edges `{node, repostedAt, cursor}` |
-| `thread` | Thread! | thread rooted at this event |
-| `zaps` `zapSats` `uniqueZappers` | Int! | **always 0 — stubbed** (kind 9735 not wired) |
-| `zappers(first)` | ZapConnection! | **always empty — stubbed** |
-| `updatedAt` | DateTime! | last-seen time |
-
-## Profile
+## NostrEvent
 
 | Field | Type | Meaning |
 |---|---|---|
-| `pubkey` | String! | hex pubkey |
-| `metadata` | ProfileMetadata | `{name, displayName, picture, about, nip05, lud16}`; null if no kind-0 |
-| `followers` | Int! | distinct pubkeys whose latest kind-3 `p`-tags this pubkey |
-| `following` | Int! | distinct `p`-tags in this pubkey's kind-3 |
-| `followerList(first)` | FollowConnection! | edges `{node, followedAt, cursor}` |
-| `followingList(first)` | FollowConnection! | edges `{node, followedAt, cursor}` |
-| `followedBy(viewerPubkey: String!)` | Boolean! | does `viewerPubkey` follow this profile |
-| `updatedAt` | DateTime! | |
+| `id` | String! | event id |
+| `pubkey` | String! | author pubkey |
+| `kind` | Int! | Nostr kind |
+| `createdAt` | DateTime! | event timestamp |
+| `content` | String! | raw event content |
+| `tags` | [[String!]!]! | raw tag arrays |
+| `sig` | String! | event signature |
+| `updatedAt` | DateTime! | last-seen/update timestamp |
+| `pubkeyEvents(kinds, limit)` | [NostrEvent!]! | latest events by the same pubkey, useful for kind-0 metadata |
 
-## Thread
+`pubkeyEvents.limit` defaults to 1 and is capped at 20. Invalid or zero limits
+fall back to 1.
 
-| Field | Type | Meaning |
-|---|---|---|
-| `root` | Event! | the root event |
-| `directReplies` | Int! | == root's `commentCount` |
-| `participants` | Int! | distinct authors of replies |
-| `comments(first, sort)` | CommentConnection! | `sort` = `NEWEST` (default) \| `OLDEST` |
+## events(input)
 
-**Comment** node: `{id, author: Profile!, content, createdAt, replyCount, likes,
-reposts, zaps/zapSats/uniqueZappers (0)}`.
+```graphql
+input EventQueryInput {
+  ids: [String!]
+  pubkeys: [String!]
+  kinds: [Int!]
+  tags: [TagFilterInput!]
+  limit: Int = 50
+}
 
-## Connections
+input TagFilterInput {
+  key: String!
+  value: String
+  values: [String!]
+}
+```
 
-Every `*Connection`: `{ edges [...], pageInfo { hasNextPage, endCursor }, totalCount }`.
-`first`: default 50, **max 100**. `pageInfo.hasNextPage` is **always false** and
-cursors are not honored as input — there is no working pagination yet.
+Returns `EventConnection { nodes, pageInfo }`. `limit` defaults to 50 and is
+capped at 500. Results are ordered by `created_at DESC, id DESC`. `pageInfo` has
+`hasNextPage: false` and an `endCursor`; cursor input is not implemented.
 
-`ReactionTally`: `{ content: String!, count: Int! }`.
+Tag filters match events with matching flattened tags. With `value`, the tag
+value must equal it. With `values`, the tag value must be in the list. With
+neither, only tag-key existence is required.
+
+## eventContext(id, limit)
+
+Fetches the root event and recursively follows events with `e` tags pointing at
+the current frontier. It searches up to depth 8 and caps `limit` to the range
+1-2000, defaulting invalid values to 1000.
+
+Return shape:
+
+```graphql
+type EventContext {
+  root: NostrEvent!
+  events: [NostrEvent!]!
+}
+```
+
+This is a generic context helper, not a semantic thread type. Clients decide
+whether `e`-tagged events are replies, reactions, zaps, or something else.
 
 ## aggregateEvents(input)
 
 ```graphql
 input EventAggregationInput {
-  dataset: String!        # EVENTS | TAGS | REACTIONS | REPLIES
-  groupBy: [String!]!     # >= 1 dimension (see matrix)
-  metrics: [String!]      # default ["COUNT"]
-  kinds: [Int!]           # kind filter — honored ONLY for EVENTS and TAGS
-  limit: Int              # default 100, max 1000 (0 -> 100)
+  dataset: String = "EVENTS"  # EVENTS | TAGS | RELAYS
+  groupBy: [String!]!
+  metrics: [String!]          # default ["COUNT"]
+  ids: [String!]
+  pubkeys: [String!]
+  kinds: [Int!]
+  tags: [TagFilterInput!]
+  limit: Int = 100            # max 1000; 0 -> 100
 }
 ```
 
-Returns `AggregationResult { rows: [AggregationRow!]! }`, each row
-`{ dimensions: JSON, metrics: JSON }`. Rows are ordered by the **first metric**
-DESC. Dimension values come back as **strings**; metric values as numbers.
-**Result JSON keys are lower-cased**, not the SCREAMING_CASE you pass in:
-`KIND`→`kind`, `UNIQUE_EVENTS`→`unique_events`, `TARGET_EVENT`→`target_event`.
+Returns `AggregationResult { rows: [AggregationRow!]! }`, each row containing
+`{ dimensions: JSON, metrics: JSON }`. Rows are ordered by the first metric
+descending. Output keys are lower-cased versions of requested names:
+`KIND` -> `kind`, `UNIQUE_EVENTS` -> `unique_events`.
 
 ### Datasets
 
-| dataset | source | filter |
+| dataset | source | supports filters |
 |---|---|---|
-| `EVENTS` | `nostr_events` | none |
-| `TAGS` | `event_tags` (one row per tag) | none |
-| `REACTIONS` | kind-7 events e/E-tagging a target | `kind=7 AND tag_key IN ('e','E')` |
-| `REPLIES` | kind 1/1111 events e/E-tagging a target | `kind IN (1,1111) AND tag_key IN ('e','E')` |
+| `EVENTS` | `nostr_events` | `ids`, `pubkeys`, `kinds`, `tags` |
+| `TAGS` | `event_tags` joined to `nostr_events` | `ids`, `pubkeys`, `kinds`, `tags` |
+| `RELAYS` | `event_seen_relays` | no event/tag filters |
 
-### Dimension validity (`groupBy`)
+### Dimension Validity
 
-| dim | EVENTS | TAGS | REACTIONS | REPLIES | meaning |
-|---|:-:|:-:|:-:|:-:|---|
-| `DAY` | ✓ | ✓ | ✓ | ✓ | `toDate(created_at)` |
-| `HOUR` | ✓ | ✓ | ✓ | ✓ | `toStartOfHour(created_at)` |
-| `KIND` | ✓ | ✓ | ✓ (=7) | ✓ | event kind |
-| `AUTHOR` | ✓ | ✓ | ✓ | ✓ | pubkey |
-| `EVENT_ID` | ✓ | ✓ | ✓ | ✓ | event id |
-| `TAG_KEY` | – | ✓ | – | – | tag name (e.g. `p`, `e`, `t`) |
-| `TAG_VALUE` | – | ✓ | – | – | tag value |
-| `TARGET_EVENT` | – | – | ✓ | ✓ | the e/E-tagged target id |
-| `REACTION` | – | – | ✓ | – | reaction content (emoji) |
+| dim | EVENTS | TAGS | RELAYS | meaning |
+|---|:-:|:-:|:-:|---|
+| `DAY` | yes | yes | yes | date bucket |
+| `HOUR` | yes | yes | yes | hour bucket |
+| `KIND` | yes | yes | no | event kind |
+| `PUBKEY` | yes | yes | no | event author pubkey |
+| `AUTHOR` | yes | yes | no | alias of `PUBKEY` |
+| `EVENT_ID` | yes | yes | yes | event id |
+| `CONTENT` | yes | yes | no | event content |
+| `TAG_KEY` | no | yes | no | tag name, such as `e`, `p`, `t` |
+| `TAG_VALUE` | no | yes | no | tag value |
+| `RELAY` | no | no | yes | relay URL |
 
-### Metric validity
+### Metric Validity
 
-| metric | EVENTS | TAGS | REACTIONS | REPLIES | meaning |
-|---|:-:|:-:|:-:|:-:|---|
-| `COUNT` | ✓ | ✓ | ✓ | ✓ | row count |
-| `UNIQUE_EVENTS` | ✓ | ✓ | ✓ | ✓ | distinct event ids |
-| `UNIQUE_AUTHORS` | ✓ | ✓ | ✓ | ✓ | distinct pubkeys |
-| `UNIQUE_TARGETS` | – | ✓ | ✓ | ✓ | distinct tag_value (targets) |
+| metric | EVENTS | TAGS | RELAYS | meaning |
+|---|:-:|:-:|:-:|---|
+| `COUNT` | yes | yes | yes | row count |
+| `UNIQUE_EVENTS` | yes | yes | yes | distinct event ids |
+| `UNIQUE_PUBKEYS` | yes | yes | no | distinct event authors |
+| `UNIQUE_AUTHORS` | yes | yes | no | alias of `UNIQUE_PUBKEYS` |
+| `UNIQUE_TAG_VALUES` | no | yes | no | distinct tag values |
+| `UNIQUE_RELAYS` | no | no | yes | distinct relays |
 
-A dim/metric in a `–` cell makes the API return an error.
+A dimension or metric outside the valid dataset column returns a GraphQL error.
 
-> **`TARGET_EVENT` ids are usually NOT stored events.** They're whatever an `e`/`E`
-> tag points at, so looking one up with `event(id:)` typically returns an object
-> with `kind`/`pubkey` = null. Report engagement straight from the aggregate
-> counts; don't expect the target to resolve as a full event.
->
-> **`KIND` in `REACTIONS`/`REPLIES` is the reactor's/replier's kind** (so always 7
-> for reactions), NOT the target's. There is no way to restrict a target to
-> kind-1 — i.e. "most-reacted **note**" specifically is not expressible; only
-> "most-reacted **target event**" is.
+## Recipes For App-Level Questions
 
-## Kind reference (common)
+The API does not encode app-level interpretations. Use these recipes instead.
 
-`0` profile · `1` short note · `3` contacts/follows · `5` deletion ·
-`6`/`16` repost · `7` reaction · `1111` comment · `9735` zap receipt ·
-`10002` relay list.
+| Question | Query recipe |
+|---|---|
+| Reaction count/breakdown for event | `aggregateEvents(dataset:"TAGS", kinds:[7], tags:[{key:"e", value:"<event-id>"}], groupBy:["CONTENT"], metrics:["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"])` |
+| Reaction events for event | `events(input:{kinds:[7], tags:[{key:"e", value:"<event-id>"}]})` |
+| Reply/comment events for event | `events(input:{kinds:[1,1111], tags:[{key:"e", value:"<event-id>"}]})` |
+| Associated events by kind | `aggregateEvents(dataset:"TAGS", tags:[{key:"e", value:"<event-id>"}], groupBy:["KIND"], metrics:["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"])` |
+| Contact-list events referencing pubkey | `events(input:{kinds:[3], tags:[{key:"p", value:"<pubkey>"}]})` |
+| Profile metadata for pubkey | `events(input:{pubkeys:["<pubkey>"], kinds:[0], limit:1})` |
+| Profile metadata next to event | query `pubkeyEvents(kinds:[0], limit:1)` on a returned `NostrEvent` |
+| Zap receipt events for event | `events(input:{kinds:[9735], tags:[{key:"e", value:"<event-id>"}]})` |
 
-## Limits — what the schema can NOT do
+## Limits
 
-Say so plainly and offer the closest query instead of inventing fields.
-
-- **No time-range filter** (no since/until). Only `DAY`/`HOUR` grouping.
-- **No content/text search.**
-- **No zap data** — `zaps`/`zapSats`/`uniqueZappers`/`zappers` are stubbed to 0/empty.
-- **No arbitrary WHERE** beyond `kinds` (and that only for `EVENTS`/`TAGS`).
-- **No list-all root** — you must already have an id/pubkey for `event`/`profile`/`thread`.
-  To enumerate events, use `aggregateEvents` grouped by `EVENT_ID`.
-- **No real pagination** — `first` ≤ 100, `hasNextPage` always false.
+- No server-side social fields: app concepts are query recipes.
+- No full-text search.
+- No `since`, `until`, or arbitrary WHERE filters in GraphQL inputs.
+- No parsed profile metadata type; parse kind-0 `content` client-side.
+- No parsed zap amount metrics; query raw kind-9735 events/tags.
+- No real cursor pagination yet; `hasNextPage` is always false.
