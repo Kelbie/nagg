@@ -65,7 +65,7 @@ Run the example GraphQL client:
 NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql go run ./cmd/graphql-client
 ```
 
-The first read layer exposes the typed social-stats shape from `docs/graphql-schema-proposal.md` for events, profiles, threads, reactions, reposts, and follows. It also exposes the implementation-plan-style `aggregateEvents(input:)` query for constrained ad-hoc aggregations over `EVENTS`, `TAGS`, `REACTIONS`, and `REPLIES`.
+The read layer exposes raw Nostr events plus constrained generic aggregations over `EVENTS`, `TAGS`, and `RELAYS`. App concepts such as reactions, replies, profiles, follows, and zaps are expressed as client query recipes using `kinds` and tag filters rather than hard-coded GraphQL fields.
 
 If the ClickHouse container is not published to localhost, run API/client containers in the `nagg-db` network namespace:
 

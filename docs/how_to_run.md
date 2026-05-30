@@ -37,40 +37,18 @@ docker run --rm --network container:nagg-db \
   clickhouse:lts-jammy /nagg-client
 ```
 
-This currently returns real rows like:
+The client demonstrates:
 
-```json
-{
-  "dimensions": { "kind": "21059" },
-  "metrics": { "unique_events": 3379 }
-}
-```
+- events per kind
+- tag key distribution
+- "reactions" as kind `7` events with `e` tags, grouped by `TAG_VALUE` and `CONTENT`
+- "followers" as kind `3` events with `p` tags, grouped by `TAG_VALUE`
+- "comments" as kind `1` / `1111` events with `e` tags
+- fetching full raw events matching those generic filters
 
-and tag aggregation rows like:
+**Raw `curl` Examples**
 
-```json
-{
-  "dimensions": { "tag_key": "p" },
-  "metrics": { "count": 7813, "unique_events": 4450 }
-}
-```
-
-It also demonstrates typed engagement for a real referenced event:
-
-```json
-{
-  "event": {
-    "id": "b58b6c0ec7593bc97f28b21c0c3912db4fda72ceb6b3c16e3ea0390c57a9a3f4",
-    "commentCount": 2,
-    "reactionsByContent": [{ "content": "🤙", "count": 2 }],
-    "thread": { "directReplies": 2, "participants": 2 }
-  }
-}
-```
-
-**Raw `curl` Example**
-
-If you shell into a container sharing the DB network, or expose the API on localhost, you can query directly:
+Tag-key distribution:
 
 ```sh
 curl -s http://127.0.0.1:8080/graphql \
@@ -79,12 +57,21 @@ curl -s http://127.0.0.1:8080/graphql \
   | jq
 ```
 
-Another useful one:
+Reaction-like recipe, without a `likes` field:
 
 ```sh
 curl -s http://127.0.0.1:8080/graphql \
   -H 'content-type: application/json' \
-  -d '{"query":"query { aggregateEvents(input: { dataset: \"REACTIONS\", groupBy: [\"TARGET_EVENT\", \"REACTION\"], metrics: [\"UNIQUE_EVENTS\"], limit: 5 }) { rows { dimensions metrics } } }"}' \
+  -d '{"query":"query { aggregateEvents(input: { dataset: \"TAGS\", kinds: [7], tags: [{key: \"e\"}], groupBy: [\"TAG_VALUE\", \"CONTENT\"], metrics: [\"UNIQUE_EVENTS\", \"UNIQUE_PUBKEYS\"], limit: 5 }) { rows { dimensions metrics } } }"}' \
+  | jq
+```
+
+Follower-like recipe, without a `followers` field:
+
+```sh
+curl -s http://127.0.0.1:8080/graphql \
+  -H 'content-type: application/json' \
+  -d '{"query":"query { aggregateEvents(input: { dataset: \"TAGS\", kinds: [3], tags: [{key: \"p\"}], groupBy: [\"TAG_VALUE\"], metrics: [\"UNIQUE_PUBKEYS\", \"COUNT\"], limit: 5 }) { rows { dimensions metrics } } }"}' \
   | jq
 ```
 

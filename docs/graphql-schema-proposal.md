@@ -1,357 +1,296 @@
-# GraphQL Schema Proposal: Typed Social-Stats Layer
+# GraphQL Schema Proposal: Generic Nostr Analytics Layer
 
-**Status:** Revised — key decisions incorporated; basis for nagg's typed read layer (Milestones 2–4, not yet implemented)
-**Date:** 2026-05-30 (revised)
-**Context:** Drafted in a brainstorming session, grounded in nagg's raw ingestion layer (`nostr_events`, `event_tags`, `event_seen_relays` — already implemented) and the semantic/aggregate tables planned in `IMPLEMENTATION_PLAN.md` §4–§5.
-
-> **Revised after review.** Decisions now baked in: nagg stores the full event, so the typed `Event` returns the **whole Nostr event** (`content`/`tags`/`sig`) alongside its derived stats — clients need no relay round-trip and can verify the event from `sig`. Counts are backed by cursor-paginated actor lists. Remaining divergences from `IMPLEMENTATION_PLAN.md` section 7 (offset vs cursor pagination, generic AST vs typed nodes) are reconciliation items — see [Relationship to IMPLEMENTATION_PLAN.md section 7](#relationship-to-implementation_plan-section-7).
+**Status:** Revised — generic-first read layer for nagg  
+**Date:** 2026-05-30  
+**Context:** This replaces the earlier typed social-stats proposal. The previous shape baked in app-level concepts such as `likes`, `thread`, `participants`, `followers`, and `zaps`. Those are useful interpretations, but they should be client-side query recipes over Nostr primitives, not server-side schema concepts.
 
 ---
 
 ## TL;DR
 
-A typed, entity-centric GraphQL API over nagg's raw, semantic, and aggregate tables. Two root nodes, `Event` and `Profile`, expose engagement and social-graph stats as strongly-typed fields; the `Event` node also returns the **full Nostr event** (content/tags/sig) so clients need no relay round-trip. Every count is backed by a paginated list of the actors behind it. Query-only, kind-agnostic.
+nagg should expose raw Nostr events plus constrained generic filtering and aggregation over:
 
-It answers the three motivating questions directly:
+- event fields: `id`, `pubkey`, `kind`, `created_at`, `content`
+- flattened tags: `tag_key`, `tag_value`, tag order/extra values
+- relay provenance
 
-```graphql
-# 1. Likes on an event (and who liked)
-{ event(id: "abc…") { likes  likers(first: 20) { edges { node { pubkey } content } } } }
+The server should not decide that kind `7` means "likes", kind `3` means "followers", or an `e` tag means "thread". Clients can still ask those questions, but they do it by specifying the relevant `kind`, tag filters, dimensions, and metrics.
 
-# 2. Comments on a thread for an event
-{ thread(rootEventId: "abc…") { root { commentCount } directReplies participants
-    comments(first: 20) { edges { node { author { pubkey } content replyCount } } } } }
-
-# 3. Followers per pubkey
-{ profile(pubkey: "…hex") { followers following } }
-```
+This keeps nagg useful for social apps, video apps, music apps, marketplaces, private conventions, and future Nostr NIPs without schema churn.
 
 ---
 
-## Scope and design decisions
+## What Was Accidentally Baked In
 
-These were settled deliberately during brainstorming and review:
+The old proposal included these app-level concepts:
 
-| Decision | Choice | Rationale |
-|---|---|---|
-| **Scope** | Generic social graph, kind-agnostic | Likes, reposts, comments/threads, zaps per event; followers/following per pubkey. Works for any Nostr kind, not video-specific. |
-| **Detail level** | Counts **and** paginated actor lists | Each count (likes, reposts, followers, comments) is backed by a connection to page the actual actors or the comment tree. |
-| **Liveness** | Query only | No subscriptions in v1. Clients re-query for fresh numbers. |
-| **Modeling** | Entity-centric typed nodes | `event(id)` / `profile(pubkey)` return `Event` / `Profile` nodes; a liker resolves straight to a `Profile`, a comment to its own engagement. Batch variants avoid N+1. |
-| **Event identity** | Nodes return the **full event** (`pubkey`/`kind`/`createdAt`/`content`/`tags`/`sig`) | nagg stores the whole event, so the `Event` node returns it alongside stats — clients never need a relay round-trip and can verify the event from `sig`. These fields are null only when the event was seen merely as a reference target (e.g. a reaction's target) and never ingested. |
-| **Engagement shape** | One uniform pattern per type: `<count>` (+ headline extras) + an actor connection | Likes, reposts, and zaps all follow the same shape (a flat count, optional headline figures, and a cursor connection to the actors). No type is special-cased into a bundled stats object. |
-| **Recursion** | `Comment` implements `Engageable`; `reactionsByContent` included | Comments are events, so they carry their own like/repost/zap stats directly via the `Engageable` interface (no `engagement` indirection); emoji breakdown comes for free from the per-reaction aggregate. |
-| **Pagination** | Relay-style cursor connections | Stable under the constant stream of new likes/comments (offset pages drift as rows arrive at the top); cheap deep paging in ClickHouse (`WHERE created_at < ?` seeks instead of `OFFSET n` scan-and-discard). |
+- `likes`, `likers`, `reactionsByContent`: assumes kind `7` reaction semantics and assumes `content` is the reaction dimension.
+- `reposts`, `reposters`: assumes kinds `6` and `16` deserve first-class fields.
+- `thread`, `commentCount`, `directReplies`, `participants`, `Comment`, `ThreadParent`: assumes `e`/`E` tags imply a reply tree.
+- `followers`, `following`, `followerList`, `followedBy`: assumes kind `3` is interpreted as current social graph state.
+- `zaps`, `zapSats`, `uniqueZappers`, `Zap`: assumes kind `9735` should be interpreted as payment analytics.
+- `Profile.metadata`: assumes kind `0` should be parsed into profile fields.
+- `Engageable`, `ActorSort`, `CommentSort`, `ZapSort`: assumes an engagement model and app-specific pagination semantics.
+
+Those concepts are not wrong. They are just not the right abstraction boundary for nagg's core read API.
 
 ---
 
-## Proposed schema
+## Design Principles
+
+- **Nostr primitives first.** The API exposes events, tags, relays, filters, dimensions, and metrics.
+- **No raw SQL proxy.** Clients choose from allowed datasets, filters, dimensions, and metrics.
+- **Interpretations are recipes.** "Likes", "comments", "followers", and "zaps" are documented query examples, not GraphQL fields.
+- **Kind-agnostic by default.** Any client can define meaning through `kinds` and `tags`.
+- **Full event bodies remain available.** `event(id:)` and `events(input:)` return the full Nostr event so clients can render and verify it.
+- **Semantic tables may exist internally later.** Materialized views and semantic indexes can optimize common recipes without changing the public API.
+
+---
+
+## Proposed Schema
 
 ```graphql
-# =====================================================================
-# nagg typed social-stats GraphQL API (proposal)
-# Generic, kind-agnostic Nostr engagement + social-graph aggregates.
-# Query-only. Every count is backed by a paginated list of the actors.
-# The Event node also returns the full Nostr event, so clients need no
-# relay round-trip.
-# =====================================================================
+scalar Hex64
+scalar DateTime
+scalar JSON
+scalar Cursor
 
-# ---- Scalars --------------------------------------------------------
-scalar Hex64      # lowercase 64-char hex: an event id or a pubkey
-scalar DateTime   # RFC-3339 timestamp
-scalar Long       # 64-bit int, for msat/sat sums that overflow 32-bit Int
-scalar Cursor     # opaque pagination cursor
-
-# ---- Root -----------------------------------------------------------
 type Query {
-  "Full event + engagement by id. Non-null if the id has been seen at all — even only as a reference target, in which case the raw-event fields are null (see Event)."
-  event(id: Hex64!): Event
-  "Batch form. Same order as input; null per id never seen. Avoids N+1. Max 100 ids per call."
-  events(ids: [Hex64!]!): [Event]!
+  "Fetch one full Nostr event by id."
+  event(id: Hex64!): NostrEvent
 
-  "Social-graph + metadata for a pubkey. Null if never seen."
-  profile(pubkey: Hex64!): Profile
-  "Batch form. Same order as input; null per pubkey never seen. Max 100 pubkeys per call."
-  profiles(pubkeys: [Hex64!]!): [Profile]!
+  "Fetch full events using constrained filters."
+  events(input: EventQueryInput!): EventConnection!
 
-  "The reply/comment tree hanging off an event."
-  thread(rootEventId: Hex64!): Thread
+  "Aggregate over events, tags, or relay provenance using allowed dimensions and metrics."
+  aggregateEvents(input: EventAggregationInput!): AggregationResult!
 }
 
-# ---- Engageable -----------------------------------------------------
-"""
-Anything that can be reacted to, reposted, or zapped. Both top-level
-events and comments are Nostr events, so both implement this — a comment
-exposes its own like/repost/zap stats directly, with no `engagement`
-indirection. Every engagement type follows one shape: a flat count, any
-headline figures, and a cursor connection to the actors.
-"""
-interface Engageable {
+type NostrEvent {
   id: Hex64!
-
-  # Reactions
-  likes: Int!
-  likers(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): ReactionConnection!
-  reactionsByContent(first: Int = 10): [ReactionTally!]!
-
-  # Reposts
-  reposts: Int!
-  reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
-
-  # Zaps
-  zaps: Int!
-  zapSats: Long!
-  uniqueZappers: Int!
-  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
-}
-
-# ---- Event (full event + engagement node) --------------------------
-"""
-One Nostr event by id: the full event plus its aggregate engagement.
-Kind-agnostic: a note, a video, even a comment (comments are events).
-
-The raw-event fields (pubkey/kind/createdAt/content/tags/sig) are null
-ONLY when the id has been seen merely as a reference target (e.g. a
-reaction or reply pointing at it) but the event itself was never
-ingested. When present, `sig` lets a client verify the event without a
-relay. Counts and connections are always available from the id alone.
-"""
-type Event implements Engageable {
-  id: Hex64!
-
-  # Full Nostr event (null only if referenced-but-not-ingested; see above)
-  pubkey: Hex64
-  kind: Int
-  createdAt: DateTime
-  content: String
-  tags: [[String!]!]
-  sig: String                # 64-byte hex signature, for client-side verification
-  author: Profile            # profile node for pubkey
-
-  # Reactions (NIP-25, kind 7). Like = content '+' or ''; '-' = dislike.
-  likes: Int!
-  likers(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): ReactionConnection!
-  reactionsByContent(first: Int = 10): [ReactionTally!]!   # emoji breakdown
-
-  # Reposts (NIP-18, kinds 6 & 16)
-  reposts: Int!
-  reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
-
-  # Replies / comments (kind 1 NIP-10, or kind 1111 NIP-22)
-  commentCount: Int!         # headline count, all depths in the thread
-  thread: Thread!            # direct-reply count, participants, and the comment tree
-
-  # Zaps (NIP-57, kind 9735). Largest zap = zappers(sort: LARGEST, first: 1).
-  zaps: Int!                 # count of valid zap receipts
-  zapSats: Long!             # total sats (64-bit; lifetime totals overflow 32-bit Int)
-  uniqueZappers: Int!
-  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
-
-  updatedAt: DateTime!       # when these aggregates were last refreshed
-}
-
-type ReactionTally { content: String!  count: Int! }
-
-# ---- Comments / Thread ---------------------------------------------
-"""
-The reply tree rooted at one event. Threading-scheme agnostic: built
-from the (root_event_id, parent_event_id) edges nagg extracts into
-event_replies, so it works for NIP-10 (kind 1 + e tags) and NIP-22
-(kind 1111 + E/e tags) alike. The all-depths total lives on the root
-event as `commentCount` (== `thread.root.commentCount`).
-"""
-type Thread {
-  root: Event!
-  directReplies: Int!        # direct replies to the root
-  participants: Int!         # distinct commenter pubkeys
-  comments(first: Int = 50, after: Cursor, sort: CommentSort = NEWEST): CommentConnection!
-}
-
-"""
-A comment is an event, so it implements Engageable (its own
-likes/reposts/zaps) directly. It adds thread-position fields.
-"""
-type Comment implements Engageable {
-  id: Hex64!
-  author: Profile!
-  content: String!
-  createdAt: DateTime!
-  root: Event!               # the event the thread hangs off
-  parent: ThreadParent       # root event (top-level) or another comment
-  replyCount: Int!
-  replies(first: Int = 50, after: Cursor, sort: CommentSort = NEWEST): CommentConnection!
-
-  # Engageable — this comment's own engagement stats
-  likes: Int!
-  likers(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): ReactionConnection!
-  reactionsByContent(first: Int = 10): [ReactionTally!]!
-  reposts: Int!
-  reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
-  zaps: Int!
-  zapSats: Long!
-  uniqueZappers: Int!
-  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
-}
-
-union ThreadParent = Event | Comment
-enum CommentSort { NEWEST OLDEST MOST_REPLIED MOST_LIKED }
-
-# ---- Zaps (NIP-57) -------------------------------------------------
-# Zap headline stats are flat on Event/Comment (zaps / zapSats /
-# uniqueZappers + the zappers connection), parallel to likes/reposts.
-# The largest zap is `zappers(sort: LARGEST, first: 1)`. Per-zap detail
-# (amount, memo, zapper) lives on Zap below; msat precision is per-edge.
-type Zap {
-  id: Hex64!                 # zap receipt event id
-  zapper: Profile            # resolved from embedded request (kind 9734)
-  amountSats: Int!
-  amountMsats: Long!
-  comment: String            # zap memo
-  zappedAt: DateTime!
-}
-enum ZapSort { NEWEST OLDEST LARGEST }
-
-# ---- Profile (pubkey / social-graph node) --------------------------
-type Profile {
   pubkey: Hex64!
-  metadata: ProfileMetadata          # latest kind-0, null if none seen
-  followers: Int!                    # accounts that follow this pubkey
-  following: Int!                    # accounts this pubkey follows
-  followerList(first: Int = 50, after: Cursor): FollowConnection!
-  followingList(first: Int = 50, after: Cursor): FollowConnection!
-  followedBy(viewerPubkey: Hex64!): Boolean!
+  kind: Int!
+  createdAt: DateTime!
+  content: String!
+  tags: [[String!]!]!
+  sig: String!
   updatedAt: DateTime!
 }
 
-type ProfileMetadata {
-  name: String  displayName: String  picture: String
-  about: String  nip05: String  lud16: String
+type EventConnection {
+  nodes: [NostrEvent!]!
+  pageInfo: PageInfo!
 }
 
-# ---- Connections (Relay-style cursor pagination) -------------------
-# Every connection: `first` is capped server-side (max 100); deeper
-# paging uses `after`. `totalCount` comes from the entity-keyed
-# aggregate tables, not a COUNT over the page.
-type PageInfo { hasNextPage: Boolean!  endCursor: Cursor }
-enum ActorSort { NEWEST OLDEST }
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: Cursor
+}
 
-type ReactionConnection { edges: [ReactionEdge!]!  pageInfo: PageInfo!  totalCount: Int! }
-type ReactionEdge { node: Profile!  content: String!  reactedAt: DateTime!  cursor: Cursor! }
+input EventQueryInput {
+  ids: [Hex64!]
+  pubkeys: [Hex64!]
+  kinds: [Int!]
+  tags: [TagFilterInput!]
+  since: DateTime
+  until: DateTime
+  limit: Int = 50
+  after: Cursor
+}
 
-type RepostConnection { edges: [RepostEdge!]!  pageInfo: PageInfo!  totalCount: Int! }
-type RepostEdge { node: Profile!  repostedAt: DateTime!  cursor: Cursor! }
+input TagFilterInput {
+  "Tag key, for example e, p, d, t, bolt11, imeta."
+  key: String!
+  "Single tag value match. If omitted, only tag-key existence is required."
+  value: String
+  "Any-of tag value match."
+  values: [String!]
+}
 
-type CommentConnection { edges: [CommentEdge!]!  pageInfo: PageInfo!  totalCount: Int! }
-type CommentEdge { node: Comment!  cursor: Cursor! }
+input EventAggregationInput {
+  dataset: String = "EVENTS"
+  ids: [Hex64!]
+  pubkeys: [Hex64!]
+  kinds: [Int!]
+  tags: [TagFilterInput!]
+  since: DateTime
+  until: DateTime
+  groupBy: [String!]!
+  metrics: [String!] = ["COUNT"]
+  limit: Int = 100
+}
 
-type FollowConnection { edges: [FollowEdge!]!  pageInfo: PageInfo!  totalCount: Int! }
-type FollowEdge { node: Profile!  followedAt: DateTime  cursor: Cursor! }
+type AggregationResult {
+  rows: [AggregationRow!]!
+}
 
-type ZapConnection { edges: [ZapEdge!]!  pageInfo: PageInfo!  totalCount: Int! }
-type ZapEdge { node: Zap!  cursor: Cursor! }
+type AggregationRow {
+  dimensions: JSON!
+  metrics: JSON!
+}
 ```
 
----
-
-## Limits and safety (parity with `IMPLEMENTATION_PLAN.md` §9)
-
-The typed API hits the same database as the generic AST, so it needs the same guardrails:
-
-- **Connections:** `first` defaults to 50 and is capped at **100** server-side; deeper paging is via `after` cursors, never large offsets.
-- **Batch roots:** `events(ids:)` / `profiles(pubkeys:)` accept at most **100** ids per call.
-- **`totalCount`** is read from the entity-keyed aggregate tables (a point lookup), not a `COUNT(*)` over the page query.
-- Per-query timeout, complexity scoring, and per-key rate limits carry over from §9 unchanged.
+Current implementation note: the first server accepts allowlisted strings rather than GraphQL enum types so the analytics surface can evolve quickly. Valid dataset strings are `EVENTS`, `TAGS`, and `RELAYS`. Valid dimensions are `DAY`, `HOUR`, `KIND`, `PUBKEY`, `AUTHOR`, `EVENT_ID`, `CONTENT`, `TAG_KEY`, `TAG_VALUE`, and `RELAY`, depending on dataset. Valid metrics are `COUNT`, `UNIQUE_EVENTS`, `UNIQUE_PUBKEYS`, `UNIQUE_AUTHORS`, `UNIQUE_TAG_VALUES`, and `UNIQUE_RELAYS`, depending on dataset.
 
 ---
 
-## Mapping to nagg's ClickHouse tables
+## How The Old Use Cases Work Now
 
-How each field resolves against the tables in `IMPLEMENTATION_PLAN.md`, and what is **not yet planned** and would need adding. Only the raw ingestion layer (`nostr_events`, `event_tags`, `event_seen_relays`) is implemented today; the semantic/aggregate tables below are still planned in §4–§5.
+### 1. "Likes" / reactions for an event
 
-| Schema field | Backing table(s) | Status |
-|---|---|---|
-| `Event.{pubkey,kind,createdAt,content,tags,sig}` | `nostr_events`, by `id` | **Exists** (raw table already stores the full event). See the read-path note below. |
-| `Event.likes` | `post_reaction_counts` where `reaction IN ('+','')`, `uniqMerge` | Planned (§5) |
-| `Event.likers` | `event_reactions` where `target_event_id=?` join `profiles_latest` | Planned (§4) |
-| `Event.reactionsByContent` | `post_reaction_counts` grouped by `reaction` | Planned (§5) |
-| `Event.commentCount` | `post_reply_counts` where `root_event_id=?`, `uniqMerge` | Planned (§5) |
-| `Thread.directReplies` | count over `event_replies` where `parent_event_id=?` | Needs a per-parent count (a `post_direct_reply_counts` MV, or live query) |
-| `Thread.comments` / `Comment.replies` | `event_replies` join `nostr_events` join `profiles_latest` | Planned (§4 / §7.5) |
-| `Thread.participants` | `uniq(author_pubkey)` over `event_replies` for the root | Needs a MV or live `uniq` |
-| `Comment` engagement (Engageable) | resolve the comment id as an `Event` (reactions/zaps keyed by its id) | Reuses the reaction/zap tables |
-| `Profile.metadata` | `profiles_latest` | Planned (§4) |
-| `Event.author` | `nostr_events` (pubkey) join `profiles_latest` | Planned |
-| `Event.reposts` / `reposters` | reposts semantic table | **Missing.** Plan ingests kind 6/16 but defines no `event_reposts` table or `post_repost_counts` MV |
-| `Profile.followers` / `followerList` | reverse-follow index from kind 3 | **Missing.** Plan ingests kind 3 but builds no follower index |
-| `Profile.following` / `followingList` | latest kind-3 contact list (p tags) | **Missing.** Needs a `contacts_latest` table or derivation from `event_tags` on the latest kind-3 |
-| `Event.{zaps,zapSats,uniqueZappers,zappers}` / `Zap` | zap semantic + aggregate tables from kind 9735 | **Missing.** Plan ingests kind 9735 but defines no `event_zaps` / `post_zap_totals` |
+Instead of a `likes` field, the client asks: "For kind `7` events that have an `e` tag pointing at this event, group by reaction content."
 
-**Read-path note (full event by id).** `nostr_events` is `ORDER BY (kind, created_at, pubkey, id)` — tuned for analytics scans, not point lookups by `id`. But `event(id)` / `events(ids)` now return the **full event**, making by-id fetch a hot path. The read layer needs an `id`-ordered **projection** (or a bloom-filter data-skipping index on `id`) on `nostr_events` so these lookups seek instead of scan. Add it in the same migration that introduces the semantic/aggregate tables.
+```graphql
+query {
+  aggregateEvents(input: {
+    dataset: TAGS
+    kinds: [7]
+    tags: [{ key: "e", value: "TARGET_EVENT_ID" }]
+    groupBy: [CONTENT]
+    metrics: [UNIQUE_EVENTS, UNIQUE_PUBKEYS]
+    limit: 20
+  }) {
+    rows { dimensions metrics }
+  }
+}
+```
 
-**Net new work this schema implies for the ingestion/aggregation layer:** reposts table + count, a follower/following index (semantic edges + counts), zaps semantic + totals, a direct-reply count, a thread-participants count, and the `id` projection on `nostr_events`. Everything else maps onto tables already planned.
+To list the reaction events themselves:
+
+```graphql
+query {
+  events(input: {
+    kinds: [7]
+    tags: [{ key: "e", value: "TARGET_EVENT_ID" }]
+    limit: 20
+  }) {
+    nodes { id pubkey kind createdAt content tags }
+  }
+}
+```
+
+### 2. "Comments" / replies for an event
+
+Instead of `thread(rootEventId:)`, the client asks for events of whichever kinds it considers replies, with whichever tag convention it cares about.
+
+```graphql
+query {
+  events(input: {
+    kinds: [1, 1111]
+    tags: [{ key: "e", value: "ROOT_OR_PARENT_EVENT_ID" }]
+    limit: 20
+  }) {
+    nodes { id pubkey kind createdAt content tags }
+  }
+}
+```
+
+To count reply authors:
+
+```graphql
+query {
+  aggregateEvents(input: {
+    dataset: TAGS
+    kinds: [1, 1111]
+    tags: [{ key: "e", value: "ROOT_OR_PARENT_EVENT_ID" }]
+    groupBy: [TAG_VALUE]
+    metrics: [UNIQUE_EVENTS, UNIQUE_PUBKEYS]
+  }) {
+    rows { dimensions metrics }
+  }
+}
+```
+
+### 3. "Followers" for a pubkey
+
+Instead of `profile(pubkey).followers`, the client asks: "Which kind `3` events have a `p` tag for this pubkey?"
+
+```graphql
+query {
+  aggregateEvents(input: {
+    dataset: TAGS
+    kinds: [3]
+    tags: [{ key: "p", value: "PUBKEY" }]
+    groupBy: [TAG_VALUE]
+    metrics: [UNIQUE_PUBKEYS, COUNT]
+  }) {
+    rows { dimensions metrics }
+  }
+}
+```
+
+To list follower contact-list events:
+
+```graphql
+query {
+  events(input: {
+    kinds: [3]
+    tags: [{ key: "p", value: "PUBKEY" }]
+    limit: 50
+  }) {
+    nodes { id pubkey createdAt tags }
+  }
+}
+```
+
+### 4. "Profile metadata"
+
+Instead of parsing kind `0` into a `ProfileMetadata` object in the schema:
+
+```graphql
+query {
+  events(input: {
+    pubkeys: ["PUBKEY"]
+    kinds: [0]
+    limit: 1
+  }) {
+    nodes { id pubkey createdAt content }
+  }
+}
+```
+
+The client can parse `content` as profile JSON, or nagg can later expose a generic JSON helper without making profile semantics mandatory.
+
+### 5. Zaps
+
+Instead of `zapSats`, `uniqueZappers`, or a `Zap` type, clients can query the raw receipt events and tags:
+
+```graphql
+query {
+  aggregateEvents(input: {
+    dataset: TAGS
+    kinds: [9735]
+    tags: [{ key: "e", value: "TARGET_EVENT_ID" }]
+    groupBy: [TAG_KEY]
+    metrics: [COUNT, UNIQUE_EVENTS]
+  }) {
+    rows { dimensions metrics }
+  }
+}
+```
+
+If nagg later validates receipts and extracts msat amounts, that can be added as a generic derived dataset, for example `ZAP_RECEIPT_TAGS` or `DERIVED_EVENTS`, without changing the core event/tag model.
 
 ---
 
-## Relationship to IMPLEMENTATION_PLAN.md section 7
+## Implementation Notes
 
-Section 7 already specifies a GraphQL API. This proposal is a **different shape**, not a patch to it. The divergences:
-
-| Axis | Plan section 7 | This proposal |
-|---|---|---|
-| **Philosophy** | Generic constrained analytics AST: `aggregateEvents(dataset, filters, groupBy, metrics)` returning untyped `rows { dimensions, metrics }` | Entity-centric typed nodes: `Event` / `Profile` / `Thread` / `Comment` / `Zap` with resolved relationships |
-| **Ergonomics** | Maximally flexible, fewer resolvers, weakly typed; client composes dimensions/metrics | Strongly typed and self-documenting; each field maps to a known aggregate; good for app clients |
-| **Pagination** | `limit` / `offset` | Cursor connections (`first` / `after`, `edges` / `pageInfo`) |
-| **Actor lists** | Not surfaced directly (could `groupBy` reactor) | First-class: `likers`, `reposters`, follower/following lists, comment tree |
-| **Raw event body** | Returned by `events(input)` as full `NostrEvent` nodes | Returned inline on the typed `Event` (content/tags/sig) — the two converge on one full-event-plus-stats node |
-| **Zaps / followers** | Not in the section 7 surface | First-class zap stats and `followers`/`following` |
-| **Scalars** | `ID`, `Time` | `Hex64` (validated 64-char hex), `DateTime`, `Long`, `Cursor` — supersede `ID`/`Time` for the typed surface |
-| **Shared ground** | `postStats(eventId)`, `commentsForPost`, "no raw SQL proxy" principle | Honors the same "no raw SQL proxy" principle; `postStats`/`commentsForPost` are the typed `Event`/`Thread` here |
-
-They are **not contradictory.** Section 7 already mixes typed (`postStats`, `commentsForPost`) and generic (`aggregateEvents`) queries, and this typed design honors section 7's stated key principle ("make it a constrained semantic analytics interface," not a SQL proxy).
-
-### Reconciliation options for the team
-
-1. **Complement.** Ship this typed layer as the product/app-facing API and keep `aggregateEvents` for ad-hoc analytics and dashboards. Two query families: typed nodes (cursor) for apps, generic AST (offset) for analytics. Most aligned with what section 7 already sketches. Most surface area to maintain.
-2. **Supersede.** Adopt this typed schema as the GraphQL design and defer the generic `aggregateEvents` AST until a concrete analytics/dashboard need appears. Smallest surface now, less flexible for unanticipated queries.
-3. **Adapt.** Keep the generic AST + offset pagination as canonical and fold these needs (likers, followers, zaps, threads) into it as datasets/dimensions rather than typed nodes. Maximum flexibility, weakest typing and app ergonomics.
-
-**Current direction:** nagg is proceeding with this typed layer as the read API (the `Event` / `Profile` / `Thread` nodes above); the generic `aggregateEvents` AST stays in `IMPLEMENTATION_PLAN.md` §7 as a deferred analytics surface (closest to **Complement**, sequenced typed-first).
+- The public API should use generic store methods such as `QueryEvents(ctx, EventQueryInput)` and `AggregateEvents(ctx, AggregateInput)`.
+- Avoid read-model methods named after interpretations, such as `LikeCount`, `Followers`, or `ThreadParticipants`.
+- Internally, ClickHouse materialized views can optimize common recipes:
+  - reaction tags by target event
+  - latest kind-3 contact lists
+  - kind-0 latest metadata
+  - zap receipt validation
+- Those optimizations should be hidden behind the same generic API. A query recipe should not care whether it is backed by raw tables or derived tables.
 
 ---
 
-## Phasing (v1 / v1.1)
+## Safety Rules
 
-The schema is broad; this is the suggested build order, tracking the three motivating questions and the cost of the underlying data work.
-
-**v1 — answers the three motivating questions; leans on tables that exist or are cheap additions:**
-
-- Full-event fields on `Event` (already in `nostr_events`)
-- Reactions: `likes`, `likers`, `reactionsByContent` (reaction semantic + count tables)
-- Reposts: `reposts`, `reposters` (a small new count + edge table over kinds 6/16)
-- Comments/threads: `commentCount`, `thread` (`directReplies`, `participants`, `comments`) over the reply edges
-- Social graph: `Profile.followers` / `following` / lists (the reverse-follow index over kind 3)
-
-**v1.1 — deferred, biggest new data lift:**
-
-- Zaps: `zaps`, `zapSats`, `uniqueZappers`, `zappers` — needs the zap semantic table, sat aggregation, and 9735-vs-9734-vs-lnurl validation (the most new infrastructure, and not among the three motivating questions)
-- Comment-level recursive engagement depth tuning, if profiling shows it is needed
-
-`updatedAt` / freshness plumbing applies to both phases.
-
----
-
-## Decided defaults (v1)
-
-- **`likes` semantics:** like = reaction content `'+'` or `''`; `'-'` is a dislike; any other content is a custom/emoji reaction — **excluded** from `likes` and surfaced via `reactionsByContent`.
-- **Followers:** current state only. The reverse index uses each follower's **latest** kind-3 (replace semantics, latest wins); no follow/unfollow history in v1. `FollowEdge.followedAt` is the source kind-3's `created_at` — when that contact list was published, identical for every contact in it — **not** a true per-follow timestamp. So `followerList` ordered `NEWEST` means "most recently (re)published contact lists," and the follows cursor key is `(kind3_created_at, kind3_event_id)`.
-- **Zap trust:** validate each receipt (kind 9735) against its embedded request (kind 9734) and the recipient's lnurl before counting, so `zapSats` can't be inflated by forged receipts.
-- **Bodies:** nagg stores and returns full events; clients do not need a relay to render or verify. (Raw-content retention policy is a separate Milestone-6 decision.)
-
-## Implementation notes
-
-- **Library:** `gqlgen` (schema-first, matches the plan's stated Go stack). `Long` maps to a custom int64 scalar; `Hex64` and `Cursor` are custom scalars with validation.
-- **Scalars:** the typed layer standardizes on `Hex64` (validated 64-char hex) and `DateTime`, which supersede §7's bare `ID` and `Time` for this surface. When §7's `events()` / `aggregateEvents()` are reconciled they should adopt the same scalars; this proposal does not edit §7.
-- **N+1:** batch resolvers (`events`, `profiles`) plus a dataloader per edge type (a liker's `Profile`, a comment's `author`) are needed so a 50-item connection does not fan out into 50 ClickHouse round-trips.
-- **Cursor encoding:** opaque base64 of `(created_at, id)` for reactions/reposts/zaps; `(created_at, reply_event_id)` for comments; `(kind3_created_at, kind3_event_id)` for follows. Stable under inserts.
-- **Read path:** add the `id`-ordered projection / bloom skip-index on `nostr_events` (see mapping note) so full-event-by-id lookups seek instead of scan.
-- **Freshness:** `Event.updatedAt` reflects the aggregate table's merge/refresh time so clients know staleness in this query-only model.
+- `limit` is capped server-side.
+- Dataset, dimensions, and metrics are allowlisted.
+- Tag filters are structured; clients cannot inject SQL.
+- Expensive dimensions can require a kind or time filter later.
+- Pagination should become cursor-based before production-scale public use.
+- `event(id:)` should eventually use an id-ordered projection or bloom filter index on `nostr_events`.

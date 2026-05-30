@@ -11,46 +11,38 @@ import (
 )
 
 type EventView struct {
-	ID        string
-	PubKey    string
-	Kind      int
-	CreatedAt time.Time
-	Content   string
-	Tags      [][]string
-	Sig       string
-	UpdatedAt time.Time
+	ID        string     `json:"id"`
+	PubKey    string     `json:"pubkey"`
+	Kind      int        `json:"kind"`
+	CreatedAt time.Time  `json:"createdAt"`
+	Content   string     `json:"content"`
+	Tags      [][]string `json:"tags"`
+	Sig       string     `json:"sig"`
+	UpdatedAt time.Time  `json:"updatedAt"`
 }
 
-type ProfileView struct {
-	PubKey      string
-	Name        string
-	DisplayName string
-	Picture     string
-	About       string
-	NIP05       string
-	LUD16       string
-	UpdatedAt   time.Time
+type TagFilter struct {
+	Key    string
+	Value  string
+	Values []string
 }
 
-type ActorEdge struct {
-	PubKey    string
-	Content   string
-	CreatedAt time.Time
-	Count     uint64
-}
-
-type CommentView struct {
-	ID        string
-	PubKey    string
-	Content   string
-	CreatedAt time.Time
+type EventQueryInput struct {
+	IDs     []string
+	PubKeys []string
+	Kinds   []int
+	Tags    []TagFilter
+	Limit   uint64
 }
 
 type AggregateInput struct {
 	Dataset string
 	GroupBy []string
 	Metrics []string
+	IDs     []string
+	PubKeys []string
 	Kinds   []int
+	Tags    []TagFilter
 	Limit   uint64
 }
 
@@ -60,193 +52,48 @@ type AggregateRow struct {
 }
 
 func (s *Store) EventByID(ctx context.Context, id string) (*EventView, error) {
-	row := s.conn.QueryRow(ctx, `
-		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
-		FROM nostr_events
-		WHERE id = ?
-		ORDER BY last_seen_at DESC
-		LIMIT 1
-	`, id)
-
-	var tagsJSON string
-	var ev EventView
-	if err := row.Scan(&ev.ID, &ev.PubKey, &ev.Kind, &ev.CreatedAt, &ev.Content, &tagsJSON, &ev.Sig, &ev.UpdatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			return &EventView{ID: id, UpdatedAt: time.Now().UTC()}, nil
-		}
+	events, err := s.QueryEvents(ctx, EventQueryInput{IDs: []string{id}, Limit: 1})
+	if err != nil {
 		return nil, err
 	}
-	_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
-	return &ev, nil
-}
-
-func (s *Store) ProfileByPubKey(ctx context.Context, pubkey string) (*ProfileView, error) {
-	profile := &ProfileView{PubKey: pubkey, UpdatedAt: time.Now().UTC()}
-	row := s.conn.QueryRow(ctx, `
-		SELECT content, created_at
-		FROM nostr_events
-		WHERE kind = 0 AND pubkey = ?
-		ORDER BY created_at DESC
-		LIMIT 1
-	`, pubkey)
-
-	var content string
-	if err := row.Scan(&content, &profile.UpdatedAt); err == nil {
-		var raw map[string]any
-		if json.Unmarshal([]byte(content), &raw) == nil {
-			profile.Name = stringValue(raw["name"])
-			profile.DisplayName = firstString(raw["display_name"], raw["displayName"])
-			profile.Picture = stringValue(raw["picture"])
-			profile.About = stringValue(raw["about"])
-			profile.NIP05 = stringValue(raw["nip05"])
-			profile.LUD16 = stringValue(raw["lud16"])
-		}
+	if len(events) == 0 {
+		return nil, sql.ErrNoRows
 	}
-	return profile, nil
+	return &events[0], nil
 }
 
-func (s *Store) LikeCount(ctx context.Context, target string) (uint64, error) {
-	return s.countTaggedEvents(ctx, []int{7}, target, "AND e.content IN ('', '+')")
-}
+func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]EventView, error) {
+	if input.Limit == 0 || input.Limit > 500 {
+		input.Limit = 50
+	}
 
-func (s *Store) RepostCount(ctx context.Context, target string) (uint64, error) {
-	return s.countTaggedEvents(ctx, []int{6, 16}, target, "")
-}
-
-func (s *Store) CommentCount(ctx context.Context, target string) (uint64, error) {
-	return s.countTaggedEvents(ctx, []int{1, 1111}, target, "")
-}
-
-func (s *Store) DirectReplyCount(ctx context.Context, target string) (uint64, error) {
-	return s.CommentCount(ctx, target)
-}
-
-func (s *Store) ThreadParticipants(ctx context.Context, target string) (uint64, error) {
-	row := s.conn.QueryRow(ctx, `
-		SELECT uniqExact(e.pubkey)
-		FROM event_tags t
-		INNER JOIN nostr_events e ON e.id = t.event_id
-		WHERE t.tag_key IN ('e', 'E') AND t.tag_value = ? AND e.kind IN (1, 1111)
-	`, target)
-	var n uint64
-	return n, row.Scan(&n)
-}
-
-func (s *Store) ReactionTallies(ctx context.Context, target string, limit uint64) ([]ActorEdge, error) {
+	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	args = append(args, input.Limit)
 	rows, err := s.conn.Query(ctx, `
-		SELECT e.content, uniqExact(e.id) AS c
-		FROM event_tags t
-		INNER JOIN nostr_events e ON e.id = t.event_id
-		WHERE t.tag_key = 'e' AND t.tag_value = ? AND e.kind = 7
-		GROUP BY e.content
-		ORDER BY c DESC
+		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+		FROM nostr_events e
+		`+where+`
+		ORDER BY e.created_at DESC, e.id DESC
 		LIMIT ?
-	`, target, limit)
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []ActorEdge
+	var out []EventView
 	for rows.Next() {
-		var edge ActorEdge
-		if err := rows.Scan(&edge.Content, &edge.Count); err != nil {
+		var tagsJSON string
+		var ev EventView
+		var kind uint32
+		if err := rows.Scan(&ev.ID, &ev.PubKey, &kind, &ev.CreatedAt, &ev.Content, &tagsJSON, &ev.Sig, &ev.UpdatedAt); err != nil {
 			return nil, err
 		}
-		out = append(out, edge)
+		ev.Kind = int(kind)
+		_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
+		out = append(out, ev)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) Likers(ctx context.Context, target string, limit uint64) ([]ActorEdge, error) {
-	return s.actorEdges(ctx, []int{7}, target, "AND e.content IN ('', '+')", limit)
-}
-
-func (s *Store) Reposters(ctx context.Context, target string, limit uint64) ([]ActorEdge, error) {
-	return s.actorEdges(ctx, []int{6, 16}, target, "", limit)
-}
-
-func (s *Store) Comments(ctx context.Context, target string, limit uint64, newest bool) ([]CommentView, error) {
-	order := "ASC"
-	if newest {
-		order = "DESC"
-	}
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT e.id, e.pubkey, e.content, e.created_at
-		FROM event_tags t
-		INNER JOIN nostr_events e ON e.id = t.event_id
-		WHERE t.tag_key IN ('e', 'E') AND t.tag_value = ? AND e.kind IN (1, 1111)
-		ORDER BY e.created_at %s, e.id %s
-		LIMIT ?
-	`, order, order), target, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []CommentView
-	for rows.Next() {
-		var comment CommentView
-		if err := rows.Scan(&comment.ID, &comment.PubKey, &comment.Content, &comment.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, comment)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) Followers(ctx context.Context, pubkey string) (uint64, error) {
-	row := s.conn.QueryRow(ctx, `
-		SELECT uniqExact(pubkey)
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND tag_value = ?
-	`, pubkey)
-	var n uint64
-	return n, row.Scan(&n)
-}
-
-func (s *Store) Following(ctx context.Context, pubkey string) (uint64, error) {
-	row := s.conn.QueryRow(ctx, `
-		SELECT uniqExact(tag_value)
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND pubkey = ?
-	`, pubkey)
-	var n uint64
-	return n, row.Scan(&n)
-}
-
-func (s *Store) FollowerList(ctx context.Context, pubkey string, limit uint64) ([]ActorEdge, error) {
-	rows, err := s.conn.Query(ctx, `
-		SELECT pubkey, max(created_at) AS followed_at
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND tag_value = ?
-		GROUP BY pubkey
-		ORDER BY followed_at DESC
-		LIMIT ?
-	`, pubkey, limit)
-	return scanTwoColumnProfileEdges(rows, err)
-}
-
-func (s *Store) FollowingList(ctx context.Context, pubkey string, limit uint64) ([]ActorEdge, error) {
-	rows, err := s.conn.Query(ctx, `
-		SELECT tag_value, max(created_at) AS followed_at
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND pubkey = ?
-		GROUP BY tag_value
-		ORDER BY followed_at DESC
-		LIMIT ?
-	`, pubkey, limit)
-	return scanTwoColumnProfileEdges(rows, err)
-}
-
-func (s *Store) FollowedBy(ctx context.Context, pubkey, viewerPubkey string) (bool, error) {
-	row := s.conn.QueryRow(ctx, `
-		SELECT count() > 0
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND pubkey = ? AND tag_value = ?
-	`, viewerPubkey, pubkey)
-	var ok bool
-	return ok, row.Scan(&ok)
 }
 
 func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]AggregateRow, error) {
@@ -257,7 +104,7 @@ func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]Ag
 		input.Metrics = []string{"COUNT"}
 	}
 
-	spec, err := aggregateSpec(input)
+	spec, args, err := aggregateSpec(input)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +119,7 @@ func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]Ag
 		input.Limit,
 	)
 
-	rows, err := s.conn.Query(ctx, query)
+	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -305,69 +152,6 @@ func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]Ag
 	return out, rows.Err()
 }
 
-func (s *Store) countTaggedEvents(ctx context.Context, kinds []int, target, extra string) (uint64, error) {
-	row := s.conn.QueryRow(ctx, fmt.Sprintf(`
-		SELECT uniqExact(e.id)
-		FROM event_tags t
-		INNER JOIN nostr_events e ON e.id = t.event_id
-		WHERE t.tag_key IN ('e', 'E') AND t.tag_value = ? AND e.kind IN (%s) %s
-	`, ints(kinds), extra), target)
-	var n uint64
-	return n, row.Scan(&n)
-}
-
-func (s *Store) actorEdges(ctx context.Context, kinds []int, target, extra string, limit uint64) ([]ActorEdge, error) {
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT e.pubkey, any(e.content), max(e.created_at) AS acted_at
-		FROM event_tags t
-		INNER JOIN nostr_events e ON e.id = t.event_id
-		WHERE t.tag_key IN ('e', 'E') AND t.tag_value = ? AND e.kind IN (%s) %s
-		GROUP BY e.pubkey
-		ORDER BY acted_at DESC
-		LIMIT ?
-	`, ints(kinds), extra), target, limit)
-	return scanThreeColumnActorEdges(rows, err)
-}
-
-type rowScanner interface {
-	Next() bool
-	Scan(...any) error
-	Close() error
-	Err() error
-}
-
-func scanTwoColumnProfileEdges(rows rowScanner, err error) ([]ActorEdge, error) {
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []ActorEdge
-	for rows.Next() {
-		var edge ActorEdge
-		if err := rows.Scan(&edge.PubKey, &edge.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, edge)
-	}
-	return out, rows.Err()
-}
-
-func scanThreeColumnActorEdges(rows rowScanner, err error) ([]ActorEdge, error) {
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []ActorEdge
-	for rows.Next() {
-		var edge ActorEdge
-		if err := rows.Scan(&edge.PubKey, &edge.Content, &edge.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, edge)
-	}
-	return out, rows.Err()
-}
-
 type aggSpec struct {
 	selectDims    []string
 	groupDims     []string
@@ -379,38 +163,33 @@ type aggSpec struct {
 	where         string
 }
 
-func aggregateSpec(input AggregateInput) (aggSpec, error) {
+func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 	dataset := strings.ToUpper(input.Dataset)
-	spec := aggSpec{where: "WHERE 1 = 1"}
+	if dataset == "" {
+		dataset = "EVENTS"
+	}
 
+	spec := aggSpec{}
+	var args []any
 	switch dataset {
 	case "EVENTS":
 		spec.from = "nostr_events e"
+		spec.where, args = eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
 	case "TAGS":
-		spec.from = "event_tags t"
-	case "REACTIONS":
 		spec.from = "event_tags t INNER JOIN nostr_events e ON e.id = t.event_id"
-		spec.where += " AND e.kind = 7 AND t.tag_key IN ('e', 'E')"
-	case "REPLIES":
-		spec.from = "event_tags t INNER JOIN nostr_events e ON e.id = t.event_id"
-		spec.where += " AND e.kind IN (1, 1111) AND t.tag_key IN ('e', 'E')"
+		spec.where, args = tagWhere(input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	case "RELAYS":
+		spec.from = "event_seen_relays r"
+		spec.where = "WHERE 1 = 1"
 	default:
-		return spec, fmt.Errorf("unsupported dataset %q", input.Dataset)
-	}
-
-	if len(input.Kinds) > 0 && (dataset == "EVENTS" || dataset == "TAGS") {
-		alias := "e"
-		if dataset == "TAGS" {
-			alias = "t"
-		}
-		spec.where += fmt.Sprintf(" AND %s.kind IN (%s)", alias, ints(input.Kinds))
+		return spec, nil, fmt.Errorf("unsupported dataset %q", input.Dataset)
 	}
 
 	for _, dim := range input.GroupBy {
 		key := strings.ToUpper(dim)
 		expr, err := dimensionExpr(dataset, key)
 		if err != nil {
-			return spec, err
+			return spec, nil, err
 		}
 		alias := strings.ToLower(key)
 		spec.selectDims = append(spec.selectDims, fmt.Sprintf("toString(%s) AS %s", expr, alias))
@@ -418,14 +197,14 @@ func aggregateSpec(input AggregateInput) (aggSpec, error) {
 		spec.scanDims = append(spec.scanDims, alias)
 	}
 	if len(spec.selectDims) == 0 {
-		return spec, fmt.Errorf("at least one groupBy dimension is required")
+		return spec, nil, fmt.Errorf("at least one groupBy dimension is required")
 	}
 
 	for _, metric := range input.Metrics {
 		key := strings.ToUpper(metric)
 		expr, err := metricExpr(dataset, key)
 		if err != nil {
-			return spec, err
+			return spec, nil, err
 		}
 		alias := strings.ToLower(key)
 		spec.selectMetrics = append(spec.selectMetrics, fmt.Sprintf("%s AS %s", expr, alias))
@@ -434,42 +213,87 @@ func aggregateSpec(input AggregateInput) (aggSpec, error) {
 			spec.orderMetric = alias
 		}
 	}
-	return spec, nil
+	return spec, args, nil
+}
+
+func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
+	clauses := []string{"WHERE 1 = 1"}
+	var args []any
+	if len(ids) > 0 {
+		clauses = append(clauses, alias+".id IN (?)")
+		args = append(args, ids)
+	}
+	if len(pubkeys) > 0 {
+		clauses = append(clauses, alias+".pubkey IN (?)")
+		args = append(args, pubkeys)
+	}
+	if len(kinds) > 0 {
+		clauses = append(clauses, alias+".kind IN ("+ints(kinds)+")")
+	}
+	for i, tag := range tags {
+		subAlias := fmt.Sprintf("tf%d", i)
+		clause := fmt.Sprintf("EXISTS (SELECT 1 FROM event_tags %s WHERE %s.event_id = %s.id AND %s.tag_key = ?", subAlias, subAlias, alias, subAlias)
+		args = append(args, tag.Key)
+		clause, args = addTagValueClause(clause, args, subAlias, tag)
+		clauses = append(clauses, clause+")")
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+func tagWhere(ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
+	clauses := []string{"WHERE 1 = 1"}
+	var args []any
+	if len(ids) > 0 {
+		clauses = append(clauses, "t.event_id IN (?)")
+		args = append(args, ids)
+	}
+	if len(pubkeys) > 0 {
+		clauses = append(clauses, "t.pubkey IN (?)")
+		args = append(args, pubkeys)
+	}
+	if len(kinds) > 0 {
+		clauses = append(clauses, "t.kind IN ("+ints(kinds)+")")
+	}
+	for _, tag := range tags {
+		clause := "t.tag_key = ?"
+		args = append(args, tag.Key)
+		clause, args = addTagValueClause(clause, args, "t", tag)
+		clauses = append(clauses, clause)
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+func addTagValueClause(clause string, args []any, alias string, tag TagFilter) (string, []any) {
+	if tag.Value != "" {
+		clause += " AND " + alias + ".tag_value = ?"
+		args = append(args, tag.Value)
+	} else if len(tag.Values) > 0 {
+		clause += " AND " + alias + ".tag_value IN (?)"
+		args = append(args, tag.Values)
+	}
+	return clause, args
 }
 
 func dimensionExpr(dataset, key string) (string, error) {
 	switch key {
 	case "DAY":
-		if dataset == "TAGS" {
-			return "toDate(t.created_at)", nil
-		}
-		return "toDate(e.created_at)", nil
+		return timeExpr(dataset, "toDate")
 	case "HOUR":
-		if dataset == "TAGS" {
-			return "toStartOfHour(t.created_at)", nil
-		}
-		return "toStartOfHour(e.created_at)", nil
+		return timeExpr(dataset, "toStartOfHour")
 	case "KIND":
-		if dataset == "TAGS" {
-			return "t.kind", nil
-		}
-		return "e.kind", nil
-	case "AUTHOR":
-		if dataset == "TAGS" {
-			return "t.pubkey", nil
-		}
-		return "e.pubkey", nil
+		return eventOrTagExpr(dataset, "kind")
+	case "PUBKEY", "AUTHOR":
+		return eventOrTagExpr(dataset, "pubkey")
 	case "EVENT_ID":
 		if dataset == "TAGS" {
 			return "t.event_id", nil
 		}
-		return "e.id", nil
-	case "TARGET_EVENT":
-		if dataset == "REACTIONS" || dataset == "REPLIES" {
-			return "t.tag_value", nil
+		if dataset == "RELAYS" {
+			return "r.event_id", nil
 		}
-	case "REACTION":
-		if dataset == "REACTIONS" {
+		return "e.id", nil
+	case "CONTENT":
+		if dataset == "EVENTS" || dataset == "TAGS" {
 			return "e.content", nil
 		}
 	case "TAG_KEY":
@@ -479,6 +303,10 @@ func dimensionExpr(dataset, key string) (string, error) {
 	case "TAG_VALUE":
 		if dataset == "TAGS" {
 			return "t.tag_value", nil
+		}
+	case "RELAY":
+		if dataset == "RELAYS" {
+			return "r.relay", nil
 		}
 	}
 	return "", fmt.Errorf("dimension %q is not allowed for dataset %s", key, dataset)
@@ -492,18 +320,48 @@ func metricExpr(dataset, key string) (string, error) {
 		if dataset == "TAGS" {
 			return "uniqExact(t.event_id)", nil
 		}
+		if dataset == "RELAYS" {
+			return "uniqExact(r.event_id)", nil
+		}
 		return "uniqExact(e.id)", nil
-	case "UNIQUE_AUTHORS":
+	case "UNIQUE_PUBKEYS", "UNIQUE_AUTHORS":
 		if dataset == "TAGS" {
 			return "uniqExact(t.pubkey)", nil
 		}
-		return "uniqExact(e.pubkey)", nil
-	case "UNIQUE_TARGETS":
-		if dataset == "REACTIONS" || dataset == "REPLIES" || dataset == "TAGS" {
+		if dataset == "EVENTS" {
+			return "uniqExact(e.pubkey)", nil
+		}
+	case "UNIQUE_TAG_VALUES":
+		if dataset == "TAGS" {
 			return "uniqExact(t.tag_value)", nil
+		}
+	case "UNIQUE_RELAYS":
+		if dataset == "RELAYS" {
+			return "uniqExact(r.relay)", nil
 		}
 	}
 	return "", fmt.Errorf("metric %q is not allowed for dataset %s", key, dataset)
+}
+
+func timeExpr(dataset, fn string) (string, error) {
+	switch dataset {
+	case "TAGS":
+		return fn + "(t.created_at)", nil
+	case "RELAYS":
+		return fn + "(r.last_seen_at)", nil
+	default:
+		return fn + "(e.created_at)", nil
+	}
+}
+
+func eventOrTagExpr(dataset, col string) (string, error) {
+	if dataset == "TAGS" {
+		return "t." + col, nil
+	}
+	if dataset == "EVENTS" {
+		return "e." + col, nil
+	}
+	return "", fmt.Errorf("%s is not available for dataset %s", col, dataset)
 }
 
 func ints(values []int) string {
@@ -512,18 +370,4 @@ func ints(values []int) string {
 		parts = append(parts, strconv.Itoa(value))
 	}
 	return strings.Join(parts, ",")
-}
-
-func stringValue(v any) string {
-	s, _ := v.(string)
-	return s
-}
-
-func firstString(values ...any) string {
-	for _, value := range values {
-		if s := stringValue(value); s != "" {
-			return s
-		}
-	}
-	return ""
 }

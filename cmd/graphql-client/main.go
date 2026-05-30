@@ -21,68 +21,119 @@ func main() {
 		endpoint = v
 	}
 
-	queries := []struct {
+	examples := []struct {
 		name  string
 		query string
 	}{
 		{
-			name: "events per kind",
+			name: "1. generic events per kind",
 			query: `query {
-				aggregateEvents(input: { dataset: "EVENTS", groupBy: ["KIND"], metrics: ["UNIQUE_EVENTS"], limit: 8 }) {
-					rows { dimensions metrics }
-				}
+				aggregateEvents(input: {
+					dataset: "EVENTS"
+					groupBy: ["KIND"]
+					metrics: ["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"]
+					limit: 8
+				}) { rows { dimensions metrics } }
 			}`,
 		},
 		{
-			name: "top reaction targets",
+			name: "2. generic tag-key distribution",
 			query: `query {
-				aggregateEvents(input: { dataset: "REACTIONS", groupBy: ["TARGET_EVENT", "REACTION"], metrics: ["UNIQUE_EVENTS"], limit: 5 }) {
-					rows { dimensions metrics }
-				}
+				aggregateEvents(input: {
+					dataset: "TAGS"
+					groupBy: ["TAG_KEY"]
+					metrics: ["COUNT", "UNIQUE_EVENTS"]
+					limit: 8
+				}) { rows { dimensions metrics } }
 			}`,
 		},
 		{
-			name: "top tag keys",
+			name: "3. old 'likes/reactions' use case as generic kind/tag/content aggregation",
 			query: `query {
-				aggregateEvents(input: { dataset: "TAGS", groupBy: ["TAG_KEY"], metrics: ["COUNT", "UNIQUE_EVENTS"], limit: 8 }) {
-					rows { dimensions metrics }
-				}
+				aggregateEvents(input: {
+					dataset: "TAGS"
+					kinds: [7]
+					tags: [{ key: "e" }]
+					groupBy: ["TAG_VALUE", "CONTENT"]
+					metrics: ["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"]
+					limit: 5
+				}) { rows { dimensions metrics } }
+			}`,
+		},
+		{
+			name: "4. old 'followers' use case as generic kind/tag aggregation",
+			query: `query {
+				aggregateEvents(input: {
+					dataset: "TAGS"
+					kinds: [3]
+					tags: [{ key: "p" }]
+					groupBy: ["TAG_VALUE"]
+					metrics: ["UNIQUE_PUBKEYS", "COUNT"]
+					limit: 5
+				}) { rows { dimensions metrics } }
 			}`,
 		},
 	}
 
-	var topEvent string
-	for _, q := range queries {
-		resp, err := post(endpoint, q.query)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Printf("\n# %s\n%s\n", q.name, pretty(resp))
-		if q.name == "top reaction targets" {
-			topEvent = firstDimension(resp, "target_event")
+	var reactionTarget string
+	var replyTarget string
+	for _, example := range examples {
+		resp := mustPost(endpoint, example.query)
+		fmt.Printf("\n# %s\n%s\n", example.name, pretty(resp))
+		if example.name[0] == '3' {
+			reactionTarget = firstDimension(resp, "tag_value")
 		}
 	}
 
-	if topEvent == "" {
-		fmt.Println("\n# typed event example\nNo reaction target found yet; ingest more kind 7 events to exercise event engagement.")
-		return
+	replyTargetResp := mustPost(endpoint, `query {
+		aggregateEvents(input: {
+			dataset: "TAGS"
+			kinds: [1, 1111]
+			tags: [{ key: "e" }]
+			groupBy: ["TAG_VALUE"]
+			metrics: ["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"]
+			limit: 1
+		}) { rows { dimensions metrics } }
+	}`)
+	replyTarget = firstDimension(replyTargetResp, "tag_value")
+	fmt.Printf("\n# 5. old 'comments/thread' use case as generic reply-target discovery\n%s\n", pretty(replyTargetResp))
+
+	if reactionTarget != "" {
+		query := fmt.Sprintf(`query {
+			events(input: {
+				kinds: [7]
+				tags: [{ key: "e", value: "%s" }]
+				limit: 5
+			}) {
+				nodes { id pubkey kind createdAt content tags }
+			}
+		}`, reactionTarget)
+		fmt.Printf("\n# 6. events matching the discovered reaction target %s\n%s\n", reactionTarget, pretty(mustPost(endpoint, query)))
 	}
 
-	typed := fmt.Sprintf(`query {
-		event(id: "%s") {
-			id kind pubkey createdAt content
-			likes reposts commentCount
-			reactionsByContent(first: 5) { content count }
-			likers(first: 5) { totalCount edges { node { pubkey followers following } content reactedAt } }
-			thread { directReplies participants comments(first: 5) { totalCount edges { node { id content author { pubkey } replyCount } } } }
-		}
-	}`, topEvent)
+	if replyTarget != "" {
+		query := fmt.Sprintf(`query {
+			events(input: {
+				kinds: [1, 1111]
+				tags: [{ key: "e", value: "%s" }]
+				limit: 5
+			}) {
+				nodes { id pubkey kind createdAt content tags }
+			}
+		}`, replyTarget)
+		fmt.Printf("\n# 7. events matching the discovered reply/comment target %s\n%s\n", replyTarget, pretty(mustPost(endpoint, query)))
+	}
+}
 
-	resp, err := post(endpoint, typed)
+func mustPost(endpoint, query string) graphQLResponse {
+	resp, err := post(endpoint, query)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("\n# typed event engagement\n%s\n", pretty(resp))
+	if len(resp.Errors) > 0 {
+		panic(pretty(resp.Errors))
+	}
+	return resp
 }
 
 func post(endpoint, query string) (graphQLResponse, error) {
