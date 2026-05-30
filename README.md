@@ -47,3 +47,31 @@ NAGG_VERIFY_EVENTS=true
 ```
 
 Leave `NAGG_KINDS` empty to request all event kinds. Set `NAGG_SINCE=0` to omit the `since` filter.
+
+## Run The GraphQL API
+
+```sh
+NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+NAGG_CLICKHOUSE_USERNAME=nagg \
+NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+go run ./cmd/api
+```
+
+The API listens on `:8080` by default and serves `POST /graphql`. Set `NAGG_API_ADDR=:9090` to change the bind address.
+
+Run the example GraphQL client:
+
+```sh
+NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql go run ./cmd/graphql-client
+```
+
+The first read layer exposes the typed social-stats shape from `docs/graphql-schema-proposal.md` for events, profiles, threads, reactions, reposts, and follows. It also exposes the implementation-plan-style `aggregateEvents(input:)` query for constrained ad-hoc aggregations over `EVENTS`, `TAGS`, `REACTIONS`, and `REPLIES`.
+
+If the ClickHouse container is not published to localhost, run API/client containers in the `nagg-db` network namespace:
+
+```sh
+docker run --rm --network container:nagg-db \
+  -v "$PWD/bin/nagg-api-linux-arm64:/nagg-api:ro" \
+  -e NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+  clickhouse:lts-jammy /nagg-api
+```

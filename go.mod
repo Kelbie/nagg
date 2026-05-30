@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.40.3
 	github.com/gorilla/websocket v1.5.3
+	github.com/graphql-go/graphql v0.8.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/nbd-wtf/go-nostr v0.52.0
 )
