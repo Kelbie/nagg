@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/graphql-go/graphql"
@@ -66,6 +67,19 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					nodes, _ := p.Source.([]chstore.EventView)
 					return map[string]any{"hasNextPage": false, "endCursor": eventEndCursor(nodes)}, nil
 				},
+			},
+		},
+	})
+
+	eventContextType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "EventContext",
+		Fields: graphql.Fields{
+			"root": &graphql.Field{Type: graphql.NewNonNull(eventType)},
+			"events": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
+			},
+			"profiles": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
 			},
 		},
 	})
@@ -154,10 +168,105 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					return map[string]any{"rows": rows}, err
 				},
 			},
+			"eventContext": &graphql.Field{
+				Type: eventContextType,
+				Args: graphql.FieldConfigArgument{
+					"id":    &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
+					"limit": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 1000},
+				},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					id := p.Args["id"].(string)
+					if err := validateHex64(id); err != nil {
+						return nil, err
+					}
+					limit := intValue(p.Args["limit"], 1000)
+					if limit <= 0 || limit > 2000 {
+						limit = 1000
+					}
+					return r.eventContext(p.Context, id, limit)
+				},
+			},
 		},
 	})
 
 	return graphql.NewSchema(graphql.SchemaConfig{Query: queryType})
+}
+
+func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {
+	root, err := r.store.EventByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	eventsByID := map[string]chstore.EventView{root.ID: *root}
+	visited := map[string]struct{}{}
+	frontier := []string{root.ID}
+
+	for depth := 0; depth < 8 && len(frontier) > 0 && len(eventsByID) < limit; depth++ {
+		batch := takeUnvisited(visited, frontier, 100)
+		if len(batch) == 0 {
+			break
+		}
+		remaining := limit - len(eventsByID)
+		if remaining <= 0 {
+			break
+		}
+		events, err := r.store.QueryEvents(ctx, chstore.EventQueryInput{
+			Tags:  []chstore.TagFilter{{Key: "e", Values: batch}},
+			Limit: uint64(min(remaining, 500)),
+		})
+		if err != nil {
+			return nil, err
+		}
+		frontier = frontier[:0]
+		for _, event := range events {
+			if _, ok := eventsByID[event.ID]; ok {
+				continue
+			}
+			eventsByID[event.ID] = event
+			frontier = append(frontier, event.ID)
+		}
+	}
+
+	pubkeys := map[string]struct{}{}
+	for _, event := range eventsByID {
+		pubkeys[event.PubKey] = struct{}{}
+		for _, tag := range event.Tags {
+			if len(tag) >= 2 && tag[0] == "p" && hex64Pattern.MatchString(tag[1]) {
+				pubkeys[tag[1]] = struct{}{}
+			}
+		}
+	}
+
+	profilesByPubkey := map[string]chstore.EventView{}
+	for _, batch := range chunks(keys(pubkeys), 200) {
+		profiles, err := r.store.QueryEvents(ctx, chstore.EventQueryInput{
+			PubKeys: batch,
+			Kinds:   []int{0},
+			Limit:   uint64(min(len(batch)*2, 500)),
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, profile := range profiles {
+			if _, ok := profilesByPubkey[profile.PubKey]; ok {
+				continue
+			}
+			profilesByPubkey[profile.PubKey] = profile
+		}
+	}
+
+	events := make([]chstore.EventView, 0, len(eventsByID)-1)
+	for _, event := range eventsByID {
+		if event.ID != root.ID {
+			events = append(events, event)
+		}
+	}
+	profiles := make([]chstore.EventView, 0, len(profilesByPubkey))
+	for _, profile := range profilesByPubkey {
+		profiles = append(profiles, profile)
+	}
+	return map[string]any{"root": root, "events": events, "profiles": profiles}, nil
 }
 
 func Handler(schema graphql.Schema) http.HandlerFunc {
@@ -314,6 +423,41 @@ func eventEndCursor(events []chstore.EventView) any {
 	}
 	last := events[len(events)-1]
 	return last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID
+}
+
+func takeUnvisited(visited map[string]struct{}, ids []string, max int) []string {
+	out := make([]string, 0, min(len(ids), max))
+	for _, id := range ids {
+		if _, ok := visited[id]; ok {
+			continue
+		}
+		visited[id] = struct{}{}
+		out = append(out, id)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+func keys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for key := range m {
+		if key != "" {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func chunks(values []string, size int) [][]string {
+	var out [][]string
+	for start := 0; start < len(values); start += size {
+		end := min(start+size, len(values))
+		out = append(out, values[start:end])
+	}
+	return out
 }
 
 func validateHex64(value string) error {

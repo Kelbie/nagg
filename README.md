@@ -75,3 +75,27 @@ docker run --rm --network container:nagg-db \
   -e NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
   clickhouse:lts-jammy /nagg-api
 ```
+
+## Backfill One Thread
+
+Fetch a root event, recursively crawl associated `e`-tagged events, fetch zaps from Primal's cache API, and backfill kind-0 profiles for all discovered pubkeys:
+
+```sh
+NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+NAGG_THREAD_EXTRA_RELAYS=wss://nos.lol \
+go run ./cmd/thread-crawler nevent1...
+```
+
+Then demonstrate that GraphQL can resolve a display-ready thread summary:
+
+```sh
+NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \
+go run ./cmd/thread-demo <root-event-id>
+```
+
+For a cleaner text UI that renders the thread tree with usernames, profile image URLs, comment counts, and like counts, use:
+
+```sh
+NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \
+go run ./cmd/thread-cli <root-event-id>
+```

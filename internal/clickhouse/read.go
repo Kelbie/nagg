@@ -71,7 +71,7 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 	args = append(args, input.Limit)
 	rows, err := s.conn.Query(ctx, `
 		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events e
+		FROM nostr_events AS e FINAL
 		`+where+`
 		ORDER BY e.created_at DESC, e.id DESC
 		LIMIT ?
@@ -173,10 +173,10 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 	var args []any
 	switch dataset {
 	case "EVENTS":
-		spec.from = "nostr_events e"
+		spec.from = "nostr_events AS e FINAL"
 		spec.where, args = eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
 	case "TAGS":
-		spec.from = "event_tags t INNER JOIN nostr_events e ON e.id = t.event_id"
+		spec.from = "event_tags t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id"
 		spec.where, args = tagWhere(input.IDs, input.PubKeys, input.Kinds, input.Tags)
 	case "RELAYS":
 		spec.from = "event_seen_relays r"
