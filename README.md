@@ -76,6 +76,16 @@ docker run --rm --network container:nagg-db \
   clickhouse:lts-jammy /nagg-api
 ```
 
+## Ask In Plain Language
+
+The `nagg-graphql` skill (in `.claude/skills/nagg-graphql/`) turns plain-language questions into GraphQL queries and runs them against `$NAGG_GRAPHQL_ENDPOINT`. For example:
+
+- "How many likes and reposts does `nevent1…` have?"
+- "How many followers does `npub1…` have, and what's their nip05?"
+- "Show the 10 newest comments in the thread rooted at `nevent1…`."
+- "What are the top event kinds on the relay?"
+- "Which events got the most reactions?"
+
 ## Backfill One Thread
 
 Fetch a root event, recursively crawl associated `e`-tagged events, fetch zaps from Primal's cache API, and backfill kind-0 profiles for all discovered pubkeys:
