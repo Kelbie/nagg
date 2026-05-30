@@ -19,7 +19,7 @@ It answers the three motivating questions directly:
 { event(id: "abc…") { likes  likers(first: 20) { edges { node { pubkey } content } } } }
 
 # 2. Comments on a thread for an event
-{ thread(rootEventId: "abc…") { totalComments directReplies participants
+{ thread(rootEventId: "abc…") { root { commentCount } directReplies participants
     comments(first: 20) { edges { node { author { pubkey } content replyCount } } } } }
 
 # 3. Followers per pubkey
@@ -39,6 +39,7 @@ These were settled deliberately during brainstorming and review:
 | **Liveness** | Query only | No subscriptions in v1. Clients re-query for fresh numbers. |
 | **Modeling** | Entity-centric typed nodes | `event(id)` / `profile(pubkey)` return `Event` / `Profile` nodes; a liker resolves straight to a `Profile`, a comment to its own engagement. Batch variants avoid N+1. |
 | **Event identity** | Nodes return the **full event** (`pubkey`/`kind`/`createdAt`/`content`/`tags`/`sig`) | nagg stores the whole event, so the `Event` node returns it alongside stats — clients never need a relay round-trip and can verify the event from `sig`. These fields are null only when the event was seen merely as a reference target (e.g. a reaction's target) and never ingested. |
+| **Engagement shape** | One uniform pattern per type: `<count>` (+ headline extras) + an actor connection | Likes, reposts, and zaps all follow the same shape (a flat count, optional headline figures, and a cursor connection to the actors). No type is special-cased into a bundled stats object. |
 | **Recursion** | `Comment` implements `Engageable`; `reactionsByContent` included | Comments are events, so they carry their own like/repost/zap stats directly via the `Engageable` interface (no `engagement` indirection); emoji breakdown comes for free from the per-reaction aggregate. |
 | **Pagination** | Relay-style cursor connections | Stable under the constant stream of new likes/comments (offset pages drift as rows arrive at the top); cheap deep paging in ClickHouse (`WHERE created_at < ?` seeks instead of `OFFSET n` scan-and-discard). |
 
@@ -82,16 +83,26 @@ type Query {
 Anything that can be reacted to, reposted, or zapped. Both top-level
 events and comments are Nostr events, so both implement this — a comment
 exposes its own like/repost/zap stats directly, with no `engagement`
-indirection.
+indirection. Every engagement type follows one shape: a flat count, any
+headline figures, and a cursor connection to the actors.
 """
 interface Engageable {
   id: Hex64!
+
+  # Reactions
   likes: Int!
   likers(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): ReactionConnection!
   reactionsByContent(first: Int = 10): [ReactionTally!]!
+
+  # Reposts
   reposts: Int!
   reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
-  zaps: ZapStats!
+
+  # Zaps
+  zaps: Int!
+  zapSats: Long!
+  uniqueZappers: Int!
+  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
 }
 
 # ---- Event (full event + engagement node) --------------------------
@@ -127,12 +138,14 @@ type Event implements Engageable {
   reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
 
   # Replies / comments (kind 1 NIP-10, or kind 1111 NIP-22)
-  commentCount: Int!         # all depths in the thread
-  directReplyCount: Int!     # direct replies to this event only
-  thread: Thread!
+  commentCount: Int!         # headline count, all depths in the thread
+  thread: Thread!            # direct-reply count, participants, and the comment tree
 
-  # Zaps (NIP-57, kind 9735)
-  zaps: ZapStats!
+  # Zaps (NIP-57, kind 9735). Largest zap = zappers(sort: LARGEST, first: 1).
+  zaps: Int!                 # count of valid zap receipts
+  zapSats: Long!             # total sats (64-bit; lifetime totals overflow 32-bit Int)
+  uniqueZappers: Int!
+  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
 
   updatedAt: DateTime!       # when these aggregates were last refreshed
 }
@@ -144,11 +157,11 @@ type ReactionTally { content: String!  count: Int! }
 The reply tree rooted at one event. Threading-scheme agnostic: built
 from the (root_event_id, parent_event_id) edges nagg extracts into
 event_replies, so it works for NIP-10 (kind 1 + e tags) and NIP-22
-(kind 1111 + E/e tags) alike.
+(kind 1111 + E/e tags) alike. The all-depths total lives on the root
+event as `commentCount` (== `thread.root.commentCount`).
 """
 type Thread {
   root: Event!
-  totalComments: Int!        # every depth
   directReplies: Int!        # direct replies to the root
   participants: Int!         # distinct commenter pubkeys
   comments(first: Int = 50, after: Cursor, sort: CommentSort = NEWEST): CommentConnection!
@@ -174,22 +187,20 @@ type Comment implements Engageable {
   reactionsByContent(first: Int = 10): [ReactionTally!]!
   reposts: Int!
   reposters(first: Int = 50, after: Cursor, sort: ActorSort = NEWEST): RepostConnection!
-  zaps: ZapStats!
+  zaps: Int!
+  zapSats: Long!
+  uniqueZappers: Int!
+  zappers(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
 }
 
 union ThreadParent = Event | Comment
 enum CommentSort { NEWEST OLDEST MOST_REPLIED MOST_LIKED }
 
 # ---- Zaps (NIP-57) -------------------------------------------------
-type ZapStats {
-  count: Int!                # valid zap receipts
-  totalSats: Long!           # 64-bit: lifetime sat totals overflow 32-bit Int
-  totalMsats: Long!
-  uniqueZappers: Int!
-  top: Zap                   # largest single zap
-  zaps(first: Int = 50, after: Cursor, sort: ZapSort = NEWEST): ZapConnection!
-}
-
+# Zap headline stats are flat on Event/Comment (zaps / zapSats /
+# uniqueZappers + the zappers connection), parallel to likes/reposts.
+# The largest zap is `zappers(sort: LARGEST, first: 1)`. Per-zap detail
+# (amount, memo, zapper) lives on Zap below; msat precision is per-edge.
 type Zap {
   id: Hex64!                 # zap receipt event id
   zapper: Profile            # resolved from embedded request (kind 9734)
@@ -264,7 +275,7 @@ How each field resolves against the tables in `IMPLEMENTATION_PLAN.md`, and what
 | `Event.likers` | `event_reactions` where `target_event_id=?` join `profiles_latest` | Planned (§4) |
 | `Event.reactionsByContent` | `post_reaction_counts` grouped by `reaction` | Planned (§5) |
 | `Event.commentCount` | `post_reply_counts` where `root_event_id=?`, `uniqMerge` | Planned (§5) |
-| `Event.directReplyCount` | count over `event_replies` where `parent_event_id=?` | Needs a per-parent count (a `post_direct_reply_counts` MV, or live query) |
+| `Thread.directReplies` | count over `event_replies` where `parent_event_id=?` | Needs a per-parent count (a `post_direct_reply_counts` MV, or live query) |
 | `Thread.comments` / `Comment.replies` | `event_replies` join `nostr_events` join `profiles_latest` | Planned (§4 / §7.5) |
 | `Thread.participants` | `uniq(author_pubkey)` over `event_replies` for the root | Needs a MV or live `uniq` |
 | `Comment` engagement (Engageable) | resolve the comment id as an `Event` (reactions/zaps keyed by its id) | Reuses the reaction/zap tables |
@@ -273,7 +284,7 @@ How each field resolves against the tables in `IMPLEMENTATION_PLAN.md`, and what
 | `Event.reposts` / `reposters` | reposts semantic table | **Missing.** Plan ingests kind 6/16 but defines no `event_reposts` table or `post_repost_counts` MV |
 | `Profile.followers` / `followerList` | reverse-follow index from kind 3 | **Missing.** Plan ingests kind 3 but builds no follower index |
 | `Profile.following` / `followingList` | latest kind-3 contact list (p tags) | **Missing.** Needs a `contacts_latest` table or derivation from `event_tags` on the latest kind-3 |
-| `Event.zaps` / `ZapStats` / `Zap` | zap semantic + aggregate tables from kind 9735 | **Missing.** Plan ingests kind 9735 but defines no `event_zaps` / `post_zap_totals` |
+| `Event.{zaps,zapSats,uniqueZappers,zappers}` / `Zap` | zap semantic + aggregate tables from kind 9735 | **Missing.** Plan ingests kind 9735 but defines no `event_zaps` / `post_zap_totals` |
 
 **Read-path note (full event by id).** `nostr_events` is `ORDER BY (kind, created_at, pubkey, id)` — tuned for analytics scans, not point lookups by `id`. But `event(id)` / `events(ids)` now return the **full event**, making by-id fetch a hot path. The read layer needs an `id`-ordered **projection** (or a bloom-filter data-skipping index on `id`) on `nostr_events` so these lookups seek instead of scan. Add it in the same migration that introduces the semantic/aggregate tables.
 
@@ -292,7 +303,8 @@ Section 7 already specifies a GraphQL API. This proposal is a **different shape*
 | **Pagination** | `limit` / `offset` | Cursor connections (`first` / `after`, `edges` / `pageInfo`) |
 | **Actor lists** | Not surfaced directly (could `groupBy` reactor) | First-class: `likers`, `reposters`, follower/following lists, comment tree |
 | **Raw event body** | Returned by `events(input)` as full `NostrEvent` nodes | Returned inline on the typed `Event` (content/tags/sig) — the two converge on one full-event-plus-stats node |
-| **Zaps / followers** | Not in the section 7 surface | First-class `ZapStats` and `followers`/`following` |
+| **Zaps / followers** | Not in the section 7 surface | First-class zap stats and `followers`/`following` |
+| **Scalars** | `ID`, `Time` | `Hex64` (validated 64-char hex), `DateTime`, `Long`, `Cursor` — supersede `ID`/`Time` for the typed surface |
 | **Shared ground** | `postStats(eventId)`, `commentsForPost`, "no raw SQL proxy" principle | Honors the same "no raw SQL proxy" principle; `postStats`/`commentsForPost` are the typed `Event`/`Thread` here |
 
 They are **not contradictory.** Section 7 already mixes typed (`postStats`, `commentsForPost`) and generic (`aggregateEvents`) queries, and this typed design honors section 7's stated key principle ("make it a constrained semantic analytics interface," not a SQL proxy).
@@ -307,17 +319,39 @@ They are **not contradictory.** Section 7 already mixes typed (`postStats`, `com
 
 ---
 
+## Phasing (v1 / v1.1)
+
+The schema is broad; this is the suggested build order, tracking the three motivating questions and the cost of the underlying data work.
+
+**v1 — answers the three motivating questions; leans on tables that exist or are cheap additions:**
+
+- Full-event fields on `Event` (already in `nostr_events`)
+- Reactions: `likes`, `likers`, `reactionsByContent` (reaction semantic + count tables)
+- Reposts: `reposts`, `reposters` (a small new count + edge table over kinds 6/16)
+- Comments/threads: `commentCount`, `thread` (`directReplies`, `participants`, `comments`) over the reply edges
+- Social graph: `Profile.followers` / `following` / lists (the reverse-follow index over kind 3)
+
+**v1.1 — deferred, biggest new data lift:**
+
+- Zaps: `zaps`, `zapSats`, `uniqueZappers`, `zappers` — needs the zap semantic table, sat aggregation, and 9735-vs-9734-vs-lnurl validation (the most new infrastructure, and not among the three motivating questions)
+- Comment-level recursive engagement depth tuning, if profiling shows it is needed
+
+`updatedAt` / freshness plumbing applies to both phases.
+
+---
+
 ## Decided defaults (v1)
 
 - **`likes` semantics:** like = reaction content `'+'` or `''`; `'-'` is a dislike; any other content is a custom/emoji reaction — **excluded** from `likes` and surfaced via `reactionsByContent`.
 - **Followers:** current state only. The reverse index uses each follower's **latest** kind-3 (replace semantics, latest wins); no follow/unfollow history in v1. `FollowEdge.followedAt` is the source kind-3's `created_at` — when that contact list was published, identical for every contact in it — **not** a true per-follow timestamp. So `followerList` ordered `NEWEST` means "most recently (re)published contact lists," and the follows cursor key is `(kind3_created_at, kind3_event_id)`.
-- **Zap trust:** validate each receipt (kind 9735) against its embedded request (kind 9734) and the recipient's lnurl before counting, so `totalSats` / `totalMsats` can't be inflated by forged receipts.
+- **Zap trust:** validate each receipt (kind 9735) against its embedded request (kind 9734) and the recipient's lnurl before counting, so `zapSats` can't be inflated by forged receipts.
 - **Bodies:** nagg stores and returns full events; clients do not need a relay to render or verify. (Raw-content retention policy is a separate Milestone-6 decision.)
 
 ## Implementation notes
 
 - **Library:** `gqlgen` (schema-first, matches the plan's stated Go stack). `Long` maps to a custom int64 scalar; `Hex64` and `Cursor` are custom scalars with validation.
+- **Scalars:** the typed layer standardizes on `Hex64` (validated 64-char hex) and `DateTime`, which supersede §7's bare `ID` and `Time` for this surface. When §7's `events()` / `aggregateEvents()` are reconciled they should adopt the same scalars; this proposal does not edit §7.
 - **N+1:** batch resolvers (`events`, `profiles`) plus a dataloader per edge type (a liker's `Profile`, a comment's `author`) are needed so a 50-item connection does not fan out into 50 ClickHouse round-trips.
-- **Cursor encoding:** opaque base64 of `(created_at, id)` for reactions/reposts; `(created_at, reply_event_id)` for comments; `(kind3_created_at, kind3_event_id)` for follows. Stable under inserts.
+- **Cursor encoding:** opaque base64 of `(created_at, id)` for reactions/reposts/zaps; `(created_at, reply_event_id)` for comments; `(kind3_created_at, kind3_event_id)` for follows. Stable under inserts.
 - **Read path:** add the `id`-ordered projection / bloom skip-index on `nostr_events` (see mapping note) so full-event-by-id lookups seek instead of scan.
 - **Freshness:** `Event.updatedAt` reflects the aggregate table's merge/refresh time so clients know staleness in this query-only model.
