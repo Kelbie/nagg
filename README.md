@@ -65,7 +65,7 @@ Run the example GraphQL client:
 NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql go run ./cmd/graphql-client
 ```
 
-The read layer exposes raw Nostr events plus constrained generic aggregations over `EVENTS`, `TAGS`, and `RELAYS`. App concepts such as reactions, replies, profiles, follows, and zaps are expressed as client query recipes using `kinds` and tag filters rather than hard-coded GraphQL fields.
+The read layer exposes raw Nostr events plus constrained generic aggregations over `EVENTS`, `TAGS`, and `RELAYS`. App concepts such as reactions, replies, profiles, follows, and zaps are expressed as client query recipes using `kinds` and tag filters rather than hard-coded GraphQL fields. When you need a server-side join, the API stays generic by exposing more raw events through primitive relations like `pubkeyEvents(kinds: [0], limit: 1)`.
 
 If the ClickHouse container is not published to localhost, run API/client containers in the `nagg-db` network namespace:
 
@@ -86,7 +86,7 @@ NAGG_THREAD_EXTRA_RELAYS=wss://nos.lol \
 go run ./cmd/thread-crawler nevent1...
 ```
 
-Then demonstrate that GraphQL can resolve a display-ready thread summary:
+Then demonstrate that GraphQL can resolve a display-ready thread summary using only raw events plus same-`pubkey` lookups for kind `0` metadata:
 
 ```sh
 NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \

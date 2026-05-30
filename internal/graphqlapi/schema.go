@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/graphql-go/graphql"
@@ -17,6 +19,7 @@ import (
 type Store interface {
 	EventByID(context.Context, string) (*chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
+	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 }
 
@@ -26,22 +29,62 @@ type resolver struct {
 	store Store
 }
 
+type eventNode struct {
+	event     chstore.EventView
+	relations *pubkeyRelationCache
+}
+
+type eventConnectionSource struct {
+	raw   []chstore.EventView
+	nodes []eventNode
+}
+
+type pubkeyRelationKey struct {
+	kinds string
+	limit int
+}
+
+type pubkeyRelationCache struct {
+	store   Store
+	pubkeys []string
+
+	mu    sync.Mutex
+	cache map[pubkeyRelationKey]map[string][]chstore.EventView
+}
+
 func NewSchema(store Store) (graphql.Schema, error) {
 	r := &resolver{store: store}
 	jsonType := jsonScalar("JSON")
 
-	eventType := graphql.NewObject(graphql.ObjectConfig{
+	var eventType *graphql.Object
+	eventType = graphql.NewObject(graphql.ObjectConfig{
 		Name: "NostrEvent",
-		Fields: graphql.Fields{
-			"id":        &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"pubkey":    &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"kind":      &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
-			"createdAt": &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime)},
-			"content":   &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"tags":      &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String)))))},
-			"sig":       &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"updatedAt": &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime)},
-		},
+		Fields: graphql.FieldsThunk(func() graphql.Fields {
+			return graphql.Fields{
+				"id":        &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: eventField(func(ev chstore.EventView) any { return ev.ID })},
+				"pubkey":    &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: eventField(func(ev chstore.EventView) any { return ev.PubKey })},
+				"kind":      &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: eventField(func(ev chstore.EventView) any { return ev.Kind })},
+				"createdAt": &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: eventField(func(ev chstore.EventView) any { return ev.CreatedAt })},
+				"content":   &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: eventField(func(ev chstore.EventView) any { return ev.Content })},
+				"tags":      &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String))))), Resolve: eventField(func(ev chstore.EventView) any { return ev.Tags })},
+				"sig":       &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: eventField(func(ev chstore.EventView) any { return ev.Sig })},
+				"updatedAt": &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: eventField(func(ev chstore.EventView) any { return ev.UpdatedAt })},
+				"pubkeyEvents": &graphql.Field{
+					Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
+					Args: graphql.FieldConfigArgument{
+						"kinds": &graphql.ArgumentConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
+						"limit": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 1},
+					},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						node, ok := asEventNode(p.Source)
+						if !ok || node.relations == nil {
+							return []eventNode{}, nil
+						}
+						return node.relations.load(p.Context, node.event.PubKey, intList(p.Args["kinds"]), intValue(p.Args["limit"], 1))
+					},
+				},
+			}
+		}),
 	})
 
 	pageInfoType := graphql.NewObject(graphql.ObjectConfig{
@@ -58,14 +101,15 @@ func NewSchema(store Store) (graphql.Schema, error) {
 			"nodes": &graphql.Field{
 				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
 				Resolve: func(p graphql.ResolveParams) (any, error) {
-					return p.Source, nil
+					source, _ := p.Source.(eventConnectionSource)
+					return source.nodes, nil
 				},
 			},
 			"pageInfo": &graphql.Field{
 				Type: graphql.NewNonNull(pageInfoType),
 				Resolve: func(p graphql.ResolveParams) (any, error) {
-					nodes, _ := p.Source.([]chstore.EventView)
-					return map[string]any{"hasNextPage": false, "endCursor": eventEndCursor(nodes)}, nil
+					source, _ := p.Source.(eventConnectionSource)
+					return map[string]any{"hasNextPage": false, "endCursor": eventEndCursor(source.raw)}, nil
 				},
 			},
 		},
@@ -76,9 +120,6 @@ func NewSchema(store Store) (graphql.Schema, error) {
 		Fields: graphql.Fields{
 			"root": &graphql.Field{Type: graphql.NewNonNull(eventType)},
 			"events": &graphql.Field{
-				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
-			},
-			"profiles": &graphql.Field{
 				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
 			},
 		},
@@ -142,7 +183,11 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					if err := validateHex64(id); err != nil {
 						return nil, err
 					}
-					return r.store.EventByID(p.Context, id)
+					event, err := r.store.EventByID(p.Context, id)
+					if err != nil {
+						return nil, err
+					}
+					return wrapEvent(*event, newPubkeyRelationCache(r.store, []chstore.EventView{*event})), nil
 				},
 			},
 			"events": &graphql.Field{
@@ -153,7 +198,12 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
-					return r.store.QueryEvents(p.Context, input)
+					events, err := r.store.QueryEvents(p.Context, input)
+					if err != nil {
+						return nil, err
+					}
+					relations := newPubkeyRelationCache(r.store, events)
+					return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations)}, nil
 				},
 			},
 			"aggregateEvents": &graphql.Field{
@@ -228,45 +278,20 @@ func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[
 		}
 	}
 
-	pubkeys := map[string]struct{}{}
-	for _, event := range eventsByID {
-		pubkeys[event.PubKey] = struct{}{}
-		for _, tag := range event.Tags {
-			if len(tag) >= 2 && tag[0] == "p" && hex64Pattern.MatchString(tag[1]) {
-				pubkeys[tag[1]] = struct{}{}
-			}
-		}
-	}
-
-	profilesByPubkey := map[string]chstore.EventView{}
-	for _, batch := range chunks(keys(pubkeys), 200) {
-		profiles, err := r.store.QueryEvents(ctx, chstore.EventQueryInput{
-			PubKeys: batch,
-			Kinds:   []int{0},
-			Limit:   uint64(min(len(batch)*2, 500)),
-		})
-		if err != nil {
-			return nil, err
-		}
-		for _, profile := range profiles {
-			if _, ok := profilesByPubkey[profile.PubKey]; ok {
-				continue
-			}
-			profilesByPubkey[profile.PubKey] = profile
-		}
-	}
-
 	events := make([]chstore.EventView, 0, len(eventsByID)-1)
 	for _, event := range eventsByID {
 		if event.ID != root.ID {
 			events = append(events, event)
 		}
 	}
-	profiles := make([]chstore.EventView, 0, len(profilesByPubkey))
-	for _, profile := range profilesByPubkey {
-		profiles = append(profiles, profile)
-	}
-	return map[string]any{"root": root, "events": events, "profiles": profiles}, nil
+	all := make([]chstore.EventView, 0, len(events)+1)
+	all = append(all, *root)
+	all = append(all, events...)
+	relations := newPubkeyRelationCache(r.store, all)
+	return map[string]any{
+		"root":   wrapEvent(*root, relations),
+		"events": wrapEvents(events, relations),
+	}, nil
 }
 
 func Handler(schema graphql.Schema) http.HandlerFunc {
@@ -423,6 +448,132 @@ func eventEndCursor(events []chstore.EventView) any {
 	}
 	last := events[len(events)-1]
 	return last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID
+}
+
+func eventField(fn func(chstore.EventView) any) graphql.FieldResolveFn {
+	return func(p graphql.ResolveParams) (any, error) {
+		event, ok := eventFromSource(p.Source)
+		if !ok {
+			return nil, nil
+		}
+		return fn(event), nil
+	}
+}
+
+func eventFromSource(source any) (chstore.EventView, bool) {
+	switch value := source.(type) {
+	case eventNode:
+		return value.event, true
+	case *eventNode:
+		return value.event, true
+	case chstore.EventView:
+		return value, true
+	case *chstore.EventView:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return chstore.EventView{}, false
+}
+
+func asEventNode(source any) (eventNode, bool) {
+	switch value := source.(type) {
+	case eventNode:
+		return value, true
+	case *eventNode:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return eventNode{}, false
+}
+
+func wrapEvent(event chstore.EventView, relations *pubkeyRelationCache) eventNode {
+	return eventNode{event: event, relations: relations}
+}
+
+func wrapEvents(events []chstore.EventView, relations *pubkeyRelationCache) []eventNode {
+	out := make([]eventNode, 0, len(events))
+	for _, event := range events {
+		out = append(out, wrapEvent(event, relations))
+	}
+	return out
+}
+
+func newPubkeyRelationCache(store Store, events []chstore.EventView) *pubkeyRelationCache {
+	pubkeys := make([]string, 0, len(events))
+	seen := map[string]struct{}{}
+	for _, event := range events {
+		if event.PubKey == "" {
+			continue
+		}
+		if _, ok := seen[event.PubKey]; ok {
+			continue
+		}
+		seen[event.PubKey] = struct{}{}
+		pubkeys = append(pubkeys, event.PubKey)
+	}
+	sort.Strings(pubkeys)
+	return &pubkeyRelationCache{
+		store:   store,
+		pubkeys: pubkeys,
+		cache:   map[pubkeyRelationKey]map[string][]chstore.EventView{},
+	}
+}
+
+func (c *pubkeyRelationCache) load(ctx context.Context, pubkey string, kinds []int, limit int) ([]eventNode, error) {
+	if c == nil || pubkey == "" {
+		return []eventNode{}, nil
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 1
+	}
+	key := pubkeyRelationKey{kindSignature(uniqueInts(kinds)), limit}
+
+	c.mu.Lock()
+	results, ok := c.cache[key]
+	c.mu.Unlock()
+	if !ok {
+		loaded, err := c.store.QueryLatestEventsByPubKeys(ctx, c.pubkeys, uniqueInts(kinds), uint64(limit))
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if existing, exists := c.cache[key]; exists {
+			results = existing
+		} else {
+			c.cache[key] = loaded
+			results = loaded
+		}
+		c.mu.Unlock()
+	}
+	related := results[pubkey]
+	return wrapEvents(related, newPubkeyRelationCache(c.store, related)), nil
+}
+
+func uniqueInts(values []int) []int {
+	seen := map[int]struct{}{}
+	out := make([]int, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func kindSignature(values []int) string {
+	if len(values) == 0 {
+		return "*"
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		parts = append(parts, fmt.Sprintf("%d", value))
+	}
+	return strings.Join(parts, ",")
 }
 
 func takeUnvisited(visited map[string]struct{}, ids []string, max int) []string {

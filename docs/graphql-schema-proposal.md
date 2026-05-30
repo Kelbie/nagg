@@ -42,6 +42,7 @@ Those concepts are not wrong. They are just not the right abstraction boundary f
 - **No raw SQL proxy.** Clients choose from allowed datasets, filters, dimensions, and metrics.
 - **Interpretations are recipes.** "Likes", "comments", "followers", and "zaps" are documented query examples, not GraphQL fields.
 - **Kind-agnostic by default.** Any client can define meaning through `kinds` and `tags`.
+- **Joins stay primitive.** Related data is requested as more raw events keyed by `pubkey`, `id`, or tags, not through app-specific types like `Profile` or `Author`.
 - **Full event bodies remain available.** `event(id:)` and `events(input:)` return the full Nostr event so clients can render and verify it.
 - **Semantic tables may exist internally later.** Materialized views and semantic indexes can optimize common recipes without changing the public API.
 
@@ -75,6 +76,7 @@ type NostrEvent {
   tags: [[String!]!]!
   sig: String!
   updatedAt: DateTime!
+  pubkeyEvents(kinds: [Int!], limit: Int = 1): [NostrEvent!]!
 }
 
 type EventConnection {
@@ -250,6 +252,32 @@ query {
 ```
 
 The client can parse `content` as profile JSON, or nagg can later expose a generic JSON helper without making profile semantics mandatory.
+
+If the client wants that data inline in a single GraphQL request, it can still stay generic by asking for more raw events that share the same `pubkey`:
+
+```graphql
+query {
+  events(input: {
+    kinds: [1]
+    limit: 20
+  }) {
+    nodes {
+      id
+      pubkey
+      content
+      pubkeyEvents(kinds: [0], limit: 1) {
+        id
+        pubkey
+        kind
+        createdAt
+        content
+      }
+    }
+  }
+}
+```
+
+That keeps the public API generic: the server is only resolving a same-`pubkey` relation and returning more `NostrEvent` rows.
 
 ### 5. Zaps
 

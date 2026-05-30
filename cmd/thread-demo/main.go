@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"time"
 )
@@ -33,7 +32,15 @@ func main() {
 	endpoint := env("NAGG_GRAPHQL_ENDPOINT", "http://127.0.0.1:8080/graphql")
 
 	rootResp := mustPost(endpoint, fmt.Sprintf(`query {
-		event(id: "%s") { id pubkey kind createdAt content tags }
+		event(id: "%s") {
+			id
+			pubkey
+			kind
+			createdAt
+			content
+			tags
+			pubkeyEvents(kinds: [0], limit: 1) { pubkey content createdAt }
+		}
 	}`, root))
 	rootEvent := rootResp.Data["event"].(map[string]any)
 
@@ -53,17 +60,36 @@ func main() {
 			tags: [{ key: "e", value: "%s" }]
 			limit: 100
 		}) {
-			nodes { id pubkey kind createdAt content tags }
+			nodes {
+				id
+				pubkey
+				kind
+				createdAt
+				content
+				tags
+				pubkeyEvents(kinds: [0], limit: 1) { pubkey content createdAt }
+			}
 		}
 	}`, root))
 	replies := nodes(repliesResp)
-
-	pubkeys := map[string]struct{}{rootEvent["pubkey"].(string): {}}
-	for _, reply := range replies {
-		pubkeys[reply["pubkey"].(string)] = struct{}{}
+	profiles := map[string]profile{}
+	if pubkey := stringField(rootEvent, "pubkey"); pubkey != "" {
+		if meta := parseKindZeroMeta(rootEvent["pubkeyEvents"]); meta.Name != "" || meta.Picture != "" {
+			profiles[pubkey] = meta
+		}
 	}
-	pubkeyList := keys(pubkeys)
-	profiles := fetchProfiles(endpoint, pubkeyList)
+	for _, reply := range replies {
+		pubkey := stringField(reply, "pubkey")
+		if pubkey == "" {
+			continue
+		}
+		if _, ok := profiles[pubkey]; ok {
+			continue
+		}
+		if meta := parseKindZeroMeta(reply["pubkeyEvents"]); meta.Name != "" || meta.Picture != "" {
+			profiles[pubkey] = meta
+		}
+	}
 
 	fmt.Printf("Thread root: %s\n", root)
 	fmt.Printf("Author: %s\n", describe(profiles, rootEvent["pubkey"].(string)))
@@ -94,32 +120,21 @@ func main() {
 	}
 }
 
-func fetchProfiles(endpoint string, pubkeys []string) map[string]profile {
-	rawPubkeys, _ := json.Marshal(pubkeys)
-	resp := mustPost(endpoint, fmt.Sprintf(`query {
-		events(input: {
-			kinds: [0]
-			pubkeys: %s
-			limit: %d
-		}) {
-			nodes { pubkey content createdAt }
-		}
-	}`, rawPubkeys, max(1, len(pubkeys)*2)))
-
-	out := map[string]profile{}
-	for _, node := range nodes(resp) {
-		pubkey := node["pubkey"].(string)
-		if _, ok := out[pubkey]; ok {
-			continue
-		}
-		var meta map[string]any
-		_ = json.Unmarshal([]byte(fmt.Sprint(node["content"])), &meta)
-		out[pubkey] = profile{
-			Name:    first(meta["display_name"], meta["displayName"], meta["name"], pubkey[:12]),
-			Picture: first(meta["picture"]),
-		}
+func parseKindZeroMeta(raw any) profile {
+	items, ok := raw.([]any)
+	if !ok || len(items) == 0 {
+		return profile{}
 	}
-	return out
+	rawEvent, ok := items[0].(map[string]any)
+	if !ok {
+		return profile{}
+	}
+	var meta map[string]any
+	_ = json.Unmarshal([]byte(stringField(rawEvent, "content")), &meta)
+	return profile{
+		Name:    first(meta["display_name"], meta["displayName"], meta["name"]),
+		Picture: first(meta["picture"]),
+	}
 }
 
 func mustPost(endpoint, query string) graphQLResponse {
@@ -175,20 +190,18 @@ func aggregateRows(resp graphQLResponse) []map[string]any {
 	return out
 }
 
-func keys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for key := range m {
-		out = append(out, key)
-	}
-	sort.Strings(out)
-	return out
-}
-
 func describe(profiles map[string]profile, pubkey string) string {
 	if p, ok := profiles[pubkey]; ok && p.Name != "" {
 		return p.Name + " (" + pubkey[:12] + "...)"
 	}
 	return pubkey[:12] + "..."
+}
+
+func stringField(raw map[string]any, key string) string {
+	if value, ok := raw[key].(string); ok {
+		return value
+	}
+	return ""
 }
 
 func first(values ...any) string {

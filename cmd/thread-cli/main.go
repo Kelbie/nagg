@@ -24,6 +24,7 @@ type event struct {
 	CreatedAt string
 	Content   string
 	Tags      [][]string
+	Meta      profile
 }
 
 type profile struct {
@@ -47,7 +48,19 @@ func main() {
 
 	root := parseEvent(context["root"].(map[string]any))
 	events := parseEvents(context["events"].([]any))
-	profiles := parseProfiles(context["profiles"].([]any))
+	profiles := map[string]profile{}
+	if root.Meta.Name != "" || root.Meta.Picture != "" {
+		profiles[root.PubKey] = root.Meta
+	}
+	for _, ev := range events {
+		if ev.Meta.Name == "" && ev.Meta.Picture == "" {
+			continue
+		}
+		if _, ok := profiles[ev.PubKey]; ok {
+			continue
+		}
+		profiles[ev.PubKey] = ev.Meta
+	}
 
 	children := map[string][]event{}
 	likes := map[string]int{}
@@ -79,9 +92,24 @@ func main() {
 func query(rootID string) string {
 	return fmt.Sprintf(`query {
 		eventContext(id: "%s", limit: 1500) {
-			root { id pubkey kind createdAt content tags }
-			events { id pubkey kind createdAt content tags }
-			profiles { pubkey content createdAt }
+			root {
+				id
+				pubkey
+				kind
+				createdAt
+				content
+				tags
+				pubkeyEvents(kinds: [0], limit: 1) { pubkey content createdAt }
+			}
+			events {
+				id
+				pubkey
+				kind
+				createdAt
+				content
+				tags
+				pubkeyEvents(kinds: [0], limit: 1) { pubkey content createdAt }
+			}
 		}
 	}`, rootID)
 }
@@ -120,6 +148,7 @@ func parseEvent(raw map[string]any) event {
 		CreatedAt: fmt.Sprint(raw["createdAt"]),
 		Content:   fmt.Sprint(raw["content"]),
 		Tags:      parseTags(raw["tags"].([]any)),
+		Meta:      parseKindZeroMeta(raw["pubkeyEvents"]),
 	}
 }
 
@@ -136,25 +165,21 @@ func parseTags(raw []any) [][]string {
 	return tags
 }
 
-func parseProfiles(raw []any) map[string]profile {
-	profiles := map[string]profile{}
-	for _, item := range raw {
-		rawEvent := item.(map[string]any)
-		pubkey := stringField(rawEvent, "pubkey")
-		if pubkey == "" {
-			continue
-		}
-		if _, ok := profiles[pubkey]; ok {
-			continue
-		}
-		var meta map[string]any
-		_ = json.Unmarshal([]byte(stringField(rawEvent, "content")), &meta)
-		profiles[pubkey] = profile{
-			Name:    first(meta["display_name"], meta["displayName"], meta["name"]),
-			Picture: first(meta["picture"]),
-		}
+func parseKindZeroMeta(raw any) profile {
+	items, ok := raw.([]any)
+	if !ok || len(items) == 0 {
+		return profile{}
 	}
-	return profiles
+	rawEvent, ok := items[0].(map[string]any)
+	if !ok {
+		return profile{}
+	}
+	var meta map[string]any
+	_ = json.Unmarshal([]byte(stringField(rawEvent, "content")), &meta)
+	return profile{
+		Name:    first(meta["display_name"], meta["displayName"], meta["name"]),
+		Picture: first(meta["picture"]),
+	}
 }
 
 func stringField(raw map[string]any, key string) string {

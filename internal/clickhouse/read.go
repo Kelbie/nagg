@@ -51,6 +51,47 @@ type AggregateRow struct {
 	Metrics    map[string]uint64 `json:"metrics"`
 }
 
+func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string, kinds []int, limitPerPubKey uint64) (map[string][]EventView, error) {
+	pubkeys = uniqueStrings(pubkeys)
+	if len(pubkeys) == 0 {
+		return map[string][]EventView{}, nil
+	}
+	if limitPerPubKey == 0 || limitPerPubKey > 20 {
+		limitPerPubKey = 1
+	}
+
+	where, args := eventWhere("e", nil, pubkeys, kinds, nil)
+	query := fmt.Sprintf(`
+		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+		FROM nostr_events AS e FINAL
+		%s
+		ORDER BY e.pubkey ASC, e.created_at DESC, e.id DESC
+		LIMIT %d BY e.pubkey
+	`, where, limitPerPubKey)
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string][]EventView, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		out[pubkey] = nil
+	}
+	for rows.Next() {
+		var tagsJSON string
+		var ev EventView
+		var kind uint32
+		if err := rows.Scan(&ev.ID, &ev.PubKey, &kind, &ev.CreatedAt, &ev.Content, &tagsJSON, &ev.Sig, &ev.UpdatedAt); err != nil {
+			return nil, err
+		}
+		ev.Kind = int(kind)
+		_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
+		out[ev.PubKey] = append(out[ev.PubKey], ev)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) EventByID(ctx context.Context, id string) (*EventView, error) {
 	events, err := s.QueryEvents(ctx, EventQueryInput{IDs: []string{id}, Limit: 1})
 	if err != nil {
@@ -370,4 +411,20 @@ func ints(values []int) string {
 		parts = append(parts, strconv.Itoa(value))
 	}
 	return strings.Join(parts, ",")
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
