@@ -2,10 +2,37 @@
 
 Nagg is a Nostr AppView aggregator. The first milestone is a Go ingester that subscribes to configured Nostr relays, validates events, and stores raw events, relay provenance, and flattened tags in ClickHouse.
 
+## Prerequisites
+
+### ClickHouse
+
+Run a ClickHouse instance using the [official Docker image](https://hub.docker.com/_/clickhouse):
+
+```sh
+docker run -d \
+  --name nagg-db \
+  --ulimit nofile=262144:262144 \
+  -p 8123:8123 \
+  -p 9000:9000 \
+  clickhouse/clickhouse-server:lts-jammy
+```
+
+Create the `nagg` user:
+
+```sh
+docker exec nagg-db clickhouse-client --query "
+  CREATE USER IF NOT EXISTS nagg IDENTIFIED BY 'nagg_secret';
+  GRANT ALL ON default.* TO nagg;
+"
+```
+
 ## Run The Ingester
 
 ```sh
-NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 go run ./cmd/ingester
+NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+NAGG_CLICKHOUSE_USERNAME=nagg \
+NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+go run ./cmd/ingester
 ```
 
 Useful configuration:
