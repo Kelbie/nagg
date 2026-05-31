@@ -5,6 +5,9 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
@@ -14,6 +17,9 @@ import (
 //go:embed migrations/001_ingestion.sql
 var ingestionMigration string
 
+//go:embed migrations/002_appview.sql
+var appviewMigration string
+
 type Config struct {
 	Addr     string
 	Database string
@@ -22,7 +28,14 @@ type Config struct {
 }
 
 type Store struct {
-	conn ch.Conn
+	conn            ch.Conn
+	trendingCacheMu sync.Mutex
+	trendingCache   map[string]trendingCacheEntry
+}
+
+type trendingCacheEntry struct {
+	expiresAt time.Time
+	events    []EventView
 }
 
 type EventRecord struct {
@@ -48,7 +61,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := conn.Ping(ctx); err != nil {
 		return nil, err
 	}
-	return &Store{conn: conn}, nil
+	return &Store{conn: conn, trendingCache: map[string]trendingCacheEntry{}}, nil
 }
 
 func (s *Store) Close() error {
@@ -56,10 +69,110 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	for _, stmt := range splitSQLStatements(ingestionMigration) {
-		if err := s.conn.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("migration failed: %w", err)
+	for _, migration := range []string{ingestionMigration, appviewMigration} {
+		for _, stmt := range splitSQLStatements(migration) {
+			if err := s.conn.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("migration failed: %w", err)
+			}
 		}
+	}
+	return nil
+}
+
+func (s *Store) Backfill(ctx context.Context) error {
+	statements := []string{
+		"TRUNCATE TABLE IF EXISTS note_like_counts",
+		"TRUNCATE TABLE IF EXISTS note_repost_counts",
+		"TRUNCATE TABLE IF EXISTS note_reply_counts",
+		"TRUNCATE TABLE IF EXISTS note_zaps",
+		"TRUNCATE TABLE IF EXISTS note_zap_totals",
+		"TRUNCATE TABLE IF EXISTS profiles_latest",
+		`INSERT INTO note_like_counts
+		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS likes
+		 FROM event_tags
+		 WHERE kind = 7 AND tag_key = 'e' AND length(tag_value) = 64
+		 GROUP BY target_event_id`,
+		`INSERT INTO note_repost_counts
+		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS reposts
+		 FROM event_tags
+		 WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
+		 GROUP BY target_event_id`,
+		`INSERT INTO note_reply_counts
+		 SELECT tag_value AS target_event_id, uniqState(event_id) AS replies
+		 FROM event_tags
+		 WHERE kind = 1 AND tag_key = 'e' AND length(tag_value) = 64
+		 GROUP BY target_event_id`,
+		`INSERT INTO profiles_latest
+		 SELECT
+		   pubkey,
+		   id AS event_id,
+		   created_at,
+		   JSONExtractString(content, 'name') AS name,
+		   JSONExtractString(content, 'display_name') AS display_name,
+		   JSONExtractString(content, 'picture') AS picture,
+		   JSONExtractString(content, 'about') AS about,
+		   JSONExtractString(content, 'nip05') AS nip05,
+		   JSONExtractString(content, 'lud16') AS lud16,
+		   JSONExtractString(content, 'lud06') AS lud06,
+		   JSONExtractString(content, 'banner') AS banner,
+		   JSONExtractString(content, 'website') AS website,
+		   content AS raw_json
+		 FROM nostr_events FINAL
+		 WHERE kind = 0`,
+	}
+	for _, stmt := range statements {
+		if err := s.conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("backfill failed: %w", err)
+		}
+	}
+	if err := s.backfillZaps(ctx); err != nil {
+		return fmt.Errorf("backfill zaps failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) backfillZaps(ctx context.Context) error {
+	rows, err := s.conn.Query(ctx, `
+		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM nostr_events FINAL
+		WHERE kind = 9735
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	events, err := scanEventRows(rows)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+
+	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO note_zaps")
+	if err != nil {
+		return err
+	}
+	appended := false
+	for _, event := range events {
+		zap, ok := extractNoteZap(eventViewToNostrEvent(event), event.CreatedAt)
+		if !ok {
+			continue
+		}
+		appended = true
+		if err := batch.Append(
+			zap.ReceiptID,
+			zap.TargetEventID,
+			zap.PubKey,
+			zap.CreatedAt,
+			zap.Sats,
+		); err != nil {
+			return err
+		}
+	}
+	if appended {
+		return batch.Send()
 	}
 	return nil
 }
@@ -81,6 +194,11 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 	if err != nil {
 		return err
 	}
+	zapsBatch, err := s.conn.PrepareBatch(ctx, "INSERT INTO note_zaps")
+	if err != nil {
+		return err
+	}
+	zapsAppended := false
 
 	for _, record := range records {
 		event := record.Event
@@ -126,6 +244,19 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 				return err
 			}
 		}
+
+		if zap, ok := extractNoteZap(event, createdAt); ok {
+			zapsAppended = true
+			if err := zapsBatch.Append(
+				zap.ReceiptID,
+				zap.TargetEventID,
+				zap.PubKey,
+				zap.CreatedAt,
+				zap.Sats,
+			); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := eventsBatch.Send(); err != nil {
@@ -134,7 +265,22 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 	if err := relaysBatch.Send(); err != nil {
 		return err
 	}
-	return tagsBatch.Send()
+	if err := tagsBatch.Send(); err != nil {
+		return err
+	}
+	if zapsAppended {
+		if err := zapsBatch.Send(); err != nil {
+			return err
+		}
+	}
+	s.clearTrendingCache()
+	return nil
+}
+
+func (s *Store) clearTrendingCache() {
+	s.trendingCacheMu.Lock()
+	defer s.trendingCacheMu.Unlock()
+	s.trendingCache = map[string]trendingCacheEntry{}
 }
 
 func flattenTag(tag nostr.Tag) (string, string, []string) {
@@ -151,4 +297,163 @@ func flattenTag(tag nostr.Tag) (string, string, []string) {
 		extra = append(extra, tag[2:]...)
 	}
 	return key, value, extra
+}
+
+type noteZap struct {
+	ReceiptID     string
+	TargetEventID string
+	PubKey        string
+	CreatedAt     time.Time
+	Sats          uint64
+}
+
+func eventViewToNostrEvent(event EventView) *nostr.Event {
+	tags := make(nostr.Tags, 0, len(event.Tags))
+	for _, tag := range event.Tags {
+		tags = append(tags, nostr.Tag(tag))
+	}
+	return &nostr.Event{
+		ID:        event.ID,
+		PubKey:    event.PubKey,
+		CreatedAt: nostr.Timestamp(event.CreatedAt.Unix()),
+		Kind:      event.Kind,
+		Tags:      tags,
+		Content:   event.Content,
+		Sig:       event.Sig,
+	}
+}
+
+func extractNoteZap(event *nostr.Event, createdAt time.Time) (noteZap, bool) {
+	if event.Kind != 9735 {
+		return noteZap{}, false
+	}
+	targetID := firstHexNostrTag(event.Tags, "e")
+	description := firstNostrTag(event.Tags, "description")
+	if targetID == "" && description != "" {
+		targetID = targetIDFromZapRequest(description)
+	}
+	if targetID == "" {
+		return noteZap{}, false
+	}
+
+	msats := amountMSatsFromZapRequest(description)
+	var sats uint64
+	if msats > 0 {
+		sats = msats / 1000
+	} else if bolt11 := firstNostrTag(event.Tags, "bolt11"); bolt11 != "" {
+		sats = satsFromBolt11(bolt11)
+	}
+
+	return noteZap{
+		ReceiptID:     event.ID,
+		TargetEventID: targetID,
+		PubKey:        event.PubKey,
+		CreatedAt:     createdAt,
+		Sats:          sats,
+	}, true
+}
+
+func targetIDFromZapRequest(raw string) string {
+	var req struct {
+		Tags [][]string `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		return ""
+	}
+	return firstHexTag(req.Tags, "e")
+}
+
+func amountMSatsFromZapRequest(raw string) uint64 {
+	var req struct {
+		Tags [][]string `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		return 0
+	}
+	value := firstTag(req.Tags, "amount")
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func satsFromBolt11(invoice string) uint64 {
+	invoice = strings.ToLower(strings.TrimSpace(invoice))
+	if !strings.HasPrefix(invoice, "lnbc") {
+		return 0
+	}
+	sep := strings.LastIndexByte(invoice, '1')
+	if sep <= len("lnbc") {
+		return 0
+	}
+	amount := invoice[len("lnbc"):sep]
+	if amount == "" {
+		return 0
+	}
+
+	unit := byte(0)
+	last := amount[len(amount)-1]
+	if last < '0' || last > '9' {
+		unit = last
+		amount = amount[:len(amount)-1]
+	}
+	n, err := strconv.ParseUint(amount, 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	switch unit {
+	case 0:
+		return n * 100_000_000
+	case 'm':
+		return n * 100_000
+	case 'u':
+		return n * 100
+	case 'n':
+		return n / 10
+	case 'p':
+		return n / 10_000
+	default:
+		return 0
+	}
+}
+
+func firstHexTag(tags [][]string, key string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == key && len(tag[1]) == 64 {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func firstTag(tags [][]string, key string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == key {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func firstHexNostrTag(tags nostr.Tags, key string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == key && len(tag[1]) == 64 {
+			return tag[1]
+		}
+	}
+	return ""
+}
+
+func firstNostrTag(tags nostr.Tags, key string) string {
+	for _, tag := range tags {
+		if len(tag) >= 2 && tag[0] == key {
+			return tag[1]
+		}
+	}
+	return ""
 }

@@ -11,19 +11,13 @@ Run a ClickHouse instance using the [official Docker image](https://hub.docker.c
 ```sh
 docker run -d \
   --name nagg-db \
+  -e CLICKHOUSE_USER=nagg \
+  -e CLICKHOUSE_PASSWORD=nagg_secret \
+  -e CLICKHOUSE_DB=default \
   --ulimit nofile=262144:262144 \
   -p 8123:8123 \
   -p 9000:9000 \
-  clickhouse/clickhouse-server:lts-jammy
-```
-
-Create the `nagg` user:
-
-```sh
-docker exec nagg-db clickhouse-client --query "
-  CREATE USER IF NOT EXISTS nagg IDENTIFIED BY 'nagg_secret';
-  GRANT ALL ON default.* TO nagg;
-"
+  clickhouse/clickhouse-server:latest
 ```
 
 ## Run The Ingester
@@ -38,17 +32,30 @@ go run ./cmd/ingester
 Useful configuration:
 
 ```sh
-NAGG_RELAYS=wss://relay.damus.io,wss://relay.primal.net,wss://nos.lol
-NAGG_KINDS=0,1,3,5,6,7,9735,10002
+NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
+NAGG_KINDS=0,1,3,6,7,16,9735
 NAGG_SINCE=24h
 NAGG_BATCH_SIZE=1000
 NAGG_FLUSH_INTERVAL=5s
 NAGG_VERIFY_EVENTS=true
 ```
 
-Leave `NAGG_KINDS` empty to request all event kinds. Set `NAGG_SINCE=0` to omit the `since` filter.
+The default `NAGG_KINDS` is `0,1,3,6,7,16,9735`, which covers profiles, notes, contact lists, reposts, reactions, generic reposts, and zaps for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Set `NAGG_SINCE=0` to omit the `since` filter.
 
-## Run The GraphQL API
+## Backfill The App-View Tables
+
+ClickHouse materialized views only populate from inserts after migration. Run the app-view backfill once after creating the schema or after changing app-view aggregates:
+
+```sh
+NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+NAGG_CLICKHOUSE_USERNAME=nagg \
+NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+go run ./cmd/backfill
+```
+
+The command is idempotent: it truncates and rebuilds app-view counter/profile tables from `nostr_events` and `event_tags`.
+
+## Run The API
 
 ```sh
 NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
@@ -57,7 +64,63 @@ NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
 go run ./cmd/api
 ```
 
-The API listens on `:8080` by default and serves `POST /graphql`. Set `NAGG_API_ADDR=:9090` to change the bind address.
+The API listens on `:8080` by default and serves `POST /graphql`, `GET /healthz`, and the app-view REST routes under `/nostr/*`. Set `NAGG_API_ADDR=:9090` to change the bind address. If `NAGG_API_ADDR` is unset and Railway provides `PORT`, the API listens on that port.
+
+The Vertex DVM proxy routes (`/nostr/profile`, `/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. If the key is empty they return `503`; if Vertex rejects the key it returns the DVM kind-7000 error as a `502`.
+
+```sh
+NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret> \
+NAGG_VERTEX_RELAY=wss://relay.vertexlab.io \
+NAGG_NIP05_VALIDATE=true \
+go run ./cmd/api
+```
+
+App-view smoke checks:
+
+```sh
+curl http://127.0.0.1:8080/healthz
+curl 'http://127.0.0.1:8080/nostr/feed?kind=trending&limit=20'
+curl -X POST http://127.0.0.1:8080/nostr/notes/stats \
+  -H 'content-type: application/json' \
+  -d '{"ids":[]}'
+```
+
+## Deploy On Railway
+
+This repo includes a `Dockerfile` and `railway.toml` for the API service. Railway builds the Dockerfile, runs `./nagg-migrate` as the pre-deploy command, starts `./nagg-api`, and checks `GET /healthz` before making the deployment active.
+
+Required service variables:
+
+```sh
+NAGG_CLICKHOUSE_ADDR=<clickhouse-private-host>:9000
+NAGG_CLICKHOUSE_DATABASE=default
+NAGG_CLICKHOUSE_USERNAME=<clickhouse-user>
+NAGG_CLICKHOUSE_PASSWORD=<clickhouse-password>
+```
+
+Optional service variables:
+
+```sh
+NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band
+NAGG_KINDS=0,1,3,6,7,16,9735
+NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret>
+NAGG_VERTEX_RELAY=wss://relay.vertexlab.io
+NAGG_NIP05_VALIDATE=true
+```
+
+Do not set `PORT` yourself on Railway; Railway injects it for the web service. Set `NAGG_API_ADDR` only when you intentionally want to override the bind address outside Railway.
+
+The pre-deploy command only migrates schemas. After first deploy, or after changing app-view aggregate logic, run the backfill command once from the Railway shell or a one-off command:
+
+```sh
+./nagg-backfill
+```
+
+If you want the ingester as a separate Railway service, deploy the same image and override the start command to:
+
+```sh
+./nagg-ingester
+```
 
 Run the example GraphQL client:
 
@@ -73,7 +136,9 @@ If the ClickHouse container is not published to localhost, run API/client contai
 docker run --rm --network container:nagg-db \
   -v "$PWD/bin/nagg-api-linux-arm64:/nagg-api:ro" \
   -e NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
-  clickhouse:lts-jammy /nagg-api
+  -e NAGG_CLICKHOUSE_USERNAME=nagg \
+  -e NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+  alpine:3.20 /nagg-api
 ```
 
 ## Ask In Plain Language
@@ -88,11 +153,12 @@ The `nagg-graphql` skill (in `.claude/skills/nagg-graphql/`) turns plain-languag
 
 ## Backfill One Thread
 
-Fetch a root event, recursively crawl associated `e`-tagged events, fetch zaps from Primal's cache API, and backfill kind-0 profiles for all discovered pubkeys:
+Fetch a root event from configured Nostr relays, recursively crawl associated `e`-tagged events, and backfill kind-0 profiles for all discovered pubkeys:
 
 ```sh
 NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
-NAGG_THREAD_EXTRA_RELAYS=wss://nos.lol \
+NAGG_THREAD_RELAY=wss://relay.damus.io \
+NAGG_THREAD_EXTRA_RELAYS=wss://nos.lol,wss://relay.nostr.band \
 go run ./cmd/thread-crawler nevent1...
 ```
 

@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/vertex-lab/nagg/internal/appview"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 func main() {
@@ -41,16 +44,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	var vertexClient *vertex.Client
+	if cfg.Vertex.PrivateKey != "" {
+		vertexClient, err = vertex.New(vertex.Config{
+			PrivateKey: cfg.Vertex.PrivateKey,
+			Relay:      cfg.Vertex.Relay,
+		})
+		if err != nil {
+			slog.Error("vertex client failed", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", graphqlapi.Handler(schema))
+	appviewOpts := []appview.Option{appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05)}
+	if vertexClient != nil {
+		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
+	}
+	appview.New(store, appviewOpts...).Register(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
 	})
 
-	addr := ":8080"
-	if v := os.Getenv("NAGG_API_ADDR"); v != "" {
-		addr = v
-	}
+	addr := listenAddr(os.Getenv)
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -69,4 +86,18 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+}
+
+func listenAddr(getenv func(string) string) string {
+	if addr := strings.TrimSpace(getenv("NAGG_API_ADDR")); addr != "" {
+		return addr
+	}
+	port := strings.TrimSpace(getenv("PORT"))
+	if port == "" {
+		return ":8080"
+	}
+	if strings.HasPrefix(port, ":") || strings.Contains(port, ":") {
+		return port
+	}
+	return ":" + port
 }

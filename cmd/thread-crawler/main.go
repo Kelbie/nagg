@@ -21,8 +21,6 @@ import (
 	"github.com/vertex-lab/nagg/internal/config"
 )
 
-const defaultRelay = "wss://cache2.primal.net/v1"
-
 type crawler struct {
 	relay  string
 	events map[string]*nostr.Event
@@ -41,7 +39,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	relay := env("NAGG_THREAD_RELAY", defaultRelay)
 	rootID, err := decodeEventID(target)
 	if err != nil {
 		slog.Error("target decode failed", "error", err)
@@ -51,6 +48,15 @@ func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("configuration failed", "error", err)
+		os.Exit(1)
+	}
+
+	relay := env("NAGG_THREAD_RELAY", "")
+	if relay == "" && len(cfg.Firehose.Relays) > 0 {
+		relay = cfg.Firehose.Relays[0]
+	}
+	if relay == "" {
+		slog.Error("missing thread relay", "usage", "set NAGG_THREAD_RELAY or NAGG_RELAYS")
 		os.Exit(1)
 	}
 
@@ -106,36 +112,14 @@ func main() {
 }
 
 func (c *crawler) crawl(ctx context.Context, rootID string) error {
-	rootEvents, err := c.queryCache(ctx, "events", map[string]any{"event_ids": []string{rootID}, "extended_response": true}, 12*time.Second)
+	rootEvents, err := c.query(ctx, "root", map[string]any{"ids": []string{rootID}, "limit": 10}, 12*time.Second)
 	if err != nil {
 		return err
-	}
-	if len(rootEvents) == 0 {
-		rootEvents, err = c.query(ctx, "root", map[string]any{"ids": []string{rootID}, "limit": 10}, 12*time.Second)
-		if err != nil {
-			return err
-		}
 	}
 	if len(rootEvents) == 0 {
 		return fmt.Errorf("root event %s not found on %s", rootID, c.relay)
 	}
 	c.add(rootEvents)
-
-	threadEvents, err := c.queryCache(ctx, "thread_view", map[string]any{"event_id": rootID, "limit": 1000}, 25*time.Second)
-	if err != nil {
-		slog.Warn("primal thread_view failed", "error", err)
-	} else {
-		c.add(threadEvents)
-		slog.Info("primal thread_view fetched", "events", len(threadEvents), "new_total", len(c.events))
-	}
-
-	zaps, err := c.queryCache(ctx, "event_zaps_by_satszapped", map[string]any{"event_id": rootID, "limit": 1000, "offset": 0}, 20*time.Second)
-	if err != nil {
-		slog.Warn("primal zaps fetch failed", "error", err)
-	} else {
-		c.add(zaps)
-		slog.Info("primal zaps fetched", "events", len(zaps), "new_total", len(c.events))
-	}
 
 	if err := c.crawlReferences(ctx, rootID); err != nil {
 		return err
@@ -150,18 +134,36 @@ func (c *crawler) crawl(ctx context.Context, rootID string) error {
 	}
 	c.relay = primaryRelay
 
+	if err := c.crawlEngagement(ctx); err != nil {
+		slog.Warn("engagement crawl failed", "relay", c.relay, "error", err)
+	}
+
 	authors := c.pubkeys()
 	for _, batch := range chunks(authors, 80) {
-		events, err := c.queryCache(ctx, "user_infos", map[string]any{"pubkeys": batch}, 15*time.Second)
-		if err != nil || len(events) == 0 {
-			slog.Warn("primal user_infos failed or empty; falling back to kind 0 query", "error", err, "profiles", len(events))
-			events, err = c.query(ctx, "profiles", map[string]any{"kinds": []int{0}, "authors": batch, "limit": len(batch) * 3}, 15*time.Second)
-		}
+		events, err := c.query(ctx, "profiles", map[string]any{"kinds": []int{0}, "authors": batch, "limit": len(batch) * 3}, 15*time.Second)
 		if err != nil {
 			return err
 		}
 		c.add(events)
 		slog.Info("profile batch fetched", "authors", len(batch), "profiles", len(events), "new_total", len(c.events))
+	}
+	return nil
+}
+
+func (c *crawler) crawlEngagement(ctx context.Context) error {
+	eventIDs := c.eventIDs()
+	for batchIndex, batch := range chunks(eventIDs, 80) {
+		events, err := c.query(ctx, fmt.Sprintf("engagement-%d", batchIndex), map[string]any{
+			"kinds": []int{6, 7, 16, 9735},
+			"#e":    batch,
+			"limit": 5000,
+		}, 20*time.Second)
+		if err != nil {
+			return err
+		}
+		before := len(c.events)
+		c.add(events)
+		slog.Info("engagement batch fetched", "relay", c.relay, "targets", len(batch), "events", len(events), "new_total", len(c.events), "new_events", len(c.events)-before)
 	}
 	return nil
 }
@@ -196,10 +198,6 @@ func (c *crawler) crawlReferences(ctx context.Context, rootID string) error {
 		}
 	}
 	return nil
-}
-
-func (c *crawler) queryCache(ctx context.Context, method string, payload map[string]any, timeout time.Duration) ([]*nostr.Event, error) {
-	return c.queryEnvelope(ctx, "cache-"+method, map[string]any{"cache": []any{method, payload}}, timeout)
 }
 
 func (c *crawler) query(ctx context.Context, subID string, filter map[string]any, timeout time.Duration) ([]*nostr.Event, error) {
@@ -330,6 +328,15 @@ func (c *crawler) pubkeys() []string {
 	out := make([]string, 0, len(seen))
 	for pubkey := range seen {
 		out = append(out, pubkey)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (c *crawler) eventIDs() []string {
+	out := make([]string, 0, len(c.events))
+	for id := range c.events {
+		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out

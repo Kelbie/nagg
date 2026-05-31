@@ -8,6 +8,7 @@ require (
 	github.com/graphql-go/graphql v0.8.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/nbd-wtf/go-nostr v0.52.0
+	golang.org/x/sync v0.20.0
 )
 
 require (
