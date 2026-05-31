@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +20,13 @@ type Config struct {
 	ClickHouse chstore.Config
 	Firehose   firehose.Config
 	Ingest     ingest.Config
+	Vertex     VertexConfig
+}
+
+type VertexConfig struct {
+	PrivateKey    string
+	Relay         string
+	ValidateNIP05 bool
 }
 
 func Load() (Config, error) {
@@ -29,8 +38,8 @@ func Load() (Config, error) {
 			Password: os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
 		},
 		Firehose: firehose.Config{
-			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://relay.primal.net,wss://nos.lol,wss://relay.nostr.band")),
-			Kinds:         parseKinds(os.Getenv("NAGG_KINDS")),
+			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band")),
+			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,6,7,16,9735")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
 			SeenCacheSize: parseInt(env("NAGG_SEEN_CACHE_SIZE", "200000")),
@@ -42,6 +51,11 @@ func Load() (Config, error) {
 			FlushInterval: parseDuration(env("NAGG_FLUSH_INTERVAL", "5s")),
 			QueueSize:     parseInt(env("NAGG_QUEUE_SIZE", "10000")),
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
+		},
+		Vertex: VertexConfig{
+			PrivateKey:    os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
+			Relay:         env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
+			ValidateNIP05: parseBool(env("NAGG_NIP05_VALIDATE", "true")),
 		},
 	}
 
@@ -63,6 +77,21 @@ func (c Config) validate() error {
 	}
 	if c.Ingest.FlushInterval <= 0 {
 		return errors.New("NAGG_FLUSH_INTERVAL must be positive")
+	}
+	if c.Vertex.PrivateKey != "" {
+		if len(c.Vertex.PrivateKey) != 64 {
+			return errors.New("NAGG_VERTEX_PRIVATE_KEY must be 64 hex characters")
+		}
+		if _, err := hex.DecodeString(c.Vertex.PrivateKey); err != nil {
+			return fmt.Errorf("NAGG_VERTEX_PRIVATE_KEY: %w", err)
+		}
+		relayURL, err := url.Parse(c.Vertex.Relay)
+		if err != nil {
+			return fmt.Errorf("NAGG_VERTEX_RELAY: %w", err)
+		}
+		if relayURL.Scheme != "wss" && relayURL.Scheme != "ws" {
+			return errors.New("NAGG_VERTEX_RELAY must use ws or wss")
+		}
 	}
 	return nil
 }

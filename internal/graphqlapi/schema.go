@@ -21,6 +21,7 @@ type Store interface {
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
+	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
 var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -243,46 +244,9 @@ func NewSchema(store Store) (graphql.Schema, error) {
 }
 
 func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {
-	root, err := r.store.EventByID(ctx, id)
+	root, events, err := r.store.ThreadEvents(ctx, id, limit)
 	if err != nil {
 		return nil, err
-	}
-
-	eventsByID := map[string]chstore.EventView{root.ID: *root}
-	visited := map[string]struct{}{}
-	frontier := []string{root.ID}
-
-	for depth := 0; depth < 8 && len(frontier) > 0 && len(eventsByID) < limit; depth++ {
-		batch := takeUnvisited(visited, frontier, 100)
-		if len(batch) == 0 {
-			break
-		}
-		remaining := limit - len(eventsByID)
-		if remaining <= 0 {
-			break
-		}
-		events, err := r.store.QueryEvents(ctx, chstore.EventQueryInput{
-			Tags:  []chstore.TagFilter{{Key: "e", Values: batch}},
-			Limit: uint64(min(remaining, 500)),
-		})
-		if err != nil {
-			return nil, err
-		}
-		frontier = frontier[:0]
-		for _, event := range events {
-			if _, ok := eventsByID[event.ID]; ok {
-				continue
-			}
-			eventsByID[event.ID] = event
-			frontier = append(frontier, event.ID)
-		}
-	}
-
-	events := make([]chstore.EventView, 0, len(eventsByID)-1)
-	for _, event := range eventsByID {
-		if event.ID != root.ID {
-			events = append(events, event)
-		}
 	}
 	all := make([]chstore.EventView, 0, len(events)+1)
 	all = append(all, *root)

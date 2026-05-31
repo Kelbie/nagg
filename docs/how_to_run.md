@@ -17,7 +17,9 @@ In one terminal:
 docker run --rm --network container:nagg-db \
   -v "$PWD/bin/nagg-api-linux-arm64:/nagg-api:ro" \
   -e NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
-  clickhouse:lts-jammy /nagg-api
+  -e NAGG_CLICKHOUSE_USERNAME=nagg \
+  -e NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+  alpine:3.20 /nagg-api
 ```
 
 You should see:
@@ -34,7 +36,7 @@ In another terminal:
 docker run --rm --network container:nagg-db \
   -v "$PWD/bin/nagg-graphql-client-linux-arm64:/nagg-client:ro" \
   -e NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \
-  clickhouse:lts-jammy /nagg-client
+  alpine:3.20 /nagg-client
 ```
 
 The client demonstrates:
