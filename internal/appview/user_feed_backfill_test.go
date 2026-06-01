@@ -42,6 +42,30 @@ func TestHydrationJobReturnsSlowAndContinues(t *testing.T) {
 	waitForHydrationJob(t, job)
 }
 
+func TestHydrationJobReturnsImmediatelyWhenWaitIsZero(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(nil, UserFeedBackfillConfig{Wait: 0})
+	release := make(chan struct{})
+	job := backfiller.scheduleJob(context.Background(), "instant", func(context.Context) error {
+		<-release
+		return nil
+	})
+
+	started := time.Now()
+	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job})
+	if err != nil {
+		t.Fatalf("waitJobs err = %v", err)
+	}
+	if completed {
+		t.Fatal("waitJobs completed = true, want false")
+	}
+	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {
+		t.Fatalf("waitJobs took %s, want immediate return", elapsed)
+	}
+
+	close(release)
+	waitForHydrationJob(t, job)
+}
+
 func TestHydrationJobDeduplicatesInFlightWork(t *testing.T) {
 	backfiller := NewRelayUserFeedBackfiller(nil, UserFeedBackfillConfig{Wait: 100 * time.Millisecond})
 	release := make(chan struct{})

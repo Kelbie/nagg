@@ -19,6 +19,12 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeed {
 		t.Fatal("on-demand user feed backfill should be opt-in by default")
 	}
+	if cfg.OnDemand.Wait != 0 {
+		t.Fatalf("on-demand wait = %s, want instant default", cfg.OnDemand.Wait)
+	}
+	if cfg.ClickHouse.MaxOpenConns != 30 || cfg.ClickHouse.MaxIdleConns != 10 {
+		t.Fatalf("clickhouse pool = open %d idle %d", cfg.ClickHouse.MaxOpenConns, cfg.ClickHouse.MaxIdleConns)
+	}
 	for _, relay := range cfg.Firehose.Relays {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
 			t.Fatalf("default relay set includes external cache host %q", relay)

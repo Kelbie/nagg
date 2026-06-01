@@ -636,8 +636,8 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		Npub:          vertex.Npub(pubkey),
 		Rank:          dvmProfile.Rank,
 		Score:         dvmProfile.Score,
-		Followers:     counts.Followers,
-		Follows:       counts.Follows,
+		Followers:     profileCount(counts.Followers, dvmProfile.Followers),
+		Follows:       profileCount(counts.Follows, dvmProfile.Follows),
 		CreatedAt:     createdAt,
 		Nodes:         dvmProfile.Nodes,
 		TopFollowers:  topFollowers,
@@ -1041,6 +1041,13 @@ func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchR
 		})
 	}
 	return out, nil
+}
+
+func profileCount(local uint64, dvm *uint64) uint64 {
+	if dvm != nil {
+		return *dvm
+	}
+	return local
 }
 
 func (h *Handler) enrichTopFollowers(ctx context.Context, followers []vertex.TopFollower) ([]TopFollower, error) {

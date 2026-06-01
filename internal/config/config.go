@@ -44,10 +44,12 @@ type OnDemandConfig struct {
 func Load() (Config, error) {
 	cfg := Config{
 		ClickHouse: chstore.Config{
-			Addr:     env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
-			Database: env("NAGG_CLICKHOUSE_DATABASE", "default"),
-			Username: env("NAGG_CLICKHOUSE_USERNAME", "default"),
-			Password: os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
+			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
+			Database:     env("NAGG_CLICKHOUSE_DATABASE", "default"),
+			Username:     env("NAGG_CLICKHOUSE_USERNAME", "default"),
+			Password:     os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
+			MaxOpenConns: parseInt(env("NAGG_CLICKHOUSE_MAX_OPEN_CONNS", "30")),
+			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
@@ -73,7 +75,7 @@ func Load() (Config, error) {
 			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
 			Cooldown:        parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
 			Timeout:         parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
-			Wait:            parseDuration(env("NAGG_ON_DEMAND_WAIT", "750ms")),
+			Wait:            parseDuration(env("NAGG_ON_DEMAND_WAIT", "0s")),
 			AuthorLimit:     parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
 			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
 			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),

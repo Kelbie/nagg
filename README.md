@@ -39,7 +39,7 @@ NAGG_BATCH_SIZE=1000
 NAGG_FLUSH_INTERVAL=5s
 NAGG_VERIFY_EVENTS=true
 NAGG_ON_DEMAND_USER_FEED=false
-NAGG_ON_DEMAND_WAIT=750ms
+NAGG_ON_DEMAND_WAIT=0s
 ```
 
 The default `NAGG_KINDS` is `0,1,3,6,7,16,9735`, which covers profiles, notes, contact lists, reposts, reactions, generic reposts, and zaps for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Set `NAGG_SINCE=0` to omit the `since` filter.
@@ -111,7 +111,9 @@ NAGG_NIP05_VALIDATE=true
 NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_COOLDOWN=5m
 NAGG_ON_DEMAND_TIMEOUT=5s
-NAGG_ON_DEMAND_WAIT=750ms
+NAGG_ON_DEMAND_WAIT=0s
+NAGG_CLICKHOUSE_MAX_OPEN_CONNS=30
+NAGG_CLICKHOUSE_MAX_IDLE_CONNS=10
 NAGG_ON_DEMAND_AUTHOR_LIMIT=100
 NAGG_ON_DEMAND_ENGAGEMENT_LIMIT=1000
 NAGG_ON_DEMAND_THREAD_LIMIT=1000
@@ -120,7 +122,7 @@ NAGG_ON_DEMAND_FOLLOW_LIMIT=1000
 
 Do not set `PORT` yourself on Railway; Railway injects it for the web service. Set `NAGG_API_ADDR` only when you intentionally want to override the bind address outside Railway.
 
-Set `NAGG_ON_DEMAND_USER_FEED=true` on the API service to opportunistically hydrate app-view reads from `NAGG_RELAYS`. The API inserts fetched author notes/reposts, matching originals, engagement events, replies, profiles, and follow/contact-list events into ClickHouse. Reads wait up to `NAGG_ON_DEMAND_WAIT` for targeted hydration to finish; if relays are slower, the request returns the indexed data already available while hydration continues in the background so the next matching request is fast. This covers `/graphql` author queries and `/nostr/feed`, `/nostr/feed/user`, `/nostr/events`, `/nostr/profiles`, `/nostr/profile`, `/nostr/follows`, `/nostr/notes/stats`, and `/nostr/thread`. Keep the cooldown enabled in production so repeated requests for the same missing data do not fan out to relays every time.
+Set `NAGG_ON_DEMAND_USER_FEED=true` on the API service to opportunistically hydrate app-view reads from `NAGG_RELAYS`. The API inserts fetched author notes/reposts, matching originals, engagement events, replies, profiles, and follow/contact-list events into ClickHouse. By default `NAGG_ON_DEMAND_WAIT=0s`, so reads return the indexed data already available while targeted hydration continues in the background for the next matching request. Set `NAGG_ON_DEMAND_WAIT=500ms` or similar only if you want a request to briefly wait and re-read when hydration finishes quickly. This covers `/graphql` author queries and `/nostr/feed`, `/nostr/feed/user`, `/nostr/events`, `/nostr/profiles`, `/nostr/profile`, `/nostr/follows`, `/nostr/notes/stats`, and `/nostr/thread`. Keep the cooldown enabled in production so repeated requests for the same missing data do not fan out to relays every time.
 
 The pre-deploy command only migrates schemas. After first deploy, or after changing app-view aggregate logic, run the backfill command once from the Railway shell or a one-off command:
 

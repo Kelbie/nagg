@@ -109,9 +109,6 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
 	}
-	if cfg.Wait <= 0 {
-		cfg.Wait = 750 * time.Millisecond
-	}
 	if cfg.AuthorLimit <= 0 {
 		cfg.AuthorLimit = 100
 	}
@@ -517,7 +514,7 @@ func (b *RelayUserFeedBackfiller) waitJobs(ctx context.Context, jobs []*hydratio
 	}
 	wait := b.cfg.Wait
 	if wait <= 0 {
-		wait = 750 * time.Millisecond
+		return false, nil
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()

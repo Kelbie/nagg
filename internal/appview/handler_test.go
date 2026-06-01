@@ -479,6 +479,47 @@ func TestProfileMergesVertexWithLocalProfile(t *testing.T) {
 	}
 }
 
+func TestProfileUsesVertexFollowCountsWhenLocalCountsAreEmpty(t *testing.T) {
+	followers := uint64(10)
+	follows := uint64(3)
+	handler := New(
+		fakeStore{
+			profiles: map[string]chstore.ProfileRow{
+				testPubkey: {
+					PubKey:      testPubkey,
+					Name:        "sovran",
+					DisplayName: "Sovran",
+				},
+			},
+		},
+		WithVertex(fakeVertex{
+			profile: vertex.ProfileResult{
+				PubKey:    testPubkey,
+				Npub:      vertex.Npub(testPubkey),
+				Rank:      0.01,
+				Followers: &followers,
+				Follows:   &follows,
+			},
+		}),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/profile?pubkey="+testPubkey, nil)
+	handler.profile(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response ProfileResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Followers != followers || response.Follows != follows {
+		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	}
+}
+
 func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 	rank := 0.01
 	score := 42.5

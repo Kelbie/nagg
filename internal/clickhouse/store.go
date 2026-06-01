@@ -21,10 +21,12 @@ var ingestionMigration string
 var appviewMigration string
 
 type Config struct {
-	Addr     string
-	Database string
-	Username string
-	Password string
+	Addr         string
+	Database     string
+	Username     string
+	Password     string
+	MaxOpenConns int
+	MaxIdleConns int
 }
 
 type Store struct {
@@ -45,6 +47,11 @@ type EventRecord struct {
 }
 
 func Open(ctx context.Context, cfg Config) (*Store, error) {
+	maxOpenConns := positiveOrDefault(cfg.MaxOpenConns, 30)
+	maxIdleConns := positiveOrDefault(cfg.MaxIdleConns, 10)
+	if maxIdleConns > maxOpenConns {
+		maxIdleConns = maxOpenConns
+	}
 	conn, err := ch.Open(&ch.Options{
 		Addr: []string{cfg.Addr},
 		Auth: ch.Auth{
@@ -54,6 +61,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		},
 		DialTimeout:      10 * time.Second,
 		ConnOpenStrategy: ch.ConnOpenInOrder,
+		MaxOpenConns:     maxOpenConns,
+		MaxIdleConns:     maxIdleConns,
+		ConnMaxLifetime:  time.Hour,
 	})
 	if err != nil {
 		return nil, err
@@ -62,6 +72,13 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	return &Store{conn: conn, trendingCache: map[string]trendingCacheEntry{}}, nil
+}
+
+func positiveOrDefault(value int, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
 }
 
 func (s *Store) Close() error {
