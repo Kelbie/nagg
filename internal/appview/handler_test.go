@@ -72,6 +72,41 @@ func (s *sequencedFeedStore) FollowsFeed(context.Context, []string, int64, uint6
 	return s.feeds[idx], nil
 }
 
+type sequencedEventStore struct {
+	fakeStore
+	events [][]chstore.EventView
+	calls  int
+}
+
+func (s *sequencedEventStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error) {
+	if len(s.events) == 0 {
+		s.calls++
+		return nil, nil
+	}
+	idx := s.calls
+	if idx >= len(s.events) {
+		idx = len(s.events) - 1
+	}
+	s.calls++
+	return s.events[idx], nil
+}
+
+type sequencedThreadStore struct {
+	fakeStore
+	root    chstore.EventView
+	threads [][]chstore.EventView
+	calls   int
+}
+
+func (s *sequencedThreadStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
+	idx := s.calls
+	if idx >= len(s.threads) {
+		idx = len(s.threads) - 1
+	}
+	s.calls++
+	return &s.root, s.threads[idx], nil
+}
+
 type fakeUserBackfiller struct {
 	calls  int
 	pubkey string
@@ -82,6 +117,52 @@ func (f *fakeUserBackfiller) BackfillUserFeed(_ context.Context, pubkey string, 
 	f.calls++
 	f.pubkey = pubkey
 	f.limit = limit
+	return nil
+}
+
+type fakeAppBackfiller struct {
+	fakeUserBackfiller
+	eventCalls      int
+	eventIDs        []string
+	profileCalls    int
+	profilePubkeys  []string
+	engagementCalls int
+	engagementIDs   []string
+	threadCalls     int
+	threadID        string
+	threadLimit     int
+	followCalls     int
+	followPubkey    string
+}
+
+func (f *fakeAppBackfiller) BackfillEvents(_ context.Context, ids []string) error {
+	f.eventCalls++
+	f.eventIDs = append([]string(nil), ids...)
+	return nil
+}
+
+func (f *fakeAppBackfiller) BackfillProfiles(_ context.Context, pubkeys []string) error {
+	f.profileCalls++
+	f.profilePubkeys = append([]string(nil), pubkeys...)
+	return nil
+}
+
+func (f *fakeAppBackfiller) BackfillEngagement(_ context.Context, ids []string) error {
+	f.engagementCalls++
+	f.engagementIDs = append([]string(nil), ids...)
+	return nil
+}
+
+func (f *fakeAppBackfiller) BackfillThread(_ context.Context, id string, limit int) error {
+	f.threadCalls++
+	f.threadID = id
+	f.threadLimit = limit
+	return nil
+}
+
+func (f *fakeAppBackfiller) BackfillFollows(_ context.Context, pubkey string) error {
+	f.followCalls++
+	f.followPubkey = pubkey
 	return nil
 }
 
@@ -144,6 +225,144 @@ func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
 	}
 	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "hello" {
 		t.Fatalf("items = %+v", response.Items)
+	}
+}
+
+func TestEventsEndpointBackfillsMissingEventsBeforeEnrichment(t *testing.T) {
+	const eventID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	store := &sequencedEventStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		events: [][]chstore.EventView{
+			nil,
+			{{
+				ID:        eventID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "quoted",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	backfiller := &fakeAppBackfiller{}
+	handler := New(
+		store,
+		WithAppViewBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/events?ids="+eventID, nil)
+	handler.events(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.eventCalls != 1 || len(backfiller.eventIDs) != 1 || backfiller.eventIDs[0] != eventID {
+		t.Fatalf("event backfill = %+v", backfiller)
+	}
+	if store.calls != 2 {
+		t.Fatalf("store calls = %d, want 2", store.calls)
+	}
+	var response EnrichmentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Quoted[eventID].Content != "quoted" {
+		t.Fatalf("quoted = %+v", response.Quoted)
+	}
+}
+
+func TestThreadBackfillsWhenIndexedRepliesAreShort(t *testing.T) {
+	const rootID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const replyID = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	root := chstore.EventView{
+		ID:        rootID,
+		PubKey:    testPubkey,
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_000, 0),
+		Content:   "root",
+		Tags:      [][]string{},
+		Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}
+	reply := chstore.EventView{
+		ID:        replyID,
+		PubKey:    testPubkey,
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_001, 0),
+		Content:   "reply",
+		Tags:      [][]string{{"e", rootID, "", "reply"}},
+		Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	}
+	store := &sequencedThreadStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		root:      root,
+		threads: [][]chstore.EventView{
+			nil,
+			{reply},
+		},
+	}
+	backfiller := &fakeAppBackfiller{}
+	handler := New(
+		store,
+		WithAppViewBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/thread?id="+rootID+"&limit=2", nil)
+	handler.thread(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.threadCalls != 1 || backfiller.threadID != rootID || backfiller.threadLimit != 2 {
+		t.Fatalf("thread backfill = %+v", backfiller)
+	}
+	if store.calls != 2 {
+		t.Fatalf("store calls = %d, want 2", store.calls)
+	}
+	var response struct {
+		Root   FeedEvent   `json:"root"`
+		Events []FeedEvent `json:"events"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Root.ID != rootID || len(response.Events) != 1 || response.Events[0].ID != replyID {
+		t.Fatalf("thread response = %+v", response)
+	}
+}
+
+func TestProfilesEndpointReturnsPictureEvenWhenNameMissing(t *testing.T) {
+	handler := New(
+		fakeStore{
+			profiles: map[string]chstore.ProfileRow{
+				testPubkey: {
+					PubKey:  testPubkey,
+					EventID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					Picture: "https://example.test/avatar.png",
+				},
+			},
+		},
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/profiles?pubkeys="+testPubkey, nil)
+	handler.profiles(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response EnrichmentResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	profile, ok := response.Profiles[testPubkey]
+	if !ok || profile.Picture != "https://example.test/avatar.png" {
+		t.Fatalf("profiles = %+v", response.Profiles)
 	}
 }
 

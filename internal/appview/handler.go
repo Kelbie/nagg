@@ -2,6 +2,7 @@ package appview
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,11 +29,16 @@ type Store interface {
 }
 
 type Handler struct {
-	store          Store
-	vertex         VertexClient
-	userBackfiller UserFeedBackfiller
-	nip05Validator *nip05Validator
-	rateLimiter    *rateLimiter
+	store                Store
+	vertex               VertexClient
+	userBackfiller       UserFeedBackfiller
+	eventBackfiller      EventBackfiller
+	profileBackfiller    ProfileBackfiller
+	engagementBackfiller EngagementBackfiller
+	threadBackfiller     ThreadBackfiller
+	followBackfiller     FollowBackfiller
+	nip05Validator       *nip05Validator
+	rateLimiter          *rateLimiter
 }
 
 type VertexClient interface {
@@ -64,6 +70,18 @@ func WithRateLimit(limit int, window time.Duration) Option {
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 	return func(h *Handler) {
 		h.userBackfiller = backfiller
+		h.setOptionalBackfillers(backfiller)
+	}
+}
+
+func WithAppViewBackfill(backfiller AppViewBackfiller) Option {
+	return func(h *Handler) {
+		h.userBackfiller = backfiller
+		h.eventBackfiller = backfiller
+		h.profileBackfiller = backfiller
+		h.engagementBackfiller = backfiller
+		h.threadBackfiller = backfiller
+		h.followBackfiller = backfiller
 	}
 }
 
@@ -77,6 +95,24 @@ func New(store Store, opts ...Option) *Handler {
 		opt(h)
 	}
 	return h
+}
+
+func (h *Handler) setOptionalBackfillers(backfiller any) {
+	if b, ok := backfiller.(EventBackfiller); ok {
+		h.eventBackfiller = b
+	}
+	if b, ok := backfiller.(ProfileBackfiller); ok {
+		h.profileBackfiller = b
+	}
+	if b, ok := backfiller.(EngagementBackfiller); ok {
+		h.engagementBackfiller = b
+	}
+	if b, ok := backfiller.(ThreadBackfiller); ok {
+		h.threadBackfiller = b
+	}
+	if b, ok := backfiller.(FollowBackfiller); ok {
+		h.followBackfiller = b
+	}
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
@@ -98,7 +134,7 @@ func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		next(w, r.WithContext(ctx))
 	}
@@ -222,6 +258,16 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if !trending && h.shouldBackfillAuthoredFeed(events, authors, req.Until, req.Limit, req.Offset) {
+		for _, author := range takeStrings(authors, 10) {
+			h.tryBackfillUserFeed(r.Context(), author, req.Limit)
+		}
+		events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	h.writeFeedResponse(w, r, events)
 }
 
@@ -282,11 +328,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.shouldBackfillUserFeed(events, until, limit, offset) {
-		if err := h.userBackfiller.BackfillUserFeed(r.Context(), pubkey, limit); err != nil {
-			// On-demand relay fetch is opportunistic. Serve the indexed data we
-			// already have rather than failing the user feed for a flaky relay.
-			slog.Warn("user feed backfill failed", "pubkey", pubkey, "error", err)
-		} else {
+		if h.tryBackfillUserFeed(r.Context(), pubkey, limit) {
 			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
 			if err != nil {
 				writeError(w, err)
@@ -303,6 +345,16 @@ func (h *Handler) shouldBackfillUserFeed(events []chstore.EventView, until int64
 	}
 	if limit == 0 || limit > 100 {
 		limit = 50
+	}
+	return len(events) < int(limit)
+}
+
+func (h *Handler) shouldBackfillAuthoredFeed(events []chstore.EventView, authors []string, until int64, limit uint64, offset uint64) bool {
+	if h.userBackfiller == nil || len(authors) == 0 || until != 0 || offset != 0 {
+		return false
+	}
+	if limit == 0 || limit > 100 {
+		limit = 30
 	}
 	return len(events) < int(limit)
 }
@@ -361,6 +413,9 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		items = append(items, FeedItem{Type: "note", Event: &feedEvent})
 	}
 
+	h.tryBackfillEngagement(ctx, metricIDs)
+	h.tryBackfillProfiles(ctx, pubkeys)
+
 	metrics, err := h.store.NoteStats(ctx, metricIDs)
 	if err != nil {
 		return FeedResponse{}, err
@@ -397,6 +452,7 @@ func (h *Handler) noteStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ids := normalizeHexIDs(req.IDs)
+	h.tryBackfillEngagement(r.Context(), ids)
 	stats, err := h.store.NoteStats(r.Context(), ids)
 	if err != nil {
 		writeError(w, err)
@@ -415,7 +471,17 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	root, events, err := h.store.ThreadEvents(r.Context(), id, intParam(r, "limit", 1000))
+	limit := intParam(r, "limit", 1000)
+	root, events, err := h.store.ThreadEvents(r.Context(), id, limit)
+	if errors.Is(err, sql.ErrNoRows) {
+		if h.tryBackfillThread(r.Context(), id, limit) {
+			root, events, err = h.store.ThreadEvents(r.Context(), id, limit)
+		}
+	} else if err == nil && h.shouldBackfillThread(events, limit) {
+		if h.tryBackfillThread(r.Context(), id, limit) {
+			root, events, err = h.store.ThreadEvents(r.Context(), id, limit)
+		}
+	}
 	if err != nil {
 		writeError(w, err)
 		return
@@ -427,6 +493,8 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		metricIDs = append(metricIDs, event.ID)
 		pubkeys = append(pubkeys, event.PubKey)
 	}
+	h.tryBackfillEngagement(r.Context(), metricIDs)
+	h.tryBackfillProfiles(r.Context(), pubkeys)
 	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
 	if err != nil {
 		writeError(w, err)
@@ -463,6 +531,7 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	h.tryBackfillFollows(r.Context(), pubkey)
 	counts, err := h.store.FollowCounts(r.Context(), pubkey)
 	if err != nil {
 		writeError(w, err)
@@ -493,6 +562,8 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		metricIDs = append(metricIDs, id)
 		pubkeys = append(pubkeys, event.PubKey)
 	}
+	h.tryBackfillEngagement(r.Context(), metricIDs)
+	h.tryBackfillProfiles(r.Context(), pubkeys)
 	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
 	if err != nil {
 		writeError(w, err)
@@ -537,6 +608,8 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	h.tryBackfillProfiles(r.Context(), []string{pubkey})
+	h.tryBackfillFollows(r.Context(), pubkey)
 	dvmProfile, fromCache, err := h.vertex.Profile(r.Context(), pubkey)
 	if err != nil {
 		writeVertexError(w, err)
@@ -673,13 +746,33 @@ func (h *Handler) eventsByID(ctx context.Context, ids []string) (map[string]chst
 	for _, event := range events {
 		out[event.ID] = event
 	}
+	missing := missingIDs(ids, out)
+	if len(missing) > 0 && h.tryBackfillEvents(ctx, missing) {
+		events, err = h.store.QueryEvents(ctx, chstore.EventQueryInput{IDs: missing, Limit: uint64(len(missing))})
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			out[event.ID] = event
+		}
+	}
 	return out, nil
 }
 
 func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[string]ProfileInfo, error) {
-	rows, err := h.store.LatestProfiles(ctx, normalizePubkeys(pubkeys))
+	pubkeys = normalizePubkeys(pubkeys)
+	rows, err := h.store.LatestProfiles(ctx, pubkeys)
 	if err != nil {
 		return nil, err
+	}
+	if missing := missingProfiles(pubkeys, rows); len(missing) > 0 && h.tryBackfillProfiles(ctx, missing) {
+		refreshed, err := h.store.LatestProfiles(ctx, missing)
+		if err != nil {
+			return nil, err
+		}
+		for pubkey, row := range refreshed {
+			rows[pubkey] = row
+		}
 	}
 	out := make(map[string]ProfileInfo, len(rows))
 	for pubkey, row := range rows {
@@ -687,12 +780,115 @@ func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[strin
 		if name == "" {
 			name = row.Name
 		}
-		if name == "" {
+		if name == "" && row.Picture == "" {
 			continue
 		}
 		out[pubkey] = ProfileInfo{Name: name, Picture: row.Picture}
 	}
 	return out, nil
+}
+
+func (h *Handler) shouldBackfillThread(events []chstore.EventView, limit int) bool {
+	if h.threadBackfiller == nil {
+		return false
+	}
+	if limit <= 0 || limit > 2000 {
+		limit = 1000
+	}
+	return len(events)+1 < limit
+}
+
+func (h *Handler) tryBackfillUserFeed(ctx context.Context, pubkey string, limit uint64) bool {
+	if h.userBackfiller == nil {
+		return false
+	}
+	if err := h.userBackfiller.BackfillUserFeed(ctx, pubkey, limit); err != nil {
+		slog.Warn("user feed backfill failed", "pubkey", pubkey, "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillEvents(ctx context.Context, ids []string) bool {
+	if h.eventBackfiller == nil || len(ids) == 0 {
+		return false
+	}
+	if err := h.eventBackfiller.BackfillEvents(ctx, ids); err != nil {
+		slog.Warn("event backfill failed", "ids", len(ids), "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillProfiles(ctx context.Context, pubkeys []string) bool {
+	if h.profileBackfiller == nil || len(pubkeys) == 0 {
+		return false
+	}
+	if err := h.profileBackfiller.BackfillProfiles(ctx, pubkeys); err != nil {
+		slog.Warn("profile backfill failed", "pubkeys", len(pubkeys), "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillEngagement(ctx context.Context, ids []string) bool {
+	if h.engagementBackfiller == nil || len(ids) == 0 {
+		return false
+	}
+	if err := h.engagementBackfiller.BackfillEngagement(ctx, ids); err != nil {
+		slog.Warn("engagement backfill failed", "ids", len(ids), "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillThread(ctx context.Context, id string, limit int) bool {
+	if h.threadBackfiller == nil {
+		return false
+	}
+	if err := h.threadBackfiller.BackfillThread(ctx, id, limit); err != nil {
+		slog.Warn("thread backfill failed", "id", id, "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillFollows(ctx context.Context, pubkey string) bool {
+	if h.followBackfiller == nil {
+		return false
+	}
+	if err := h.followBackfiller.BackfillFollows(ctx, pubkey); err != nil {
+		slog.Warn("follow graph backfill failed", "pubkey", pubkey, "error", err)
+		return false
+	}
+	return true
+}
+
+func missingIDs(ids []string, found map[string]chstore.EventView) []string {
+	out := make([]string, 0)
+	for _, id := range ids {
+		if _, ok := found[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func missingProfiles(pubkeys []string, rows map[string]chstore.ProfileRow) []string {
+	out := make([]string, 0)
+	for _, pubkey := range pubkeys {
+		if row, ok := rows[pubkey]; !ok || row.EventID == "" {
+			out = append(out, pubkey)
+		}
+	}
+	return out
+}
+
+func takeStrings(values []string, limit int) []string {
+	if limit <= 0 || len(values) <= limit {
+		return values
+	}
+	return values[:limit]
 }
 
 type profileFieldsResult struct {
@@ -705,6 +901,7 @@ func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchR
 	for _, row := range rows {
 		pubkeys = append(pubkeys, row.PubKey)
 	}
+	h.tryBackfillProfiles(ctx, pubkeys)
 	profiles, err := h.store.LatestProfiles(ctx, pubkeys)
 	if err != nil {
 		return nil, err
@@ -733,6 +930,7 @@ func (h *Handler) enrichTopFollowers(ctx context.Context, followers []vertex.Top
 	for _, follower := range followers {
 		pubkeys = append(pubkeys, follower.PubKey)
 	}
+	h.tryBackfillProfiles(ctx, pubkeys)
 	profiles, err := h.store.LatestProfiles(ctx, pubkeys)
 	if err != nil {
 		return nil, err

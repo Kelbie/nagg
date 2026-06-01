@@ -410,6 +410,7 @@ func (s *Store) ThreadEvents(ctx context.Context, id string, limit int) (*EventV
 		}
 		events, err := s.QueryEvents(ctx, EventQueryInput{
 			Tags:  []TagFilter{{Key: "e", Values: batch}},
+			Kinds: []int{1, 1111},
 			Limit: uint64(min(remaining, 500)),
 		})
 		if err != nil {

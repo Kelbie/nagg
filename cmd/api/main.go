@@ -59,6 +59,8 @@ func main() {
 			Timeout:         cfg.OnDemand.Timeout,
 			AuthorLimit:     cfg.OnDemand.AuthorLimit,
 			EngagementLimit: cfg.OnDemand.EngagementLimit,
+			ThreadLimit:     cfg.OnDemand.ThreadLimit,
+			FollowLimit:     cfg.OnDemand.FollowLimit,
 		})
 	}
 

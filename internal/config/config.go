@@ -36,6 +36,8 @@ type OnDemandConfig struct {
 	Timeout         time.Duration
 	AuthorLimit     int
 	EngagementLimit int
+	ThreadLimit     int
+	FollowLimit     int
 }
 
 func Load() (Config, error) {
@@ -47,7 +49,7 @@ func Load() (Config, error) {
 			Password: os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
 		},
 		Firehose: firehose.Config{
-			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band")),
+			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
 			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,6,7,16,9735")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
@@ -72,6 +74,8 @@ func Load() (Config, error) {
 			Timeout:         parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
 			AuthorLimit:     parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
 			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
+			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
+			FollowLimit:     parseInt(env("NAGG_ON_DEMAND_FOLLOW_LIMIT", "1000")),
 		},
 	}
 
