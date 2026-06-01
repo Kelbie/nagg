@@ -34,6 +34,7 @@ type OnDemandConfig struct {
 	UserFeed        bool
 	Cooldown        time.Duration
 	Timeout         time.Duration
+	Wait            time.Duration
 	AuthorLimit     int
 	EngagementLimit int
 	ThreadLimit     int
@@ -72,6 +73,7 @@ func Load() (Config, error) {
 			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
 			Cooldown:        parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
 			Timeout:         parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
+			Wait:            parseDuration(env("NAGG_ON_DEMAND_WAIT", "750ms")),
 			AuthorLimit:     parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
 			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
 			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),

@@ -120,6 +120,17 @@ func (f *fakeUserBackfiller) BackfillUserFeed(_ context.Context, pubkey string, 
 	return nil
 }
 
+type fakeHydratingUserBackfiller struct {
+	fakeUserBackfiller
+	completed bool
+	hydrated  int
+}
+
+func (f *fakeHydratingUserBackfiller) HydrateUserFeed(ctx context.Context, pubkey string, limit uint64) (bool, error) {
+	f.hydrated++
+	return f.completed, f.BackfillUserFeed(ctx, pubkey, limit)
+}
+
 type fakeAppBackfiller struct {
 	fakeUserBackfiller
 	eventCalls      int
@@ -225,6 +236,51 @@ func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
 	}
 	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "hello" {
 		t.Fatalf("items = %+v", response.Items)
+	}
+}
+
+func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		feeds: [][]chstore.EventView{
+			nil,
+			{{
+				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "eventually available",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	backfiller := &fakeHydratingUserBackfiller{completed: false}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey="+testPubkey+"&limit=5", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.hydrated != 1 || backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.limit != 5 {
+		t.Fatalf("hydration call = %+v", backfiller)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1", store.calls)
+	}
+	var response FeedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 0 {
+		t.Fatalf("items = %+v, want stale empty response", response.Items)
 	}
 }
 

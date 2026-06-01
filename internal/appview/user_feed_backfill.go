@@ -2,6 +2,8 @@ package appview
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"sort"
 	"strings"
@@ -17,24 +19,52 @@ type UserFeedBackfiller interface {
 	BackfillUserFeed(context.Context, string, uint64) error
 }
 
+type UserFeedHydrator interface {
+	HydrateUserFeed(context.Context, string, uint64) (bool, error)
+}
+
+type UserFeedsHydrator interface {
+	HydrateUserFeeds(context.Context, []string, uint64) (bool, error)
+}
+
 type EventBackfiller interface {
 	BackfillEvents(context.Context, []string) error
+}
+
+type EventHydrator interface {
+	HydrateEvents(context.Context, []string) (bool, error)
 }
 
 type ProfileBackfiller interface {
 	BackfillProfiles(context.Context, []string) error
 }
 
+type ProfileHydrator interface {
+	HydrateProfiles(context.Context, []string) (bool, error)
+}
+
 type EngagementBackfiller interface {
 	BackfillEngagement(context.Context, []string) error
+}
+
+type EngagementHydrator interface {
+	HydrateEngagement(context.Context, []string) (bool, error)
 }
 
 type ThreadBackfiller interface {
 	BackfillThread(context.Context, string, int) error
 }
 
+type ThreadHydrator interface {
+	HydrateThread(context.Context, string, int) (bool, error)
+}
+
 type FollowBackfiller interface {
 	BackfillFollows(context.Context, string) error
+}
+
+type FollowHydrator interface {
+	HydrateFollows(context.Context, string) (bool, error)
 }
 
 type AppViewBackfiller interface {
@@ -55,6 +85,7 @@ type UserFeedBackfillConfig struct {
 	ReadLimit       int64
 	Cooldown        time.Duration
 	Timeout         time.Duration
+	Wait            time.Duration
 	AuthorLimit     int
 	EngagementLimit int
 	ThreadLimit     int
@@ -68,6 +99,7 @@ type RelayUserFeedBackfiller struct {
 
 	mu       sync.Mutex
 	attempts map[string]time.Time
+	jobs     map[string]*hydrationJob
 }
 
 func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig) *RelayUserFeedBackfiller {
@@ -76,6 +108,9 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.Wait <= 0 {
+		cfg.Wait = 750 * time.Millisecond
 	}
 	if cfg.AuthorLimit <= 0 {
 		cfg.AuthorLimit = 100
@@ -97,7 +132,79 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 		},
 		cfg:      cfg,
 		attempts: map[string]time.Time{},
+		jobs:     map[string]*hydrationJob{},
 	}
+}
+
+func (b *RelayUserFeedBackfiller) HydrateUserFeed(ctx context.Context, pubkey string, limit uint64) (bool, error) {
+	return b.HydrateUserFeeds(ctx, []string{pubkey}, limit)
+}
+
+func (b *RelayUserFeedBackfiller) HydrateUserFeeds(ctx context.Context, pubkeys []string, limit uint64) (bool, error) {
+	pubkeys = validPubkeys(pubkeys)
+	if b == nil || b.store == nil || len(pubkeys) == 0 {
+		return true, nil
+	}
+	jobs := make([]*hydrationJob, 0, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		pubkey := pubkey
+		jobs = append(jobs, b.scheduleJob(ctx, "feed:"+pubkey, func(jobCtx context.Context) error {
+			return b.BackfillUserFeed(jobCtx, pubkey, limit)
+		}))
+	}
+	return b.waitJobs(ctx, jobs)
+}
+
+func (b *RelayUserFeedBackfiller) HydrateEvents(ctx context.Context, ids []string) (bool, error) {
+	ids = validHexIDs(ids)
+	if b == nil || b.store == nil || len(ids) == 0 {
+		return true, nil
+	}
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("events", ids), func(jobCtx context.Context) error {
+		return b.BackfillEvents(jobCtx, ids)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateProfiles(ctx context.Context, pubkeys []string) (bool, error) {
+	pubkeys = validPubkeys(pubkeys)
+	if b == nil || b.store == nil || len(pubkeys) == 0 {
+		return true, nil
+	}
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("profiles", pubkeys), func(jobCtx context.Context) error {
+		return b.BackfillProfiles(jobCtx, pubkeys)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateEngagement(ctx context.Context, ids []string) (bool, error) {
+	ids = validHexIDs(ids)
+	if b == nil || b.store == nil || len(ids) == 0 {
+		return true, nil
+	}
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("engagement", ids), func(jobCtx context.Context) error {
+		return b.BackfillEngagement(jobCtx, ids)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateThread(ctx context.Context, id string, limit int) (bool, error) {
+	ids := validHexIDs([]string{id})
+	if b == nil || b.store == nil || len(ids) != 1 {
+		return true, nil
+	}
+	id = ids[0]
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, "thread:"+id, func(jobCtx context.Context) error {
+		return b.BackfillThread(jobCtx, id, limit)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateFollows(ctx context.Context, pubkey string) (bool, error) {
+	pubkeys := validPubkeys([]string{pubkey})
+	if b == nil || b.store == nil || len(pubkeys) != 1 {
+		return true, nil
+	}
+	pubkey = pubkeys[0]
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, "follows:"+pubkey, func(jobCtx context.Context) error {
+		return b.BackfillFollows(jobCtx, pubkey)
+	})})
 }
 
 func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey string, limit uint64) error {
@@ -370,6 +477,67 @@ func (b *RelayUserFeedBackfiller) attemptValues(prefix string, values []string) 
 	return out
 }
 
+type hydrationJob struct {
+	done chan struct{}
+	err  error
+}
+
+func (b *RelayUserFeedBackfiller) scheduleJob(ctx context.Context, key string, work func(context.Context) error) *hydrationJob {
+	if key == "" {
+		key = "unknown"
+	}
+	b.mu.Lock()
+	if b.jobs == nil {
+		b.jobs = map[string]*hydrationJob{}
+	}
+	if job, ok := b.jobs[key]; ok {
+		b.mu.Unlock()
+		return job
+	}
+	job := &hydrationJob{done: make(chan struct{})}
+	b.jobs[key] = job
+	b.mu.Unlock()
+
+	go func() {
+		job.err = work(context.WithoutCancel(ctx))
+		close(job.done)
+
+		b.mu.Lock()
+		if b.jobs[key] == job {
+			delete(b.jobs, key)
+		}
+		b.mu.Unlock()
+	}()
+	return job
+}
+
+func (b *RelayUserFeedBackfiller) waitJobs(ctx context.Context, jobs []*hydrationJob) (bool, error) {
+	if len(jobs) == 0 {
+		return true, nil
+	}
+	wait := b.cfg.Wait
+	if wait <= 0 {
+		wait = 750 * time.Millisecond
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	var firstErr error
+	for _, job := range jobs {
+		select {
+		case <-job.done:
+			if job.err != nil && firstErr == nil {
+				firstErr = job.err
+			}
+		case <-timer.C:
+			return false, nil
+		case <-ctx.Done():
+			return false, nil
+		}
+	}
+	return true, firstErr
+}
+
 type eventCollector struct {
 	records map[string]chstore.EventRecord
 }
@@ -495,6 +663,19 @@ func sortedKeys(values map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func hydrationBatchKey(prefix string, values []string) string {
+	values = append([]string(nil), values...)
+	sort.Strings(values)
+	if len(values) == 0 {
+		return prefix
+	}
+	if len(values) == 1 {
+		return prefix + ":" + values[0]
+	}
+	sum := sha256.Sum256([]byte(strings.Join(values, ",")))
+	return prefix + ":" + hex.EncodeToString(sum[:8])
 }
 
 func takeUnvisited(visited map[string]struct{}, ids []string, max int) []string {

@@ -57,6 +57,7 @@ func main() {
 			ReadLimit:       cfg.Firehose.ReadLimit,
 			Cooldown:        cfg.OnDemand.Cooldown,
 			Timeout:         cfg.OnDemand.Timeout,
+			Wait:            cfg.OnDemand.Wait,
 			AuthorLimit:     cfg.OnDemand.AuthorLimit,
 			EngagementLimit: cfg.OnDemand.EngagementLimit,
 			ThreadLimit:     cfg.OnDemand.ThreadLimit,

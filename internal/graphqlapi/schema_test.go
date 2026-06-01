@@ -58,6 +58,17 @@ func (f *fakeUserBackfiller) BackfillUserFeed(_ context.Context, pubkey string, 
 	return nil
 }
 
+type fakeHydratingUserBackfiller struct {
+	fakeUserBackfiller
+	completed bool
+	hydrated  int
+}
+
+func (f *fakeHydratingUserBackfiller) HydrateUserFeed(ctx context.Context, pubkey string, limit uint64) (bool, error) {
+	f.hydrated++
+	return f.completed, f.BackfillUserFeed(ctx, pubkey, limit)
+}
+
 func TestEventsQueryBackfillsAuthorWhenFirstPageShort(t *testing.T) {
 	store := &fakeStore{
 		events: [][]chstore.EventView{
@@ -109,5 +120,55 @@ func TestEventsQueryBackfillsAuthorWhenFirstPageShort(t *testing.T) {
 	node := nodes[0].(map[string]any)
 	if node["content"] != "hello" {
 		t.Fatalf("node = %+v", node)
+	}
+}
+
+func TestEventsQueryReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			nil,
+			{{
+				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "eventually available",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	backfiller := &fakeHydratingUserBackfiller{completed: false}
+	schema, err := NewSchema(store, WithUserFeedBackfill(backfiller))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{
+				pubkeys:["` + testPubkey + `"],
+				kinds:[1,6,16],
+				limit:20
+			}) { nodes { id kind pubkey content } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if backfiller.hydrated != 1 || backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.limit != 20 {
+		t.Fatalf("hydration call = %+v", backfiller)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1", store.calls)
+	}
+	data := result.Data.(map[string]any)
+	events := data["events"].(map[string]any)
+	nodes := events["nodes"].([]any)
+	if len(nodes) != 0 {
+		t.Fatalf("nodes len = %d, want 0", len(nodes))
 	}
 }

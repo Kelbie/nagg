@@ -36,6 +36,14 @@ type UserFeedBackfiller interface {
 	BackfillUserFeed(context.Context, string, uint64) error
 }
 
+type UserFeedHydrator interface {
+	HydrateUserFeed(context.Context, string, uint64) (bool, error)
+}
+
+type UserFeedsHydrator interface {
+	HydrateUserFeeds(context.Context, []string, uint64) (bool, error)
+}
+
 type Option func(*resolver)
 
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
@@ -221,9 +229,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return nil, err
 					}
 					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, len(events), input.Limit) {
-						if err := r.backfillAuthors(p.Context, input.PubKeys, input.Limit); err != nil {
+						completed, err := r.hydrateAuthors(p.Context, input.PubKeys, input.Limit)
+						if err != nil {
 							slog.Warn("graphql author backfill failed", "pubkeys", input.PubKeys, "error", err)
-						} else {
+						} else if completed {
 							events, err = r.store.QueryEvents(p.Context, input)
 							if err != nil {
 								return nil, err
@@ -243,7 +252,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return nil, err
 					}
 					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, 0, 1) {
-						if err := r.backfillAuthors(p.Context, input.PubKeys, 100); err != nil {
+						if _, err := r.hydrateAuthors(p.Context, input.PubKeys, 100); err != nil {
 							slog.Warn("graphql aggregate author backfill failed", "pubkeys", input.PubKeys, "error", err)
 						}
 					}
@@ -295,16 +304,32 @@ func (r *resolver) shouldBackfillAuthorQuery(pubkeys []string, ids []string, tag
 	return true
 }
 
-func (r *resolver) backfillAuthors(ctx context.Context, pubkeys []string, limit uint64) error {
+func (r *resolver) hydrateAuthors(ctx context.Context, pubkeys []string, limit uint64) (bool, error) {
 	if limit == 0 {
 		limit = 50
 	}
+	if hydrator, ok := r.userBackfiller.(UserFeedsHydrator); ok {
+		return hydrator.HydrateUserFeeds(ctx, pubkeys, limit)
+	}
+	if hydrator, ok := r.userBackfiller.(UserFeedHydrator); ok {
+		completed := true
+		for _, pubkey := range pubkeys {
+			ok, err := hydrator.HydrateUserFeed(ctx, pubkey, limit)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				completed = false
+			}
+		}
+		return completed, nil
+	}
 	for _, pubkey := range pubkeys {
 		if err := r.userBackfiller.BackfillUserFeed(ctx, pubkey, limit); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {

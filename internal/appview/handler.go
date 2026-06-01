@@ -259,13 +259,12 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !trending && h.shouldBackfillAuthoredFeed(events, authors, req.Until, req.Limit, req.Offset) {
-		for _, author := range takeStrings(authors, 10) {
-			h.tryBackfillUserFeed(r.Context(), author, req.Limit)
-		}
-		events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
-		if err != nil {
-			writeError(w, err)
-			return
+		if h.tryBackfillUserFeeds(r.Context(), takeStrings(authors, 10), req.Limit) {
+			events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
 		}
 	}
 	h.writeFeedResponse(w, r, events)
@@ -413,8 +412,7 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		items = append(items, FeedItem{Type: "note", Event: &feedEvent})
 	}
 
-	h.tryBackfillEngagement(ctx, metricIDs)
-	h.tryBackfillProfiles(ctx, pubkeys)
+	h.tryBackfillEnrichment(ctx, metricIDs, pubkeys)
 
 	metrics, err := h.store.NoteStats(ctx, metricIDs)
 	if err != nil {
@@ -493,8 +491,7 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		metricIDs = append(metricIDs, event.ID)
 		pubkeys = append(pubkeys, event.PubKey)
 	}
-	h.tryBackfillEngagement(r.Context(), metricIDs)
-	h.tryBackfillProfiles(r.Context(), pubkeys)
+	h.tryBackfillEnrichment(r.Context(), metricIDs, pubkeys)
 	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
 	if err != nil {
 		writeError(w, err)
@@ -562,8 +559,7 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		metricIDs = append(metricIDs, id)
 		pubkeys = append(pubkeys, event.PubKey)
 	}
-	h.tryBackfillEngagement(r.Context(), metricIDs)
-	h.tryBackfillProfiles(r.Context(), pubkeys)
+	h.tryBackfillEnrichment(r.Context(), metricIDs, pubkeys)
 	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
 	if err != nil {
 		writeError(w, err)
@@ -608,8 +604,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	h.tryBackfillProfiles(r.Context(), []string{pubkey})
-	h.tryBackfillFollows(r.Context(), pubkey)
+	h.tryBackfillProfileSummary(r.Context(), pubkey)
 	dvmProfile, fromCache, err := h.vertex.Profile(r.Context(), pubkey)
 	if err != nil {
 		writeVertexError(w, err)
@@ -802,6 +797,14 @@ func (h *Handler) tryBackfillUserFeed(ctx context.Context, pubkey string, limit 
 	if h.userBackfiller == nil {
 		return false
 	}
+	if hydrator, ok := h.userBackfiller.(UserFeedHydrator); ok {
+		completed, err := hydrator.HydrateUserFeed(ctx, pubkey, limit)
+		if err != nil {
+			slog.Warn("user feed hydration failed", "pubkey", pubkey, "error", err)
+			return false
+		}
+		return completed
+	}
 	if err := h.userBackfiller.BackfillUserFeed(ctx, pubkey, limit); err != nil {
 		slog.Warn("user feed backfill failed", "pubkey", pubkey, "error", err)
 		return false
@@ -809,9 +812,38 @@ func (h *Handler) tryBackfillUserFeed(ctx context.Context, pubkey string, limit 
 	return true
 }
 
+func (h *Handler) tryBackfillUserFeeds(ctx context.Context, pubkeys []string, limit uint64) bool {
+	if h.userBackfiller == nil || len(pubkeys) == 0 {
+		return false
+	}
+	if hydrator, ok := h.userBackfiller.(UserFeedsHydrator); ok {
+		completed, err := hydrator.HydrateUserFeeds(ctx, pubkeys, limit)
+		if err != nil {
+			slog.Warn("user feeds hydration failed", "pubkeys", len(pubkeys), "error", err)
+			return false
+		}
+		return completed
+	}
+	completed := true
+	for _, pubkey := range pubkeys {
+		if !h.tryBackfillUserFeed(ctx, pubkey, limit) {
+			completed = false
+		}
+	}
+	return completed
+}
+
 func (h *Handler) tryBackfillEvents(ctx context.Context, ids []string) bool {
 	if h.eventBackfiller == nil || len(ids) == 0 {
 		return false
+	}
+	if hydrator, ok := h.eventBackfiller.(EventHydrator); ok {
+		completed, err := hydrator.HydrateEvents(ctx, ids)
+		if err != nil {
+			slog.Warn("event hydration failed", "ids", len(ids), "error", err)
+			return false
+		}
+		return completed
 	}
 	if err := h.eventBackfiller.BackfillEvents(ctx, ids); err != nil {
 		slog.Warn("event backfill failed", "ids", len(ids), "error", err)
@@ -824,6 +856,14 @@ func (h *Handler) tryBackfillProfiles(ctx context.Context, pubkeys []string) boo
 	if h.profileBackfiller == nil || len(pubkeys) == 0 {
 		return false
 	}
+	if hydrator, ok := h.profileBackfiller.(ProfileHydrator); ok {
+		completed, err := hydrator.HydrateProfiles(ctx, pubkeys)
+		if err != nil {
+			slog.Warn("profile hydration failed", "pubkeys", len(pubkeys), "error", err)
+			return false
+		}
+		return completed
+	}
 	if err := h.profileBackfiller.BackfillProfiles(ctx, pubkeys); err != nil {
 		slog.Warn("profile backfill failed", "pubkeys", len(pubkeys), "error", err)
 		return false
@@ -834,6 +874,14 @@ func (h *Handler) tryBackfillProfiles(ctx context.Context, pubkeys []string) boo
 func (h *Handler) tryBackfillEngagement(ctx context.Context, ids []string) bool {
 	if h.engagementBackfiller == nil || len(ids) == 0 {
 		return false
+	}
+	if hydrator, ok := h.engagementBackfiller.(EngagementHydrator); ok {
+		completed, err := hydrator.HydrateEngagement(ctx, ids)
+		if err != nil {
+			slog.Warn("engagement hydration failed", "ids", len(ids), "error", err)
+			return false
+		}
+		return completed
 	}
 	if err := h.engagementBackfiller.BackfillEngagement(ctx, ids); err != nil {
 		slog.Warn("engagement backfill failed", "ids", len(ids), "error", err)
@@ -846,6 +894,14 @@ func (h *Handler) tryBackfillThread(ctx context.Context, id string, limit int) b
 	if h.threadBackfiller == nil {
 		return false
 	}
+	if hydrator, ok := h.threadBackfiller.(ThreadHydrator); ok {
+		completed, err := hydrator.HydrateThread(ctx, id, limit)
+		if err != nil {
+			slog.Warn("thread hydration failed", "id", id, "error", err)
+			return false
+		}
+		return completed
+	}
 	if err := h.threadBackfiller.BackfillThread(ctx, id, limit); err != nil {
 		slog.Warn("thread backfill failed", "id", id, "error", err)
 		return false
@@ -857,11 +913,73 @@ func (h *Handler) tryBackfillFollows(ctx context.Context, pubkey string) bool {
 	if h.followBackfiller == nil {
 		return false
 	}
+	if hydrator, ok := h.followBackfiller.(FollowHydrator); ok {
+		completed, err := hydrator.HydrateFollows(ctx, pubkey)
+		if err != nil {
+			slog.Warn("follow graph hydration failed", "pubkey", pubkey, "error", err)
+			return false
+		}
+		return completed
+	}
 	if err := h.followBackfiller.BackfillFollows(ctx, pubkey); err != nil {
 		slog.Warn("follow graph backfill failed", "pubkey", pubkey, "error", err)
 		return false
 	}
 	return true
+}
+
+func (h *Handler) tryBackfillEnrichment(ctx context.Context, ids []string, pubkeys []string) bool {
+	type result struct {
+		completed bool
+	}
+	tasks := 0
+	results := make(chan result, 2)
+	if h.engagementBackfiller != nil && len(ids) > 0 {
+		tasks++
+		go func() {
+			results <- result{completed: h.tryBackfillEngagement(ctx, ids)}
+		}()
+	}
+	if h.profileBackfiller != nil && len(pubkeys) > 0 {
+		tasks++
+		go func() {
+			results <- result{completed: h.tryBackfillProfiles(ctx, pubkeys)}
+		}()
+	}
+	completed := true
+	for i := 0; i < tasks; i++ {
+		if !(<-results).completed {
+			completed = false
+		}
+	}
+	return completed
+}
+
+func (h *Handler) tryBackfillProfileSummary(ctx context.Context, pubkey string) bool {
+	type result struct {
+		completed bool
+	}
+	tasks := 0
+	results := make(chan result, 2)
+	if h.profileBackfiller != nil {
+		tasks++
+		go func() {
+			results <- result{completed: h.tryBackfillProfiles(ctx, []string{pubkey})}
+		}()
+	}
+	if h.followBackfiller != nil {
+		tasks++
+		go func() {
+			results <- result{completed: h.tryBackfillFollows(ctx, pubkey)}
+		}()
+	}
+	completed := true
+	for i := 0; i < tasks; i++ {
+		if !(<-results).completed {
+			completed = false
+		}
+	}
+	return completed
 }
 
 func missingIDs(ids []string, found map[string]chstore.EventView) []string {
