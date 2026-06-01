@@ -38,12 +38,6 @@ func main() {
 	}
 	defer store.Close()
 
-	schema, err := graphqlapi.NewSchema(store)
-	if err != nil {
-		slog.Error("graphql schema failed", "error", err)
-		os.Exit(1)
-	}
-
 	var vertexClient *vertex.Client
 	if cfg.Vertex.PrivateKey != "" {
 		vertexClient, err = vertex.New(vertex.Config{
@@ -56,21 +50,36 @@ func main() {
 		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/graphql", graphqlapi.Handler(schema))
-	appviewOpts := []appview.Option{appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05)}
-	if vertexClient != nil {
-		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
-	}
+	var userFeedBackfiller *appview.RelayUserFeedBackfiller
 	if cfg.OnDemand.UserFeed {
-		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(appview.NewRelayUserFeedBackfiller(store, appview.UserFeedBackfillConfig{
+		userFeedBackfiller = appview.NewRelayUserFeedBackfiller(store, appview.UserFeedBackfillConfig{
 			Relays:          cfg.Firehose.Relays,
 			ReadLimit:       cfg.Firehose.ReadLimit,
 			Cooldown:        cfg.OnDemand.Cooldown,
 			Timeout:         cfg.OnDemand.Timeout,
 			AuthorLimit:     cfg.OnDemand.AuthorLimit,
 			EngagementLimit: cfg.OnDemand.EngagementLimit,
-		})))
+		})
+	}
+
+	schemaOpts := []graphqlapi.Option{}
+	if userFeedBackfiller != nil {
+		schemaOpts = append(schemaOpts, graphqlapi.WithUserFeedBackfill(userFeedBackfiller))
+	}
+	schema, err := graphqlapi.NewSchema(store, schemaOpts...)
+	if err != nil {
+		slog.Error("graphql schema failed", "error", err)
+		os.Exit(1)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/graphql", graphqlapi.Handler(schema))
+	appviewOpts := []appview.Option{appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05)}
+	if vertexClient != nil {
+		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
+	}
+	if userFeedBackfiller != nil {
+		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

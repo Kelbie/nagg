@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"sort"
@@ -27,7 +28,20 @@ type Store interface {
 var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type resolver struct {
-	store Store
+	store          Store
+	userBackfiller UserFeedBackfiller
+}
+
+type UserFeedBackfiller interface {
+	BackfillUserFeed(context.Context, string, uint64) error
+}
+
+type Option func(*resolver)
+
+func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
+	return func(r *resolver) {
+		r.userBackfiller = backfiller
+	}
 }
 
 type eventNode struct {
@@ -53,8 +67,11 @@ type pubkeyRelationCache struct {
 	cache map[pubkeyRelationKey]map[string][]chstore.EventView
 }
 
-func NewSchema(store Store) (graphql.Schema, error) {
+func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	r := &resolver{store: store}
+	for _, opt := range opts {
+		opt(r)
+	}
 	jsonType := jsonScalar("JSON")
 
 	var eventType *graphql.Object
@@ -203,6 +220,16 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
+					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, len(events), input.Limit) {
+						if err := r.backfillAuthors(p.Context, input.PubKeys, input.Limit); err != nil {
+							slog.Warn("graphql author backfill failed", "pubkeys", input.PubKeys, "error", err)
+						} else {
+							events, err = r.store.QueryEvents(p.Context, input)
+							if err != nil {
+								return nil, err
+							}
+						}
+					}
 					relations := newPubkeyRelationCache(r.store, events)
 					return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations)}, nil
 				},
@@ -214,6 +241,11 @@ func NewSchema(store Store) (graphql.Schema, error) {
 					input, err := parseAggregateInput(p.Args["input"].(map[string]any))
 					if err != nil {
 						return nil, err
+					}
+					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, 0, 1) {
+						if err := r.backfillAuthors(p.Context, input.PubKeys, 100); err != nil {
+							slog.Warn("graphql aggregate author backfill failed", "pubkeys", input.PubKeys, "error", err)
+						}
 					}
 					rows, err := r.store.AggregateEvents(p.Context, input)
 					return map[string]any{"rows": rows}, err
@@ -241,6 +273,38 @@ func NewSchema(store Store) (graphql.Schema, error) {
 	})
 
 	return graphql.NewSchema(graphql.SchemaConfig{Query: queryType})
+}
+
+func (r *resolver) shouldBackfillAuthorQuery(pubkeys []string, ids []string, tags []chstore.TagFilter, kinds []int, currentLen int, limit uint64) bool {
+	if r.userBackfiller == nil || len(pubkeys) == 0 || len(ids) > 0 || len(tags) > 0 {
+		return false
+	}
+	if limit == 0 || limit > 500 {
+		limit = 50
+	}
+	if currentLen >= int(limit) {
+		return false
+	}
+	for _, kind := range kinds {
+		switch kind {
+		case 0, 1, 6, 16:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (r *resolver) backfillAuthors(ctx context.Context, pubkeys []string, limit uint64) error {
+	if limit == 0 {
+		limit = 50
+	}
+	for _, pubkey := range pubkeys {
+		if err := r.userBackfiller.BackfillUserFeed(ctx, pubkey, limit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {
