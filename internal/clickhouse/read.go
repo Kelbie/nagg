@@ -638,7 +638,7 @@ func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilt
 	}
 	for i, tag := range tags {
 		subAlias := fmt.Sprintf("tf%d", i)
-		clause := fmt.Sprintf("EXISTS (SELECT 1 FROM event_tags %s WHERE %s.event_id = %s.id AND %s.tag_key = ?", subAlias, subAlias, alias, subAlias)
+		clause := fmt.Sprintf("%s.id IN (SELECT %s.event_id FROM event_tags %s WHERE %s.tag_key = ?", alias, subAlias, subAlias, subAlias)
 		args = append(args, tag.Key)
 		clause, args = addTagValueClause(clause, args, subAlias, tag)
 		clauses = append(clauses, clause+")")
