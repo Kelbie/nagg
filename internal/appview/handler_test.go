@@ -53,6 +53,38 @@ func (s fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventVie
 	return nil, nil, nil
 }
 
+type sequencedFeedStore struct {
+	fakeStore
+	feeds [][]chstore.EventView
+	calls int
+}
+
+func (s *sequencedFeedStore) FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error) {
+	if len(s.feeds) == 0 {
+		s.calls++
+		return nil, nil
+	}
+	idx := s.calls
+	if idx >= len(s.feeds) {
+		idx = len(s.feeds) - 1
+	}
+	s.calls++
+	return s.feeds[idx], nil
+}
+
+type fakeUserBackfiller struct {
+	calls  int
+	pubkey string
+	limit  uint64
+}
+
+func (f *fakeUserBackfiller) BackfillUserFeed(_ context.Context, pubkey string, limit uint64) error {
+	f.calls++
+	f.pubkey = pubkey
+	f.limit = limit
+	return nil
+}
+
 type fakeVertex struct {
 	profile vertex.ProfileResult
 	search  []vertex.SearchResult
@@ -68,6 +100,51 @@ func (v fakeVertex) Recommended(context.Context, vertex.RecommendedArgs) ([]vert
 
 func (v fakeVertex) Profile(context.Context, string) (vertex.ProfileResult, bool, error) {
 	return v.profile, true, nil
+}
+
+func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		feeds: [][]chstore.EventView{
+			nil,
+			{{
+				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "hello",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	backfiller := &fakeUserBackfiller{}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey="+testPubkey+"&limit=5", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.limit != 5 {
+		t.Fatalf("backfill call = %+v", backfiller)
+	}
+	if store.calls != 2 {
+		t.Fatalf("store calls = %d, want 2", store.calls)
+	}
+	var response FeedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "hello" {
+		t.Fatalf("items = %+v", response.Items)
+	}
 }
 
 func TestProfileMergesVertexWithLocalProfile(t *testing.T) {

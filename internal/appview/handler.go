@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ type Store interface {
 type Handler struct {
 	store          Store
 	vertex         VertexClient
+	userBackfiller UserFeedBackfiller
 	nip05Validator *nip05Validator
 	rateLimiter    *rateLimiter
 }
@@ -56,6 +58,12 @@ func WithNIP05Validation(enabled bool) Option {
 func WithRateLimit(limit int, window time.Duration) Option {
 	return func(h *Handler) {
 		h.rateLimiter = newRateLimiter(limit, window)
+	}
+}
+
+func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
+	return func(h *Handler) {
+		h.userBackfiller = backfiller
 	}
 }
 
@@ -251,18 +259,52 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	until := int64(intParam(r, "until", 0))
+	limitParam := intParam(r, "limit", 50)
+	if limitParam < 0 {
+		limitParam = 0
+	}
+	offsetParam := intParam(r, "offset", 0)
+	if offsetParam < 0 {
+		offsetParam = 0
+	}
+	limit := uint64(limitParam)
+	offset := uint64(offsetParam)
 	events, err := h.store.FollowsFeed(
 		r.Context(),
 		[]string{pubkey},
-		int64(intParam(r, "until", 0)),
-		uint64(intParam(r, "limit", 50)),
-		uint64(intParam(r, "offset", 0)),
+		until,
+		limit,
+		offset,
 	)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	if h.shouldBackfillUserFeed(events, until, limit, offset) {
+		if err := h.userBackfiller.BackfillUserFeed(r.Context(), pubkey, limit); err != nil {
+			// On-demand relay fetch is opportunistic. Serve the indexed data we
+			// already have rather than failing the user feed for a flaky relay.
+			slog.Warn("user feed backfill failed", "pubkey", pubkey, "error", err)
+		} else {
+			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+		}
+	}
 	h.writeFeedResponse(w, r, events)
+}
+
+func (h *Handler) shouldBackfillUserFeed(events []chstore.EventView, until int64, limit uint64, offset uint64) bool {
+	if h.userBackfiller == nil || until != 0 || offset != 0 {
+		return false
+	}
+	if limit == 0 || limit > 100 {
+		limit = 50
+	}
+	return len(events) < int(limit)
 }
 
 func (h *Handler) writeFeedResponse(w http.ResponseWriter, r *http.Request, events []chstore.EventView) {

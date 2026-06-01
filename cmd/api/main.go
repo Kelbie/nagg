@@ -62,6 +62,16 @@ func main() {
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}
+	if cfg.OnDemand.UserFeed {
+		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(appview.NewRelayUserFeedBackfiller(store, appview.UserFeedBackfillConfig{
+			Relays:          cfg.Firehose.Relays,
+			ReadLimit:       cfg.Firehose.ReadLimit,
+			Cooldown:        cfg.OnDemand.Cooldown,
+			Timeout:         cfg.OnDemand.Timeout,
+			AuthorLimit:     cfg.OnDemand.AuthorLimit,
+			EngagementLimit: cfg.OnDemand.EngagementLimit,
+		})))
+	}
 	appview.New(store, appviewOpts...).Register(mux)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
