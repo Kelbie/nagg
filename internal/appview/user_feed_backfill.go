@@ -66,6 +66,12 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	if b == nil || b.store == nil || pubkey == "" || !b.shouldAttempt(pubkey) {
 		return nil
 	}
+	timeout := b.cfg.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
 
 	records := map[string]chstore.EventRecord{}
 	add := func(events []relayquery.Event) {
@@ -90,7 +96,7 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 		"authors": []string{pubkey},
 		"kinds":   []int{0, 1, 6, 16},
 		"limit":   authorLimit,
-	}, b.cfg.Timeout)
+	}, timeout)
 	if err != nil {
 		return err
 	}
@@ -102,7 +108,7 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 			originals, err := b.query.Query(ctx, map[string]any{
 				"ids":   batch,
 				"limit": len(batch) * 2,
-			}, b.cfg.Timeout)
+			}, timeout)
 			if err != nil {
 				slog.Debug("user feed original backfill failed", "error", err)
 			}
@@ -112,7 +118,7 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 				"#e":    batch,
 				"kinds": []int{1, 6, 7, 16, 9735},
 				"limit": b.cfg.EngagementLimit,
-			}, b.cfg.Timeout)
+			}, timeout)
 			if err != nil {
 				slog.Debug("user feed engagement backfill failed", "error", err)
 			}
@@ -125,7 +131,7 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 			"authors": batch,
 			"kinds":   []int{0},
 			"limit":   len(batch) * 3,
-		}, b.cfg.Timeout)
+		}, timeout)
 		if err != nil {
 			slog.Debug("user feed profile backfill failed", "error", err)
 		}
