@@ -70,8 +70,9 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-	defer cancel()
+	baseCtx := context.WithoutCancel(ctx)
+	queryCtx, cancelQuery := context.WithTimeout(baseCtx, timeout)
+	defer cancelQuery()
 
 	records := map[string]chstore.EventRecord{}
 	add := func(events []relayquery.Event) {
@@ -92,7 +93,7 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	}
 
 	authorLimit := maxInt(b.cfg.AuthorLimit, int(limit))
-	authorEvents, err := b.query.Query(ctx, map[string]any{
+	authorEvents, err := b.query.Query(queryCtx, map[string]any{
 		"authors": []string{pubkey},
 		"kinds":   []int{0, 1, 6, 16},
 		"limit":   authorLimit,
@@ -105,7 +106,10 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	targetIDs := targetEventIDs(records)
 	if len(targetIDs) > 0 {
 		for _, batch := range chunks(targetIDs, 80) {
-			originals, err := b.query.Query(ctx, map[string]any{
+			if queryCtx.Err() != nil {
+				break
+			}
+			originals, err := b.query.Query(queryCtx, map[string]any{
 				"ids":   batch,
 				"limit": len(batch) * 2,
 			}, timeout)
@@ -114,7 +118,10 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 			}
 			add(originals)
 
-			engagement, err := b.query.Query(ctx, map[string]any{
+			if queryCtx.Err() != nil {
+				break
+			}
+			engagement, err := b.query.Query(queryCtx, map[string]any{
 				"#e":    batch,
 				"kinds": []int{1, 6, 7, 16, 9735},
 				"limit": b.cfg.EngagementLimit,
@@ -127,7 +134,10 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	}
 
 	for _, batch := range chunks(profilePubkeys(records), 80) {
-		profiles, err := b.query.Query(ctx, map[string]any{
+		if queryCtx.Err() != nil {
+			break
+		}
+		profiles, err := b.query.Query(queryCtx, map[string]any{
 			"authors": batch,
 			"kinds":   []int{0},
 			"limit":   len(batch) * 3,
@@ -148,7 +158,9 @@ func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey s
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Event.CreatedAt < out[j].Event.CreatedAt
 	})
-	if err := b.store.InsertEvents(ctx, out); err != nil {
+	insertCtx, cancelInsert := context.WithTimeout(baseCtx, 10*time.Second)
+	defer cancelInsert()
+	if err := b.store.InsertEvents(insertCtx, out); err != nil {
 		return err
 	}
 	slog.Info("user feed backfill inserted", "pubkey", pubkey, "events", len(out))
