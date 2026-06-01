@@ -53,6 +53,16 @@ func (s fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventVie
 	return nil, nil, nil
 }
 
+type followCountSpyStore struct {
+	fakeStore
+	calls int
+}
+
+func (s *followCountSpyStore) FollowCounts(ctx context.Context, pubkey string) (chstore.FollowCounts, error) {
+	s.calls++
+	return s.fakeStore.FollowCounts(ctx, pubkey)
+}
+
 type sequencedFeedStore struct {
 	fakeStore
 	feeds [][]chstore.EventView
@@ -482,8 +492,8 @@ func TestProfileMergesVertexWithLocalProfile(t *testing.T) {
 func TestProfileUsesVertexFollowCountsWhenLocalCountsAreEmpty(t *testing.T) {
 	followers := uint64(10)
 	follows := uint64(3)
-	handler := New(
-		fakeStore{
+	store := &followCountSpyStore{
+		fakeStore: fakeStore{
 			profiles: map[string]chstore.ProfileRow{
 				testPubkey: {
 					PubKey:      testPubkey,
@@ -492,6 +502,9 @@ func TestProfileUsesVertexFollowCountsWhenLocalCountsAreEmpty(t *testing.T) {
 				},
 			},
 		},
+	}
+	handler := New(
+		store,
 		WithVertex(fakeVertex{
 			profile: vertex.ProfileResult{
 				PubKey:    testPubkey,
@@ -517,6 +530,9 @@ func TestProfileUsesVertexFollowCountsWhenLocalCountsAreEmpty(t *testing.T) {
 	}
 	if response.Followers != followers || response.Follows != follows {
 		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	}
+	if store.calls != 0 {
+		t.Fatalf("local follow count calls = %d, want 0", store.calls)
 	}
 }
 

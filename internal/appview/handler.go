@@ -615,7 +615,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	counts, err := h.store.FollowCounts(r.Context(), pubkey)
+	counts, err := h.profileCounts(r.Context(), pubkey, dvmProfile)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -636,8 +636,8 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		Npub:          vertex.Npub(pubkey),
 		Rank:          dvmProfile.Rank,
 		Score:         dvmProfile.Score,
-		Followers:     profileCount(counts.Followers, dvmProfile.Followers),
-		Follows:       profileCount(counts.Follows, dvmProfile.Follows),
+		Followers:     counts.Followers,
+		Follows:       counts.Follows,
 		CreatedAt:     createdAt,
 		Nodes:         dvmProfile.Nodes,
 		TopFollowers:  topFollowers,
@@ -1043,11 +1043,21 @@ func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchR
 	return out, nil
 }
 
-func profileCount(local uint64, dvm *uint64) uint64 {
-	if dvm != nil {
-		return *dvm
+func (h *Handler) profileCounts(ctx context.Context, pubkey string, dvmProfile vertex.ProfileResult) (chstore.FollowCounts, error) {
+	if dvmProfile.Followers != nil && dvmProfile.Follows != nil {
+		return chstore.FollowCounts{Followers: *dvmProfile.Followers, Follows: *dvmProfile.Follows}, nil
 	}
-	return local
+	counts, err := h.store.FollowCounts(ctx, pubkey)
+	if err != nil {
+		return chstore.FollowCounts{}, err
+	}
+	if dvmProfile.Followers != nil {
+		counts.Followers = *dvmProfile.Followers
+	}
+	if dvmProfile.Follows != nil {
+		counts.Follows = *dvmProfile.Follows
+	}
+	return counts, nil
 }
 
 func (h *Handler) enrichTopFollowers(ctx context.Context, followers []vertex.TopFollower) ([]TopFollower, error) {
