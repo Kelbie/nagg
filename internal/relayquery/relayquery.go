@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ func (c Client) Query(ctx context.Context, filter map[string]any, timeout time.D
 			out = append(out, events...)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", relay, err))
+				slog.Warn("on-demand relay query failed", "relay", relay, "error", err)
+			} else if len(events) > 0 {
+				slog.Info("on-demand relay query returned events", "relay", relay, "events", len(events))
 			}
 		}()
 	}
