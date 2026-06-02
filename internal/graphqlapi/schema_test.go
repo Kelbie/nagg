@@ -19,6 +19,7 @@ type fakeStore struct {
 	calls           int
 	aggregateCalls  int
 	eventInputs     []chstore.EventQueryInput
+	referenceInputs []referencingEventsInput
 	latestInputs    []latestEventsInput
 	aggregateInputs []chstore.AggregateInput
 }
@@ -27,6 +28,13 @@ type latestEventsInput struct {
 	pubkeys []string
 	kinds   []int
 	limit   uint64
+}
+
+type referencingEventsInput struct {
+	input          chstore.EventQueryInput
+	tag            chstore.TagFilter
+	targets        []string
+	limitPerTarget uint64
 }
 
 func (s *fakeStore) EventByID(_ context.Context, id string) (*chstore.EventView, error) {
@@ -54,6 +62,49 @@ func (s *fakeStore) QueryEvents(_ context.Context, input chstore.EventQueryInput
 	}
 	s.calls++
 	return s.events[idx], nil
+}
+
+func (s *fakeStore) QueryEventsByTagTargets(_ context.Context, input chstore.EventQueryInput, tag chstore.TagFilter, targets []string, limitPerTarget uint64) (map[string][]chstore.EventView, error) {
+	s.referenceInputs = append(s.referenceInputs, referencingEventsInput{
+		input:          input,
+		tag:            tag,
+		targets:        append([]string(nil), targets...),
+		limitPerTarget: limitPerTarget,
+	})
+	out := make(map[string][]chstore.EventView, len(targets))
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		out[target] = nil
+		targetSet[target] = struct{}{}
+	}
+	if input.Empty {
+		s.calls++
+		return out, nil
+	}
+	if len(s.events) == 0 {
+		s.calls++
+		return out, nil
+	}
+	idx := s.calls
+	if idx >= len(s.events) {
+		idx = len(s.events) - 1
+	}
+	s.calls++
+	for _, event := range s.events[idx] {
+		if len(input.PubKeys) > 0 && !containsString(input.PubKeys, event.PubKey) {
+			continue
+		}
+		for _, eventTag := range event.Tags {
+			if len(eventTag) < 2 || eventTag[0] != tag.Key {
+				continue
+			}
+			if _, ok := targetSet[eventTag[1]]; !ok {
+				continue
+			}
+			out[eventTag[1]] = append(out[eventTag[1]], event)
+		}
+	}
+	return out, nil
 }
 
 func (s *fakeStore) QueryLatestEventsByPubKeys(_ context.Context, pubkeys []string, kinds []int, limit uint64) (map[string][]chstore.EventView, error) {
@@ -112,6 +163,15 @@ type fakeHydratingUserBackfiller struct {
 func (f *fakeHydratingUserBackfiller) HydrateUserFeed(ctx context.Context, pubkey string, limit uint64) (bool, error) {
 	f.hydrated++
 	return f.completed, f.BackfillUserFeed(ctx, pubkey, limit)
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestEventsQueryBackfillsAuthorWhenFirstPageShort(t *testing.T) {
@@ -692,15 +752,21 @@ func TestRankedReferencedByRanksCandidateEventsByGenericReferences(t *testing.T)
 	if len(result.Errors) > 0 {
 		t.Fatalf("graphql errors = %+v", result.Errors)
 	}
-	if len(store.eventInputs) != 2 {
+	if len(store.eventInputs) != 1 {
 		t.Fatalf("event inputs len = %d", len(store.eventInputs))
 	}
-	candidateInput := store.eventInputs[0]
-	if len(candidateInput.Tags) != 1 || candidateInput.Tags[0].Key != "e" || candidateInput.Tags[0].Value != rootID {
-		t.Fatalf("candidate tags = %+v", candidateInput.Tags)
+	if len(store.referenceInputs) != 1 {
+		t.Fatalf("reference inputs len = %d", len(store.referenceInputs))
 	}
+	candidateInput := store.referenceInputs[0].input
 	if got := candidateInput.PubKeys; len(got) != 2 || got[0] != authorA || got[1] != authorB {
 		t.Fatalf("candidate pubkeys = %+v", got)
+	}
+	if got := store.referenceInputs[0].tag.Key; got != "e" {
+		t.Fatalf("candidate tag key = %q", got)
+	}
+	if got := store.referenceInputs[0].targets; len(got) != 1 || got[0] != rootID {
+		t.Fatalf("candidate targets = %+v", got)
 	}
 	if len(store.aggregateInputs) != 1 {
 		t.Fatalf("aggregate inputs len = %d", len(store.aggregateInputs))
@@ -709,12 +775,176 @@ func TestRankedReferencedByRanksCandidateEventsByGenericReferences(t *testing.T)
 	if aggregateInput.Dataset != "TAGS" || len(aggregateInput.Tags) != 1 || aggregateInput.Tags[0].Key != "e" {
 		t.Fatalf("aggregate input = %+v", aggregateInput)
 	}
-	if got := aggregateInput.Tags[0].Values; len(got) != 2 || got[0] != replyBID || got[1] != replyAID {
+	if got := aggregateInput.Tags[0].Values; len(got) != 2 || !containsString(got, replyAID) || !containsString(got, replyBID) {
 		t.Fatalf("aggregate tag values = %+v", got)
 	}
 	data := result.Data.(map[string]any)
 	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
 	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != replyAID {
 		t.Fatalf("nodes = %+v", nodes)
+	}
+}
+
+func TestRankedReferencedByBatchesAcrossSiblingEvents(t *testing.T) {
+	rootAID := "1111111111111111111111111111111111111111111111111111111111111111"
+	rootBID := "2222222222222222222222222222222222222222222222222222222222222222"
+	replyAID := "3333333333333333333333333333333333333333333333333333333333333333"
+	replyBID := "4444444444444444444444444444444444444444444444444444444444444444"
+	authorA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	authorB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := &fakeStore{
+		latestEvents: map[string][]chstore.EventView{
+			testPubkey: {{
+				ID:        "5555555555555555555555555555555555555555555555555555555555555555",
+				PubKey:    testPubkey,
+				Kind:      3,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Tags:      [][]string{{"p", authorA}, {"p", authorB}},
+			}},
+		},
+		events: [][]chstore.EventView{
+			{
+				{
+					ID:        rootAID,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_010, 0),
+					Content:   "root a",
+					Tags:      [][]string{},
+					Sig:       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				},
+				{
+					ID:        rootBID,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_009, 0),
+					Content:   "root b",
+					Tags:      [][]string{},
+					Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				},
+			},
+			{
+				{
+					ID:        replyAID,
+					PubKey:    authorA,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_008, 0),
+					Content:   "reply a",
+					Tags:      [][]string{{"e", rootAID}},
+					Sig:       "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				},
+				{
+					ID:        replyBID,
+					PubKey:    authorB,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_007, 0),
+					Content:   "reply b",
+					Tags:      [][]string{{"e", rootBID}},
+					Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+				},
+			},
+			{
+				{
+					ID:        replyAID,
+					PubKey:    authorA,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_008, 0),
+					Content:   "reply a",
+					Tags:      [][]string{{"e", rootAID}},
+					Sig:       "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				},
+				{
+					ID:        replyBID,
+					PubKey:    authorB,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_007, 0),
+					Content:   "reply b",
+					Tags:      [][]string{{"e", rootBID}},
+					Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+				},
+			},
+		},
+		aggregateRows: [][]chstore.AggregateRow{{
+			{
+				Dimensions: map[string]string{"tag_value": replyAID},
+				Metrics:    map[string]uint64{"unique_pubkeys": 10},
+			},
+			{
+				Dimensions: map[string]string{"tag_value": replyBID},
+				Metrics:    map[string]uint64{"unique_pubkeys": 9},
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + rootAID + `","` + rootBID + `"], limit:2}) {
+				nodes {
+					id
+					rankedReferencedBy(input:{
+						via:{key:"e"}
+						events:{
+							kinds:[1]
+							pubkeysFrom:[{
+								latestEventTags:{
+									pubkey:"` + testPubkey + `"
+									kinds:[3]
+									tag:{key:"p"}
+								}
+							}]
+							limit:10
+						}
+						rank:{
+							references:{kinds:[7]}
+							via:{key:"e"}
+							metric:{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+						}
+						limit:1
+					}) { nodes { id } }
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.latestInputs) != 1 {
+		t.Fatalf("latest inputs len = %d", len(store.latestInputs))
+	}
+	if len(store.referenceInputs) != 1 {
+		t.Fatalf("reference inputs len = %d", len(store.referenceInputs))
+	}
+	if got := store.referenceInputs[0].targets; len(got) != 2 || got[0] != rootAID || got[1] != rootBID {
+		t.Fatalf("reference targets = %+v", got)
+	}
+	if store.referenceInputs[0].limitPerTarget != 10 {
+		t.Fatalf("reference limit per target = %d", store.referenceInputs[0].limitPerTarget)
+	}
+	if len(store.aggregateInputs) != 1 {
+		t.Fatalf("aggregate inputs len = %d", len(store.aggregateInputs))
+	}
+	if len(store.eventInputs) != 2 {
+		t.Fatalf("event inputs len = %d", len(store.eventInputs))
+	}
+
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	replyA := nodes[0].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	replyB := nodes[1].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(replyA) != 1 || replyA[0].(map[string]any)["id"] != replyAID {
+		t.Fatalf("replyA = %+v", replyA)
+	}
+	if len(replyB) != 1 || replyB[0].(map[string]any)["id"] != replyBID {
+		t.Fatalf("replyB = %+v", replyB)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -564,6 +565,114 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 	return out, rows.Err()
 }
 
+func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInput, tag TagFilter, targets []string, limitPerTarget uint64) (map[string][]EventView, error) {
+	targets = uniqueStrings(targets)
+	sort.Strings(targets)
+	out := make(map[string][]EventView, len(targets))
+	for _, target := range targets {
+		out[target] = nil
+	}
+	if input.Empty || tag.Key == "" || len(targets) == 0 {
+		return out, nil
+	}
+	if tag.Value != "" {
+		targets = []string{tag.Value}
+	} else if len(tag.Values) > 0 {
+		targets = intersectStrings(targets, tag.Values)
+	}
+	if len(targets) == 0 {
+		return out, nil
+	}
+	if limitPerTarget == 0 || limitPerTarget > 500 {
+		limitPerTarget = 50
+	}
+	queryLimit := limitPerTarget + input.Offset
+	if queryLimit == 0 || queryLimit > 1000 {
+		queryLimit = limitPerTarget
+	}
+
+	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	if input.Since > 0 {
+		where += " AND e.created_at >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		where += " AND e.created_at < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
+	where += " AND rt.tag_key = ? AND rt.tag_value IN (?)"
+	args = append(args, tag.Key, targets)
+
+	query := fmt.Sprintf(`
+		SELECT target_value, id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM (
+			SELECT
+				rt.tag_value AS target_value,
+				e.id AS id,
+				e.pubkey AS pubkey,
+				e.kind AS kind,
+				e.created_at AS created_at,
+				e.content AS content,
+				e.tags_json AS tags_json,
+				e.sig AS sig,
+				e.last_seen_at AS last_seen_at
+			FROM event_tags AS rt
+			INNER JOIN nostr_events AS e FINAL ON e.id = rt.event_id
+			%s
+			ORDER BY rt.tag_value ASC, e.created_at DESC, e.id DESC
+			LIMIT %d BY rt.tag_value
+		)
+		ORDER BY target_value ASC, created_at DESC, id DESC
+	`, where, queryLimit)
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seenByTarget := make(map[string]map[string]struct{}, len(targets))
+	for rows.Next() {
+		var target string
+		var tagsJSON string
+		var ev EventView
+		var kind uint32
+		if err := rows.Scan(&target, &ev.ID, &ev.PubKey, &kind, &ev.CreatedAt, &ev.Content, &tagsJSON, &ev.Sig, &ev.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if seenByTarget[target] == nil {
+			seenByTarget[target] = map[string]struct{}{}
+		}
+		if _, ok := seenByTarget[target][ev.ID]; ok {
+			continue
+		}
+		seenByTarget[target][ev.ID] = struct{}{}
+		ev.Kind = int(kind)
+		_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
+		out[target] = append(out[target], ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if input.Offset == 0 && limitPerTarget == queryLimit {
+		return out, nil
+	}
+	for target, events := range out {
+		if input.Offset > 0 {
+			if input.Offset >= uint64(len(events)) {
+				out[target] = nil
+				continue
+			}
+			events = events[input.Offset:]
+		}
+		if uint64(len(events)) > limitPerTarget {
+			events = events[:limitPerTarget]
+		}
+		out[target] = events
+	}
+	return out, nil
+}
+
 type eventRows interface {
 	Next() bool
 	Scan(dest ...any) error
@@ -902,6 +1011,22 @@ func uniqueStrings(values []string) []string {
 		}
 		seen[value] = struct{}{}
 		out = append(out, value)
+	}
+	return out
+}
+
+func intersectStrings(left, right []string) []string {
+	allowed := make(map[string]struct{}, len(right))
+	for _, value := range right {
+		if value != "" {
+			allowed[value] = struct{}{}
+		}
+	}
+	out := make([]string, 0, min(len(left), len(right)))
+	for _, value := range left {
+		if _, ok := allowed[value]; ok {
+			out = append(out, value)
+		}
 	}
 	return out
 }
