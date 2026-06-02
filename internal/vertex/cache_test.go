@@ -121,3 +121,44 @@ func TestCachedCallStaleWhileRevalidate(t *testing.T) {
 		t.Fatalf("background refresh calls = %d, want at least 2", calls.Load())
 	}
 }
+
+func TestCachedCallRefreshBypassesFreshCache(t *testing.T) {
+	var calls atomic.Int32
+	cache, err := newCachedCall(
+		func(context.Context, string) (string, error) {
+			return fmt.Sprintf("value:%d", calls.Add(1)), nil
+		},
+		func(key string) string { return key },
+		func(value string) bool { return value != "" },
+		time.Hour,
+		24*time.Hour,
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	value, fromCache, err := cache.Get(context.Background(), "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromCache || value != "value:1" {
+		t.Fatalf("initial value = %q fromCache=%v", value, fromCache)
+	}
+
+	value, err = cache.Refresh(context.Background(), "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "value:2" {
+		t.Fatalf("refresh value = %q, want value:2", value)
+	}
+
+	value, fromCache, err = cache.Get(context.Background(), "same")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fromCache || value != "value:2" {
+		t.Fatalf("cached refreshed value = %q fromCache=%v", value, fromCache)
+	}
+}

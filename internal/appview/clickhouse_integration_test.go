@@ -15,6 +15,7 @@ import (
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/nbd-wtf/go-nostr"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 func TestClickHouseAppViewIntegration(t *testing.T) {
@@ -49,6 +50,7 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 	if err := store.Backfill(ctx); err != nil {
 		t.Fatal(err)
 	}
+	assertProfileStoreHelpers(t, ctx, store)
 
 	mux := http.NewServeMux()
 	New(store, WithNIP05Validation(false), WithRateLimit(1_000, time.Minute)).Register(mux)
@@ -108,6 +110,46 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 		t.Fatalf("quoted root = %+v", enrichment.Quoted)
 	}
 	assertRootStats(t, enrichment.Metrics[integrationRootID])
+}
+
+func assertProfileStoreHelpers(t *testing.T, ctx context.Context, store *chstore.Store) {
+	t.Helper()
+
+	firstAt, err := store.ProfileFirstEventCreatedAt(ctx, integrationAlice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAt == nil {
+		t.Fatal("expected first local event timestamp")
+	}
+
+	score := 42.5
+	followers := uint64(500)
+	profile := vertex.ProfileResult{
+		PubKey:    integrationAlice,
+		Npub:      vertex.Npub(integrationAlice),
+		Rank:      0.01,
+		Score:     &score,
+		Followers: &followers,
+		TopFollowers: []vertex.TopFollower{{
+			PubKey: integrationBob,
+			Npub:   vertex.Npub(integrationBob),
+			Rank:   0.02,
+		}},
+	}
+	if err := store.SaveVertexProfile(ctx, profile); err != nil {
+		t.Fatal(err)
+	}
+	cached, ok, err := store.CachedVertexProfile(ctx, integrationAlice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || cached.PubKey != integrationAlice || cached.Score == nil || *cached.Score != score {
+		t.Fatalf("cached profile = %+v ok=%v", cached, ok)
+	}
+	if cached.Followers == nil || *cached.Followers != followers || len(cached.TopFollowers) != 1 {
+		t.Fatalf("cached profile fields = %+v", cached)
+	}
 }
 
 func createIntegrationDatabase(t *testing.T, ctx context.Context, addr string, username string, password string, database string) {

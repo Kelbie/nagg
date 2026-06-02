@@ -42,22 +42,22 @@ type SearchResult struct {
 }
 
 type ProfileResult struct {
-	PubKey       string
-	Npub         string
-	Rank         float64
-	Score        *float64
-	Followers    *uint64
-	Follows      *uint64
-	CreatedAt    *int64
-	Nodes        *int
-	TopFollowers []TopFollower
+	PubKey       string        `json:"pubkey"`
+	Npub         string        `json:"npub"`
+	Rank         float64       `json:"rank"`
+	Score        *float64      `json:"score,omitempty"`
+	Followers    *uint64       `json:"followers,omitempty"`
+	Follows      *uint64       `json:"follows,omitempty"`
+	CreatedAt    *int64        `json:"created_at,omitempty"`
+	Nodes        *int          `json:"nodes,omitempty"`
+	TopFollowers []TopFollower `json:"topFollowers,omitempty"`
 }
 
 type TopFollower struct {
-	PubKey string
-	Npub   string
-	Rank   float64
-	Score  *float64
+	PubKey string   `json:"pubkey"`
+	Npub   string   `json:"npub"`
+	Rank   float64  `json:"rank"`
+	Score  *float64 `json:"score,omitempty"`
 }
 
 type Client struct {
@@ -149,6 +149,14 @@ func (c *Client) Profile(ctx context.Context, pubkey string) (ProfileResult, boo
 		return ProfileResult{}, false, fmt.Errorf("invalid pubkey")
 	}
 	return c.profile.Get(ctx, normalized)
+}
+
+func (c *Client) ProfileRefresh(ctx context.Context, pubkey string) (ProfileResult, error) {
+	normalized, ok := NormalizePubkey(pubkey)
+	if !ok {
+		return ProfileResult{}, fmt.Errorf("invalid pubkey")
+	}
+	return c.profile.Refresh(ctx, normalized)
 }
 
 func (c *Client) SearchStats() CacheStats {

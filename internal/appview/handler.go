@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -25,33 +26,48 @@ type Store interface {
 	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
 	FollowCounts(context.Context, string) (chstore.FollowCounts, error)
+	ProfileFirstEventCreatedAt(context.Context, string) (*time.Time, error)
+	CachedVertexProfile(context.Context, string) (vertex.ProfileResult, bool, error)
+	SaveVertexProfile(context.Context, vertex.ProfileResult) error
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
 type Handler struct {
-	store                Store
-	vertex               VertexClient
-	userBackfiller       UserFeedBackfiller
-	eventBackfiller      EventBackfiller
-	profileBackfiller    ProfileBackfiller
-	engagementBackfiller EngagementBackfiller
-	threadBackfiller     ThreadBackfiller
-	followBackfiller     FollowBackfiller
-	nip05Validator       *nip05Validator
-	rateLimiter          *rateLimiter
+	store                     Store
+	vertex                    VertexClient
+	userBackfiller            UserFeedBackfiller
+	eventBackfiller           EventBackfiller
+	profileBackfiller         ProfileBackfiller
+	engagementBackfiller      EngagementBackfiller
+	threadBackfiller          ThreadBackfiller
+	followBackfiller          FollowBackfiller
+	nip05Validator            *nip05Validator
+	rateLimiter               *rateLimiter
+	vertexProfileMinFollowers uint64
 }
 
 type VertexClient interface {
 	Search(context.Context, vertex.SearchArgs) ([]vertex.SearchResult, bool, error)
 	Recommended(context.Context, vertex.RecommendedArgs) ([]vertex.SearchResult, bool, error)
-	Profile(context.Context, string) (vertex.ProfileResult, bool, error)
+	ProfileRefresh(context.Context, string) (vertex.ProfileResult, error)
 }
 
 type Option func(*Handler)
 
+const defaultVertexProfileMinFollowers uint64 = 500
+
 func WithVertex(client VertexClient) Option {
 	return func(h *Handler) {
 		h.vertex = client
+	}
+}
+
+func WithVertexProfileMinFollowers(minFollowers int) Option {
+	return func(h *Handler) {
+		if minFollowers < 0 {
+			minFollowers = 0
+		}
+		h.vertexProfileMinFollowers = uint64(minFollowers)
 	}
 }
 
@@ -87,9 +103,10 @@ func WithAppViewBackfill(backfiller AppViewBackfiller) Option {
 
 func New(store Store, opts ...Option) *Handler {
 	h := &Handler{
-		store:          store,
-		nip05Validator: newNIP05Validator(true),
-		rateLimiter:    newRateLimiter(120, time.Minute),
+		store:                     store,
+		nip05Validator:            newNIP05Validator(true),
+		rateLimiter:               newRateLimiter(120, time.Minute),
+		vertexProfileMinFollowers: defaultVertexProfileMinFollowers,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -160,6 +177,8 @@ type FeedItem struct {
 	RepostEvent     *FeedEvent `json:"repostEvent,omitempty"`
 	OriginalEvent   *FeedEvent `json:"originalEvent,omitempty"`
 	OriginalEventID string     `json:"originalEventId,omitempty"`
+	RootEvent       *FeedEvent `json:"rootEvent,omitempty"`
+	RootEventID     string     `json:"rootEventId,omitempty"`
 }
 
 type FeedResponse struct {
@@ -176,6 +195,20 @@ type EnrichmentResponse struct {
 	Profiles map[string]ProfileInfo       `json:"profiles"`
 	Quoted   map[string]FeedEvent         `json:"quoted"`
 }
+
+type appViewHydration struct {
+	Metrics  map[string]chstore.NoteStats
+	Profiles map[string]ProfileInfo
+	Quoted   map[string]FeedEvent
+}
+
+type resolvedRootEvent struct {
+	ID       string
+	Event    chstore.EventView
+	HasEvent bool
+}
+
+var nostrEventURI = regexp.MustCompile(`nostr:(note1|nevent1)[a-z0-9]{1,512}`)
 
 type ProfileFields struct {
 	Name        *string `json:"name,omitempty"`
@@ -381,9 +414,18 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		return FeedResponse{}, err
 	}
 
+	rootSources := make([]chstore.EventView, 0, len(events)+len(originals))
+	rootSources = append(rootSources, events...)
+	for _, original := range originals {
+		rootSources = append(rootSources, original)
+	}
+	roots, err := h.rootEvents(ctx, rootSources)
+	if err != nil {
+		return FeedResponse{}, err
+	}
+
 	items := make([]FeedItem, 0, len(events))
-	metricIDs := make([]string, 0, len(events)+len(originals))
-	pubkeys := make([]string, 0, len(events)+len(originals))
+	hydrationEvents := make([]chstore.EventView, 0, len(events)+len(originals)+len(roots))
 	var paginationUntil int64
 
 	for _, event := range events {
@@ -391,7 +433,7 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		if paginationUntil == 0 || feedEvent.CreatedAt < paginationUntil {
 			paginationUntil = feedEvent.CreatedAt
 		}
-		pubkeys = append(pubkeys, event.PubKey)
+		hydrationEvents = append(hydrationEvents, event)
 
 		if event.Kind == 6 || event.Kind == 16 {
 			originalID := firstEventTag(event)
@@ -399,35 +441,42 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 			if original, ok := originals[originalID]; ok {
 				originalEvent := eventJSON(original)
 				item.OriginalEvent = &originalEvent
-				pubkeys = append(pubkeys, original.PubKey)
-			}
-			if originalID != "" {
-				metricIDs = append(metricIDs, originalID)
+				hydrationEvents = append(hydrationEvents, original)
+				if root, ok := roots[original.ID]; ok {
+					item.RootEventID = root.ID
+					if root.HasEvent {
+						rootEvent := eventJSON(root.Event)
+						item.RootEvent = &rootEvent
+						hydrationEvents = append(hydrationEvents, root.Event)
+					}
+				}
 			}
 			items = append(items, item)
 			continue
 		}
 
-		metricIDs = append(metricIDs, event.ID)
-		items = append(items, FeedItem{Type: "note", Event: &feedEvent})
+		item := FeedItem{Type: "note", Event: &feedEvent}
+		if root, ok := roots[event.ID]; ok {
+			item.RootEventID = root.ID
+			if root.HasEvent {
+				rootEvent := eventJSON(root.Event)
+				item.RootEvent = &rootEvent
+				hydrationEvents = append(hydrationEvents, root.Event)
+			}
+		}
+		items = append(items, item)
 	}
 
-	h.tryBackfillEnrichment(ctx, metricIDs, pubkeys)
-
-	metrics, err := h.store.NoteStats(ctx, metricIDs)
-	if err != nil {
-		return FeedResponse{}, err
-	}
-	profiles, err := h.profileInfos(ctx, pubkeys)
+	hydration, err := h.hydrateAppViewEvents(ctx, hydrationEvents)
 	if err != nil {
 		return FeedResponse{}, err
 	}
 
 	return FeedResponse{
 		Items:            items,
-		Metrics:          metrics,
-		Profiles:         profiles,
-		Quoted:           map[string]FeedEvent{},
+		Metrics:          hydration.Metrics,
+		Profiles:         hydration.Profiles,
+		Quoted:           hydration.Quoted,
 		PaginationUntil:  paginationUntil,
 		PaginationOffset: len(items),
 	}, nil
@@ -485,19 +534,7 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	allEvents := append([]chstore.EventView{*root}, events...)
-	metricIDs := make([]string, 0, len(allEvents))
-	pubkeys := make([]string, 0, len(allEvents))
-	for _, event := range allEvents {
-		metricIDs = append(metricIDs, event.ID)
-		pubkeys = append(pubkeys, event.PubKey)
-	}
-	h.tryBackfillEnrichment(r.Context(), metricIDs, pubkeys)
-	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	profiles, err := h.profileInfos(r.Context(), pubkeys)
+	hydration, err := h.hydrateAppViewEvents(r.Context(), allEvents)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -511,9 +548,9 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 	}{
 		Root:     eventJSON(*root),
 		Events:   eventsJSON(events),
-		Metrics:  metrics,
-		Profiles: profiles,
-		Quoted:   map[string]FeedEvent{},
+		Metrics:  hydration.Metrics,
+		Profiles: hydration.Profiles,
+		Quoted:   hydration.Quoted,
 	}
 	writeJSON(w, out)
 }
@@ -551,26 +588,21 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	events := make([]chstore.EventView, 0, len(eventsByID))
 	quoted := make(map[string]FeedEvent, len(eventsByID))
-	metricIDs := make([]string, 0, len(eventsByID))
-	pubkeys := make([]string, 0, len(eventsByID))
 	for id, event := range eventsByID {
+		events = append(events, event)
 		quoted[id] = eventJSON(event)
-		metricIDs = append(metricIDs, id)
-		pubkeys = append(pubkeys, event.PubKey)
 	}
-	h.tryBackfillEnrichment(r.Context(), metricIDs, pubkeys)
-	metrics, err := h.store.NoteStats(r.Context(), metricIDs)
+	hydration, err := h.hydrateAppViewEvents(r.Context(), events)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	profiles, err := h.profileInfos(r.Context(), pubkeys)
-	if err != nil {
-		writeError(w, err)
-		return
+	for id, event := range hydration.Quoted {
+		quoted[id] = event
 	}
-	writeJSON(w, EnrichmentResponse{Metrics: metrics, Profiles: profiles, Quoted: quoted})
+	writeJSON(w, EnrichmentResponse{Metrics: hydration.Metrics, Profiles: hydration.Profiles, Quoted: quoted})
 }
 
 func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
@@ -595,43 +627,41 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profile only", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.vertex == nil {
-		http.Error(w, "Vertex DVM proxy not configured", http.StatusServiceUnavailable)
-		return
-	}
 	pubkey, err := normalizePubkey(r.URL.Query().Get("pubkey"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	h.tryBackfillProfileSummary(r.Context(), pubkey)
-	dvmProfile, fromCache, err := h.vertex.Profile(r.Context(), pubkey)
-	if err != nil {
-		writeVertexError(w, err)
-		return
-	}
-	profiles, err := h.store.LatestProfiles(r.Context(), []string{pubkey})
+	ctx := r.Context()
+	h.tryBackfillProfileSummary(ctx, pubkey)
+	profiles, err := h.store.LatestProfiles(ctx, []string{pubkey})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	counts, err := h.profileCounts(r.Context(), pubkey, dvmProfile)
+	counts, err := h.store.FollowCounts(ctx, pubkey)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	profile := profiles[pubkey]
-	topFollowers, err := h.enrichTopFollowers(r.Context(), dvmProfile.TopFollowers)
+	createdAt, err := h.localProfileCreatedAt(ctx, pubkey, profile)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	createdAt := unixPtr(profile.CreatedAt)
-	if createdAt == nil {
-		createdAt = dvmProfile.CreatedAt
+	var dvmProfile vertex.ProfileResult
+	var fromCache bool
+	if counts.Followers >= h.vertexProfileMinFollowers {
+		dvmProfile, fromCache = h.vertexProfile(ctx, pubkey)
+	}
+	topFollowers, err := h.enrichTopFollowers(ctx, dvmProfile.TopFollowers)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	writeJSON(w, ProfileResponse{
-		ProfileFields: h.profileFields(r.Context(), pubkey, profile).fields,
+		ProfileFields: h.profileFields(ctx, pubkey, profile).fields,
 		PubKey:        pubkey,
 		Npub:          vertex.Npub(pubkey),
 		Rank:          dvmProfile.Rank,
@@ -781,6 +811,136 @@ func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[strin
 		out[pubkey] = ProfileInfo{Name: name, Picture: row.Picture}
 	}
 	return out, nil
+}
+
+func (h *Handler) hydrateAppViewEvents(ctx context.Context, events []chstore.EventView) (appViewHydration, error) {
+	metricIDs := make([]string, 0, len(events))
+	pubkeys := make([]string, 0, len(events))
+	quotedIDs := make([]string, 0)
+	seenMetricIDs := map[string]struct{}{}
+	seenPubkeys := map[string]struct{}{}
+	seenQuotedIDs := map[string]struct{}{}
+
+	for _, event := range events {
+		metricIDs = appendUniqueString(metricIDs, seenMetricIDs, event.ID)
+		pubkeys = appendUniqueString(pubkeys, seenPubkeys, event.PubKey)
+		for _, id := range quotedEventIDs(event) {
+			quotedIDs = appendUniqueString(quotedIDs, seenQuotedIDs, id)
+		}
+	}
+
+	quotedEvents, err := h.eventsByID(ctx, quotedIDs)
+	if err != nil {
+		return appViewHydration{}, err
+	}
+	quoted := make(map[string]FeedEvent, len(quotedEvents))
+	for id, event := range quotedEvents {
+		quoted[id] = eventJSON(event)
+		metricIDs = appendUniqueString(metricIDs, seenMetricIDs, id)
+		pubkeys = appendUniqueString(pubkeys, seenPubkeys, event.PubKey)
+	}
+
+	h.tryBackfillEnrichment(ctx, metricIDs, pubkeys)
+	metrics, err := h.store.NoteStats(ctx, metricIDs)
+	if err != nil {
+		return appViewHydration{}, err
+	}
+	profiles, err := h.profileInfos(ctx, pubkeys)
+	if err != nil {
+		return appViewHydration{}, err
+	}
+	return appViewHydration{Metrics: metrics, Profiles: profiles, Quoted: quoted}, nil
+}
+
+func (h *Handler) rootEvents(ctx context.Context, events []chstore.EventView) (map[string]resolvedRootEvent, error) {
+	candidates := make(map[string]string, len(events))
+	paths := make(map[string]map[string]struct{}, len(events))
+	pending := make([]string, 0, len(events))
+	seenPending := map[string]struct{}{}
+
+	for _, event := range events {
+		rootID := rootEventID(event)
+		if rootID == "" {
+			continue
+		}
+		candidates[event.ID] = rootID
+		paths[event.ID] = map[string]struct{}{rootID: {}}
+		pending = appendUniqueString(pending, seenPending, rootID)
+	}
+	if len(candidates) == 0 {
+		return map[string]resolvedRootEvent{}, nil
+	}
+
+	fetched := make(map[string]chstore.EventView, len(pending))
+	for depth := 0; depth < 8 && len(pending) > 0; depth++ {
+		batch := pending
+		pending = nil
+		seenPending = map[string]struct{}{}
+
+		toFetch := make([]string, 0, len(batch))
+		seenFetch := map[string]struct{}{}
+		for _, id := range batch {
+			if _, ok := fetched[id]; ok {
+				continue
+			}
+			toFetch = appendUniqueString(toFetch, seenFetch, id)
+		}
+		if len(toFetch) == 0 {
+			break
+		}
+
+		eventsByID, err := h.eventsByID(ctx, toFetch)
+		if err != nil {
+			return nil, err
+		}
+		for id, event := range eventsByID {
+			fetched[id] = event
+		}
+
+		for _, source := range events {
+			currentID := candidates[source.ID]
+			if currentID == "" {
+				continue
+			}
+			current, ok := fetched[currentID]
+			if !ok {
+				continue
+			}
+			nextID := rootEventID(current)
+			if nextID == "" || nextID == source.ID || nextID == currentID {
+				continue
+			}
+			path := paths[source.ID]
+			if _, seen := path[nextID]; seen {
+				continue
+			}
+			path[nextID] = struct{}{}
+			candidates[source.ID] = nextID
+			pending = appendUniqueString(pending, seenPending, nextID)
+		}
+	}
+
+	out := make(map[string]resolvedRootEvent, len(candidates))
+	for sourceID, rootID := range candidates {
+		root := resolvedRootEvent{ID: rootID}
+		if event, ok := fetched[rootID]; ok {
+			root.Event = event
+			root.HasEvent = true
+		}
+		out[sourceID] = root
+	}
+	return out, nil
+}
+
+func appendUniqueString(values []string, seen map[string]struct{}, value string) []string {
+	if value == "" {
+		return values
+	}
+	if _, ok := seen[value]; ok {
+		return values
+	}
+	seen[value] = struct{}{}
+	return append(values, value)
 }
 
 func (h *Handler) shouldBackfillThread(events []chstore.EventView, limit int) bool {
@@ -1043,21 +1203,37 @@ func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchR
 	return out, nil
 }
 
-func (h *Handler) profileCounts(ctx context.Context, pubkey string, dvmProfile vertex.ProfileResult) (chstore.FollowCounts, error) {
-	if dvmProfile.Followers != nil && dvmProfile.Follows != nil {
-		return chstore.FollowCounts{Followers: *dvmProfile.Followers, Follows: *dvmProfile.Follows}, nil
+func (h *Handler) vertexProfile(ctx context.Context, pubkey string) (vertex.ProfileResult, bool) {
+	if h.vertex != nil {
+		profile, err := h.vertex.ProfileRefresh(ctx, pubkey)
+		if err == nil {
+			if saveErr := h.store.SaveVertexProfile(ctx, profile); saveErr != nil {
+				slog.Warn("vertex profile cache save failed", "pubkey", pubkey, "error", saveErr)
+			}
+			return profile, false
+		}
+		slog.Warn("vertex profile refresh failed", "pubkey", pubkey, "error", err)
 	}
-	counts, err := h.store.FollowCounts(ctx, pubkey)
+	profile, ok, err := h.store.CachedVertexProfile(ctx, pubkey)
 	if err != nil {
-		return chstore.FollowCounts{}, err
+		slog.Warn("vertex profile cache read failed", "pubkey", pubkey, "error", err)
+		return vertex.ProfileResult{}, false
 	}
-	if dvmProfile.Followers != nil {
-		counts.Followers = *dvmProfile.Followers
+	if ok {
+		return profile, true
 	}
-	if dvmProfile.Follows != nil {
-		counts.Follows = *dvmProfile.Follows
+	return vertex.ProfileResult{}, false
+}
+
+func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, localProfile chstore.ProfileRow) (*int64, error) {
+	firstEventAt, err := h.store.ProfileFirstEventCreatedAt(ctx, pubkey)
+	if err != nil {
+		return nil, err
 	}
-	return counts, nil
+	if firstEventAt != nil {
+		return unixPtr(*firstEventAt), nil
+	}
+	return unixPtr(localProfile.CreatedAt), nil
 }
 
 func (h *Handler) enrichTopFollowers(ctx context.Context, followers []vertex.TopFollower) ([]TopFollower, error) {
@@ -1139,6 +1315,79 @@ func firstEventTag(event chstore.EventView) string {
 		if len(tag) >= 2 && tag[0] == "e" && len(tag[1]) == 64 {
 			return tag[1]
 		}
+	}
+	return ""
+}
+
+func rootEventID(event chstore.EventView) string {
+	rootID := markedEventTag(event, "root")
+	if rootID == "" {
+		rootID = firstPositionalEventTag(event)
+	}
+	if rootID == "" || rootID == event.ID {
+		return ""
+	}
+	return rootID
+}
+
+func markedEventTag(event chstore.EventView, marker string) string {
+	for _, tag := range event.Tags {
+		if len(tag) < 4 || tag[0] != "e" || tag[3] != marker {
+			continue
+		}
+		if id := cleanEventID(tag[1]); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func firstPositionalEventTag(event chstore.EventView) string {
+	for _, tag := range event.Tags {
+		if len(tag) < 2 || tag[0] != "e" {
+			continue
+		}
+		marker := ""
+		if len(tag) >= 4 {
+			marker = tag[3]
+		}
+		if marker == "mention" {
+			continue
+		}
+		if marker != "" && marker != "root" && marker != "reply" {
+			continue
+		}
+		if id := cleanEventID(tag[1]); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func quotedEventIDs(event chstore.EventView) []string {
+	matches := nostrEventURI.FindAllString(event.Content, -1)
+	out := make([]string, 0, len(matches))
+	seen := map[string]struct{}{}
+	for _, match := range matches {
+		id, err := normalizeEventID(strings.TrimPrefix(match, "nostr:"))
+		if err != nil {
+			continue
+		}
+		out = appendUniqueString(out, seen, id)
+	}
+	for _, tag := range event.Tags {
+		if len(tag) < 2 || tag[0] != "q" {
+			continue
+		}
+		out = appendUniqueString(out, seen, cleanEventID(tag[1]))
+	}
+	return out
+}
+
+func cleanEventID(value string) string {
+	id := strings.ToLower(strings.TrimSpace(value))
+	if nostr.IsValid32ByteHex(id) {
+		return id
 	}
 	return ""
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vertex-lab/nagg/internal/vertex"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -238,6 +239,66 @@ func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, 
 		return out, err
 	}
 	return out, nil
+}
+
+func (s *Store) ProfileFirstEventCreatedAt(ctx context.Context, pubkey string) (*time.Time, error) {
+	var first sql.NullTime
+	if err := s.conn.QueryRow(ctx, `
+		SELECT minOrNull(created_at)
+		FROM nostr_events
+		WHERE pubkey = ?
+	`, pubkey).Scan(&first); err != nil {
+		return nil, err
+	}
+	if !first.Valid {
+		return nil, nil
+	}
+	firstTime := first.Time.UTC()
+	return &firstTime, nil
+}
+
+func (s *Store) CachedVertexProfile(ctx context.Context, pubkey string) (vertex.ProfileResult, bool, error) {
+	var payload string
+	if err := s.conn.QueryRow(ctx, `
+		SELECT payload
+		FROM vertex_profile_cache FINAL
+		WHERE pubkey = ?
+	`, pubkey).Scan(&payload); err != nil {
+		if err == sql.ErrNoRows {
+			return vertex.ProfileResult{}, false, nil
+		}
+		return vertex.ProfileResult{}, false, err
+	}
+	var profile vertex.ProfileResult
+	if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+		return vertex.ProfileResult{}, false, err
+	}
+	if profile.PubKey == "" {
+		profile.PubKey = pubkey
+	}
+	if profile.Npub == "" {
+		profile.Npub = vertex.Npub(profile.PubKey)
+	}
+	return profile, true, nil
+}
+
+func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileResult) error {
+	pubkey, ok := vertex.NormalizePubkey(profile.PubKey)
+	if !ok {
+		return fmt.Errorf("invalid vertex profile pubkey")
+	}
+	profile.PubKey = pubkey
+	if profile.Npub == "" {
+		profile.Npub = vertex.Npub(pubkey)
+	}
+	payload, err := json.Marshal(profile)
+	if err != nil {
+		return err
+	}
+	return s.conn.Exec(ctx, `
+		INSERT INTO vertex_profile_cache (pubkey, fetched_at, payload)
+		VALUES (?, ?, ?)
+	`, pubkey, time.Now().UTC(), string(payload))
 }
 
 func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[string]ProfileRow, error) {

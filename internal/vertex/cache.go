@@ -100,6 +100,14 @@ func (c *cachedCall[A, R]) Get(ctx context.Context, args A) (R, bool, error) {
 	return value, false, err
 }
 
+func (c *cachedCall[A, R]) Refresh(ctx context.Context, args A) (R, error) {
+	key := c.key(args)
+	c.mu.Lock()
+	c.refreshes++
+	c.mu.Unlock()
+	return c.fetchOnce(ctx, key, args)
+}
+
 func (c *cachedCall[A, R]) Peek(args A) (R, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

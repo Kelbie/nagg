@@ -121,3 +121,12 @@ SELECT
     content AS raw_json
 FROM nostr_events
 WHERE kind = 0;
+
+CREATE TABLE IF NOT EXISTS vertex_profile_cache
+(
+    pubkey FixedString(64),
+    fetched_at DateTime,
+    payload String
+)
+ENGINE = ReplacingMergeTree(fetched_at)
+ORDER BY pubkey;

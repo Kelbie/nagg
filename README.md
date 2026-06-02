@@ -33,7 +33,7 @@ Useful configuration:
 
 ```sh
 NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social
-NAGG_KINDS=0,1,3,6,7,16,9735
+NAGG_KINDS=0,1,3,6,7,16,9735,38000
 NAGG_SINCE=24h
 NAGG_BATCH_SIZE=1000
 NAGG_FLUSH_INTERVAL=5s
@@ -42,7 +42,7 @@ NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_WAIT=0s
 ```
 
-The default `NAGG_KINDS` is `0,1,3,6,7,16,9735`, which covers profiles, notes, contact lists, reposts, reactions, generic reposts, and zaps for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Set `NAGG_SINCE=0` to omit the `since` filter.
+The default `NAGG_KINDS` is `0,1,3,6,7,16,9735,38000`, which covers profiles, notes, contact lists, reposts, reactions, generic reposts, zaps, and Cashu mint review events for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Set `NAGG_SINCE=0` to omit the `since` filter.
 
 ## Backfill The App-View Tables
 
@@ -68,11 +68,12 @@ go run ./cmd/api
 
 The API listens on `:8080` by default and serves `POST /graphql`, `GET /healthz`, and the app-view REST routes under `/nostr/*`. Set `NAGG_API_ADDR=:9090` to change the bind address. If `NAGG_API_ADDR` is unset and Railway provides `PORT`, the API listens on that port.
 
-The Vertex DVM proxy routes (`/nostr/profile`, `/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. If the key is empty they return `503`; if Vertex rejects the key it returns the DVM kind-7000 error as a `502`.
+The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local Nagg profile data when available; it only calls Vertex for profiles with at least `NAGG_VERTEX_PROFILE_MIN_FOLLOWERS` local followers, default `500`, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails.
 
 ```sh
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret> \
 NAGG_VERTEX_RELAY=wss://relay.vertexlab.io \
+NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500 \
 NAGG_NIP05_VALIDATE=true \
 go run ./cmd/api
 ```
@@ -104,9 +105,10 @@ Optional service variables:
 
 ```sh
 NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social
-NAGG_KINDS=0,1,3,6,7,16,9735
+NAGG_KINDS=0,1,3,6,7,16,9735,38000
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret>
 NAGG_VERTEX_RELAY=wss://relay.vertexlab.io
+NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500
 NAGG_NIP05_VALIDATE=true
 NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_COOLDOWN=5m

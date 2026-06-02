@@ -77,7 +77,10 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/graphql", graphqlapi.Handler(schema))
-	appviewOpts := []appview.Option{appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05)}
+	appviewOpts := []appview.Option{
+		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
+		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
+	}
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}

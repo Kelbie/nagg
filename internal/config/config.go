@@ -25,9 +25,10 @@ type Config struct {
 }
 
 type VertexConfig struct {
-	PrivateKey    string
-	Relay         string
-	ValidateNIP05 bool
+	PrivateKey          string
+	Relay               string
+	ValidateNIP05       bool
+	ProfileMinFollowers int
 }
 
 type OnDemandConfig struct {
@@ -53,7 +54,7 @@ func Load() (Config, error) {
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
-			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,6,7,16,9735")),
+			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,6,7,16,9735,38000")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
 			SeenCacheSize: parseInt(env("NAGG_SEEN_CACHE_SIZE", "200000")),
@@ -67,9 +68,10 @@ func Load() (Config, error) {
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
 		},
 		Vertex: VertexConfig{
-			PrivateKey:    os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
-			Relay:         env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
-			ValidateNIP05: parseBool(env("NAGG_NIP05_VALIDATE", "true")),
+			PrivateKey:          os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
+			Relay:               env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
+			ValidateNIP05:       parseBool(env("NAGG_NIP05_VALIDATE", "true")),
+			ProfileMinFollowers: parseInt(env("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "500")),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
@@ -116,6 +118,9 @@ func (c Config) validate() error {
 		if relayURL.Scheme != "wss" && relayURL.Scheme != "ws" {
 			return errors.New("NAGG_VERTEX_RELAY must use ws or wss")
 		}
+	}
+	if c.Vertex.ProfileMinFollowers < 0 {
+		return errors.New("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS must be non-negative")
 	}
 	return nil
 }
