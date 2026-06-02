@@ -90,6 +90,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var referenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
+	var rankedEventsInputType *graphql.InputObject
 
 	var eventType *graphql.Object
 	eventType = graphql.NewObject(graphql.ObjectConfig{
@@ -294,7 +295,20 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"pubkeys": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"kinds":   &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
 			"tags":    &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 100},
+		},
+	})
+	rankedEventsInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "RankedEventsInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"references": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
+			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"target":     &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
+			"limit":      &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 30},
+			"offset":     &graphql.InputObjectFieldConfig{Type: graphql.Int},
 		},
 	})
 
@@ -358,6 +372,13 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					}
 					rows, err := r.store.AggregateEvents(p.Context, input)
 					return map[string]any{"rows": rows}, err
+				},
+			},
+			"rankedEvents": &graphql.Field{
+				Type: graphql.NewNonNull(eventConnectionType),
+				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(rankedEventsInputType)}},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					return r.rankedEvents(p.Context, p.Args["input"])
 				},
 			},
 			"eventContext": &graphql.Field{
@@ -587,9 +608,56 @@ func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore
 	return map[string]any{"rows": rows}, nil
 }
 
+func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSource, error) {
+	input, err := parseRankedEventsInput(raw)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	rows, err := r.store.AggregateEvents(ctx, input.References)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	targetIDs := rankedTargetIDs(rows, input.Offset, input.Limit)
+	if len(targetIDs) == 0 {
+		return eventConnectionSource{}, nil
+	}
+	if len(input.Target.IDs) > 0 {
+		targetIDs = intersectRankedIDs(targetIDs, input.Target.IDs)
+	}
+	if len(targetIDs) == 0 {
+		return eventConnectionSource{}, nil
+	}
+	input.Target.IDs = targetIDs
+	input.Target.Limit = uint64(len(targetIDs))
+
+	events, err := r.store.QueryEvents(ctx, input.Target)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	eventsByID := make(map[string]chstore.EventView, len(events))
+	for _, event := range events {
+		eventsByID[event.ID] = event
+	}
+	ordered := make([]chstore.EventView, 0, len(events))
+	for _, id := range targetIDs {
+		if event, ok := eventsByID[id]; ok {
+			ordered = append(ordered, event)
+		}
+	}
+	relations := newPubkeyRelationCache(r.store, ordered)
+	return eventConnectionSource{raw: ordered, nodes: wrapEvents(ordered, relations)}, nil
+}
+
 type referenceInput struct {
 	Tags  []graphTagPredicate
 	Limit int
+}
+
+type rankedEventsInput struct {
+	References chstore.AggregateInput
+	Target     chstore.EventQueryInput
+	Limit      int
+	Offset     int
 }
 
 func parseReferenceInput(raw any) referenceInput {
@@ -653,6 +721,136 @@ func aggregateReferencedByQuery(event chstore.EventView, raw any) (chstore.Event
 		input.Limit = 500
 	}
 	return input, genericDimensions(m["groupBy"]), genericMetrics(m["metrics"]), intValue(m["first"], 100), stringValue(m["orderBy"]), nil
+}
+
+func parseRankedEventsInput(raw any) (rankedEventsInput, error) {
+	m, _ := raw.(map[string]any)
+	var out rankedEventsInput
+	referencesRaw, ok := m["references"].(map[string]any)
+	if !ok {
+		return out, fmt.Errorf("references input is required")
+	}
+	references, err := parseEventQueryInput(referencesRaw)
+	if err != nil {
+		return out, err
+	}
+	via := graphTagPredicateFrom(m["via"])
+	if via.Key == "" {
+		return out, fmt.Errorf("via.key is required")
+	}
+	limit := intValue(m["limit"], 30)
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	offset := intValue(m["offset"], 0)
+	if offset < 0 {
+		offset = 0
+	}
+	aggregateLimit := limit + offset
+	if aggregateLimit <= 0 || aggregateLimit > 1000 {
+		aggregateLimit = limit
+	}
+	out = rankedEventsInput{
+		References: chstore.AggregateInput{
+			Dataset: "TAGS",
+			GroupBy: []string{"TAG_VALUE"},
+			Metrics: []string{rankMetricName(m["metric"])},
+			IDs:     references.IDs,
+			PubKeys: references.PubKeys,
+			Kinds:   references.Kinds,
+			Tags: append(references.Tags, chstore.TagFilter{
+				Key: via.Key, Value: via.Value, Values: via.Values,
+			}),
+			Since: references.Since,
+			Until: references.Until,
+			Limit: uint64(aggregateLimit),
+		},
+		Target: chstore.EventQueryInput{Limit: uint64(limit)},
+		Limit:  limit,
+		Offset: offset,
+	}
+	if targetRaw, ok := m["target"].(map[string]any); ok {
+		target, err := parseEventQueryInput(targetRaw)
+		if err != nil {
+			return out, err
+		}
+		out.Target = target
+	}
+	out.Target.Limit = uint64(limit)
+	return out, nil
+}
+
+func rankMetricName(raw any) string {
+	metric := genericMetric{}
+	if m, ok := raw.(map[string]any); ok {
+		metric = genericMetric{
+			Op:            strings.ToUpper(stringValue(m["op"])),
+			Field:         stringValue(m["field"]),
+			DistinctField: stringValue(m["distinctField"]),
+		}
+	}
+	if metric.Op == "" {
+		return "UNIQUE_PUBKEYS"
+	}
+	switch metric.Op {
+	case "COUNT":
+		return "COUNT"
+	case "COUNT_DISTINCT":
+		field := strings.ToUpper(metric.DistinctField)
+		if field == "" {
+			field = strings.ToUpper(metric.Field)
+		}
+		switch field {
+		case "ID", "EVENT_ID":
+			return "UNIQUE_EVENTS"
+		default:
+			return "UNIQUE_PUBKEYS"
+		}
+	default:
+		return "UNIQUE_PUBKEYS"
+	}
+}
+
+func rankedTargetIDs(rows []chstore.AggregateRow, offset, limit int) []string {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		return nil
+	}
+	out := make([]string, 0, limit)
+	for _, row := range rows {
+		id := row.Dimensions["tag_value"]
+		if id == "" {
+			id = row.Dimensions["TAG_VALUE"]
+		}
+		if !hex64Pattern.MatchString(id) {
+			continue
+		}
+		if offset > 0 {
+			offset--
+			continue
+		}
+		out = append(out, id)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func intersectRankedIDs(rankedIDs, allowedIDs []string) []string {
+	allowed := make(map[string]struct{}, len(allowedIDs))
+	for _, id := range allowedIDs {
+		allowed[id] = struct{}{}
+	}
+	out := make([]string, 0, len(rankedIDs))
+	for _, id := range rankedIDs {
+		if _, ok := allowed[id]; ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func graphTagPredicates(v any) []graphTagPredicate {
@@ -1010,6 +1208,8 @@ func parseAggregateInput(raw map[string]any) (chstore.AggregateInput, error) {
 		PubKeys: stringList(raw["pubkeys"]),
 		Kinds:   intList(raw["kinds"]),
 		Tags:    tagFilters(raw["tags"]),
+		Since:   int64(intValue(raw["since"], 0)),
+		Until:   int64(intValue(raw["until"], 0)),
 		Limit:   uint64(intValue(raw["limit"], 100)),
 	}
 	return input, validateHexFilters(input.IDs, input.PubKeys)

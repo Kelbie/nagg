@@ -15,6 +15,7 @@ uses a 10 second request context timeout.
 |---|---|---|
 | `event` | `id: String!` | `NostrEvent` |
 | `events` | `input: EventQueryInput!` | `EventConnection!` |
+| `rankedEvents` | `input: RankedEventsInput!` | `EventConnection!` |
 | `eventContext` | `id: String!`, `limit: Int = 1000` | `EventContext` |
 | `aggregateEvents` | `input: EventAggregationInput!` | `AggregationResult!` |
 
@@ -221,14 +222,71 @@ input EventAggregationInput {
   pubkeys: [String!]
   kinds: [Int!]
   tags: [TagFilterInput!]
+  since: Int
+  until: Int
   limit: Int = 100            # max 1000; 0 -> 100
 }
 ```
 
 Returns `AggregationResult { rows: [AggregationRow!]! }`, each row containing
 `{ dimensions: JSON, metrics: JSON }`. Rows are ordered by the first metric
-descending. Output keys are lower-cased versions of requested names:
-`KIND` -> `kind`, `UNIQUE_EVENTS` -> `unique_events`.
+descending. `since` is inclusive and `until` is exclusive over the source
+event/tag/relay timestamp. Output keys are lower-cased versions of requested
+names: `KIND` -> `kind`, `UNIQUE_EVENTS` -> `unique_events`.
+
+## rankedEvents(input)
+
+`rankedEvents` ranks target events by aggregating source events that reference
+them through a tag. It is generic: likes are source events `kind:7` via `e`;
+reposts are source events `kind:6/16` via `e`; quote rankings can use `q`.
+
+```graphql
+input RankedEventsInput {
+  references: EventQueryInput!
+  via: TagFilterInput!
+  target: EventQueryInput
+  metric: GenericMetricInput
+  limit: Int = 30
+  offset: Int
+}
+```
+
+The resolver aggregates `references` over the flattened tag rows matching
+`via.key`, groups by the referenced tag value, orders by the requested metric,
+hydrates those tag values as event ids, applies optional `target` filters, and
+returns the target events in aggregate rank order. Supported rank metrics map to
+the generic aggregate metrics: `COUNT`, `COUNT_DISTINCT PUBKEY/AUTHOR`, and
+`COUNT_DISTINCT ID/EVENT_ID`. The default is distinct pubkeys.
+
+Top notes liked during the last 24 hours, while each returned note can still ask
+for all-time like counts through `aggregateReferencedBy`:
+
+```graphql
+query($since: Int!) {
+  rankedEvents(input: {
+    references: { kinds: [7], since: $since }
+    via: { key: "e" }
+    target: { kinds: [1] }
+    metric: { name: "likers", op: "COUNT_DISTINCT", distinctField: "PUBKEY" }
+    limit: 20
+  }) {
+    nodes {
+      id
+      pubkey
+      kind
+      createdAt
+      content
+      likes: aggregateReferencedBy(input: {
+        via: { key: "e" }
+        events: { kinds: [7], limit: 500 }
+        metrics: [{ name: "allTimeLikers", op: "COUNT_DISTINCT", distinctField: "PUBKEY" }]
+      }) {
+        rows { metrics }
+      }
+    }
+  }
+}
+```
 
 ### Datasets
 
@@ -278,6 +336,7 @@ The API does not encode app-level interpretations. Use these recipes instead.
 | Quoted event for note | `event(id:"<event-id>") { references(input:{tags:[{key:"q"}], limit:1}) { nodes { id content } } }` |
 | Reverse references for note | `event(id:"<event-id>") { referencedBy(input:{via:{key:"e"}, events:{kinds:[1,7,9735]}}) { nodes { id kind pubkey } } }` |
 | Distinct likers for note | `event(id:"<event-id>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{kinds:[7]}, metrics:[{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]}) { rows { metrics } } }` |
+| Top notes by likes in last 24h | `rankedEvents(input:{references:{kinds:[7], since:<24h-ago>}, via:{key:"e"}, target:{kinds:[1]}, metric:{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}})` |
 | Top zappers for note | `event(id:"<event-id>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{kinds:[9735]}, groupBy:[{name:"pubkey", derived:"nip57.sender_pubkey"}], metrics:[{name:"sats", op:"SUM", derived:"nip57.amount_sats"}], first:3, orderBy:"sats"}) { rows { dimensions metrics } } }` |
 | Associated events by kind | `aggregateEvents(dataset:"TAGS", tags:[{key:"e", value:"<event-id>"}], groupBy:["KIND"], metrics:["UNIQUE_EVENTS", "UNIQUE_PUBKEYS"])` |
 | Contact-list events referencing pubkey | `events(input:{kinds:[3], tags:[{key:"p", value:"<pubkey>"}]})` |

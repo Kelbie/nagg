@@ -50,6 +50,8 @@ type AggregateInput struct {
 	PubKeys []string
 	Kinds   []int
 	Tags    []TagFilter
+	Since   int64
+	Until   int64
 	Limit   uint64
 }
 
@@ -667,6 +669,18 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 	default:
 		return spec, nil, fmt.Errorf("unsupported dataset %q", input.Dataset)
 	}
+	timeColumn, err := aggregateTimeColumn(dataset)
+	if err != nil {
+		return spec, nil, err
+	}
+	if input.Since > 0 {
+		spec.where += " AND " + timeColumn + " >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		spec.where += " AND " + timeColumn + " < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
 
 	for _, dim := range input.GroupBy {
 		key := strings.ToUpper(dim)
@@ -697,6 +711,19 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 		}
 	}
 	return spec, args, nil
+}
+
+func aggregateTimeColumn(dataset string) (string, error) {
+	switch dataset {
+	case "EVENTS":
+		return "e.created_at", nil
+	case "TAGS":
+		return "t.created_at", nil
+	case "RELAYS":
+		return "r.last_seen_at", nil
+	default:
+		return "", fmt.Errorf("unsupported dataset %q", dataset)
+	}
 }
 
 func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {

@@ -38,6 +38,7 @@ and generic aggregations, not first-class schema fields.
 |---|---|---|
 | one event by id | `event(id)` | `id`, `pubkey`, `kind`, `createdAt`, `content`, `tags`, `sig`, `updatedAt`, `pubkeyEvents`, `references`, `referencedBy`, `aggregateReferencedBy` |
 | filtered raw events | `events(input)` | `nodes`, `pageInfo` |
+| events ranked by references | `rankedEvents(input)` | `nodes`, `pageInfo` |
 | recursive event context | `eventContext(id)` | `root`, `events` |
 | aggregate stats | `aggregateEvents(input)` | `dataset`, `groupBy`, `metrics`, `rows` |
 
@@ -50,6 +51,7 @@ query { eventContext(id:"<hex>", limit:100) { root { id content } events { id ki
 query { aggregateEvents(input:{ dataset:"EVENTS", groupBy:["KIND"], metrics:["UNIQUE_EVENTS"], limit:10 }) { rows { dimensions metrics } } }
 query { event(id:"<hex>") { references(input:{tags:[{key:"q"}]}) { nodes { id content } } } }
 query { event(id:"<hex>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{kinds:[7]}, metrics:[{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]}) { rows { metrics } } } }
+query { rankedEvents(input:{references:{kinds:[7], since:1710000000}, via:{key:"e"}, target:{kinds:[1]}, metric:{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}, limit:10}) { nodes { id content } } }
 ```
 
 ## Common Recipes
@@ -69,6 +71,7 @@ query { event(id:"<hex>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{
 | Distinct likers for a target | `event(id:"<event-id>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{kinds:[7]}, metrics:[{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]}) { rows { metrics } } }` |
 | Zap sats for a target | `event(id:"<event-id>") { aggregateReferencedBy(input:{via:{key:"e"}, events:{kinds:[9735]}, metrics:[{name:"sats", op:"SUM", derived:"nip57.amount_sats"}]}) { rows { metrics } } }` |
 | Zap receipt events/tags | `events(input:{kinds:[9735], tags:[{key:"e", value:"<event-id>"}]})` |
+| Top notes by recent likes | `rankedEvents(input:{references:{kinds:[7], since:<24h-ago>}, via:{key:"e"}, target:{kinds:[1]}, metric:{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}})` |
 | Relay distribution | `aggregateEvents(dataset:"RELAYS", groupBy:["RELAY"], metrics:["UNIQUE_EVENTS"])` |
 
 ## aggregateEvents Cheat Sheet
