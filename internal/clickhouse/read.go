@@ -36,7 +36,10 @@ type EventQueryInput struct {
 	PubKeys []string
 	Kinds   []int
 	Tags    []TagFilter
+	Since   int64
+	Until   int64
 	Limit   uint64
+	Offset  uint64
 }
 
 type AggregateInput struct {
@@ -513,14 +516,27 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 	}
 
 	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	if input.Since > 0 {
+		where += " AND e.created_at >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		where += " AND e.created_at < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
 	args = append(args, input.Limit)
-	rows, err := s.conn.Query(ctx, `
+	query := `
 		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
 		FROM nostr_events AS e FINAL
-		`+where+`
+		` + where + `
 		ORDER BY e.created_at DESC, e.id DESC
 		LIMIT ?
-	`, args...)
+	`
+	if input.Offset > 0 {
+		query += " OFFSET ?"
+		args = append(args, input.Offset)
+	}
+	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

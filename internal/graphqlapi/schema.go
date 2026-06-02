@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,14 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	}
 	jsonType := jsonScalar("JSON")
 
+	var eventConnectionType *graphql.Object
+	var aggregationResultType *graphql.Object
+	var tagFilterType *graphql.InputObject
+	var eventQueryInputType *graphql.InputObject
+	var referenceInputType *graphql.InputObject
+	var reverseReferenceInputType *graphql.InputObject
+	var aggregateReferencedByInputType *graphql.InputObject
+
 	var eventType *graphql.Object
 	eventType = graphql.NewObject(graphql.ObjectConfig{
 		Name: "NostrEvent",
@@ -109,6 +118,39 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return node.relations.load(p.Context, node.event.PubKey, intList(p.Args["kinds"]), intValue(p.Args["limit"], 1))
 					},
 				},
+				"references": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: referenceInputType}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventReferences(p.Context, event, p.Args["input"])
+					},
+				},
+				"referencedBy": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(reverseReferenceInputType)}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventReferencedBy(p.Context, event, p.Args["input"])
+					},
+				},
+				"aggregateReferencedBy": &graphql.Field{
+					Type: graphql.NewNonNull(aggregationResultType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(aggregateReferencedByInputType)}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return map[string]any{"rows": []chstore.AggregateRow{}}, nil
+						}
+						return r.eventAggregateReferencedBy(p.Context, event, p.Args["input"])
+					},
+				},
 			}
 		}),
 	})
@@ -121,7 +163,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
-	eventConnectionType := graphql.NewObject(graphql.ObjectConfig{
+	eventConnectionType = graphql.NewObject(graphql.ObjectConfig{
 		Name: "EventConnection",
 		Fields: graphql.Fields{
 			"nodes": &graphql.Field{
@@ -151,23 +193,81 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
-	tagFilterType := graphql.NewInputObject(graphql.InputObjectConfig{
+	tagFilterType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "TagFilterInput",
 		Fields: graphql.InputObjectConfigFieldMap{
 			"key":    &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
 			"value":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"values": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
+			"marker": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"index":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
 		},
 	})
 
-	eventQueryInputType := graphql.NewInputObject(graphql.InputObjectConfig{
+	eventQueryInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "EventQueryInput",
 		Fields: graphql.InputObjectConfigFieldMap{
 			"ids":     &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"pubkeys": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"kinds":   &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
 			"tags":    &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+			"offset":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+		},
+	})
+
+	referenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "EventReferenceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"tags":  &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"limit": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 20},
+		},
+	})
+	reverseReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ReverseEventReferenceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"events": &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"via":    &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"target": &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "EVENT_ID"},
+			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+			"offset": &graphql.InputObjectFieldConfig{Type: graphql.Int},
+		},
+	})
+	metricInputType := graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "GenericMetricInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"name":          &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"op":            &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"field":         &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"tagKey":        &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"tagIndex":      &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 1},
+			"derived":       &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"distinctField": &graphql.InputObjectFieldConfig{Type: graphql.String},
+		},
+	})
+	dimensionInputType := graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "GenericDimensionInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"name":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"field":    &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"tagKey":   &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"tagIndex": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 1},
+			"derived":  &graphql.InputObjectFieldConfig{Type: graphql.String},
+		},
+	})
+	aggregateReferencedByInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ReverseEventReferenceAggregateInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"events":  &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"via":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"target":  &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "EVENT_ID"},
+			"groupBy": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(dimensionInputType))},
+			"metrics": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(metricInputType))},
+			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 500},
+			"first":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 100},
+			"orderBy": &graphql.InputObjectFieldConfig{Type: graphql.String},
 		},
 	})
 
@@ -178,7 +278,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"metrics":    &graphql.Field{Type: graphql.NewNonNull(jsonType)},
 		},
 	})
-	aggregationResultType := graphql.NewObject(graphql.ObjectConfig{
+	aggregationResultType = graphql.NewObject(graphql.ObjectConfig{
 		Name: "AggregationResult",
 		Fields: graphql.Fields{
 			"rows": &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(aggregateRowType)))},
@@ -347,6 +447,516 @@ func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[
 	}, nil
 }
 
+type graphTagPredicate struct {
+	Key    string
+	Value  string
+	Values []string
+	Marker string
+	Index  int
+}
+
+type genericDimension struct {
+	Name     string
+	Field    string
+	TagKey   string
+	TagIndex int
+	Derived  string
+}
+
+type genericMetric struct {
+	Name          string
+	Op            string
+	Field         string
+	TagKey        string
+	TagIndex      int
+	Derived       string
+	DistinctField string
+}
+
+func (r *resolver) eventReferences(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	input := parseReferenceInput(raw)
+	ids := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, tag := range event.Tags {
+		for _, predicate := range input.Tags {
+			if !sourceTagMatches(tag, predicate) || len(tag) < 2 || !hex64Pattern.MatchString(tag[1]) {
+				continue
+			}
+			if _, ok := seen[tag[1]]; ok {
+				continue
+			}
+			seen[tag[1]] = struct{}{}
+			ids = append(ids, tag[1])
+			if len(ids) >= input.Limit {
+				break
+			}
+		}
+		if len(ids) >= input.Limit {
+			break
+		}
+	}
+	if len(ids) == 0 {
+		return eventConnectionSource{}, nil
+	}
+	events, err := r.store.QueryEvents(ctx, chstore.EventQueryInput{IDs: ids, Limit: uint64(input.Limit)})
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	relations := newPubkeyRelationCache(r.store, events)
+	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations)}, nil
+}
+
+func (r *resolver) eventReferencedBy(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	input, err := reverseReferenceQuery(event, raw)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	events, err := r.store.QueryEvents(ctx, input)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	relations := newPubkeyRelationCache(r.store, events)
+	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations)}, nil
+}
+
+func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore.EventView, raw any) (map[string]any, error) {
+	input, dimensions, metrics, first, orderBy, err := aggregateReferencedByQuery(event, raw)
+	if err != nil {
+		return nil, err
+	}
+	events, err := r.store.QueryEvents(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	if len(metrics) == 0 {
+		metrics = []genericMetric{{Name: "count", Op: "COUNT"}}
+	}
+
+	type group struct {
+		dimensions map[string]string
+		events     []chstore.EventView
+	}
+	groups := map[string]*group{}
+	for _, event := range events {
+		dimValues := map[string]string{}
+		keyParts := make([]string, 0, len(dimensions))
+		for _, dim := range dimensions {
+			value := selectorString(event, selectorParts{
+				field: dim.Field, tagKey: dim.TagKey, tagIndex: dim.TagIndex, derived: dim.Derived,
+			})
+			dimValues[dim.Name] = value
+			keyParts = append(keyParts, dim.Name+"="+value)
+		}
+		key := strings.Join(keyParts, "\x00")
+		if key == "" {
+			key = "__all__"
+		}
+		if groups[key] == nil {
+			groups[key] = &group{dimensions: dimValues}
+		}
+		groups[key].events = append(groups[key].events, event)
+	}
+	if len(groups) == 0 {
+		groups["__all__"] = &group{dimensions: map[string]string{}}
+	}
+
+	rows := make([]chstore.AggregateRow, 0, len(groups))
+	for _, group := range groups {
+		row := chstore.AggregateRow{Dimensions: group.dimensions, Metrics: map[string]uint64{}}
+		for _, metric := range metrics {
+			row.Metrics[metric.Name] = computeMetric(group.events, metric)
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		key := orderBy
+		if key == "" && len(metrics) > 0 {
+			key = metrics[0].Name
+		}
+		if key == "" {
+			return false
+		}
+		return rows[i].Metrics[key] > rows[j].Metrics[key]
+	})
+	if first <= 0 || first > 100 {
+		first = 100
+	}
+	if len(rows) > first {
+		rows = rows[:first]
+	}
+	return map[string]any{"rows": rows}, nil
+}
+
+type referenceInput struct {
+	Tags  []graphTagPredicate
+	Limit int
+}
+
+func parseReferenceInput(raw any) referenceInput {
+	input := referenceInput{Limit: 20}
+	if m, ok := raw.(map[string]any); ok {
+		input.Tags = graphTagPredicates(m["tags"])
+		input.Limit = intValue(m["limit"], 20)
+	}
+	if len(input.Tags) == 0 {
+		input.Tags = []graphTagPredicate{{Key: "e", Index: -1}, {Key: "q", Index: -1}}
+	}
+	if input.Limit <= 0 || input.Limit > 100 {
+		input.Limit = 20
+	}
+	return input
+}
+
+func reverseReferenceQuery(event chstore.EventView, raw any) (chstore.EventQueryInput, error) {
+	m, _ := raw.(map[string]any)
+	var input chstore.EventQueryInput
+	if eventsRaw, ok := m["events"].(map[string]any); ok {
+		parsed, err := parseEventQueryInput(eventsRaw)
+		if err != nil {
+			return input, err
+		}
+		input = parsed
+	}
+	via := graphTagPredicateFrom(m["via"])
+	target := targetValue(event, stringValue(m["target"]))
+	if via.Value != "" {
+		target = via.Value
+	}
+	if target == "" {
+		input.Limit = 0
+		return input, nil
+	}
+	if via.Key == "" {
+		via.Key = "e"
+	}
+	input.Tags = append(input.Tags, chstore.TagFilter{Key: via.Key, Value: target})
+	input.Limit = uint64(intValue(m["limit"], int(input.Limit)))
+	if input.Limit == 0 || input.Limit > 500 {
+		input.Limit = 50
+	}
+	input.Offset = uint64(intValue(m["offset"], int(input.Offset)))
+	return input, nil
+}
+
+func aggregateReferencedByQuery(event chstore.EventView, raw any) (chstore.EventQueryInput, []genericDimension, []genericMetric, int, string, error) {
+	m, _ := raw.(map[string]any)
+	input, err := reverseReferenceQuery(event, map[string]any{
+		"events": m["events"],
+		"via":    m["via"],
+		"target": m["target"],
+		"limit":  m["limit"],
+	})
+	if err != nil {
+		return input, nil, nil, 0, "", err
+	}
+	if input.Limit == 0 || input.Limit > 1000 {
+		input.Limit = 500
+	}
+	return input, genericDimensions(m["groupBy"]), genericMetrics(m["metrics"]), intValue(m["first"], 100), stringValue(m["orderBy"]), nil
+}
+
+func graphTagPredicates(v any) []graphTagPredicate {
+	values := anyList(v)
+	out := make([]graphTagPredicate, 0, len(values))
+	for _, value := range values {
+		predicate := graphTagPredicateFrom(value)
+		if predicate.Key != "" {
+			out = append(out, predicate)
+		}
+	}
+	return out
+}
+
+func graphTagPredicateFrom(v any) graphTagPredicate {
+	raw, _ := v.(map[string]any)
+	return graphTagPredicate{
+		Key:    stringValue(raw["key"]),
+		Value:  stringValue(raw["value"]),
+		Values: stringList(raw["values"]),
+		Marker: stringValue(raw["marker"]),
+		Index:  intValue(raw["index"], -1),
+	}
+}
+
+func genericDimensions(v any) []genericDimension {
+	values := anyList(v)
+	out := make([]genericDimension, 0, len(values))
+	for _, value := range values {
+		raw, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := stringValue(raw["name"])
+		if name == "" {
+			continue
+		}
+		out = append(out, genericDimension{
+			Name:     name,
+			Field:    stringValue(raw["field"]),
+			TagKey:   stringValue(raw["tagKey"]),
+			TagIndex: intValue(raw["tagIndex"], 1),
+			Derived:  stringValue(raw["derived"]),
+		})
+	}
+	return out
+}
+
+func genericMetrics(v any) []genericMetric {
+	values := anyList(v)
+	out := make([]genericMetric, 0, len(values))
+	for _, value := range values {
+		raw, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := stringValue(raw["name"])
+		if name == "" {
+			continue
+		}
+		out = append(out, genericMetric{
+			Name:          name,
+			Op:            strings.ToUpper(stringValue(raw["op"])),
+			Field:         stringValue(raw["field"]),
+			TagKey:        stringValue(raw["tagKey"]),
+			TagIndex:      intValue(raw["tagIndex"], 1),
+			Derived:       stringValue(raw["derived"]),
+			DistinctField: stringValue(raw["distinctField"]),
+		})
+	}
+	return out
+}
+
+func sourceTagMatches(tag []string, predicate graphTagPredicate) bool {
+	if len(tag) == 0 || tag[0] != predicate.Key {
+		return false
+	}
+	if predicate.Index >= 0 && predicate.Index >= len(tag) {
+		return false
+	}
+	if predicate.Value != "" && (len(tag) < 2 || tag[1] != predicate.Value) {
+		return false
+	}
+	if len(predicate.Values) > 0 {
+		if len(tag) < 2 {
+			return false
+		}
+		found := false
+		for _, value := range predicate.Values {
+			if tag[1] == value {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if predicate.Marker != "" && (len(tag) < 4 || tag[3] != predicate.Marker) {
+		return false
+	}
+	return true
+}
+
+func targetValue(event chstore.EventView, target string) string {
+	switch strings.ToUpper(target) {
+	case "PUBKEY":
+		return event.PubKey
+	case "ADDRESS":
+		return eventAddress(event)
+	default:
+		return event.ID
+	}
+}
+
+func eventAddress(event chstore.EventView) string {
+	for _, tag := range event.Tags {
+		if len(tag) >= 2 && tag[0] == "d" {
+			return fmt.Sprintf("%d:%s:%s", event.Kind, event.PubKey, tag[1])
+		}
+	}
+	if event.Kind == 0 || event.Kind == 3 || (event.Kind >= 10000 && event.Kind < 20000) {
+		return fmt.Sprintf("%d:%s:", event.Kind, event.PubKey)
+	}
+	return ""
+}
+
+type selectorParts struct {
+	field    string
+	tagKey   string
+	tagIndex int
+	derived  string
+}
+
+func computeMetric(events []chstore.EventView, metric genericMetric) uint64 {
+	switch metric.Op {
+	case "COUNT":
+		return uint64(len(events))
+	case "COUNT_DISTINCT":
+		seen := map[string]struct{}{}
+		selector := selectorParts{field: metric.DistinctField}
+		if selector.field == "" {
+			selector.field = metric.Field
+		}
+		if selector.field == "" && metric.Derived == "" && metric.TagKey == "" {
+			selector.field = "PUBKEY"
+		}
+		selector.tagKey = metric.TagKey
+		selector.tagIndex = metric.TagIndex
+		selector.derived = metric.Derived
+		for _, event := range events {
+			value := selectorString(event, selector)
+			if value != "" {
+				seen[value] = struct{}{}
+			}
+		}
+		return uint64(len(seen))
+	case "SUM", "AVG", "MIN", "MAX":
+		var sum uint64
+		var minValue uint64
+		var maxValue uint64
+		var count uint64
+		selector := selectorParts{field: metric.Field, tagKey: metric.TagKey, tagIndex: metric.TagIndex, derived: metric.Derived}
+		for _, event := range events {
+			value := selectorUint(event, selector)
+			if metric.Op == "MIN" && (count == 0 || value < minValue) {
+				minValue = value
+			}
+			if metric.Op == "MAX" && value > maxValue {
+				maxValue = value
+			}
+			sum += value
+			count++
+		}
+		switch metric.Op {
+		case "AVG":
+			if count == 0 {
+				return 0
+			}
+			return sum / count
+		case "MIN":
+			return minValue
+		case "MAX":
+			return maxValue
+		default:
+			return sum
+		}
+	default:
+		return 0
+	}
+}
+
+func selectorUint(event chstore.EventView, selector selectorParts) uint64 {
+	value := selectorString(event, selector)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func selectorString(event chstore.EventView, selector selectorParts) string {
+	if selector.derived != "" {
+		return derivedValue(event, selector.derived)
+	}
+	if selector.tagKey != "" {
+		return tagItem(event.Tags, selector.tagKey, selector.tagIndex)
+	}
+	switch strings.ToUpper(selector.field) {
+	case "ID", "EVENT_ID":
+		return event.ID
+	case "PUBKEY", "AUTHOR":
+		return event.PubKey
+	case "KIND":
+		return strconv.Itoa(event.Kind)
+	case "CREATED_AT":
+		return strconv.FormatInt(event.CreatedAt.Unix(), 10)
+	case "CONTENT":
+		return event.Content
+	default:
+		return ""
+	}
+}
+
+func tagItem(tags [][]string, key string, index int) string {
+	if index < 0 {
+		index = 1
+	}
+	for _, tag := range tags {
+		if len(tag) > index && tag[0] == key {
+			return tag[index]
+		}
+	}
+	return ""
+}
+
+func derivedValue(event chstore.EventView, key string) string {
+	switch strings.ToLower(key) {
+	case "nip57.amount_msat":
+		return strconv.FormatUint(zapAmountMSats(event), 10)
+	case "nip57.amount_sats":
+		return strconv.FormatUint(zapAmountMSats(event)/1000, 10)
+	case "nip57.sender_pubkey":
+		if pubkey := tagItem(event.Tags, "P", 1); pubkey != "" {
+			return pubkey
+		}
+		return zapRequestPubkey(event)
+	default:
+		return ""
+	}
+}
+
+func zapAmountMSats(event chstore.EventView) uint64 {
+	if event.Kind != 9735 {
+		return 0
+	}
+	if amount := zapRequestAmount(event); amount > 0 {
+		return amount
+	}
+	value := tagItem(event.Tags, "amount", 1)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func zapRequestAmount(event chstore.EventView) uint64 {
+	var req struct {
+		Tags [][]string `json:"tags"`
+	}
+	if err := json.Unmarshal([]byte(tagItem(event.Tags, "description", 1)), &req); err != nil {
+		return 0
+	}
+	value := tagItem(req.Tags, "amount", 1)
+	if value == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func zapRequestPubkey(event chstore.EventView) string {
+	var req struct {
+		PubKey string `json:"pubkey"`
+	}
+	if err := json.Unmarshal([]byte(tagItem(event.Tags, "description", 1)), &req); err != nil {
+		return event.PubKey
+	}
+	if req.PubKey == "" {
+		return event.PubKey
+	}
+	return req.PubKey
+}
+
 func Handler(schema graphql.Schema) http.HandlerFunc {
 	type request struct {
 		Query         string         `json:"query"`
@@ -383,7 +993,10 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 		PubKeys: stringList(raw["pubkeys"]),
 		Kinds:   intList(raw["kinds"]),
 		Tags:    tagFilters(raw["tags"]),
+		Since:   int64(intValue(raw["since"], 0)),
+		Until:   int64(intValue(raw["until"], 0)),
 		Limit:   uint64(intValue(raw["limit"], 50)),
+		Offset:  uint64(intValue(raw["offset"], 0)),
 	}
 	return input, validateHexFilters(input.IDs, input.PubKeys)
 }

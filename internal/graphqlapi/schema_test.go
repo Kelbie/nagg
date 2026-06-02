@@ -172,3 +172,132 @@ func TestEventsQueryReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 		t.Fatalf("nodes len = %d, want 0", len(nodes))
 	}
 }
+
+func TestEventReferencesResolveByGenericTagPredicate(t *testing.T) {
+	sourceID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	quoteID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{{
+				ID:        sourceID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "quoting",
+				Tags:      [][]string{{"q", quoteID}},
+				Sig:       "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			}},
+			{{
+				ID:        quoteID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "quoted",
+				Tags:      [][]string{},
+				Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + sourceID + `"], limit:1}) {
+				nodes {
+					id
+					references(input:{tags:[{key:"q"}], limit:1}) {
+						nodes { id content }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	refs := nodes[0].(map[string]any)["references"].(map[string]any)["nodes"].([]any)
+	if len(refs) != 1 || refs[0].(map[string]any)["id"] != quoteID {
+		t.Fatalf("refs = %+v", refs)
+	}
+}
+
+func TestEventAggregateReferencedByCountsDistinctGenericSources(t *testing.T) {
+	sourceID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	reactionID1 := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	reactionID2 := "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	reactionPubkey := "1111111111111111111111111111111111111111111111111111111111111111"
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{{
+				ID:        sourceID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "target",
+				Tags:      [][]string{},
+				Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			}},
+			{
+				{
+					ID:        reactionID1,
+					PubKey:    reactionPubkey,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_001, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", sourceID}},
+					Sig:       "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+				},
+				{
+					ID:        reactionID2,
+					PubKey:    reactionPubkey,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_002, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", sourceID}},
+					Sig:       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+				},
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + sourceID + `"], limit:1}) {
+				nodes {
+					aggregateReferencedBy(input:{
+						via:{key:"e"}
+						events:{kinds:[7], limit:20}
+						metrics:[{name:"pubkeys", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]
+					}) {
+						rows { metrics }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	rows := nodes[0].(map[string]any)["aggregateReferencedBy"].(map[string]any)["rows"].([]any)
+	metrics := rows[0].(map[string]any)["metrics"].(map[string]uint64)
+	if metrics["pubkeys"] != 1 {
+		t.Fatalf("metrics = %+v", metrics)
+	}
+}
