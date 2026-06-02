@@ -86,10 +86,14 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var eventConnectionType *graphql.Object
 	var aggregationResultType *graphql.Object
 	var tagFilterType *graphql.InputObject
+	var latestEventTagPubkeySourceInputType *graphql.InputObject
+	var pubkeySourceInputType *graphql.InputObject
 	var eventQueryInputType *graphql.InputObject
 	var referenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
+	var referenceRankInputType *graphql.InputObject
+	var rankedReverseReferenceInputType *graphql.InputObject
 	var rankedEventsInputType *graphql.InputObject
 
 	var eventType *graphql.Object
@@ -139,6 +143,17 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 							return eventConnectionSource{}, nil
 						}
 						return r.eventReferencedBy(p.Context, event, p.Args["input"])
+					},
+				},
+				"rankedReferencedBy": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(rankedReverseReferenceInputType)}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventRankedReferencedBy(p.Context, event, p.Args["input"])
 					},
 				},
 				"aggregateReferencedBy": &graphql.Field{
@@ -205,17 +220,35 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
+	latestEventTagPubkeySourceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "LatestEventTagPubkeySourceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"pubkey":    &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"kinds":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.Int)))},
+			"tag":       &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"limit":     &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 1},
+			"maxValues": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 2000},
+		},
+	})
+	pubkeySourceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "PubkeySourceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"latestEventTags": &graphql.InputObjectFieldConfig{Type: latestEventTagPubkeySourceInputType},
+		},
+	})
+
 	eventQueryInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "EventQueryInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"ids":     &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
-			"pubkeys": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
-			"kinds":   &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
-			"tags":    &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
-			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
-			"offset":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"ids":         &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
+			"pubkeys":     &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
+			"pubkeysFrom": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(pubkeySourceInputType))},
+			"kinds":       &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
+			"tags":        &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"since":       &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":       &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"limit":       &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+			"offset":      &graphql.InputObjectFieldConfig{Type: graphql.Int},
 		},
 	})
 
@@ -269,6 +302,25 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 500},
 			"first":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 100},
 			"orderBy": &graphql.InputObjectFieldConfig{Type: graphql.String},
+		},
+	})
+	referenceRankInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ReferenceRankInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"references": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
+			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
+		},
+	})
+	rankedReverseReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "RankedReverseEventReferenceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"events": &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"via":    &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"target": &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "EVENT_ID"},
+			"rank":   &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(referenceRankInputType)},
+			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 1},
+			"offset": &graphql.InputObjectFieldConfig{Type: graphql.Int},
 		},
 	})
 
@@ -334,11 +386,11 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 				Type: graphql.NewNonNull(eventConnectionType),
 				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(eventQueryInputType)}},
 				Resolve: func(p graphql.ResolveParams) (any, error) {
-					input, err := parseEventQueryInput(p.Args["input"].(map[string]any))
+					input, err := r.parseEventQueryInput(p.Context, p.Args["input"].(map[string]any))
 					if err != nil {
 						return nil, err
 					}
-					events, err := r.store.QueryEvents(p.Context, input)
+					events, err := r.queryEvents(p.Context, input)
 					if err != nil {
 						return nil, err
 					}
@@ -347,7 +399,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						if err != nil {
 							slog.Warn("graphql author backfill failed", "pubkeys", input.PubKeys, "error", err)
 						} else if completed {
-							events, err = r.store.QueryEvents(p.Context, input)
+							events, err = r.queryEvents(p.Context, input)
 							if err != nil {
 								return nil, err
 							}
@@ -528,11 +580,11 @@ func (r *resolver) eventReferences(ctx context.Context, event chstore.EventView,
 }
 
 func (r *resolver) eventReferencedBy(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
-	input, err := reverseReferenceQuery(event, raw)
+	input, err := r.reverseReferenceQuery(ctx, event, raw)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	events, err := r.store.QueryEvents(ctx, input)
+	events, err := r.queryEvents(ctx, input)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
@@ -540,12 +592,68 @@ func (r *resolver) eventReferencedBy(ctx context.Context, event chstore.EventVie
 	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations)}, nil
 }
 
+func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	input, err := r.rankedReverseReferenceQuery(ctx, event, raw)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	candidates, err := r.queryEvents(ctx, input.Events)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	if len(candidates) == 0 {
+		return eventConnectionSource{}, nil
+	}
+
+	candidateIDs := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidateIDs = append(candidateIDs, candidate.ID)
+	}
+	rankAggregate := input.RankReferences
+	if !rankAggregate.Empty {
+		rankAggregate.Tags = append(rankAggregate.Tags, chstore.TagFilter{
+			Key: input.RankVia.Key, Value: input.RankVia.Value, Values: rankTagValues(input.RankVia, candidateIDs),
+		})
+		if rankAggregate.Limit == 0 || rankAggregate.Limit > 1000 {
+			rankAggregate.Limit = uint64(len(candidateIDs))
+		}
+		if rankAggregate.Limit < uint64(len(candidateIDs)) {
+			rankAggregate.Limit = uint64(len(candidateIDs))
+		}
+	}
+	rows, err := r.store.AggregateEvents(ctx, rankAggregate)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	targetIDs := rankedCandidateIDs(rows, candidates, input.Offset, input.Limit)
+	if len(targetIDs) == 0 {
+		return eventConnectionSource{}, nil
+	}
+	targetQuery := chstore.EventQueryInput{IDs: targetIDs, Limit: uint64(len(targetIDs))}
+	events, err := r.queryEvents(ctx, targetQuery)
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	eventsByID := make(map[string]chstore.EventView, len(events))
+	for _, event := range events {
+		eventsByID[event.ID] = event
+	}
+	ordered := make([]chstore.EventView, 0, len(events))
+	for _, id := range targetIDs {
+		if event, ok := eventsByID[id]; ok {
+			ordered = append(ordered, event)
+		}
+	}
+	relations := newPubkeyRelationCache(r.store, ordered)
+	return eventConnectionSource{raw: ordered, nodes: wrapEvents(ordered, relations)}, nil
+}
+
 func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore.EventView, raw any) (map[string]any, error) {
-	input, dimensions, metrics, first, orderBy, err := aggregateReferencedByQuery(event, raw)
+	input, dimensions, metrics, first, orderBy, err := r.aggregateReferencedByQuery(ctx, event, raw)
 	if err != nil {
 		return nil, err
 	}
-	events, err := r.store.QueryEvents(ctx, input)
+	events, err := r.queryEvents(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -609,7 +717,7 @@ func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore
 }
 
 func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSource, error) {
-	input, err := parseRankedEventsInput(raw)
+	input, err := r.parseRankedEventsInput(ctx, raw)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
@@ -630,7 +738,7 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 	input.Target.IDs = targetIDs
 	input.Target.Limit = uint64(len(targetIDs))
 
-	events, err := r.store.QueryEvents(ctx, input.Target)
+	events, err := r.queryEvents(ctx, input.Target)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
@@ -660,6 +768,14 @@ type rankedEventsInput struct {
 	Offset     int
 }
 
+type rankedReverseReferenceInput struct {
+	Events         chstore.EventQueryInput
+	RankReferences chstore.AggregateInput
+	RankVia        graphTagPredicate
+	Limit          int
+	Offset         int
+}
+
 func parseReferenceInput(raw any) referenceInput {
 	input := referenceInput{Limit: 20}
 	if m, ok := raw.(map[string]any); ok {
@@ -675,11 +791,11 @@ func parseReferenceInput(raw any) referenceInput {
 	return input
 }
 
-func reverseReferenceQuery(event chstore.EventView, raw any) (chstore.EventQueryInput, error) {
+func (r *resolver) reverseReferenceQuery(ctx context.Context, event chstore.EventView, raw any) (chstore.EventQueryInput, error) {
 	m, _ := raw.(map[string]any)
 	var input chstore.EventQueryInput
 	if eventsRaw, ok := m["events"].(map[string]any); ok {
-		parsed, err := parseEventQueryInput(eventsRaw)
+		parsed, err := r.parseEventQueryInput(ctx, eventsRaw)
 		if err != nil {
 			return input, err
 		}
@@ -706,9 +822,77 @@ func reverseReferenceQuery(event chstore.EventView, raw any) (chstore.EventQuery
 	return input, nil
 }
 
-func aggregateReferencedByQuery(event chstore.EventView, raw any) (chstore.EventQueryInput, []genericDimension, []genericMetric, int, string, error) {
+func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstore.EventView, raw any) (rankedReverseReferenceInput, error) {
 	m, _ := raw.(map[string]any)
-	input, err := reverseReferenceQuery(event, map[string]any{
+	var out rankedReverseReferenceInput
+	if eventsRaw, ok := m["events"].(map[string]any); ok {
+		events, err := r.parseEventQueryInput(ctx, eventsRaw)
+		if err != nil {
+			return out, err
+		}
+		out.Events = events
+	}
+	via := graphTagPredicateFrom(m["via"])
+	target := targetValue(event, stringValue(m["target"]))
+	if via.Value != "" {
+		target = via.Value
+	}
+	if target == "" {
+		out.Events.Empty = true
+		return out, nil
+	}
+	if via.Key == "" {
+		via.Key = "e"
+	}
+	out.Events.Tags = append(out.Events.Tags, chstore.TagFilter{Key: via.Key, Value: target})
+	if out.Events.Limit == 0 || out.Events.Limit > 500 {
+		out.Events.Limit = 50
+	}
+
+	rankRaw, ok := m["rank"].(map[string]any)
+	if !ok {
+		return out, fmt.Errorf("rank input is required")
+	}
+	referencesRaw, ok := rankRaw["references"].(map[string]any)
+	if !ok {
+		return out, fmt.Errorf("rank.references input is required")
+	}
+	references, err := r.parseEventQueryInput(ctx, referencesRaw)
+	if err != nil {
+		return out, err
+	}
+	rankVia := graphTagPredicateFrom(rankRaw["via"])
+	if rankVia.Key == "" {
+		return out, fmt.Errorf("rank.via.key is required")
+	}
+	out.RankVia = rankVia
+	out.RankReferences = chstore.AggregateInput{
+		Dataset: "TAGS",
+		GroupBy: []string{"TAG_VALUE"},
+		Metrics: []string{rankMetricName(rankRaw["metric"])},
+		IDs:     references.IDs,
+		PubKeys: references.PubKeys,
+		Kinds:   references.Kinds,
+		Tags:    references.Tags,
+		Since:   references.Since,
+		Until:   references.Until,
+		Limit:   references.Limit,
+		Empty:   references.Empty,
+	}
+	out.Limit = intValue(m["limit"], 1)
+	if out.Limit <= 0 || out.Limit > 50 {
+		out.Limit = 1
+	}
+	out.Offset = intValue(m["offset"], 0)
+	if out.Offset < 0 {
+		out.Offset = 0
+	}
+	return out, nil
+}
+
+func (r *resolver) aggregateReferencedByQuery(ctx context.Context, event chstore.EventView, raw any) (chstore.EventQueryInput, []genericDimension, []genericMetric, int, string, error) {
+	m, _ := raw.(map[string]any)
+	input, err := r.reverseReferenceQuery(ctx, event, map[string]any{
 		"events": m["events"],
 		"via":    m["via"],
 		"target": m["target"],
@@ -723,14 +907,14 @@ func aggregateReferencedByQuery(event chstore.EventView, raw any) (chstore.Event
 	return input, genericDimensions(m["groupBy"]), genericMetrics(m["metrics"]), intValue(m["first"], 100), stringValue(m["orderBy"]), nil
 }
 
-func parseRankedEventsInput(raw any) (rankedEventsInput, error) {
+func (r *resolver) parseRankedEventsInput(ctx context.Context, raw any) (rankedEventsInput, error) {
 	m, _ := raw.(map[string]any)
 	var out rankedEventsInput
 	referencesRaw, ok := m["references"].(map[string]any)
 	if !ok {
 		return out, fmt.Errorf("references input is required")
 	}
-	references, err := parseEventQueryInput(referencesRaw)
+	references, err := r.parseEventQueryInput(ctx, referencesRaw)
 	if err != nil {
 		return out, err
 	}
@@ -764,13 +948,14 @@ func parseRankedEventsInput(raw any) (rankedEventsInput, error) {
 			Since: references.Since,
 			Until: references.Until,
 			Limit: uint64(aggregateLimit),
+			Empty: references.Empty,
 		},
 		Target: chstore.EventQueryInput{Limit: uint64(limit)},
 		Limit:  limit,
 		Offset: offset,
 	}
 	if targetRaw, ok := m["target"].(map[string]any); ok {
-		target, err := parseEventQueryInput(targetRaw)
+		target, err := r.parseEventQueryInput(ctx, targetRaw)
 		if err != nil {
 			return out, err
 		}
@@ -851,6 +1036,53 @@ func intersectRankedIDs(rankedIDs, allowedIDs []string) []string {
 		}
 	}
 	return out
+}
+
+func rankedCandidateIDs(rows []chstore.AggregateRow, candidates []chstore.EventView, offset, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		allowed[candidate.ID] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	ordered := make([]string, 0, len(candidates))
+	for _, id := range rankedTargetIDs(rows, 0, len(candidates)) {
+		if _, ok := allowed[id]; !ok {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ordered = append(ordered, id)
+	}
+	for _, candidate := range candidates {
+		if _, ok := seen[candidate.ID]; ok {
+			continue
+		}
+		seen[candidate.ID] = struct{}{}
+		ordered = append(ordered, candidate.ID)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(ordered) {
+		return nil
+	}
+	ordered = ordered[offset:]
+	if len(ordered) > limit {
+		ordered = ordered[:limit]
+	}
+	return ordered
+}
+
+func rankTagValues(predicate graphTagPredicate, candidateIDs []string) []string {
+	if predicate.Value != "" || len(predicate.Values) > 0 {
+		return predicate.Values
+	}
+	return candidateIDs
 }
 
 func graphTagPredicates(v any) []graphTagPredicate {
@@ -1155,6 +1387,126 @@ func zapRequestPubkey(event chstore.EventView) string {
 	return req.PubKey
 }
 
+type pubkeySource struct {
+	latestEventTags *latestEventTagPubkeySource
+}
+
+type latestEventTagPubkeySource struct {
+	PubKey    string
+	Kinds     []int
+	Tag       graphTagPredicate
+	Limit     int
+	MaxValues int
+}
+
+func (r *resolver) queryEvents(ctx context.Context, input chstore.EventQueryInput) ([]chstore.EventView, error) {
+	if input.Empty {
+		return []chstore.EventView{}, nil
+	}
+	return r.store.QueryEvents(ctx, input)
+}
+
+func (r *resolver) parseEventQueryInput(ctx context.Context, raw map[string]any) (chstore.EventQueryInput, error) {
+	input, err := parseEventQueryInput(raw)
+	if err != nil {
+		return input, err
+	}
+	sources := pubkeySources(raw["pubkeysFrom"])
+	if len(sources) == 0 {
+		return input, nil
+	}
+	derived, err := r.resolvePubkeySources(ctx, sources)
+	if err != nil {
+		return input, err
+	}
+	input.PubKeys = uniqueStrings(append(input.PubKeys, derived...))
+	if len(input.PubKeys) == 0 {
+		input.Empty = true
+	}
+	return input, nil
+}
+
+func (r *resolver) resolvePubkeySources(ctx context.Context, sources []pubkeySource) ([]string, error) {
+	var out []string
+	for _, source := range sources {
+		if source.latestEventTags == nil {
+			continue
+		}
+		values, err := r.resolveLatestEventTagPubkeys(ctx, *source.latestEventTags)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, values...)
+	}
+	return uniqueStrings(out), nil
+}
+
+func (r *resolver) resolveLatestEventTagPubkeys(ctx context.Context, source latestEventTagPubkeySource) ([]string, error) {
+	if err := validateHex64(source.PubKey); err != nil {
+		return nil, fmt.Errorf("pubkeysFrom.latestEventTags.pubkey: %w", err)
+	}
+	if len(source.Kinds) == 0 {
+		return nil, fmt.Errorf("pubkeysFrom.latestEventTags.kinds is required")
+	}
+	if source.Tag.Key == "" {
+		return nil, fmt.Errorf("pubkeysFrom.latestEventTags.tag.key is required")
+	}
+	if source.Limit <= 0 || source.Limit > 20 {
+		source.Limit = 1
+	}
+	if source.MaxValues <= 0 || source.MaxValues > 5000 {
+		source.MaxValues = 2000
+	}
+	events, err := r.store.QueryLatestEventsByPubKeys(ctx, []string{source.PubKey}, uniqueInts(source.Kinds), uint64(source.Limit))
+	if err != nil {
+		return nil, err
+	}
+	latest := events[source.PubKey]
+	seen := map[string]struct{}{}
+	out := make([]string, 0, min(source.MaxValues, 64))
+	for _, event := range latest {
+		for _, tag := range event.Tags {
+			if !sourceTagMatches(tag, source.Tag) || len(tag) < 2 || !hex64Pattern.MatchString(tag[1]) {
+				continue
+			}
+			if _, ok := seen[tag[1]]; ok {
+				continue
+			}
+			seen[tag[1]] = struct{}{}
+			out = append(out, tag[1])
+			if len(out) >= source.MaxValues {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
+}
+
+func pubkeySources(v any) []pubkeySource {
+	values := anyList(v)
+	out := make([]pubkeySource, 0, len(values))
+	for _, value := range values {
+		raw, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		source := pubkeySource{}
+		if latestRaw, ok := raw["latestEventTags"].(map[string]any); ok {
+			source.latestEventTags = &latestEventTagPubkeySource{
+				PubKey:    stringValue(latestRaw["pubkey"]),
+				Kinds:     intList(latestRaw["kinds"]),
+				Tag:       graphTagPredicateFrom(latestRaw["tag"]),
+				Limit:     intValue(latestRaw["limit"], 1),
+				MaxValues: intValue(latestRaw["maxValues"], 2000),
+			}
+		}
+		if source.latestEventTags != nil {
+			out = append(out, source)
+		}
+	}
+	return out
+}
+
 func Handler(schema graphql.Schema) http.HandlerFunc {
 	type request struct {
 		Query         string         `json:"query"`
@@ -1428,6 +1780,23 @@ func uniqueInts(values []int) []int {
 		out = append(out, value)
 	}
 	sort.Ints(out)
+	return out
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	sort.Strings(out)
 	return out
 }
 

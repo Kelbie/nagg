@@ -40,6 +40,7 @@ type EventQueryInput struct {
 	Until   int64
 	Limit   uint64
 	Offset  uint64
+	Empty   bool
 }
 
 type AggregateInput struct {
@@ -53,6 +54,7 @@ type AggregateInput struct {
 	Since   int64
 	Until   int64
 	Limit   uint64
+	Empty   bool
 }
 
 type AggregateRow struct {
@@ -513,6 +515,9 @@ func (s *Store) EventByID(ctx context.Context, id string) (*EventView, error) {
 }
 
 func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]EventView, error) {
+	if input.Empty {
+		return []EventView{}, nil
+	}
 	if input.Limit == 0 || input.Limit > 500 {
 		input.Limit = 50
 	}
@@ -582,6 +587,9 @@ func scanEventRows(rows eventRows) ([]EventView, error) {
 }
 
 func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]AggregateRow, error) {
+	if input.Empty {
+		return []AggregateRow{}, nil
+	}
 	if input.Limit == 0 || input.Limit > 1000 {
 		input.Limit = 100
 	}
