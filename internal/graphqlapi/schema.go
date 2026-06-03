@@ -28,6 +28,10 @@ type Store interface {
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
+type referenceAggregateStore interface {
+	AggregateEventsByTagTargets(context.Context, chstore.ReferenceAggregateInput) (map[string][]chstore.AggregateRow, bool, error)
+}
+
 var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type resolver struct {
@@ -1375,6 +1379,36 @@ func genericMetrics(v any) []genericMetric {
 	return out
 }
 
+func referenceAggregateDimensions(values []genericDimension) []chstore.ReferenceAggregateDimension {
+	out := make([]chstore.ReferenceAggregateDimension, 0, len(values))
+	for _, value := range values {
+		out = append(out, chstore.ReferenceAggregateDimension{
+			Name:     value.Name,
+			Field:    value.Field,
+			TagKey:   value.TagKey,
+			TagIndex: value.TagIndex,
+			Derived:  value.Derived,
+		})
+	}
+	return out
+}
+
+func referenceAggregateMetrics(values []genericMetric) []chstore.ReferenceAggregateMetric {
+	out := make([]chstore.ReferenceAggregateMetric, 0, len(values))
+	for _, value := range values {
+		out = append(out, chstore.ReferenceAggregateMetric{
+			Name:          value.Name,
+			Op:            value.Op,
+			Field:         value.Field,
+			TagKey:        value.TagKey,
+			TagIndex:      value.TagIndex,
+			Derived:       value.Derived,
+			DistinctField: value.DistinctField,
+		})
+	}
+	return out
+}
+
 func sourceTagMatches(tag []string, predicate graphTagPredicate) bool {
 	if len(tag) == 0 || tag[0] != predicate.Key {
 		return false
@@ -2068,6 +2102,38 @@ func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context,
 	}
 	if len(targets) > 0 {
 		sort.Strings(targets)
+		if aggregateStore, ok := c.store.(referenceAggregateStore); ok {
+			first := uint64(0)
+			if input.First > 0 {
+				first = uint64(input.First)
+			}
+			rowsByTarget, supported, err := aggregateStore.AggregateEventsByTagTargets(ctx, chstore.ReferenceAggregateInput{
+				Events:         input.Events,
+				Tag:            chstore.TagFilter{Key: input.Via.Key},
+				Targets:        targets,
+				LimitPerTarget: input.Events.Limit,
+				GroupBy:        referenceAggregateDimensions(input.Dimensions),
+				Metrics:        referenceAggregateMetrics(input.Metrics),
+				First:          first,
+				OrderBy:        input.OrderBy,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if supported {
+				for _, target := range targets {
+					rows := rowsByTarget[target]
+					if len(rows) == 0 {
+						rows = aggregateReferencedRows(nil, input.Dimensions, input.Metrics, input.First, input.OrderBy)
+					}
+					for _, parentID := range targetToParentIDs[target] {
+						out[parentID] = rows
+					}
+				}
+				return out, nil
+			}
+		}
+
 		eventsByTarget, err := c.store.QueryEventsByTagTargets(ctx, input.Events, chstore.TagFilter{Key: input.Via.Key}, targets, input.Events.Limit)
 		if err != nil {
 			return nil, err

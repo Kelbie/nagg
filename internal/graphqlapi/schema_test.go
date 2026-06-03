@@ -17,16 +17,19 @@ func testHex(ch string) string {
 }
 
 type fakeStore struct {
-	events          [][]chstore.EventView
-	eventByID       map[string]chstore.EventView
-	latestEvents    map[string][]chstore.EventView
-	aggregateRows   [][]chstore.AggregateRow
-	calls           int
-	aggregateCalls  int
-	eventInputs     []chstore.EventQueryInput
-	referenceInputs []referencingEventsInput
-	latestInputs    []latestEventsInput
-	aggregateInputs []chstore.AggregateInput
+	events                      [][]chstore.EventView
+	eventByID                   map[string]chstore.EventView
+	latestEvents                map[string][]chstore.EventView
+	aggregateRows               [][]chstore.AggregateRow
+	calls                       int
+	aggregateCalls              int
+	referenceAggregateSupported bool
+	referenceAggregateRows      map[string][]chstore.AggregateRow
+	eventInputs                 []chstore.EventQueryInput
+	referenceInputs             []referencingEventsInput
+	referenceAggregateInputs    []chstore.ReferenceAggregateInput
+	latestInputs                []latestEventsInput
+	aggregateInputs             []chstore.AggregateInput
 }
 
 type latestEventsInput struct {
@@ -140,6 +143,21 @@ func (s *fakeStore) AggregateEvents(_ context.Context, input chstore.AggregateIn
 	}
 	s.aggregateCalls++
 	return s.aggregateRows[idx], nil
+}
+
+func (s *fakeStore) AggregateEventsByTagTargets(_ context.Context, input chstore.ReferenceAggregateInput) (map[string][]chstore.AggregateRow, bool, error) {
+	s.referenceAggregateInputs = append(s.referenceAggregateInputs, input)
+	if !s.referenceAggregateSupported {
+		return nil, false, nil
+	}
+	out := make(map[string][]chstore.AggregateRow, len(input.Targets))
+	for _, target := range input.Targets {
+		out[target] = nil
+		if s.referenceAggregateRows != nil {
+			out[target] = s.referenceAggregateRows[target]
+		}
+	}
+	return out, true, nil
 }
 
 func (s *fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
@@ -736,6 +754,96 @@ func TestEventAggregateReferencedByBatchesAcrossSiblingEvents(t *testing.T) {
 		t.Fatalf("reference inputs = %+v", store.referenceInputs)
 	}
 	if got := store.referenceInputs[0].targets; len(got) != 2 || got[0] != sourceID1 || got[1] != sourceID2 {
+		t.Fatalf("targets = %+v", got)
+	}
+}
+
+func TestEventAggregateReferencedByUsesAggregateStoreFastPath(t *testing.T) {
+	sourceID1 := testHex("a")
+	sourceID2 := testHex("b")
+	store := &fakeStore{
+		referenceAggregateSupported: true,
+		referenceAggregateRows: map[string][]chstore.AggregateRow{
+			sourceID1: {{
+				Dimensions: map[string]string{},
+				Metrics:    map[string]uint64{"pubkeys": 2},
+			}},
+			sourceID2: {{
+				Dimensions: map[string]string{},
+				Metrics:    map[string]uint64{"pubkeys": 3},
+			}},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        sourceID1,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "source one",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("a", 128),
+			},
+			{
+				ID:        sourceID2,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "source two",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("b", 128),
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:2}) {
+				nodes {
+					id
+					aggregateReferencedBy(input:{
+						via:{key:"e"}
+						events:{kinds:[7], limit:500}
+						metrics:[{name:"pubkeys", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]
+					}) {
+						rows { metrics }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	gotByID := map[string]uint64{}
+	for _, rawNode := range nodes {
+		node := rawNode.(map[string]any)
+		rows := node["aggregateReferencedBy"].(map[string]any)["rows"].([]any)
+		metrics := rows[0].(map[string]any)["metrics"].(map[string]uint64)
+		gotByID[node["id"].(string)] = metrics["pubkeys"]
+	}
+	if gotByID[sourceID1] != 2 || gotByID[sourceID2] != 3 {
+		t.Fatalf("metrics = %+v", gotByID)
+	}
+	if len(store.referenceAggregateInputs) != 1 {
+		t.Fatalf("reference aggregate inputs = %+v", store.referenceAggregateInputs)
+	}
+	if len(store.referenceInputs) != 0 {
+		t.Fatalf("fallback reference inputs = %+v", store.referenceInputs)
+	}
+	input := store.referenceAggregateInputs[0]
+	if input.Tag.Key != "e" || input.LimitPerTarget != 500 {
+		t.Fatalf("aggregate input = %+v", input)
+	}
+	if got := input.Targets; len(got) != 2 || got[0] != sourceID1 || got[1] != sourceID2 {
 		t.Fatalf("targets = %+v", got)
 	}
 }

@@ -63,6 +63,35 @@ type AggregateRow struct {
 	Metrics    map[string]uint64 `json:"metrics"`
 }
 
+type ReferenceAggregateInput struct {
+	Events         EventQueryInput
+	Tag            TagFilter
+	Targets        []string
+	LimitPerTarget uint64
+	GroupBy        []ReferenceAggregateDimension
+	Metrics        []ReferenceAggregateMetric
+	First          uint64
+	OrderBy        string
+}
+
+type ReferenceAggregateDimension struct {
+	Name     string
+	Field    string
+	TagKey   string
+	TagIndex int
+	Derived  string
+}
+
+type ReferenceAggregateMetric struct {
+	Name          string
+	Op            string
+	Field         string
+	TagKey        string
+	TagIndex      int
+	Derived       string
+	DistinctField string
+}
+
 type NoteStats struct {
 	LikeCount   uint64 `json:"likeCount"`
 	RepostCount uint64 `json:"repostCount"`
@@ -673,6 +702,118 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 	return out, nil
 }
 
+func (s *Store) AggregateEventsByTagTargets(ctx context.Context, input ReferenceAggregateInput) (map[string][]AggregateRow, bool, error) {
+	targets := uniqueStrings(input.Targets)
+	sort.Strings(targets)
+	out := make(map[string][]AggregateRow, len(targets))
+	for _, target := range targets {
+		out[target] = nil
+	}
+	if input.Events.Empty || input.Tag.Key == "" || len(targets) == 0 {
+		return out, true, nil
+	}
+	if input.Tag.Value != "" {
+		targets = []string{input.Tag.Value}
+	} else if len(input.Tag.Values) > 0 {
+		targets = intersectStrings(targets, input.Tag.Values)
+	}
+	if len(targets) == 0 {
+		return out, true, nil
+	}
+	if input.LimitPerTarget == 0 || input.LimitPerTarget > 500 {
+		input.LimitPerTarget = 50
+	}
+	if input.Events.Offset > 0 {
+		return nil, false, nil
+	}
+	queryLimit := input.LimitPerTarget + input.Events.Offset
+	if queryLimit == 0 || queryLimit > 1000 {
+		queryLimit = input.LimitPerTarget
+	}
+	if len(input.Metrics) == 0 {
+		input.Metrics = []ReferenceAggregateMetric{{Name: "count", Op: "COUNT"}}
+	}
+
+	spec, ok := referenceAggregateSpec(input)
+	if !ok {
+		return nil, false, nil
+	}
+
+	where, args := eventWhere("e", input.Events.IDs, input.Events.PubKeys, input.Events.Kinds, input.Events.Tags)
+	if input.Events.Since > 0 {
+		where += " AND e.created_at >= ?"
+		args = append(args, time.Unix(input.Events.Since, 0).UTC())
+	}
+	if input.Events.Until > 0 {
+		where += " AND e.created_at < ?"
+		args = append(args, time.Unix(input.Events.Until, 0).UTC())
+	}
+	where += " AND rt.tag_key = ? AND rt.tag_value IN (?)"
+	args = append(args, input.Tag.Key, targets)
+
+	selectParts := append([]string{"target_value"}, spec.selectDims...)
+	selectParts = append(selectParts, spec.selectMetrics...)
+	groupParts := append([]string{"target_value"}, spec.groupDims...)
+	query := fmt.Sprintf(`
+		SELECT *
+		FROM (
+			SELECT %s
+			FROM (
+				SELECT DISTINCT
+					rt.tag_value AS target_value,
+					e.id AS id,
+					e.pubkey AS pubkey,
+					e.kind AS kind,
+					e.created_at AS created_at,
+					e.content AS content
+				FROM event_tags AS rt
+				INNER JOIN nostr_events AS e FINAL ON e.id = rt.event_id
+				%s
+				ORDER BY rt.tag_value ASC, e.created_at DESC, e.id DESC
+				LIMIT %d BY rt.tag_value
+			)
+			GROUP BY %s
+		)
+		ORDER BY target_value ASC, %s DESC
+	`, strings.Join(selectParts, ", "), where, queryLimit, strings.Join(groupParts, ", "), spec.orderMetric)
+	if input.First > 0 {
+		query += fmt.Sprintf(" LIMIT %d BY target_value", input.First)
+	}
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, true, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var target string
+		values := make([]any, 0, 1+len(spec.scanDims)+len(spec.scanMetrics))
+		dimValues := make([]string, len(spec.scanDims))
+		metricValues := make([]uint64, len(spec.scanMetrics))
+		values = append(values, &target)
+		for i := range dimValues {
+			values = append(values, &dimValues[i])
+		}
+		for i := range metricValues {
+			values = append(values, &metricValues[i])
+		}
+		if err := rows.Scan(values...); err != nil {
+			return nil, true, err
+		}
+
+		row := AggregateRow{Dimensions: map[string]string{}, Metrics: map[string]uint64{}}
+		for i, key := range spec.scanDims {
+			row.Dimensions[key] = dimValues[i]
+		}
+		for i, key := range spec.scanMetrics {
+			row.Metrics[key] = metricValues[i]
+		}
+		out[target] = append(out[target], row)
+	}
+	return out, true, rows.Err()
+}
+
 type eventRows interface {
 	Next() bool
 	Scan(dest ...any) error
@@ -828,6 +969,144 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 		}
 	}
 	return spec, args, nil
+}
+
+func referenceAggregateSpec(input ReferenceAggregateInput) (aggSpec, bool) {
+	spec := aggSpec{}
+	for i, dim := range input.GroupBy {
+		expr, ok := referenceSelectorStringExpr(ReferenceAggregateMetric{
+			Field:    dim.Field,
+			TagKey:   dim.TagKey,
+			TagIndex: dim.TagIndex,
+			Derived:  dim.Derived,
+		}, false)
+		if !ok || dim.Name == "" {
+			return spec, false
+		}
+		alias := fmt.Sprintf("d%d", i)
+		spec.selectDims = append(spec.selectDims, fmt.Sprintf("toString(%s) AS %s", expr, alias))
+		spec.groupDims = append(spec.groupDims, alias)
+		spec.scanDims = append(spec.scanDims, dim.Name)
+	}
+
+	matchedOrder := input.OrderBy == ""
+	for i, metric := range input.Metrics {
+		if metric.Name == "" {
+			return spec, false
+		}
+		expr, ok := referenceMetricExpr(metric)
+		if !ok {
+			return spec, false
+		}
+		alias := fmt.Sprintf("m%d", i)
+		spec.selectMetrics = append(spec.selectMetrics, fmt.Sprintf("%s AS %s", expr, alias))
+		spec.scanMetrics = append(spec.scanMetrics, metric.Name)
+		if spec.orderMetric == "" || input.OrderBy == metric.Name {
+			spec.orderMetric = alias
+			if input.OrderBy == metric.Name {
+				matchedOrder = true
+			}
+		}
+	}
+	if !matchedOrder {
+		return spec, false
+	}
+	if spec.orderMetric == "" && len(spec.selectMetrics) > 0 {
+		spec.orderMetric = "m0"
+	}
+	if spec.orderMetric == "" {
+		return spec, false
+	}
+	return spec, true
+}
+
+func referenceMetricExpr(metric ReferenceAggregateMetric) (string, bool) {
+	switch strings.ToUpper(metric.Op) {
+	case "", "COUNT":
+		return "count()", true
+	case "COUNT_DISTINCT":
+		selector := ReferenceAggregateMetric{
+			Field: metric.DistinctField,
+		}
+		if selector.Field == "" {
+			selector.Field = metric.Field
+		}
+		if selector.Field == "" && metric.Derived == "" && metric.TagKey == "" {
+			selector.Field = "PUBKEY"
+		}
+		selector.TagKey = metric.TagKey
+		selector.TagIndex = metric.TagIndex
+		selector.Derived = metric.Derived
+		expr, ok := referenceSelectorStringExpr(selector, true)
+		if !ok {
+			return "", false
+		}
+		return "uniqExact(" + expr + ")", true
+	case "SUM":
+		expr, ok := referenceSelectorUintExpr(metric)
+		if !ok {
+			return "", false
+		}
+		return "sum(" + expr + ")", true
+	case "AVG":
+		expr, ok := referenceSelectorUintExpr(metric)
+		if !ok {
+			return "", false
+		}
+		return "toUInt64(avg(" + expr + "))", true
+	case "MIN":
+		expr, ok := referenceSelectorUintExpr(metric)
+		if !ok {
+			return "", false
+		}
+		return "min(" + expr + ")", true
+	case "MAX":
+		expr, ok := referenceSelectorUintExpr(metric)
+		if !ok {
+			return "", false
+		}
+		return "max(" + expr + ")", true
+	default:
+		return "", false
+	}
+}
+
+func referenceSelectorUintExpr(metric ReferenceAggregateMetric) (string, bool) {
+	expr, ok := referenceSelectorStringExpr(metric, false)
+	if !ok {
+		return "", false
+	}
+	switch strings.ToUpper(metric.Field) {
+	case "KIND":
+		return "toUInt64(kind)", true
+	case "CREATED_AT":
+		return "toUInt64(toUnixTimestamp(created_at))", true
+	default:
+		return "toUInt64OrZero(" + expr + ")", true
+	}
+}
+
+func referenceSelectorStringExpr(metric ReferenceAggregateMetric, defaultPubkey bool) (string, bool) {
+	if metric.Derived != "" || metric.TagKey != "" {
+		return "", false
+	}
+	if metric.Field == "" && !defaultPubkey {
+		return "", false
+	}
+	switch strings.ToUpper(metric.Field) {
+	case "", "PUBKEY", "AUTHOR":
+		return "pubkey", true
+	case "ID", "EVENT_ID":
+		return "id", true
+	case "KIND":
+		return "toString(kind)", true
+	case "CREATED_AT":
+		return "toString(toUnixTimestamp(created_at))", true
+	case "CONTENT":
+		return "content", true
+	default:
+		return "", false
+	}
 }
 
 func aggregateTimeColumn(dataset string) (string, error) {
