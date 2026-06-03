@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -121,6 +122,8 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var selectedReferenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
+	var weightedRankTermInputType *graphql.InputObject
+	var candidatePubkeyBoostInputType *graphql.InputObject
 	var referenceRankInputType *graphql.InputObject
 	var rankedReverseReferenceInputType *graphql.InputObject
 	var rankedEventsInputType *graphql.InputObject
@@ -373,12 +376,34 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"orderBy": &graphql.InputObjectFieldConfig{Type: graphql.String},
 		},
 	})
-	referenceRankInputType = graphql.NewInputObject(graphql.InputObjectConfig{
-		Name: "ReferenceRankInput",
+	weightedRankTermInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "WeightedRankTermInput",
 		Fields: graphql.InputObjectConfigFieldMap{
 			"references": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
 			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
 			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
+			"weight":     &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
+			"transform":  &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
+		},
+	})
+	candidatePubkeyBoostInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "CandidatePubkeyBoostInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"pubkeys":     &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
+			"pubkeysFrom": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(pubkeySourceInputType))},
+			"weight":      &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
+		},
+	})
+	referenceRankInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ReferenceRankInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"references":            &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
+			"via":                   &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
+			"metric":                &graphql.InputObjectFieldConfig{Type: metricInputType},
+			"weight":                &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
+			"transform":             &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
+			"terms":                 &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(weightedRankTermInputType))},
+			"candidatePubkeyBoosts": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(candidatePubkeyBoostInputType))},
 		},
 	})
 	rankedReverseReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -706,11 +731,16 @@ func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.Ev
 			rankAggregate.Limit = uint64(len(candidateIDs))
 		}
 	}
-	rows, err := r.store.AggregateEvents(ctx, rankAggregate)
-	if err != nil {
-		return eventConnectionSource{}, err
+	var targetIDs []string
+	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) {
+		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, candidates, input.WeightedTerms, input.CandidateBoosts, input.Offset, input.Limit)
+	} else {
+		rows, err := r.store.AggregateEvents(ctx, rankAggregate)
+		if err != nil {
+			return eventConnectionSource{}, err
+		}
+		targetIDs = rankedCandidateIDs(rows, candidates, input.Offset, input.Limit)
 	}
-	targetIDs := rankedCandidateIDs(rows, candidates, input.Offset, input.Limit)
 	if len(targetIDs) == 0 {
 		return eventConnectionSource{}, nil
 	}
@@ -874,21 +904,38 @@ type rankedEventsInput struct {
 }
 
 type rankedReverseReferenceInput struct {
-	Events         chstore.EventQueryInput
-	RankReferences chstore.AggregateInput
-	RankVia        graphTagPredicate
-	Limit          int
-	Offset         int
+	Events          chstore.EventQueryInput
+	RankReferences  chstore.AggregateInput
+	RankVia         graphTagPredicate
+	WeightedTerms   []weightedRankTerm
+	CandidateBoosts []candidatePubkeyBoost
+	Limit           int
+	Offset          int
 }
 
 type rankedReverseReferenceBatchInput struct {
-	Events         chstore.EventQueryInput
-	Via            graphTagPredicate
-	Target         string
-	RankReferences chstore.AggregateInput
-	RankVia        graphTagPredicate
-	Limit          int
-	Offset         int
+	Events          chstore.EventQueryInput
+	Via             graphTagPredicate
+	Target          string
+	RankReferences  chstore.AggregateInput
+	RankVia         graphTagPredicate
+	WeightedTerms   []weightedRankTerm
+	CandidateBoosts []candidatePubkeyBoost
+	Limit           int
+	Offset          int
+}
+
+type weightedRankTerm struct {
+	References chstore.EventQueryInput
+	Via        graphTagPredicate
+	Metric     genericMetric
+	Weight     float64
+	Transform  string
+}
+
+type candidatePubkeyBoost struct {
+	PubKeys map[string]struct{}
+	Weight  float64
 }
 
 type aggregateReferencedByBatchInput struct {
@@ -1038,6 +1085,14 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 		Limit:   references.Limit,
 		Empty:   references.Empty,
 	}
+	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, r.parseEventQueryInput)
+	if err != nil {
+		return out, err
+	}
+	out.CandidateBoosts, err = r.candidatePubkeyBoosts(ctx, rankRaw["candidatePubkeyBoosts"])
+	if err != nil {
+		return out, err
+	}
 	out.Limit = intValue(m["limit"], 1)
 	if out.Limit <= 0 || out.Limit > 50 {
 		out.Limit = 1
@@ -1098,6 +1153,14 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 		Until:   references.Until,
 		Limit:   references.Limit,
 		Empty:   references.Empty,
+	}
+	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, c.parseEventQueryInput)
+	if err != nil {
+		return out, err
+	}
+	out.CandidateBoosts, err = c.candidatePubkeyBoosts(ctx, rankRaw["candidatePubkeyBoosts"])
+	if err != nil {
+		return out, err
 	}
 	out.Limit = intValue(m["limit"], 1)
 	if out.Limit <= 0 || out.Limit > 50 {
@@ -1243,6 +1306,108 @@ func rankMetricName(raw any) string {
 	}
 }
 
+func legacyRankMetricSupported(raw any) bool {
+	metric := genericMetricFromRaw(raw, "value")
+	switch metric.Op {
+	case "", "COUNT", "COUNT_DISTINCT":
+		return true
+	default:
+		return false
+	}
+}
+
+func weightedRankTerms(
+	ctx context.Context,
+	rankRaw map[string]any,
+	parseEventQuery func(context.Context, map[string]any) (chstore.EventQueryInput, error),
+) ([]weightedRankTerm, error) {
+	useWeighted := len(anyList(rankRaw["terms"])) > 0 ||
+		len(anyList(rankRaw["candidatePubkeyBoosts"])) > 0 ||
+		!legacyRankMetricSupported(rankRaw["metric"]) ||
+		floatValue(rankRaw["weight"], 1) != 1 ||
+		rankTransform(rankRaw["transform"]) != "IDENTITY"
+	if !useWeighted {
+		return nil, nil
+	}
+
+	base, err := weightedRankTermFrom(ctx, rankRaw, parseEventQuery)
+	if err != nil {
+		return nil, err
+	}
+	terms := []weightedRankTerm{base}
+	for _, value := range anyList(rankRaw["terms"]) {
+		raw, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		term, err := weightedRankTermFrom(ctx, raw, parseEventQuery)
+		if err != nil {
+			return nil, err
+		}
+		terms = append(terms, term)
+	}
+	return terms, nil
+}
+
+func weightedRankTermFrom(
+	ctx context.Context,
+	raw map[string]any,
+	parseEventQuery func(context.Context, map[string]any) (chstore.EventQueryInput, error),
+) (weightedRankTerm, error) {
+	var out weightedRankTerm
+	referencesRaw, ok := raw["references"].(map[string]any)
+	if !ok {
+		return out, fmt.Errorf("rank term references input is required")
+	}
+	references, err := parseEventQuery(ctx, referencesRaw)
+	if err != nil {
+		return out, err
+	}
+	via := graphTagPredicateFrom(raw["via"])
+	if via.Key == "" {
+		return out, fmt.Errorf("rank term via.key is required")
+	}
+	out.References = references
+	out.Via = via
+	out.Metric = genericMetricFromRaw(raw["metric"], "value")
+	out.Weight = floatValue(raw["weight"], 1)
+	out.Transform = rankTransform(raw["transform"])
+	return out, nil
+}
+
+func genericMetricFromRaw(raw any, fallbackName string) genericMetric {
+	m, _ := raw.(map[string]any)
+	name := stringValue(m["name"])
+	if name == "" {
+		name = fallbackName
+	}
+	metric := genericMetric{
+		Name:          name,
+		Op:            strings.ToUpper(stringValue(m["op"])),
+		Field:         stringValue(m["field"]),
+		TagKey:        stringValue(m["tagKey"]),
+		TagIndex:      intValue(m["tagIndex"], 1),
+		Derived:       stringValue(m["derived"]),
+		DistinctField: stringValue(m["distinctField"]),
+	}
+	if metric.Op == "" {
+		metric.Op = "COUNT_DISTINCT"
+	}
+	if metric.Op == "COUNT_DISTINCT" && metric.DistinctField == "" && metric.Field == "" && metric.TagKey == "" && metric.Derived == "" {
+		metric.DistinctField = "PUBKEY"
+	}
+	return metric
+}
+
+func rankTransform(raw any) string {
+	switch strings.ToUpper(stringValue(raw)) {
+	case "LOG1P":
+		return "LOG1P"
+	default:
+		return "IDENTITY"
+	}
+}
+
 func rankedTargetIDs(rows []chstore.AggregateRow, offset, limit int) []string {
 	if offset < 0 {
 		offset = 0
@@ -1323,6 +1488,153 @@ func rankedCandidateIDs(rows []chstore.AggregateRow, candidates []chstore.EventV
 		ordered = ordered[:limit]
 	}
 	return ordered
+}
+
+func useWeightedRanking(terms []weightedRankTerm, boosts []candidatePubkeyBoost) bool {
+	return len(terms) > 0 || len(boosts) > 0
+}
+
+type candidateRank struct {
+	event chstore.EventView
+	score float64
+}
+
+func weightedRankCandidateIDs(
+	ctx context.Context,
+	store Store,
+	candidates []chstore.EventView,
+	terms []weightedRankTerm,
+	boosts []candidatePubkeyBoost,
+	offset int,
+	limit int,
+) ([]string, error) {
+	if limit <= 0 || len(candidates) == 0 {
+		return nil, nil
+	}
+	scores := make(map[string]float64, len(candidates))
+	candidateIDs := make([]string, 0, len(candidates))
+	seen := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if candidate.ID == "" {
+			continue
+		}
+		if _, ok := seen[candidate.ID]; ok {
+			continue
+		}
+		seen[candidate.ID] = struct{}{}
+		candidateIDs = append(candidateIDs, candidate.ID)
+		scores[candidate.ID] = 0
+		for _, boost := range boosts {
+			if _, ok := boost.PubKeys[candidate.PubKey]; ok {
+				scores[candidate.ID] += boost.Weight
+			}
+		}
+	}
+	if len(candidateIDs) == 0 {
+		return nil, nil
+	}
+	for _, term := range terms {
+		if term.References.Empty {
+			continue
+		}
+		rowsByCandidate, err := weightedRankRowsByCandidate(ctx, store, candidateIDs, term)
+		if err != nil {
+			return nil, err
+		}
+		for _, candidateID := range candidateIDs {
+			rows := rowsByCandidate[candidateID]
+			if len(rows) == 0 {
+				continue
+			}
+			value := rows[0].Metrics[term.Metric.Name]
+			scores[candidateID] += transformedRankValue(value, term.Transform) * term.Weight
+		}
+	}
+
+	ranked := make([]candidateRank, 0, len(candidates))
+	added := map[string]struct{}{}
+	for _, candidate := range candidates {
+		if _, ok := scores[candidate.ID]; !ok {
+			continue
+		}
+		if _, ok := added[candidate.ID]; ok {
+			continue
+		}
+		added[candidate.ID] = struct{}{}
+		ranked = append(ranked, candidateRank{event: candidate, score: scores[candidate.ID]})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		if !ranked[i].event.CreatedAt.Equal(ranked[j].event.CreatedAt) {
+			return ranked[i].event.CreatedAt.After(ranked[j].event.CreatedAt)
+		}
+		return ranked[i].event.ID > ranked[j].event.ID
+	})
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(ranked) {
+		return nil, nil
+	}
+	ranked = ranked[offset:]
+	if len(ranked) > limit {
+		ranked = ranked[:limit]
+	}
+	out := make([]string, 0, len(ranked))
+	for _, entry := range ranked {
+		out = append(out, entry.event.ID)
+	}
+	return out, nil
+}
+
+func weightedRankRowsByCandidate(
+	ctx context.Context,
+	store Store,
+	candidateIDs []string,
+	term weightedRankTerm,
+) (map[string][]chstore.AggregateRow, error) {
+	tag := chstore.TagFilter{Key: term.Via.Key, Value: term.Via.Value, Values: term.Via.Values}
+	if aggregateStore, ok := store.(referenceAggregateStore); ok {
+		rowsByCandidate, supported, err := aggregateStore.AggregateEventsByTagTargets(ctx, chstore.ReferenceAggregateInput{
+			Events:         term.References,
+			Tag:            tag,
+			Targets:        candidateIDs,
+			LimitPerTarget: term.References.Limit,
+			Metrics:        referenceAggregateMetrics([]genericMetric{term.Metric}),
+			First:          1,
+			OrderBy:        term.Metric.Name,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if supported {
+			return rowsByCandidate, nil
+		}
+	}
+
+	eventsByCandidate, err := store.QueryEventsByTagTargets(ctx, term.References, tag, candidateIDs, term.References.Limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]chstore.AggregateRow, len(eventsByCandidate))
+	for candidateID, events := range eventsByCandidate {
+		out[candidateID] = []chstore.AggregateRow{{
+			Dimensions: map[string]string{},
+			Metrics:    map[string]uint64{term.Metric.Name: computeMetric(events, term.Metric)},
+		}}
+	}
+	return out, nil
+}
+
+func transformedRankValue(value uint64, transform string) float64 {
+	switch transform {
+	case "LOG1P":
+		return math.Log1p(float64(value))
+	default:
+		return float64(value)
+	}
 }
 
 func rankTagValues(predicate graphTagPredicate, candidateIDs []string) []string {
@@ -1742,6 +2054,10 @@ func (r *resolver) resolvePubkeySources(ctx context.Context, sources []pubkeySou
 	return uniqueStrings(out), nil
 }
 
+func (r *resolver) candidatePubkeyBoosts(ctx context.Context, raw any) ([]candidatePubkeyBoost, error) {
+	return candidatePubkeyBoosts(ctx, raw, r.resolvePubkeySources)
+}
+
 func (r *resolver) resolveLatestEventTagPubkeys(ctx context.Context, source latestEventTagPubkeySource) ([]string, error) {
 	normalized, err := normalizeLatestEventTagPubkeySource(source)
 	if err != nil {
@@ -1895,6 +2211,45 @@ func validateHexFilters(ids, pubkeys []string) error {
 	return nil
 }
 
+func candidatePubkeyBoosts(
+	ctx context.Context,
+	raw any,
+	resolveSources func(context.Context, []pubkeySource) ([]string, error),
+) ([]candidatePubkeyBoost, error) {
+	values := anyList(raw)
+	out := make([]candidatePubkeyBoost, 0, len(values))
+	for _, value := range values {
+		m, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		pubkeys := stringList(m["pubkeys"])
+		if sources := pubkeySources(m["pubkeysFrom"]); len(sources) > 0 {
+			derived, err := resolveSources(ctx, sources)
+			if err != nil {
+				return nil, err
+			}
+			pubkeys = append(pubkeys, derived...)
+		}
+		pubkeys = uniqueStrings(pubkeys)
+		if len(pubkeys) == 0 {
+			continue
+		}
+		if err := validateHexFilters(nil, pubkeys); err != nil {
+			return nil, err
+		}
+		set := make(map[string]struct{}, len(pubkeys))
+		for _, pubkey := range pubkeys {
+			set[pubkey] = struct{}{}
+		}
+		out = append(out, candidatePubkeyBoost{
+			PubKeys: set,
+			Weight:  floatValue(m["weight"], 1),
+		})
+	}
+	return out, nil
+}
+
 func tagFilters(v any) []chstore.TagFilter {
 	values := anyList(v)
 	out := make([]chstore.TagFilter, 0, len(values))
@@ -1969,6 +2324,23 @@ func intValue(v any, fallback int) int {
 		return int(n)
 	case float64:
 		return int(n)
+	default:
+		return fallback
+	}
+}
+
+func floatValue(v any, fallback float64) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int32:
+		return float64(n)
+	case int64:
+		return float64(n)
 	default:
 		return fallback
 	}
@@ -2581,7 +2953,7 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	sort.Strings(candidateIDs)
 
 	var rows []chstore.AggregateRow
-	if !input.RankReferences.Empty {
+	if !useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) && !input.RankReferences.Empty {
 		rankAggregate := input.RankReferences
 		rankAggregate.Tags = append(rankAggregate.Tags, chstore.TagFilter{
 			Key: input.RankVia.Key, Value: input.RankVia.Value, Values: rankTagValues(input.RankVia, candidateIDs),
@@ -2599,7 +2971,15 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	selectedIDs := make([]string, 0)
 	seenSelectedIDs := map[string]struct{}{}
 	for _, target := range targets {
-		targetIDs := rankedCandidateIDs(rows, candidatesByTarget[target], input.Offset, input.Limit)
+		var targetIDs []string
+		if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) {
+			targetIDs, err = weightedRankCandidateIDs(ctx, c.store, candidatesByTarget[target], input.WeightedTerms, input.CandidateBoosts, input.Offset, input.Limit)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			targetIDs = rankedCandidateIDs(rows, candidatesByTarget[target], input.Offset, input.Limit)
+		}
 		if len(targetIDs) == 0 {
 			continue
 		}
@@ -2678,6 +3058,10 @@ func (c *eventRelationCache) resolvePubkeySources(ctx context.Context, sources [
 		out = append(out, values...)
 	}
 	return uniqueStrings(out), nil
+}
+
+func (c *eventRelationCache) candidatePubkeyBoosts(ctx context.Context, raw any) ([]candidatePubkeyBoost, error) {
+	return candidatePubkeyBoosts(ctx, raw, c.resolvePubkeySources)
 }
 
 func (c *eventRelationCache) resolveLatestEventTagPubkeys(ctx context.Context, source latestEventTagPubkeySource) ([]string, error) {

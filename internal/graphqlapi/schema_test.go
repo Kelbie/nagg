@@ -1470,6 +1470,220 @@ func TestRankedReferencedByRanksCandidateEventsByGenericReferences(t *testing.T)
 	}
 }
 
+func TestRankedReferencedBySupportsWeightedTermsAndCandidateBoosts(t *testing.T) {
+	rootID := testHex("1")
+	replyAID := testHex("2")
+	replyBID := testHex("3")
+	authorA := testHex("a")
+	authorB := testHex("b")
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		},
+		latestEvents: map[string][]chstore.EventView{
+			testPubkey: {{
+				ID:        testHex("5"),
+				PubKey:    testPubkey,
+				Kind:      3,
+				CreatedAt: time.Unix(1_710_000_004, 0),
+				Tags:      [][]string{{"p", authorA}},
+				Sig:       strings.Repeat("5", 128),
+			}},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        replyBID,
+				PubKey:    authorB,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_003, 0),
+				Content:   "more likes",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("6", 128),
+			},
+			{
+				ID:        replyAID,
+				PubKey:    authorA,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "followed author",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("7", 128),
+			},
+		}},
+		referenceAggregateSupported: true,
+		referenceAggregateRows: map[string][]chstore.AggregateRow{
+			replyAID: {{
+				Metrics: map[string]uint64{"likes": 1},
+			}},
+			replyBID: {{
+				Metrics: map[string]uint64{"likes": 3},
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				rankedReferencedBy(input:{
+					via:{key:"e"}
+					events:{kinds:[1], limit:10}
+					rank:{
+						references:{kinds:[7], limit:500}
+						via:{key:"e"}
+						metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+						weight:3.0
+						transform:"LOG1P"
+						candidatePubkeyBoosts:[{
+							pubkeysFrom:[{
+								latestEventTags:{
+									pubkey:"` + testPubkey + `"
+									kinds:[3]
+									tag:{key:"p"}
+								}
+							}]
+							weight:6.0
+						}]
+					}
+					limit:2
+				}) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 || nodes[0].(map[string]any)["id"] != replyAID || nodes[1].(map[string]any)["id"] != replyBID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	if len(store.latestInputs) != 1 {
+		t.Fatalf("latest inputs = %+v", store.latestInputs)
+	}
+	if len(store.referenceAggregateInputs) != 1 {
+		t.Fatalf("reference aggregate inputs = %+v", store.referenceAggregateInputs)
+	}
+	input := store.referenceAggregateInputs[0]
+	if input.Tag.Key != "e" || input.OrderBy != "likes" || input.First != 1 {
+		t.Fatalf("reference aggregate input = %+v", input)
+	}
+	if got := input.Targets; len(got) != 2 || !containsString(got, replyAID) || !containsString(got, replyBID) {
+		t.Fatalf("targets = %+v", got)
+	}
+	if len(input.Metrics) != 1 || input.Metrics[0].Name != "likes" || input.Metrics[0].DistinctField != "PUBKEY" {
+		t.Fatalf("metrics = %+v", input.Metrics)
+	}
+	if len(store.aggregateInputs) != 0 {
+		t.Fatalf("legacy aggregate inputs = %+v", store.aggregateInputs)
+	}
+}
+
+func TestRankedReferencedBySupportsWeightedSumMetricAndOffset(t *testing.T) {
+	rootID := testHex("1")
+	replyAID := testHex("2")
+	replyBID := testHex("3")
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        replyAID,
+				PubKey:    testHex("a"),
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "low zaps",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("a", 128),
+			},
+			{
+				ID:        replyBID,
+				PubKey:    testHex("b"),
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_003, 0),
+				Content:   "high zaps",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("b", 128),
+			},
+		}},
+		referenceAggregateSupported: true,
+		referenceAggregateRows: map[string][]chstore.AggregateRow{
+			replyAID: {{
+				Metrics: map[string]uint64{"zapSats": 10},
+			}},
+			replyBID: {{
+				Metrics: map[string]uint64{"zapSats": 100},
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				rankedReferencedBy(input:{
+					via:{key:"e"}
+					events:{kinds:[1], limit:10}
+					rank:{
+						references:{kinds:[9735], limit:500}
+						via:{key:"e"}
+						metric:{name:"zapSats", op:"SUM", derived:"nip57.amount_sats"}
+					}
+					limit:1
+					offset:1
+				}) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != replyAID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	if len(store.referenceAggregateInputs) != 1 {
+		t.Fatalf("reference aggregate inputs = %+v", store.referenceAggregateInputs)
+	}
+	metric := store.referenceAggregateInputs[0].Metrics[0]
+	if metric.Name != "zapSats" || metric.Op != "SUM" || metric.Derived != "nip57.amount_sats" {
+		t.Fatalf("metric = %+v", metric)
+	}
+	if len(store.aggregateInputs) != 0 {
+		t.Fatalf("legacy aggregate inputs = %+v", store.aggregateInputs)
+	}
+}
+
 func TestRankedReferencedByBatchesAcrossSiblingEvents(t *testing.T) {
 	rootAID := "1111111111111111111111111111111111111111111111111111111111111111"
 	rootBID := "2222222222222222222222222222222222222222222222222222222222222222"
