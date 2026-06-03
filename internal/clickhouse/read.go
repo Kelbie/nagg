@@ -551,6 +551,9 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 	if input.Limit == 0 || input.Limit > 500 {
 		input.Limit = 50
 	}
+	if len(input.IDs) > 0 {
+		return s.queryEventsByIDFilter(ctx, input)
+	}
 
 	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
 	if input.Since > 0 {
@@ -594,6 +597,41 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 	return out, rows.Err()
 }
 
+func (s *Store) queryEventsByIDFilter(ctx context.Context, input EventQueryInput) ([]EventView, error) {
+	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	if input.Since > 0 {
+		where += " AND e.created_at >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		where += " AND e.created_at < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
+	args = append(args, input.Limit)
+	query := `
+		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM (
+			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+			FROM nostr_events AS e
+			` + where + `
+			ORDER BY e.id ASC, e.last_seen_at DESC
+			LIMIT 1 BY e.id
+		)
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`
+	if input.Offset > 0 {
+		query += " OFFSET ?"
+		args = append(args, input.Offset)
+	}
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanEventRows(rows)
+}
+
 func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInput, tag TagFilter, targets []string, limitPerTarget uint64) (map[string][]EventView, error) {
 	targets = uniqueStrings(targets)
 	sort.Strings(targets)
@@ -614,6 +652,9 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 	}
 	if limitPerTarget == 0 || limitPerTarget > 500 {
 		limitPerTarget = 50
+	}
+	if len(input.Tags) == 0 {
+		return s.queryEventsByTagTargetsFromTags(ctx, out, input, tag, targets, limitPerTarget)
 	}
 	queryLimit := limitPerTarget + input.Offset
 	if queryLimit == 0 || queryLimit > 1000 {
@@ -698,6 +739,119 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 			events = events[:limitPerTarget]
 		}
 		out[target] = events
+	}
+	return out, nil
+}
+
+func (s *Store) queryEventsByTagTargetsFromTags(ctx context.Context, out map[string][]EventView, input EventQueryInput, tag TagFilter, targets []string, limitPerTarget uint64) (map[string][]EventView, error) {
+	queryLimit := limitPerTarget + input.Offset
+	if queryLimit == 0 || queryLimit > 1000 {
+		queryLimit = limitPerTarget
+	}
+
+	clauses := []string{"WHERE rt.tag_key = ?", "rt.tag_value IN (?)"}
+	args := []any{tag.Key, targets}
+	if len(input.IDs) > 0 {
+		clauses = append(clauses, "rt.event_id IN (?)")
+		args = append(args, input.IDs)
+	}
+	if len(input.PubKeys) > 0 {
+		clauses = append(clauses, "rt.pubkey IN (?)")
+		args = append(args, input.PubKeys)
+	}
+	if len(input.Kinds) > 0 {
+		clauses = append(clauses, "rt.kind IN ("+ints(input.Kinds)+")")
+	}
+	if input.Since > 0 {
+		clauses = append(clauses, "rt.created_at >= ?")
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		clauses = append(clauses, "rt.created_at < ?")
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
+
+	query := fmt.Sprintf(`
+		SELECT target_value, event_id, created_at
+		FROM (
+			SELECT
+				rt.tag_value AS target_value,
+				rt.event_id AS event_id,
+				rt.created_at AS created_at
+			FROM event_tags AS rt
+			%s
+			ORDER BY rt.tag_value ASC, rt.created_at DESC, rt.event_id DESC
+			LIMIT %d BY rt.tag_value
+		)
+		ORDER BY target_value ASC, created_at DESC, event_id DESC
+	`, strings.Join(clauses, " AND "), queryLimit)
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	idsByTarget := make(map[string][]string, len(targets))
+	allIDs := make([]string, 0)
+	seenByTarget := make(map[string]map[string]struct{}, len(targets))
+	seenAll := map[string]struct{}{}
+	for rows.Next() {
+		var target string
+		var id string
+		var createdAt time.Time
+		if err := rows.Scan(&target, &id, &createdAt); err != nil {
+			return nil, err
+		}
+		if seenByTarget[target] == nil {
+			seenByTarget[target] = map[string]struct{}{}
+		}
+		if _, ok := seenByTarget[target][id]; ok {
+			continue
+		}
+		seenByTarget[target][id] = struct{}{}
+		idsByTarget[target] = append(idsByTarget[target], id)
+		if _, ok := seenAll[id]; ok {
+			continue
+		}
+		seenAll[id] = struct{}{}
+		allIDs = append(allIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(allIDs) == 0 {
+		return out, nil
+	}
+
+	events, err := s.QueryEvents(ctx, EventQueryInput{IDs: allIDs, Limit: uint64(len(allIDs))})
+	if err != nil {
+		return nil, err
+	}
+	eventsByID := make(map[string]EventView, len(events))
+	for _, event := range events {
+		eventsByID[event.ID] = event
+	}
+	for target, ids := range idsByTarget {
+		if input.Offset > 0 {
+			if input.Offset >= uint64(len(ids)) {
+				out[target] = nil
+				continue
+			}
+			ids = ids[input.Offset:]
+		}
+		if uint64(len(ids)) > limitPerTarget {
+			ids = ids[:limitPerTarget]
+		}
+		targetEvents := make([]EventView, 0, len(ids))
+		for _, id := range ids {
+			event, ok := eventsByID[id]
+			if !ok {
+				continue
+			}
+			targetEvents = append(targetEvents, event)
+		}
+		out[target] = targetEvents
 	}
 	return out, nil
 }
