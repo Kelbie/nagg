@@ -979,28 +979,27 @@ func TestRankedEventsUsesRecentReferencesAndPreservesRank(t *testing.T) {
 	if len(result.Errors) > 0 {
 		t.Fatalf("graphql errors = %+v", result.Errors)
 	}
-	if len(store.aggregateInputs) != 0 {
-		t.Fatalf("unexpected global aggregate inputs = %+v", store.aggregateInputs)
+	if len(store.aggregateInputs) != 1 {
+		t.Fatalf("aggregate inputs len = %d", len(store.aggregateInputs))
 	}
-	if len(store.rankedTargetAggregateInputs) != 1 {
-		t.Fatalf("ranked target aggregate inputs len = %d", len(store.rankedTargetAggregateInputs))
+	if len(store.rankedTargetAggregateInputs) != 0 {
+		t.Fatalf("unexpected ranked target aggregate inputs = %+v", store.rankedTargetAggregateInputs)
 	}
-	aggregateInput := store.rankedTargetAggregateInputs[0].references
+	aggregateInput := store.aggregateInputs[0]
 	if aggregateInput.Dataset != "TAGS" || aggregateInput.Since != 1_710_000_000 {
 		t.Fatalf("aggregate input = %+v", aggregateInput)
 	}
 	if len(aggregateInput.Tags) != 1 || aggregateInput.Tags[0].Key != "e" {
 		t.Fatalf("aggregate tags = %+v", aggregateInput.Tags)
 	}
-	targetInput := store.rankedTargetAggregateInputs[0].target
-	if len(targetInput.Kinds) != 1 || targetInput.Kinds[0] != 1 {
-		t.Fatalf("target input = %+v", targetInput)
-	}
 	if len(store.eventInputs) != 1 {
 		t.Fatalf("event inputs len = %d", len(store.eventInputs))
 	}
 	if got := store.eventInputs[0].IDs; len(got) != 2 || got[0] != topID || got[1] != secondID {
 		t.Fatalf("target ids = %+v", got)
+	}
+	if got := store.eventInputs[0].Kinds; len(got) != 1 || got[0] != 1 {
+		t.Fatalf("target kinds = %+v", got)
 	}
 	data := result.Data.(map[string]any)
 	nodes := data["rankedEvents"].(map[string]any)["nodes"].([]any)

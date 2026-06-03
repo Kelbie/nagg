@@ -844,9 +844,10 @@ func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput)
 }
 
 func rankedTargetHasFilters(input chstore.EventQueryInput) bool {
+	// Kind-only targets are post-filtered during event hydration so global
+	// trending queries keep the cheaper aggregate path.
 	return len(input.IDs) > 0 ||
 		len(input.PubKeys) > 0 ||
-		len(input.Kinds) > 0 ||
 		len(input.Tags) > 0 ||
 		input.Since > 0 ||
 		input.Until > 0 ||
