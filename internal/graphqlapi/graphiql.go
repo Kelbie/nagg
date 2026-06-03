@@ -47,10 +47,22 @@ var graphiqlTemplate = template.Must(template.New("graphiql").Parse(`<!doctype h
 <body>
   <div id="graphiql">Loading Nagg GraphiQL...</div>
   <script type="module">
+    import "https://cdn.jsdelivr.net/npm/@graphiql/react@` + graphiqlReactLibVersion + `/dist/setup-workers/esm.sh.js";
     import React from "react";
     import { createRoot } from "react-dom/client";
+    import { languages as monacoGraphQLLanguages } from "https://esm.sh/monaco-graphql@^1.8.0/esm/monaco-editor?external=graphql&target=es2022";
     import { GraphiQL } from "https://esm.sh/graphiql@` + graphiqlVersion + `?external=react,react-dom,graphql,@graphiql/react";
     import { explorerPlugin } from "https://esm.sh/@graphiql/plugin-explorer@` + graphiqlExplorerVersion + `?external=react,react-dom,graphql,@graphiql/react";
+
+    if (!monacoGraphQLLanguages.json) {
+      const jsonDefaults = {
+        diagnosticsOptions: { schemas: [] },
+        setDiagnosticsOptions(options) {
+          this.diagnosticsOptions = options;
+        }
+      };
+      monacoGraphQLLanguages.json = { jsonDefaults };
+    }
 
     const graphqlEndpoint = {{ .GraphQLEndpoint }};
     const fetcher = async (graphQLParams) => {
