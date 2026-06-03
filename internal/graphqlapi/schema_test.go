@@ -1329,6 +1329,81 @@ func TestEventsQueryWithEmptyPubkeySourceDoesNotBroaden(t *testing.T) {
 	}
 }
 
+func TestReferencedByResolvesPubkeysFromSourceEventAuthor(t *testing.T) {
+	rootID := "1111111111111111111111111111111111111111111111111111111111111111"
+	replyID := "2222222222222222222222222222222222222222222222222222222222222222"
+	rootAuthor := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	otherAuthor := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    rootAuthor,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       testHex("f") + testHex("f"),
+			},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        replyID,
+				PubKey:    rootAuthor,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "thread continuation",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       testHex("e") + testHex("e"),
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				referencedBy(input:{
+					via:{key:"e"}
+					events:{
+						kinds:[1]
+						pubkeysFrom:[{sourceEventAuthor:true}]
+						limit:20
+					}
+					limit:20
+				}) { nodes { id pubkey } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs len = %d", len(store.eventInputs))
+	}
+	eventInput := store.eventInputs[0]
+	if len(eventInput.PubKeys) != 1 || eventInput.PubKeys[0] != rootAuthor {
+		t.Fatalf("source author pubkeys = %+v", eventInput.PubKeys)
+	}
+	if len(eventInput.Tags) != 1 || eventInput.Tags[0].Key != "e" || eventInput.Tags[0].Value != rootID {
+		t.Fatalf("reply target tag = %+v", eventInput.Tags)
+	}
+	if eventInput.Empty {
+		t.Fatal("source author query should not remain empty after adding source pubkey")
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["referencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 || nodes[0].(map[string]any)["pubkey"] != rootAuthor {
+		t.Fatalf("nodes = %+v (other author %s)", nodes, otherAuthor)
+	}
+}
+
 func TestRankedReferencedByRanksCandidateEventsByGenericReferences(t *testing.T) {
 	rootID := "1111111111111111111111111111111111111111111111111111111111111111"
 	replyAID := "2222222222222222222222222222222222222222222222222222222222222222"

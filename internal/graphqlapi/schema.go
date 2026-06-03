@@ -294,7 +294,8 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	pubkeySourceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "PubkeySourceInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"latestEventTags": &graphql.InputObjectFieldConfig{Type: latestEventTagPubkeySourceInputType},
+			"latestEventTags":   &graphql.InputObjectFieldConfig{Type: latestEventTagPubkeySourceInputType},
+			"sourceEventAuthor": &graphql.InputObjectFieldConfig{Type: graphql.Boolean},
 		},
 	})
 
@@ -1001,7 +1002,7 @@ func (r *resolver) reverseReferenceQuery(ctx context.Context, event chstore.Even
 	m, _ := raw.(map[string]any)
 	var input chstore.EventQueryInput
 	if eventsRaw, ok := m["events"].(map[string]any); ok {
-		parsed, err := r.parseEventQueryInput(ctx, eventsRaw)
+		parsed, err := r.parseEventQueryInputForSourceEvent(ctx, eventsRaw, event)
 		if err != nil {
 			return input, err
 		}
@@ -1032,7 +1033,7 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 	m, _ := raw.(map[string]any)
 	var out rankedReverseReferenceInput
 	if eventsRaw, ok := m["events"].(map[string]any); ok {
-		events, err := r.parseEventQueryInput(ctx, eventsRaw)
+		events, err := r.parseEventQueryInputForSourceEvent(ctx, eventsRaw, event)
 		if err != nil {
 			return out, err
 		}
@@ -2001,7 +2002,8 @@ func zapRequestPubkey(event chstore.EventView) string {
 }
 
 type pubkeySource struct {
-	latestEventTags *latestEventTagPubkeySource
+	latestEventTags   *latestEventTagPubkeySource
+	sourceEventAuthor bool
 }
 
 type latestEventTagPubkeySource struct {
@@ -2035,6 +2037,23 @@ func (r *resolver) parseEventQueryInput(ctx context.Context, raw map[string]any)
 	input.PubKeys = uniqueStrings(append(input.PubKeys, derived...))
 	if len(input.PubKeys) == 0 {
 		input.Empty = true
+	}
+	return input, nil
+}
+
+func (r *resolver) parseEventQueryInputForSourceEvent(ctx context.Context, raw map[string]any, sourceEvent chstore.EventView) (chstore.EventQueryInput, error) {
+	input, err := r.parseEventQueryInput(ctx, raw)
+	if err != nil {
+		return input, err
+	}
+	if !pubkeySourcesUseSourceEventAuthor(raw["pubkeysFrom"]) {
+		return input, nil
+	}
+	input.PubKeys = uniqueStrings(append(input.PubKeys, sourceEvent.PubKey))
+	if len(input.PubKeys) == 0 {
+		input.Empty = true
+	} else {
+		input.Empty = false
 	}
 	return input, nil
 }
@@ -2130,11 +2149,21 @@ func pubkeySources(v any) []pubkeySource {
 				MaxValues: intValue(latestRaw["maxValues"], 2000),
 			}
 		}
-		if source.latestEventTags != nil {
+		source.sourceEventAuthor = boolValue(raw["sourceEventAuthor"], false)
+		if source.latestEventTags != nil || source.sourceEventAuthor {
 			out = append(out, source)
 		}
 	}
 	return out
+}
+
+func pubkeySourcesUseSourceEventAuthor(v any) bool {
+	for _, source := range pubkeySources(v) {
+		if source.sourceEventAuthor {
+			return true
+		}
+	}
+	return false
 }
 
 func Handler(schema graphql.Schema) http.HandlerFunc {
