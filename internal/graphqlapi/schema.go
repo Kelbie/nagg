@@ -74,6 +74,7 @@ type eventRelationCache struct {
 
 	mu                 sync.Mutex
 	latestEventTags    map[string][]string
+	selectedReferences map[string]map[string][]chstore.EventView
 	rankedReferencedBy map[string]map[string][]chstore.EventView
 }
 
@@ -104,6 +105,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var pubkeySourceInputType *graphql.InputObject
 	var eventQueryInputType *graphql.InputObject
 	var referenceInputType *graphql.InputObject
+	var selectedReferenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
 	var referenceRankInputType *graphql.InputObject
@@ -146,6 +148,21 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 							return eventConnectionSource{}, nil
 						}
 						return r.eventReferences(p.Context, event, p.Args["input"])
+					},
+				},
+				"selectedReferences": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(selectedReferenceInputType)}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						node, ok := asEventNode(p.Source)
+						if ok && node.eventRelations != nil {
+							return node.eventRelations.loadSelectedReferences(p.Context, r, node.event, p.Args["input"])
+						}
+						event, hasEvent := eventFromSource(p.Source)
+						if !hasEvent {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventSelectedReferences(p.Context, event, p.Args["input"])
 					},
 				},
 				"referencedBy": &graphql.Field{
@@ -234,7 +251,13 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"value":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"values": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"marker": &graphql.InputObjectFieldConfig{Type: graphql.String},
-			"index":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"markers": &graphql.InputObjectFieldConfig{
+				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
+			},
+			"excludeMarkers": &graphql.InputObjectFieldConfig{
+				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
+			},
+			"index": &graphql.InputObjectFieldConfig{Type: graphql.Int},
 		},
 	})
 
@@ -275,6 +298,17 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		Fields: graphql.InputObjectConfigFieldMap{
 			"tags":  &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
 			"limit": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 20},
+		},
+	})
+	selectedReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "SelectedEventReferenceInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"selectors":        &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"fallback":         &graphql.InputObjectFieldConfig{Type: tagFilterType},
+			"fallbackPosition": &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "FIRST"},
+			"limit":            &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 20},
+			"maxDepth":         &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
+			"excludeSelf":      &graphql.InputObjectFieldConfig{Type: graphql.Boolean, DefaultValue: true},
 		},
 	})
 	reverseReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -541,11 +575,22 @@ func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[
 }
 
 type graphTagPredicate struct {
-	Key    string
-	Value  string
-	Values []string
-	Marker string
-	Index  int
+	Key            string
+	Value          string
+	Values         []string
+	Marker         string
+	Markers        []string
+	ExcludeMarkers []string
+	Index          int
+}
+
+type selectedReferenceInput struct {
+	Selectors        []graphTagPredicate
+	Fallback         *graphTagPredicate
+	FallbackPosition string
+	Limit            int
+	MaxDepth         int
+	ExcludeSelf      bool
 }
 
 type genericDimension struct {
@@ -596,6 +641,11 @@ func (r *resolver) eventReferences(ctx context.Context, event chstore.EventView,
 		return eventConnectionSource{}, err
 	}
 	return newEventConnection(r.store, events), nil
+}
+
+func (r *resolver) eventSelectedReferences(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	cache := newEventRelationCache(r.store, []chstore.EventView{event})
+	return cache.loadSelectedReferences(ctx, r, event, raw)
 }
 
 func (r *resolver) eventReferencedBy(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
@@ -813,6 +863,40 @@ func parseReferenceInput(raw any) referenceInput {
 	}
 	if input.Limit <= 0 || input.Limit > 100 {
 		input.Limit = 20
+	}
+	return input
+}
+
+func parseSelectedReferenceInput(raw any) selectedReferenceInput {
+	input := selectedReferenceInput{
+		Limit:            20,
+		FallbackPosition: "FIRST",
+		ExcludeSelf:      true,
+	}
+	if m, ok := raw.(map[string]any); ok {
+		input.Selectors = graphTagPredicates(m["selectors"])
+		if fallbackRaw, ok := m["fallback"].(map[string]any); ok {
+			fallback := graphTagPredicateFrom(fallbackRaw)
+			if fallback.Key != "" {
+				input.Fallback = &fallback
+			}
+		}
+		input.FallbackPosition = strings.ToUpper(stringValue(m["fallbackPosition"]))
+		input.Limit = intValue(m["limit"], 20)
+		input.MaxDepth = intValue(m["maxDepth"], 0)
+		input.ExcludeSelf = boolValue(m["excludeSelf"], true)
+	}
+	if input.FallbackPosition != "LAST" {
+		input.FallbackPosition = "FIRST"
+	}
+	if input.Limit <= 0 || input.Limit > 100 {
+		input.Limit = 20
+	}
+	if input.MaxDepth < 0 {
+		input.MaxDepth = 0
+	}
+	if input.MaxDepth > 8 {
+		input.MaxDepth = 8
 	}
 	return input
 }
@@ -1187,11 +1271,13 @@ func graphTagPredicates(v any) []graphTagPredicate {
 func graphTagPredicateFrom(v any) graphTagPredicate {
 	raw, _ := v.(map[string]any)
 	return graphTagPredicate{
-		Key:    stringValue(raw["key"]),
-		Value:  stringValue(raw["value"]),
-		Values: stringList(raw["values"]),
-		Marker: stringValue(raw["marker"]),
-		Index:  intValue(raw["index"], -1),
+		Key:            stringValue(raw["key"]),
+		Value:          stringValue(raw["value"]),
+		Values:         stringList(raw["values"]),
+		Marker:         stringValue(raw["marker"]),
+		Markers:        stringList(raw["markers"]),
+		ExcludeMarkers: stringList(raw["excludeMarkers"]),
+		Index:          intValue(raw["index"], -1),
 	}
 }
 
@@ -1270,6 +1356,28 @@ func sourceTagMatches(tag []string, predicate graphTagPredicate) bool {
 	}
 	if predicate.Marker != "" && (len(tag) < 4 || tag[3] != predicate.Marker) {
 		return false
+	}
+	if len(predicate.Markers) > 0 {
+		if len(tag) < 4 {
+			return false
+		}
+		found := false
+		for _, marker := range predicate.Markers {
+			if tag[3] == marker {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if len(predicate.ExcludeMarkers) > 0 && len(tag) >= 4 {
+		for _, marker := range predicate.ExcludeMarkers {
+			if tag[3] == marker {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -1760,6 +1868,13 @@ func intValue(v any, fallback int) int {
 	}
 }
 
+func boolValue(v any, fallback bool) bool {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return fallback
+}
+
 func eventEndCursor(events []chstore.EventView) any {
 	if len(events) == 0 {
 		return nil
@@ -1829,8 +1944,248 @@ func newEventRelationCache(store Store, events []chstore.EventView) *eventRelati
 		store:              store,
 		events:             append([]chstore.EventView(nil), events...),
 		latestEventTags:    map[string][]string{},
+		selectedReferences: map[string]map[string][]chstore.EventView{},
 		rankedReferencedBy: map[string]map[string][]chstore.EventView{},
 	}
+}
+
+func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	if c == nil {
+		return eventConnectionSource{}, nil
+	}
+	key := "selectedReferences:" + graphInputSignature(raw)
+
+	c.mu.Lock()
+	cached, ok := c.selectedReferences[key]
+	c.mu.Unlock()
+	if !ok {
+		value, err, _ := c.group.Do(key, func() (any, error) {
+			c.mu.Lock()
+			if existing, exists := c.selectedReferences[key]; exists {
+				c.mu.Unlock()
+				return existing, nil
+			}
+			c.mu.Unlock()
+
+			started := time.Now()
+			loaded, err := c.loadSelectedReferencesBatch(ctx, raw)
+			if err != nil {
+				return nil, err
+			}
+
+			c.mu.Lock()
+			c.selectedReferences[key] = loaded
+			c.mu.Unlock()
+
+			slog.Debug(
+				"graphql batched selected references loaded",
+				"parents", len(c.events),
+				"results", eventViewMapLen(loaded),
+				"duration_ms", time.Since(started).Milliseconds(),
+			)
+			return loaded, nil
+		})
+		if err != nil {
+			return eventConnectionSource{}, err
+		}
+		cached, _ = value.(map[string][]chstore.EventView)
+	}
+	return newEventConnection(c.store, cached[event.ID]), nil
+}
+
+func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, raw any) (map[string][]chstore.EventView, error) {
+	out := make(map[string][]chstore.EventView, len(c.events))
+	for _, event := range c.events {
+		out[event.ID] = nil
+	}
+
+	input := parseSelectedReferenceInput(raw)
+	selectedBySource := make(map[string][]string, len(c.events))
+	visitedBySource := make(map[string]map[string]struct{}, len(c.events))
+	for _, event := range c.events {
+		ids := selectReferenceIDs(event, input)
+		selectedBySource[event.ID] = ids
+		visited := map[string]struct{}{event.ID: {}}
+		for _, id := range ids {
+			visited[id] = struct{}{}
+		}
+		visitedBySource[event.ID] = visited
+	}
+
+	fetched := map[string]chstore.EventView{}
+	for depth := 0; ; depth++ {
+		fetchIDs := selectedReferenceFetchIDs(selectedBySource, fetched)
+		if len(fetchIDs) > 0 {
+			eventsByID, err := c.queryEventsByIDs(ctx, fetchIDs)
+			if err != nil {
+				return nil, err
+			}
+			for id, event := range eventsByID {
+				fetched[id] = event
+			}
+		}
+
+		if depth >= input.MaxDepth {
+			break
+		}
+
+		changed := false
+		for sourceID, ids := range selectedBySource {
+			visited := visitedBySource[sourceID]
+			nextIDs := make([]string, 0, len(ids))
+			seenNext := map[string]struct{}{}
+			for _, id := range ids {
+				event, ok := fetched[id]
+				if !ok {
+					nextIDs = appendUniqueReferenceID(nextIDs, seenNext, id, sourceID, false)
+					continue
+				}
+
+				candidates := selectReferenceIDs(event, input)
+				advanced := false
+				for _, candidateID := range candidates {
+					if _, seen := visited[candidateID]; seen {
+						continue
+					}
+					visited[candidateID] = struct{}{}
+					nextIDs = appendUniqueReferenceID(nextIDs, seenNext, candidateID, sourceID, false)
+					advanced = true
+				}
+				if !advanced {
+					nextIDs = appendUniqueReferenceID(nextIDs, seenNext, id, sourceID, false)
+				}
+				if len(nextIDs) >= input.Limit {
+					break
+				}
+			}
+			if !sameStrings(ids, nextIDs) {
+				changed = true
+				selectedBySource[sourceID] = nextIDs
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
+	for sourceID, ids := range selectedBySource {
+		ordered := make([]chstore.EventView, 0, len(ids))
+		seen := map[string]struct{}{}
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			event, ok := fetched[id]
+			if !ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ordered = append(ordered, event)
+		}
+		out[sourceID] = ordered
+	}
+	return out, nil
+}
+
+func (c *eventRelationCache) queryEventsByIDs(ctx context.Context, ids []string) (map[string]chstore.EventView, error) {
+	ids = uniqueStrings(ids)
+	out := make(map[string]chstore.EventView, len(ids))
+	for start := 0; start < len(ids); start += 500 {
+		end := start + 500
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[start:end]
+		events, err := c.store.QueryEvents(ctx, chstore.EventQueryInput{IDs: batch, Limit: uint64(len(batch))})
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			out[event.ID] = event
+		}
+	}
+	return out, nil
+}
+
+func selectedReferenceFetchIDs(selectedBySource map[string][]string, fetched map[string]chstore.EventView) []string {
+	ids := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, selected := range selectedBySource {
+		for _, id := range selected {
+			if _, ok := fetched[id]; ok {
+				continue
+			}
+			ids = appendUniqueReferenceID(ids, seen, id, "", false)
+		}
+	}
+	return ids
+}
+
+func selectReferenceIDs(event chstore.EventView, input selectedReferenceInput) []string {
+	for _, selector := range input.Selectors {
+		ids := matchingReferenceIDs(event, selector, input.Limit, input.ExcludeSelf, "FIRST")
+		if len(ids) > 0 {
+			return ids
+		}
+	}
+	if input.Fallback == nil {
+		return nil
+	}
+	return matchingReferenceIDs(event, *input.Fallback, input.Limit, input.ExcludeSelf, input.FallbackPosition)
+}
+
+func matchingReferenceIDs(event chstore.EventView, predicate graphTagPredicate, limit int, excludeSelf bool, position string) []string {
+	if limit <= 0 {
+		return nil
+	}
+	out := make([]string, 0, limit)
+	seen := map[string]struct{}{}
+	if strings.ToUpper(position) == "LAST" {
+		for i := len(event.Tags) - 1; i >= 0; i-- {
+			out = appendReferenceTagID(out, seen, event, event.Tags[i], predicate, limit, excludeSelf)
+			if len(out) >= limit {
+				break
+			}
+		}
+		return out
+	}
+	for _, tag := range event.Tags {
+		out = appendReferenceTagID(out, seen, event, tag, predicate, limit, excludeSelf)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func appendReferenceTagID(out []string, seen map[string]struct{}, event chstore.EventView, tag []string, predicate graphTagPredicate, limit int, excludeSelf bool) []string {
+	if len(out) >= limit || !sourceTagMatches(tag, predicate) || len(tag) < 2 || !hex64Pattern.MatchString(tag[1]) {
+		return out
+	}
+	return appendUniqueReferenceID(out, seen, tag[1], event.ID, excludeSelf)
+}
+
+func appendUniqueReferenceID(out []string, seen map[string]struct{}, id string, sourceID string, excludeSelf bool) []string {
+	if id == "" || (excludeSelf && id == sourceID) {
+		return out
+	}
+	if _, ok := seen[id]; ok {
+		return out
+	}
+	seen[id] = struct{}{}
+	return append(out, id)
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {

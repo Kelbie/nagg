@@ -2,6 +2,7 @@ package graphqlapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +11,10 @@ import (
 )
 
 const testPubkey = "50d94fc2d8580c682b071a542f8b1e31a200b0508bab95a33bef0855df281d63"
+
+func testHex(ch string) string {
+	return strings.Repeat(ch, 64)
+}
 
 type fakeStore struct {
 	events          [][]chstore.EventView
@@ -331,6 +336,220 @@ func TestEventReferencesResolveByGenericTagPredicate(t *testing.T) {
 	refs := nodes[0].(map[string]any)["references"].(map[string]any)["nodes"].([]any)
 	if len(refs) != 1 || refs[0].(map[string]any)["id"] != quoteID {
 		t.Fatalf("refs = %+v", refs)
+	}
+}
+
+func TestEventSelectedReferencesPrefersMarkedRootAndBatches(t *testing.T) {
+	rootID := testHex("a")
+	parentID := testHex("b")
+	replyID := testHex("c")
+	secondReplyID := testHex("d")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{
+				{
+					ID:        replyID,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_002, 0),
+					Content:   "reply",
+					Tags:      [][]string{{"e", parentID, "", "reply"}, {"e", rootID, "", "root"}},
+					Sig:       strings.Repeat("e", 128),
+				},
+				{
+					ID:        secondReplyID,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_001, 0),
+					Content:   "reply two",
+					Tags:      [][]string{{"e", rootID, "", "root"}},
+					Sig:       strings.Repeat("f", 128),
+				},
+			},
+			{{
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("a", 128),
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:2}) {
+				nodes {
+					id
+					selectedReferences(input:{
+						selectors:[{key:"e", marker:"root"}]
+						fallback:{key:"e", excludeMarkers:["mention"]}
+						maxDepth:8
+						limit:1
+					}) {
+						nodes { id content }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	for _, node := range nodes {
+		refs := node.(map[string]any)["selectedReferences"].(map[string]any)["nodes"].([]any)
+		if len(refs) != 1 || refs[0].(map[string]any)["id"] != rootID {
+			t.Fatalf("refs = %+v", refs)
+		}
+	}
+	if len(store.eventInputs) != 2 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	if got := store.eventInputs[1].IDs; len(got) != 1 || got[0] != rootID {
+		t.Fatalf("selected reference fetch ids = %+v", got)
+	}
+}
+
+func TestEventSelectedReferencesWalksFallbackChain(t *testing.T) {
+	rootID := testHex("a")
+	parentID := testHex("b")
+	replyID := testHex("c")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{{
+				ID:        replyID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "reply",
+				Tags:      [][]string{{"e", parentID, "", "reply"}},
+				Sig:       strings.Repeat("e", 128),
+			}},
+			{{
+				ID:        parentID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "parent",
+				Tags:      [][]string{{"e", rootID, "", "root"}},
+				Sig:       strings.Repeat("f", 128),
+			}},
+			{{
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("a", 128),
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + replyID + `"], limit:1}) {
+				nodes {
+					id
+					selectedReferences(input:{
+						selectors:[{key:"e", marker:"root"}]
+						fallback:{key:"e", excludeMarkers:["mention"]}
+						maxDepth:8
+						limit:1
+					}) {
+						nodes { id content }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	refs := nodes[0].(map[string]any)["selectedReferences"].(map[string]any)["nodes"].([]any)
+	if len(refs) != 1 || refs[0].(map[string]any)["id"] != rootID {
+		t.Fatalf("refs = %+v", refs)
+	}
+	if len(store.eventInputs) != 3 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+}
+
+func TestEventSelectedReferencesIgnoresMentionFallback(t *testing.T) {
+	mentionID := testHex("a")
+	eventID := testHex("b")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{{
+				ID:        eventID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "root with mention",
+				Tags:      [][]string{{"e", mentionID, "", "mention"}},
+				Sig:       strings.Repeat("e", 128),
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + eventID + `"], limit:1}) {
+				nodes {
+					id
+					selectedReferences(input:{
+						selectors:[{key:"e", marker:"root"}]
+						fallback:{key:"e", excludeMarkers:["mention"]}
+						maxDepth:8
+						limit:1
+					}) {
+						nodes { id }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	refs := nodes[0].(map[string]any)["selectedReferences"].(map[string]any)["nodes"].([]any)
+	if len(refs) != 0 {
+		t.Fatalf("refs = %+v", refs)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
 	}
 }
 
