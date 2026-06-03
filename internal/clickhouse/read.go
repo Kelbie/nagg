@@ -895,6 +895,82 @@ func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]Ag
 	return out, rows.Err()
 }
 
+func (s *Store) AggregateEventReferencesToTargets(ctx context.Context, references AggregateInput, target EventQueryInput) ([]AggregateRow, error) {
+	if references.Empty || target.Empty {
+		return []AggregateRow{}, nil
+	}
+	if references.Limit == 0 || references.Limit > 1000 {
+		references.Limit = 100
+	}
+	if len(references.Metrics) == 0 {
+		references.Metrics = []string{"COUNT"}
+	}
+	if dataset := strings.ToUpper(references.Dataset); dataset != "" && dataset != "TAGS" {
+		return nil, fmt.Errorf("target-aware reference aggregation requires TAGS dataset")
+	}
+	references.Dataset = "TAGS"
+
+	spec, args, err := aggregateSpec(references)
+	if err != nil {
+		return nil, err
+	}
+	spec.from = "event_tags t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id INNER JOIN nostr_events AS target FINAL ON target.id = t.tag_value"
+
+	targetWhere, targetArgs := eventWhere("target", target.IDs, target.PubKeys, target.Kinds, target.Tags)
+	spec.where += " AND " + whereBody(targetWhere)
+	args = append(args, targetArgs...)
+	if target.Since > 0 {
+		spec.where += " AND target.created_at >= ?"
+		args = append(args, time.Unix(target.Since, 0).UTC())
+	}
+	if target.Until > 0 {
+		spec.where += " AND target.created_at < ?"
+		args = append(args, time.Unix(target.Until, 0).UTC())
+	}
+
+	query := fmt.Sprintf("SELECT %s, %s FROM %s %s GROUP BY %s ORDER BY %s DESC LIMIT %d",
+		strings.Join(spec.selectDims, ", "),
+		strings.Join(spec.selectMetrics, ", "),
+		spec.from,
+		spec.where,
+		strings.Join(spec.groupDims, ", "),
+		spec.orderMetric,
+		references.Limit,
+	)
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AggregateRow
+	for rows.Next() {
+		values := make([]any, 0, len(spec.scanDims)+len(spec.scanMetrics))
+		dimValues := make([]string, len(spec.scanDims))
+		metricValues := make([]uint64, len(spec.scanMetrics))
+		for i := range dimValues {
+			values = append(values, &dimValues[i])
+		}
+		for i := range metricValues {
+			values = append(values, &metricValues[i])
+		}
+		if err := rows.Scan(values...); err != nil {
+			return nil, err
+		}
+
+		row := AggregateRow{Dimensions: map[string]string{}, Metrics: map[string]uint64{}}
+		for i, key := range spec.scanDims {
+			row.Dimensions[key] = dimValues[i]
+		}
+		for i, key := range spec.scanMetrics {
+			row.Metrics[key] = metricValues[i]
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
 type aggSpec struct {
 	selectDims    []string
 	groupDims     []string
@@ -1144,6 +1220,10 @@ func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilt
 		clauses = append(clauses, clause+")")
 	}
 	return strings.Join(clauses, " AND "), args
+}
+
+func whereBody(where string) string {
+	return strings.TrimPrefix(where, "WHERE ")
 }
 
 func tagWhere(ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {

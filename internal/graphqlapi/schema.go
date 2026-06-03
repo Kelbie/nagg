@@ -25,6 +25,7 @@ type Store interface {
 	QueryEventsByTagTargets(context.Context, chstore.EventQueryInput, chstore.TagFilter, []string, uint64) (map[string][]chstore.EventView, error)
 	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
+	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
@@ -801,7 +802,7 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	rows, err := r.store.AggregateEvents(ctx, input.References)
+	rows, err := r.rankedEventRows(ctx, input)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
@@ -833,6 +834,23 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 		}
 	}
 	return newEventConnection(r.store, ordered), nil
+}
+
+func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput) ([]chstore.AggregateRow, error) {
+	if rankedTargetHasFilters(input.Target) {
+		return r.store.AggregateEventReferencesToTargets(ctx, input.References, input.Target)
+	}
+	return r.store.AggregateEvents(ctx, input.References)
+}
+
+func rankedTargetHasFilters(input chstore.EventQueryInput) bool {
+	return len(input.IDs) > 0 ||
+		len(input.PubKeys) > 0 ||
+		len(input.Kinds) > 0 ||
+		len(input.Tags) > 0 ||
+		input.Since > 0 ||
+		input.Until > 0 ||
+		input.Empty
 }
 
 type referenceInput struct {

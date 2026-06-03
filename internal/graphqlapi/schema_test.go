@@ -29,6 +29,7 @@ type fakeStore struct {
 	referenceInputs             []referencingEventsInput
 	referenceAggregateInputs    []chstore.ReferenceAggregateInput
 	latestInputs                []latestEventsInput
+	rankedTargetAggregateInputs []rankedTargetAggregateInput
 	aggregateInputs             []chstore.AggregateInput
 }
 
@@ -43,6 +44,11 @@ type referencingEventsInput struct {
 	tag            chstore.TagFilter
 	targets        []string
 	limitPerTarget uint64
+}
+
+type rankedTargetAggregateInput struct {
+	references chstore.AggregateInput
+	target     chstore.EventQueryInput
 }
 
 func (s *fakeStore) EventByID(_ context.Context, id string) (*chstore.EventView, error) {
@@ -130,6 +136,27 @@ func (s *fakeStore) QueryLatestEventsByPubKeys(_ context.Context, pubkeys []stri
 func (s *fakeStore) AggregateEvents(_ context.Context, input chstore.AggregateInput) ([]chstore.AggregateRow, error) {
 	s.aggregateInputs = append(s.aggregateInputs, input)
 	if input.Empty {
+		s.aggregateCalls++
+		return []chstore.AggregateRow{}, nil
+	}
+	if len(s.aggregateRows) == 0 {
+		s.aggregateCalls++
+		return nil, nil
+	}
+	idx := s.aggregateCalls
+	if idx >= len(s.aggregateRows) {
+		idx = len(s.aggregateRows) - 1
+	}
+	s.aggregateCalls++
+	return s.aggregateRows[idx], nil
+}
+
+func (s *fakeStore) AggregateEventReferencesToTargets(_ context.Context, references chstore.AggregateInput, target chstore.EventQueryInput) ([]chstore.AggregateRow, error) {
+	s.rankedTargetAggregateInputs = append(s.rankedTargetAggregateInputs, rankedTargetAggregateInput{
+		references: references,
+		target:     target,
+	})
+	if references.Empty || target.Empty {
 		s.aggregateCalls++
 		return []chstore.AggregateRow{}, nil
 	}
@@ -952,15 +979,22 @@ func TestRankedEventsUsesRecentReferencesAndPreservesRank(t *testing.T) {
 	if len(result.Errors) > 0 {
 		t.Fatalf("graphql errors = %+v", result.Errors)
 	}
-	if len(store.aggregateInputs) != 1 {
-		t.Fatalf("aggregate inputs len = %d", len(store.aggregateInputs))
+	if len(store.aggregateInputs) != 0 {
+		t.Fatalf("unexpected global aggregate inputs = %+v", store.aggregateInputs)
 	}
-	aggregateInput := store.aggregateInputs[0]
+	if len(store.rankedTargetAggregateInputs) != 1 {
+		t.Fatalf("ranked target aggregate inputs len = %d", len(store.rankedTargetAggregateInputs))
+	}
+	aggregateInput := store.rankedTargetAggregateInputs[0].references
 	if aggregateInput.Dataset != "TAGS" || aggregateInput.Since != 1_710_000_000 {
 		t.Fatalf("aggregate input = %+v", aggregateInput)
 	}
 	if len(aggregateInput.Tags) != 1 || aggregateInput.Tags[0].Key != "e" {
 		t.Fatalf("aggregate tags = %+v", aggregateInput.Tags)
+	}
+	targetInput := store.rankedTargetAggregateInputs[0].target
+	if len(targetInput.Kinds) != 1 || targetInput.Kinds[0] != 1 {
+		t.Fatalf("target input = %+v", targetInput)
 	}
 	if len(store.eventInputs) != 1 {
 		t.Fatalf("event inputs len = %d", len(store.eventInputs))
@@ -971,6 +1005,105 @@ func TestRankedEventsUsesRecentReferencesAndPreservesRank(t *testing.T) {
 	data := result.Data.(map[string]any)
 	nodes := data["rankedEvents"].(map[string]any)["nodes"].([]any)
 	if len(nodes) != 2 || nodes[0].(map[string]any)["id"] != topID || nodes[1].(map[string]any)["id"] != secondID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+}
+
+func TestRankedEventsAggregatesInsideDerivedTargetFilters(t *testing.T) {
+	topID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	followedAuthor := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := &fakeStore{
+		latestEvents: map[string][]chstore.EventView{
+			testPubkey: {{
+				ID:        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				PubKey:    testPubkey,
+				Kind:      3,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Tags:      [][]string{{"p", followedAuthor}},
+			}},
+		},
+		aggregateRows: [][]chstore.AggregateRow{{
+			{
+				Dimensions: map[string]string{"tag_value": topID},
+				Metrics:    map[string]uint64{"unique_pubkeys": 3},
+			},
+		}},
+		events: [][]chstore.EventView{{
+			{
+				ID:        topID,
+				PubKey:    followedAuthor,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "popular followed post",
+				Tags:      [][]string{},
+				Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			rankedEvents(input:{
+				references:{kinds:[7], since:1710000000}
+				via:{key:"e"}
+				target:{
+					kinds:[1]
+					pubkeysFrom:[{
+						latestEventTags:{
+							pubkey:"` + testPubkey + `"
+							kinds:[3]
+							tag:{key:"p"}
+							limit:1
+							maxValues:10
+						}
+					}]
+				}
+				metric:{name:"likers", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+				limit:1
+			}) {
+				nodes { id pubkey content }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.aggregateInputs) != 0 {
+		t.Fatalf("unexpected global aggregate inputs = %+v", store.aggregateInputs)
+	}
+	if len(store.rankedTargetAggregateInputs) != 1 {
+		t.Fatalf("ranked target aggregate inputs len = %d", len(store.rankedTargetAggregateInputs))
+	}
+	aggregateInput := store.rankedTargetAggregateInputs[0]
+	if len(aggregateInput.references.Tags) != 1 || aggregateInput.references.Tags[0].Key != "e" {
+		t.Fatalf("reference tags = %+v", aggregateInput.references.Tags)
+	}
+	if len(aggregateInput.target.PubKeys) != 1 || aggregateInput.target.PubKeys[0] != followedAuthor {
+		t.Fatalf("target pubkeys = %+v", aggregateInput.target.PubKeys)
+	}
+	if len(aggregateInput.target.Kinds) != 1 || aggregateInput.target.Kinds[0] != 1 {
+		t.Fatalf("target kinds = %+v", aggregateInput.target.Kinds)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs len = %d", len(store.eventInputs))
+	}
+	eventInput := store.eventInputs[0]
+	if len(eventInput.IDs) != 1 || eventInput.IDs[0] != topID {
+		t.Fatalf("event ids = %+v", eventInput.IDs)
+	}
+	if len(eventInput.PubKeys) != 1 || eventInput.PubKeys[0] != followedAuthor {
+		t.Fatalf("event pubkeys = %+v", eventInput.PubKeys)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["rankedEvents"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != topID {
 		t.Fatalf("nodes = %+v", nodes)
 	}
 }
