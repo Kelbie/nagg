@@ -34,6 +34,8 @@ var graphiqlTemplate = template.Must(template.New("graphiql").Parse(`<!doctype h
     {
       "imports": {
         "react": "https://esm.sh/react@` + reactVersion + `",
+        "react/jsx-runtime": "https://esm.sh/react@` + reactVersion + `/jsx-runtime",
+        "react/jsx-dev-runtime": "https://esm.sh/react@` + reactVersion + `/jsx-dev-runtime",
         "react-dom": "https://esm.sh/react-dom@` + reactVersion + `",
         "react-dom/client": "https://esm.sh/react-dom@` + reactVersion + `/client",
         "graphql": "https://esm.sh/graphql@` + graphiqlGraphQLVersion + `",

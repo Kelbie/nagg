@@ -30,6 +30,7 @@ func TestGraphiQLHandlerServesExplorerPage(t *testing.T) {
 		"GraphiQL",
 		"@graphiql/plugin-explorer@5.1.2",
 		"explorerPlugin()",
+		`"react/jsx-runtime": "https://esm.sh/react@19.2.7/jsx-runtime"`,
 		`const graphqlEndpoint = "/graphql";`,
 		"query RecentNotes",
 	} {
