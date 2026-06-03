@@ -785,6 +785,118 @@ func TestEventAggregateReferencedByBatchesAcrossSiblingEvents(t *testing.T) {
 	}
 }
 
+func TestSelectedReferencesShareNestedRelationBatches(t *testing.T) {
+	replyID1 := testHex("a")
+	replyID2 := testHex("b")
+	rootID1 := testHex("c")
+	rootID2 := testHex("d")
+	reactionID1 := testHex("e")
+	reactionID2 := testHex("f")
+	reactionPubkey := testHex("1")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{
+				{
+					ID:        replyID1,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_002, 0),
+					Content:   "reply one",
+					Tags:      [][]string{{"e", rootID1}},
+					Sig:       strings.Repeat("a", 128),
+				},
+				{
+					ID:        replyID2,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_001, 0),
+					Content:   "reply two",
+					Tags:      [][]string{{"e", rootID2}},
+					Sig:       strings.Repeat("b", 128),
+				},
+			},
+			{
+				{
+					ID:        rootID1,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_000, 0),
+					Content:   "root one",
+					Tags:      [][]string{},
+					Sig:       strings.Repeat("c", 128),
+				},
+				{
+					ID:        rootID2,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_000, 0),
+					Content:   "root two",
+					Tags:      [][]string{},
+					Sig:       strings.Repeat("d", 128),
+				},
+			},
+			{
+				{
+					ID:        reactionID1,
+					PubKey:    reactionPubkey,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_003, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", rootID1}},
+					Sig:       strings.Repeat("e", 128),
+				},
+				{
+					ID:        reactionID2,
+					PubKey:    reactionPubkey,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_004, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", rootID2}},
+					Sig:       strings.Repeat("f", 128),
+				},
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{ids:["` + replyID1 + `","` + replyID2 + `"], limit:2}) {
+				nodes {
+					id
+					selectedReferences(input:{fallback:{key:"e"}, limit:1}) {
+						nodes {
+							id
+							aggregateReferencedBy(input:{
+								via:{key:"e"}
+								events:{kinds:[7], limit:20}
+								metrics:[{name:"pubkeys", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]
+							}) {
+								rows { metrics }
+							}
+						}
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.referenceInputs) != 1 {
+		t.Fatalf("reference inputs = %+v", store.referenceInputs)
+	}
+	if got := store.referenceInputs[0].targets; len(got) != 2 || got[0] != rootID1 || got[1] != rootID2 {
+		t.Fatalf("targets = %+v", got)
+	}
+}
+
 func TestEventAggregateReferencedByUsesAggregateStoreFastPath(t *testing.T) {
 	sourceID1 := testHex("a")
 	sourceID2 := testHex("b")

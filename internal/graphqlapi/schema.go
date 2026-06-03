@@ -77,11 +77,18 @@ type eventRelationCache struct {
 
 	group singleflight.Group
 
-	mu                 sync.Mutex
-	latestEventTags    map[string][]string
-	aggregateByTarget  map[string]map[string][]chstore.AggregateRow
-	selectedReferences map[string]map[string][]chstore.EventView
-	rankedReferencedBy map[string]map[string][]chstore.EventView
+	mu                  sync.Mutex
+	latestEventTags     map[string][]string
+	aggregateByTarget   map[string]map[string][]chstore.AggregateRow
+	selectedReferences  map[string]map[string][]chstore.EventView
+	rankedReferencedBy  map[string]map[string][]chstore.EventView
+	selectedConnections map[string]eventConnectionCaches
+	rankedConnections   map[string]eventConnectionCaches
+}
+
+type eventConnectionCaches struct {
+	relations      *pubkeyRelationCache
+	eventRelations *eventRelationCache
 }
 
 type pubkeyRelationKey struct {
@@ -2023,7 +2030,37 @@ func asEventNode(source any) (eventNode, bool) {
 func newEventConnection(store Store, events []chstore.EventView) eventConnectionSource {
 	relations := newPubkeyRelationCache(store, events)
 	eventRelations := newEventRelationCache(store, events)
+	return newEventConnectionWithCaches(events, relations, eventRelations)
+}
+
+func newEventConnectionWithCaches(events []chstore.EventView, relations *pubkeyRelationCache, eventRelations *eventRelationCache) eventConnectionSource {
 	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations, eventRelations)}
+}
+
+func newEventConnectionCaches(store Store, grouped map[string][]chstore.EventView) eventConnectionCaches {
+	events := uniqueGroupedEvents(grouped)
+	return eventConnectionCaches{
+		relations:      newPubkeyRelationCache(store, events),
+		eventRelations: newEventRelationCache(store, events),
+	}
+}
+
+func uniqueGroupedEvents(grouped map[string][]chstore.EventView) []chstore.EventView {
+	events := make([]chstore.EventView, 0)
+	seen := map[string]struct{}{}
+	for _, group := range grouped {
+		for _, event := range group {
+			if event.ID == "" {
+				continue
+			}
+			if _, ok := seen[event.ID]; ok {
+				continue
+			}
+			seen[event.ID] = struct{}{}
+			events = append(events, event)
+		}
+	}
+	return events
 }
 
 func wrapEvent(event chstore.EventView, relations *pubkeyRelationCache, eventRelations *eventRelationCache) eventNode {
@@ -2040,12 +2077,14 @@ func wrapEvents(events []chstore.EventView, relations *pubkeyRelationCache, even
 
 func newEventRelationCache(store Store, events []chstore.EventView) *eventRelationCache {
 	return &eventRelationCache{
-		store:              store,
-		events:             append([]chstore.EventView(nil), events...),
-		latestEventTags:    map[string][]string{},
-		aggregateByTarget:  map[string]map[string][]chstore.AggregateRow{},
-		selectedReferences: map[string]map[string][]chstore.EventView{},
-		rankedReferencedBy: map[string]map[string][]chstore.EventView{},
+		store:               store,
+		events:              append([]chstore.EventView(nil), events...),
+		latestEventTags:     map[string][]string{},
+		aggregateByTarget:   map[string]map[string][]chstore.AggregateRow{},
+		selectedReferences:  map[string]map[string][]chstore.EventView{},
+		rankedReferencedBy:  map[string]map[string][]chstore.EventView{},
+		selectedConnections: map[string]eventConnectionCaches{},
+		rankedConnections:   map[string]eventConnectionCaches{},
 	}
 }
 
@@ -2181,11 +2220,13 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 
 	c.mu.Lock()
 	cached, ok := c.selectedReferences[key]
+	connectionCaches := c.selectedConnections[key]
 	c.mu.Unlock()
 	if !ok {
 		value, err, _ := c.group.Do(key, func() (any, error) {
 			c.mu.Lock()
 			if existing, exists := c.selectedReferences[key]; exists {
+				connectionCaches = c.selectedConnections[key]
 				c.mu.Unlock()
 				return existing, nil
 			}
@@ -2199,6 +2240,7 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 
 			c.mu.Lock()
 			c.selectedReferences[key] = loaded
+			c.selectedConnections[key] = newEventConnectionCaches(c.store, loaded)
 			c.mu.Unlock()
 
 			slog.Debug(
@@ -2213,8 +2255,17 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 			return eventConnectionSource{}, err
 		}
 		cached, _ = value.(map[string][]chstore.EventView)
+		c.mu.Lock()
+		connectionCaches = c.selectedConnections[key]
+		c.mu.Unlock()
 	}
-	return newEventConnection(c.store, cached[event.ID]), nil
+	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
+		connectionCaches = newEventConnectionCaches(c.store, cached)
+		c.mu.Lock()
+		c.selectedConnections[key] = connectionCaches
+		c.mu.Unlock()
+	}
+	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
 }
 
 func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, raw any) (map[string][]chstore.EventView, error) {
@@ -2420,11 +2471,13 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 
 	c.mu.Lock()
 	cached, ok := c.rankedReferencedBy[key]
+	connectionCaches := c.rankedConnections[key]
 	c.mu.Unlock()
 	if !ok {
 		value, err, _ := c.group.Do(key, func() (any, error) {
 			c.mu.Lock()
 			if existing, exists := c.rankedReferencedBy[key]; exists {
+				connectionCaches = c.rankedConnections[key]
 				c.mu.Unlock()
 				return existing, nil
 			}
@@ -2438,6 +2491,7 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 
 			c.mu.Lock()
 			c.rankedReferencedBy[key] = loaded
+			c.rankedConnections[key] = newEventConnectionCaches(c.store, loaded)
 			c.mu.Unlock()
 
 			slog.Debug(
@@ -2452,8 +2506,17 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 			return eventConnectionSource{}, err
 		}
 		cached, _ = value.(map[string][]chstore.EventView)
+		c.mu.Lock()
+		connectionCaches = c.rankedConnections[key]
+		c.mu.Unlock()
 	}
-	return newEventConnection(c.store, cached[event.ID]), nil
+	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
+		connectionCaches = newEventConnectionCaches(c.store, cached)
+		c.mu.Lock()
+		c.rankedConnections[key] = connectionCaches
+		c.mu.Unlock()
+	}
+	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
 }
 
 func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, raw any) (map[string][]chstore.EventView, error) {
