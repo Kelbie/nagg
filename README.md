@@ -66,7 +66,7 @@ NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
 go run ./cmd/api
 ```
 
-The API listens on `:8080` by default and serves `POST /graphql`, `GET /healthz`, and the app-view REST routes under `/nostr/*`. Set `NAGG_API_ADDR=:9090` to change the bind address. If `NAGG_API_ADDR` is unset and Railway provides `PORT`, the API listens on that port.
+The API listens on `:8080` by default and serves `POST /graphql`, `GET /graphiql`, `GET /healthz`, and the app-view REST routes under `/nostr/*`. Set `NAGG_API_ADDR=:9090` to change the bind address. If `NAGG_API_ADDR` is unset and Railway provides `PORT`, the API listens on that port.
 
 The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local Nagg profile data when available; it only calls Vertex for profiles with at least `NAGG_VERTEX_PROFILE_MIN_FOLLOWERS` local followers, default `500`, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails.
 
@@ -82,6 +82,7 @@ App-view smoke checks:
 
 ```sh
 curl http://127.0.0.1:8080/healthz
+open http://127.0.0.1:8080/graphiql
 curl 'http://127.0.0.1:8080/nostr/feed?kind=trending&limit=20'
 curl -X POST http://127.0.0.1:8080/nostr/notes/stats \
   -H 'content-type: application/json' \
