@@ -626,6 +626,120 @@ func TestEventAggregateReferencedByCountsDistinctGenericSources(t *testing.T) {
 	}
 }
 
+func TestEventAggregateReferencedByBatchesAcrossSiblingEvents(t *testing.T) {
+	sourceID1 := testHex("a")
+	sourceID2 := testHex("b")
+	reactionID1 := testHex("c")
+	reactionID2 := testHex("d")
+	reactionID3 := testHex("e")
+	reactionPubkey1 := testHex("1")
+	reactionPubkey2 := testHex("2")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{
+				{
+					ID:        sourceID1,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_000, 0),
+					Content:   "source one",
+					Tags:      [][]string{},
+					Sig:       strings.Repeat("a", 128),
+				},
+				{
+					ID:        sourceID2,
+					PubKey:    testPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_001, 0),
+					Content:   "source two",
+					Tags:      [][]string{},
+					Sig:       strings.Repeat("b", 128),
+				},
+			},
+			{
+				{
+					ID:        reactionID1,
+					PubKey:    reactionPubkey1,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_002, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", sourceID1}},
+					Sig:       strings.Repeat("c", 128),
+				},
+				{
+					ID:        reactionID2,
+					PubKey:    reactionPubkey1,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_003, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", sourceID1}},
+					Sig:       strings.Repeat("d", 128),
+				},
+				{
+					ID:        reactionID3,
+					PubKey:    reactionPubkey2,
+					Kind:      7,
+					CreatedAt: time.Unix(1_710_000_004, 0),
+					Content:   "+",
+					Tags:      [][]string{{"e", sourceID2}},
+					Sig:       strings.Repeat("e", 128),
+				},
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:2}) {
+				nodes {
+					id
+					aggregateReferencedBy(input:{
+						via:{key:"e"}
+						events:{kinds:[7], limit:20}
+						metrics:[{name:"pubkeys", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}]
+					}) {
+						rows { metrics }
+					}
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	gotByID := map[string]uint64{}
+	for _, rawNode := range nodes {
+		node := rawNode.(map[string]any)
+		rows := node["aggregateReferencedBy"].(map[string]any)["rows"].([]any)
+		if len(rows) != 1 {
+			t.Fatalf("rows for %s = %+v", node["id"], rows)
+		}
+		metrics := rows[0].(map[string]any)["metrics"].(map[string]uint64)
+		gotByID[node["id"].(string)] = metrics["pubkeys"]
+	}
+	if gotByID[sourceID1] != 1 || gotByID[sourceID2] != 1 {
+		t.Fatalf("metrics = %+v", gotByID)
+	}
+	if len(store.referenceInputs) != 1 {
+		t.Fatalf("reference inputs = %+v", store.referenceInputs)
+	}
+	if got := store.referenceInputs[0].targets; len(got) != 2 || got[0] != sourceID1 || got[1] != sourceID2 {
+		t.Fatalf("targets = %+v", got)
+	}
+}
+
 func TestAggregateEventsAcceptsTimeBounds(t *testing.T) {
 	store := &fakeStore{
 		aggregateRows: [][]chstore.AggregateRow{{

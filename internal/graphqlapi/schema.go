@@ -74,6 +74,7 @@ type eventRelationCache struct {
 
 	mu                 sync.Mutex
 	latestEventTags    map[string][]string
+	aggregateByTarget  map[string]map[string][]chstore.AggregateRow
 	selectedReferences map[string]map[string][]chstore.EventView
 	rankedReferencedBy map[string]map[string][]chstore.EventView
 }
@@ -195,6 +196,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					Type: graphql.NewNonNull(aggregationResultType),
 					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(aggregateReferencedByInputType)}},
 					Resolve: func(p graphql.ResolveParams) (any, error) {
+						node, ok := asEventNode(p.Source)
+						if ok && node.eventRelations != nil {
+							return node.eventRelations.loadAggregateReferencedBy(p.Context, r, node.event, p.Args["input"])
+						}
 						event, ok := eventFromSource(p.Source)
 						if !ok {
 							return map[string]any{"rows": []chstore.AggregateRow{}}, nil
@@ -724,6 +729,10 @@ func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore
 	if err != nil {
 		return nil, err
 	}
+	return map[string]any{"rows": aggregateReferencedRows(events, dimensions, metrics, first, orderBy)}, nil
+}
+
+func aggregateReferencedRows(events []chstore.EventView, dimensions []genericDimension, metrics []genericMetric, first int, orderBy string) []chstore.AggregateRow {
 	if len(metrics) == 0 {
 		metrics = []genericMetric{{Name: "count", Op: "COUNT"}}
 	}
@@ -780,7 +789,7 @@ func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore
 	if len(rows) > first {
 		rows = rows[:first]
 	}
-	return map[string]any{"rows": rows}, nil
+	return rows
 }
 
 func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSource, error) {
@@ -850,6 +859,16 @@ type rankedReverseReferenceBatchInput struct {
 	RankVia        graphTagPredicate
 	Limit          int
 	Offset         int
+}
+
+type aggregateReferencedByBatchInput struct {
+	Events     chstore.EventQueryInput
+	Via        graphTagPredicate
+	Target     string
+	Dimensions []genericDimension
+	Metrics    []genericMetric
+	First      int
+	OrderBy    string
 }
 
 func parseReferenceInput(raw any) referenceInput {
@@ -1058,6 +1077,33 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 	if out.Offset < 0 {
 		out.Offset = 0
 	}
+	return out, nil
+}
+
+func (c *eventRelationCache) aggregateReferencedByBatchQuery(ctx context.Context, raw any) (aggregateReferencedByBatchInput, error) {
+	m, _ := raw.(map[string]any)
+	var out aggregateReferencedByBatchInput
+	if eventsRaw, ok := m["events"].(map[string]any); ok {
+		events, err := c.parseEventQueryInput(ctx, eventsRaw)
+		if err != nil {
+			return out, err
+		}
+		out.Events = events
+	}
+	via := graphTagPredicateFrom(m["via"])
+	if via.Key == "" {
+		via.Key = "e"
+	}
+	out.Via = via
+	out.Target = stringValue(m["target"])
+	out.Events.Limit = uint64(intValue(m["limit"], int(out.Events.Limit)))
+	if out.Events.Limit == 0 || out.Events.Limit > 500 {
+		out.Events.Limit = 50
+	}
+	out.Dimensions = genericDimensions(m["groupBy"])
+	out.Metrics = genericMetrics(m["metrics"])
+	out.First = intValue(m["first"], 100)
+	out.OrderBy = stringValue(m["orderBy"])
 	return out, nil
 }
 
@@ -1944,9 +1990,102 @@ func newEventRelationCache(store Store, events []chstore.EventView) *eventRelati
 		store:              store,
 		events:             append([]chstore.EventView(nil), events...),
 		latestEventTags:    map[string][]string{},
+		aggregateByTarget:  map[string]map[string][]chstore.AggregateRow{},
 		selectedReferences: map[string]map[string][]chstore.EventView{},
 		rankedReferencedBy: map[string]map[string][]chstore.EventView{},
 	}
+}
+
+func (c *eventRelationCache) loadAggregateReferencedBy(ctx context.Context, r *resolver, event chstore.EventView, raw any) (map[string]any, error) {
+	if c == nil {
+		return r.eventAggregateReferencedBy(ctx, event, raw)
+	}
+	key := "aggregateReferencedBy:" + graphInputSignature(raw)
+
+	c.mu.Lock()
+	cached, ok := c.aggregateByTarget[key]
+	c.mu.Unlock()
+	if !ok {
+		value, err, _ := c.group.Do(key, func() (any, error) {
+			c.mu.Lock()
+			if existing, exists := c.aggregateByTarget[key]; exists {
+				c.mu.Unlock()
+				return existing, nil
+			}
+			c.mu.Unlock()
+
+			started := time.Now()
+			loaded, err := c.loadAggregateReferencedByBatch(ctx, raw)
+			if err != nil {
+				return nil, err
+			}
+
+			c.mu.Lock()
+			c.aggregateByTarget[key] = loaded
+			c.mu.Unlock()
+
+			slog.Debug(
+				"graphql batched aggregate referenced-by loaded",
+				"parents", len(c.events),
+				"results", aggregateRowMapLen(loaded),
+				"duration_ms", time.Since(started).Milliseconds(),
+			)
+			return loaded, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		cached, _ = value.(map[string][]chstore.AggregateRow)
+	}
+	return map[string]any{"rows": cached[event.ID]}, nil
+}
+
+func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context, raw any) (map[string][]chstore.AggregateRow, error) {
+	out := make(map[string][]chstore.AggregateRow, len(c.events))
+	input, err := c.aggregateReferencedByBatchQuery(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+
+	targetToParentIDs := make(map[string][]string, len(c.events))
+	targets := make([]string, 0, len(c.events))
+	seenTargets := map[string]struct{}{}
+	for _, event := range c.events {
+		target := targetValue(event, input.Target)
+		if input.Via.Value != "" {
+			target = input.Via.Value
+		}
+		if target == "" {
+			out[event.ID] = aggregateReferencedRows(nil, input.Dimensions, input.Metrics, input.First, input.OrderBy)
+			continue
+		}
+		targetToParentIDs[target] = append(targetToParentIDs[target], event.ID)
+		if _, ok := seenTargets[target]; ok {
+			continue
+		}
+		seenTargets[target] = struct{}{}
+		targets = append(targets, target)
+	}
+	if len(targets) > 0 {
+		sort.Strings(targets)
+		eventsByTarget, err := c.store.QueryEventsByTagTargets(ctx, input.Events, chstore.TagFilter{Key: input.Via.Key}, targets, input.Events.Limit)
+		if err != nil {
+			return nil, err
+		}
+		for _, target := range targets {
+			rows := aggregateReferencedRows(eventsByTarget[target], input.Dimensions, input.Metrics, input.First, input.OrderBy)
+			for _, parentID := range targetToParentIDs[target] {
+				out[parentID] = rows
+			}
+		}
+	}
+	for _, event := range c.events {
+		if _, ok := out[event.ID]; ok {
+			continue
+		}
+		out[event.ID] = aggregateReferencedRows(nil, input.Dimensions, input.Metrics, input.First, input.OrderBy)
+	}
+	return out, nil
 }
 
 func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {
@@ -2537,6 +2676,8 @@ func graphTagPredicateSignature(predicate graphTagPredicate) string {
 		predicate.Value,
 		strings.Join(uniqueStrings(predicate.Values), ","),
 		predicate.Marker,
+		strings.Join(uniqueStrings(predicate.Markers), ","),
+		strings.Join(uniqueStrings(predicate.ExcludeMarkers), ","),
 		strconv.Itoa(predicate.Index),
 	}, "\x00")
 }
@@ -2545,6 +2686,14 @@ func eventViewMapLen(values map[string][]chstore.EventView) int {
 	var total int
 	for _, events := range values {
 		total += len(events)
+	}
+	return total
+}
+
+func aggregateRowMapLen(values map[string][]chstore.AggregateRow) int {
+	var total int
+	for _, rows := range values {
+		total += len(rows)
 	}
 	return total
 }
