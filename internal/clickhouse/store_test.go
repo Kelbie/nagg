@@ -59,3 +59,22 @@ func TestTrendingCacheKeyBucketsSinceToMinute(t *testing.T) {
 		t.Fatalf("keys = %q/%q rounded = %s/%s", keyA, keyB, roundedA, roundedB)
 	}
 }
+
+func TestNotificationPolicyThresholds(t *testing.T) {
+	tests := map[string]struct {
+		actor  float64
+		viewer float64
+	}{
+		"RELAXED":  {actor: 0, viewer: 0},
+		"MODERATE": {actor: 20, viewer: 60},
+		"STRICT":   {actor: 50, viewer: 80},
+		"":         {actor: 50, viewer: 80},
+		"unknown":  {actor: 50, viewer: 80},
+	}
+	for policy, want := range tests {
+		actor, viewer := notificationPolicyThresholds(policy)
+		if actor != want.actor || viewer != want.viewer {
+			t.Fatalf("%q thresholds = %.1f/%.1f, want %.1f/%.1f", policy, actor, viewer, want.actor, want.viewer)
+		}
+	}
+}

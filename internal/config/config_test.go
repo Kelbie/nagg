@@ -34,6 +34,15 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.Vertex.RankMinFollowers != 500 {
 		t.Fatalf("rank min followers = %d, want 500", cfg.Vertex.RankMinFollowers)
 	}
+	if cfg.Vertex.SyncBatch != 200 {
+		t.Fatalf("vertex sync batch = %d, want 200", cfg.Vertex.SyncBatch)
+	}
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "topics,embeddings,trending,stance,sentiment,quality,controversy,nsfw" {
+		t.Fatalf("enrich tasks = %q, want default signal tasks", got)
+	}
+	if cfg.Enrich.TrendingDedupeSimilarity != 0.82 {
+		t.Fatalf("trending dedupe similarity = %f, want 0.82", cfg.Enrich.TrendingDedupeSimilarity)
+	}
 	for _, relay := range cfg.Firehose.Relays {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
 			t.Fatalf("default relay set includes external cache host %q", relay)
@@ -63,6 +72,112 @@ func TestLoadRejectsNegativeVertexRankMinFollowers(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "NAGG_VERTEX_RANK_MIN_FOLLOWERS") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadVertexSyncBatchOverride(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_VERTEX_SYNC_BATCH", "75")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Vertex.SyncBatch != 75 {
+		t.Fatalf("vertex sync batch = %d, want 75", cfg.Vertex.SyncBatch)
+	}
+}
+
+func TestLoadRejectsInvalidVertexSyncBatch(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_VERTEX_SYNC_BATCH", "0")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "NAGG_VERTEX_SYNC_BATCH") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadEnrichConfigOverride(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ENRICH_TASKS", "topics,embeddings,topics")
+	t.Setenv("NAGG_ENRICH_BATCH_SIZE", "32")
+	t.Setenv("NAGG_ENRICH_POLL_INTERVAL", "5s")
+	t.Setenv("NAGG_ENRICH_MODEL_DIR", "/models")
+	t.Setenv("NAGG_ENRICH_MODEL_VERSION", "test-model-v1")
+	t.Setenv("NAGG_ENRICH_MODEL_BACKEND", "ort")
+	t.Setenv("NAGG_ENRICH_ONNX_LIBRARY_PATH", "/opt/onnxruntime/libonnxruntime.so")
+	t.Setenv("NAGG_TRENDING_DEDUPE_SIM", "0.7")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "topics,embeddings" {
+		t.Fatalf("enrich tasks = %q", got)
+	}
+	if cfg.Enrich.BatchSize != 32 {
+		t.Fatalf("enrich batch size = %d, want 32", cfg.Enrich.BatchSize)
+	}
+	if cfg.Enrich.PollInterval.String() != "5s" {
+		t.Fatalf("enrich poll interval = %s, want 5s", cfg.Enrich.PollInterval)
+	}
+	if cfg.Enrich.ModelDir != "/models" {
+		t.Fatalf("enrich model dir = %q", cfg.Enrich.ModelDir)
+	}
+	if cfg.Enrich.ModelVersion != "test-model-v1" {
+		t.Fatalf("enrich model version = %q", cfg.Enrich.ModelVersion)
+	}
+	if cfg.Enrich.ModelBackend != "ort" {
+		t.Fatalf("enrich model backend = %q, want ort", cfg.Enrich.ModelBackend)
+	}
+	if cfg.Enrich.OnnxLibraryPath != "/opt/onnxruntime/libonnxruntime.so" {
+		t.Fatalf("enrich onnx library path = %q", cfg.Enrich.OnnxLibraryPath)
+	}
+	if cfg.Enrich.TrendingDedupeSimilarity != 0.7 {
+		t.Fatalf("trending dedupe similarity = %f, want 0.7", cfg.Enrich.TrendingDedupeSimilarity)
+	}
+}
+
+func TestLoadRejectsUnknownEnrichTask(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ENRICH_TASKS", "topics,unknown")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "NAGG_ENRICH_TASKS") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsUnknownEnrichBackend(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ENRICH_MODEL_BACKEND", "cuda")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "NAGG_ENRICH_MODEL_BACKEND") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidTrendingDedupeSimilarity(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_TRENDING_DEDUPE_SIM", "1.5")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "NAGG_TRENDING_DEDUPE_SIM") {
 		t.Fatalf("error = %v", err)
 	}
 }

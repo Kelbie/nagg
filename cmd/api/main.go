@@ -48,6 +48,11 @@ func main() {
 			slog.Error("vertex client failed", "error", err)
 			os.Exit(1)
 		}
+		vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
+			MinFollowers: uint64(cfg.Vertex.RankMinFollowers),
+			BatchSize:    cfg.Vertex.SyncBatch,
+		}, logger)
+		go vertexSyncer.Run(ctx)
 	}
 
 	var userFeedBackfiller *appview.RelayUserFeedBackfiller

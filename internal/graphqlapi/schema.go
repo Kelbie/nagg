@@ -31,6 +31,10 @@ type Store interface {
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
+	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
+	AvailableTopics(context.Context, chstore.EventQueryInput) ([]chstore.TopicRow, error)
+	TrendingClusters(context.Context, chstore.TrendingInput) ([]chstore.TrendingClusterRow, error)
+	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
@@ -84,6 +88,21 @@ type eventNode struct {
 	eventRelations *eventRelationCache
 }
 
+type trendingClusterNode struct {
+	row   chstore.TrendingClusterRow
+	store Store
+}
+
+type notificationNode struct {
+	row   chstore.NotificationRow
+	event eventNode
+}
+
+type notificationConnectionSource struct {
+	rows  []chstore.NotificationRow
+	nodes []notificationNode
+}
+
 type eventConnectionSource struct {
 	raw   []chstore.EventView
 	nodes []eventNode
@@ -101,8 +120,10 @@ type eventRelationCache struct {
 	aggregateByTarget   map[string]map[string][]chstore.AggregateRow
 	selectedReferences  map[string]map[string][]chstore.EventView
 	rankedReferencedBy  map[string]map[string][]chstore.EventView
+	authoredReplyChains map[string]map[string][]chstore.EventView
 	selectedConnections map[string]eventConnectionCaches
 	rankedConnections   map[string]eventConnectionCaches
+	authoredConnections map[string]eventConnectionCaches
 }
 
 type eventConnectionCaches struct {
@@ -140,6 +161,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var selectedReferenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
+	var authoredReplyChainInputType *graphql.InputObject
 	var pubkeyScoreRankInputType *graphql.InputObject
 	var shuffleInputType *graphql.InputObject
 	var weightedRankTermInputType *graphql.InputObject
@@ -147,6 +169,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var referenceRankInputType *graphql.InputObject
 	var rankedReverseReferenceInputType *graphql.InputObject
 	var rankedEventsInputType *graphql.InputObject
+	var notificationInputType *graphql.InputObject
 
 	var eventType *graphql.Object
 	eventType = graphql.NewObject(graphql.ObjectConfig{
@@ -227,6 +250,21 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return r.eventRankedReferencedBy(p.Context, event, p.Args["input"])
 					},
 				},
+				"authoredReplyChain": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: authoredReplyChainInputType}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						node, ok := asEventNode(p.Source)
+						if ok && node.eventRelations != nil {
+							return node.eventRelations.loadAuthoredReplyChain(p.Context, r, node.event, p.Args["input"])
+						}
+						event, hasEvent := eventFromSource(p.Source)
+						if !hasEvent {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventAuthoredReplyChain(p.Context, event, p.Args["input"])
+					},
+				},
 				"aggregateReferencedBy": &graphql.Field{
 					Type: graphql.NewNonNull(aggregationResultType),
 					Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(aggregateReferencedByInputType)}},
@@ -290,7 +328,11 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"key":    &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
 			"value":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"values": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
-			"marker": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"excludeValues": &graphql.InputObjectFieldConfig{
+				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
+			},
+			"dataset": &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "TAGS"},
+			"marker":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"markers": &graphql.InputObjectFieldConfig{
 				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
 			},
@@ -422,6 +464,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"metric":         &graphql.InputObjectFieldConfig{Type: metricInputType},
 			"pubkeyScore":    &graphql.InputObjectFieldConfig{Type: pubkeyScoreRankInputType},
 			"candidateField": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"derivedMetric":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"weight":         &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
 			"transform":      &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
 			"halfLifeSeconds": &graphql.InputObjectFieldConfig{
@@ -461,6 +504,18 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"rank":   &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(referenceRankInputType)},
 			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 1},
 			"offset": &graphql.InputObjectFieldConfig{Type: graphql.Int},
+		},
+	})
+	authoredReplyChainInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "AuthoredReplyChainInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"events":          &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"kinds":           &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
+			"pubkeyFrom":      &graphql.InputObjectFieldConfig{Type: pubkeySourceInputType},
+			"via":             &graphql.InputObjectFieldConfig{Type: tagFilterType},
+			"target":          &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "EVENT_ID"},
+			"maxDepth":        &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 8},
+			"maxBranchFanout": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 32},
 		},
 	})
 
@@ -523,6 +578,153 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"appViewVersion":       &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
 			"capabilities":         &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String)))},
 			"appViews":             &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(appViewCapabilityType)))},
+		},
+	})
+	topicType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "Topic",
+		Fields: graphql.Fields{
+			"value":     &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"parent":    &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"label":     &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"isDefault": &graphql.Field{Type: graphql.NewNonNull(graphql.Boolean)},
+			"count":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+		},
+	})
+	trendingWindowEnumType := graphql.NewEnum(graphql.EnumConfig{
+		Name: "TrendingWindow",
+		Values: graphql.EnumValueConfigMap{
+			"H8":  &graphql.EnumValueConfig{Value: "H8"},
+			"H24": &graphql.EnumValueConfig{Value: "H24"},
+			"D7":  &graphql.EnumValueConfig{Value: "D7"},
+		},
+	})
+	trendingInputType := graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "TrendingInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"window":   &graphql.InputObjectFieldConfig{Type: trendingWindowEnumType, DefaultValue: "H24"},
+			"category": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"limit":    &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 20},
+		},
+	})
+	trendingClusterType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "TrendingCluster",
+		Fields: graphql.FieldsThunk(func() graphql.Fields {
+			return graphql.Fields{
+				"id":          &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.ID })},
+				"window":      &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Window })},
+				"startedAt":   &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.StartedAt })},
+				"category":    &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Category })},
+				"subcategory": &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Subcategory })},
+				"title":       &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Title })},
+				"description": &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Description })},
+				"eventCount":  &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.EventCount })},
+				"score":       &graphql.Field{Type: graphql.NewNonNull(graphql.Float), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Score })},
+				"computedAt":  &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.ComputedAt })},
+				"sampleEvents": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"limit": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 3}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						cluster, ok := p.Source.(trendingClusterNode)
+						if !ok {
+							return eventConnectionSource{}, nil
+						}
+						limit := intValue(p.Args["limit"], 3)
+						if limit <= 0 || limit > 20 {
+							limit = 3
+						}
+						events, err := cluster.store.QueryEvents(p.Context, chstore.EventQueryInput{
+							Kinds: []int{1, 1111},
+							Tags: []chstore.TagFilter{{
+								Key:     "cluster",
+								Value:   cluster.row.ID,
+								Dataset: "DERIVED_TAGS",
+							}},
+							Limit: uint64(limit),
+						})
+						if err != nil {
+							return nil, err
+						}
+						relations := newPubkeyRelationCache(cluster.store, events)
+						eventRelations := newEventRelationCache(cluster.store, events)
+						return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations, eventRelations)}, nil
+					},
+				},
+			}
+		}),
+	})
+	notificationTabEnumType := graphql.NewEnum(graphql.EnumConfig{
+		Name: "NotificationTab",
+		Values: graphql.EnumValueConfigMap{
+			"ALL":      &graphql.EnumValueConfig{Value: "ALL"},
+			"MENTIONS": &graphql.EnumValueConfig{Value: "MENTIONS"},
+		},
+	})
+	notificationPolicyEnumType := graphql.NewEnum(graphql.EnumConfig{
+		Name: "NotificationPolicy",
+		Values: graphql.EnumValueConfigMap{
+			"RELAXED":  &graphql.EnumValueConfig{Value: "RELAXED"},
+			"MODERATE": &graphql.EnumValueConfig{Value: "MODERATE"},
+			"STRICT":   &graphql.EnumValueConfig{Value: "STRICT"},
+		},
+	})
+	notificationInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "NotificationInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"viewer": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"tab":    &graphql.InputObjectFieldConfig{Type: notificationTabEnumType, DefaultValue: "ALL"},
+			"policy": &graphql.InputObjectFieldConfig{Type: notificationPolicyEnumType, DefaultValue: "STRICT"},
+			"since":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+		},
+	})
+	notificationType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "Notification",
+		Fields: graphql.Fields{
+			"event": &graphql.Field{
+				Type: graphql.NewNonNull(eventType),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					node, _ := p.Source.(notificationNode)
+					return node.event, nil
+				},
+			},
+			"reason": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.String),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					node, _ := p.Source.(notificationNode)
+					return node.row.Reason, nil
+				},
+			},
+			"actorVertexScore": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.Float),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					node, _ := p.Source.(notificationNode)
+					return node.row.ActorVertexScore, nil
+				},
+			},
+		},
+	})
+	notificationConnectionType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "NotificationConnection",
+		Fields: graphql.Fields{
+			"nodes": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(notificationType))),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					source, _ := p.Source.(notificationConnectionSource)
+					return source.nodes, nil
+				},
+			},
+			"pageInfo": &graphql.Field{
+				Type: graphql.NewNonNull(pageInfoType),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					source, _ := p.Source.(notificationConnectionSource)
+					events := make([]chstore.EventView, 0, len(source.rows))
+					for _, row := range source.rows {
+						events = append(events, row.Event)
+					}
+					return map[string]any{"hasNextPage": false, "endCursor": eventEndCursor(events)}, nil
+				},
+			},
 		},
 	})
 
@@ -593,6 +795,50 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					}
 					rows, err := r.store.AggregateEvents(p.Context, input)
 					return map[string]any{"rows": rows}, err
+				},
+			},
+			"availableTopics": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(topicType))),
+				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: eventQueryInputType}},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					raw, _ := p.Args["input"].(map[string]any)
+					input, err := r.parseEventQueryInput(p.Context, raw)
+					if err != nil {
+						return nil, err
+					}
+					return r.store.AvailableTopics(p.Context, input)
+				},
+			},
+			"trending": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(trendingClusterType))),
+				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: trendingInputType}},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					raw, _ := p.Args["input"].(map[string]any)
+					input := parseTrendingInput(raw)
+					rows, err := r.store.TrendingClusters(p.Context, input)
+					if err != nil {
+						return nil, err
+					}
+					nodes := make([]trendingClusterNode, 0, len(rows))
+					for _, row := range rows {
+						nodes = append(nodes, trendingClusterNode{row: row, store: r.store})
+					}
+					return nodes, nil
+				},
+			},
+			"notifications": &graphql.Field{
+				Type: graphql.NewNonNull(notificationConnectionType),
+				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(notificationInputType)}},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					input, err := parseNotificationInput(p.Args["input"].(map[string]any))
+					if err != nil {
+						return nil, err
+					}
+					rows, err := r.store.Notifications(p.Context, input)
+					if err != nil {
+						return nil, err
+					}
+					return newNotificationConnection(r.store, rows, r.pubkeyScoreMinFollowers), nil
 				},
 			},
 			"rankedEvents": &graphql.Field{
@@ -836,6 +1082,11 @@ func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.Ev
 	return r.newEventConnection(ordered), nil
 }
 
+func (r *resolver) eventAuthoredReplyChain(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	cache := newEventRelationCacheWithPubkeyScoreMinFollowers(r.store, []chstore.EventView{event}, r.pubkeyScoreMinFollowers)
+	return cache.loadAuthoredReplyChain(ctx, r, event, raw)
+}
+
 func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore.EventView, raw any) (map[string]any, error) {
 	input, dimensions, metrics, first, orderBy, err := r.aggregateReferencedByQuery(ctx, event, raw)
 	if err != nil {
@@ -1014,12 +1265,22 @@ type rankedReverseReferenceBatchInput struct {
 	Offset          int
 }
 
+type authoredReplyChainInput struct {
+	Events               chstore.EventQueryInput
+	Via                  graphTagPredicate
+	Target               string
+	UseSourceEventAuthor bool
+	MaxDepth             int
+	MaxBranchFanout      int
+}
+
 type weightedRankTermKind int
 
 const (
 	weightedRankTermReferences weightedRankTermKind = iota
 	weightedRankTermPubkeyScore
 	weightedRankTermCandidateField
+	weightedRankTermDerivedMetric
 )
 
 type weightedRankTerm struct {
@@ -1029,6 +1290,7 @@ type weightedRankTerm struct {
 	Metric          genericMetric
 	PubkeyScore     pubkeyScoreRankTerm
 	CandidateField  string
+	DerivedMetric   string
 	Weight          float64
 	Transform       string
 	HalfLifeSeconds float64
@@ -1293,6 +1555,82 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 	return out, nil
 }
 
+func (r *resolver) authoredReplyChainQuery(ctx context.Context, raw any) (authoredReplyChainInput, error) {
+	m, _ := raw.(map[string]any)
+	eventsRaw := map[string]any{}
+	if rawEvents, ok := m["events"].(map[string]any); ok {
+		for key, value := range rawEvents {
+			eventsRaw[key] = value
+		}
+	}
+	if kinds := intList(m["kinds"]); len(kinds) > 0 {
+		eventsRaw["kinds"] = anyIntList(kinds)
+	}
+	if _, ok := eventsRaw["kinds"]; !ok {
+		eventsRaw["kinds"] = []any{1, 1111}
+	}
+
+	sources := pubkeySources(eventsRaw["pubkeysFrom"])
+	if pubkeyFromRaw, ok := m["pubkeyFrom"].(map[string]any); ok {
+		sources = append(sources, pubkeySources([]any{pubkeyFromRaw})...)
+	}
+	useSourceAuthor := len(sources) == 0
+	for _, source := range sources {
+		if source.sourceEventAuthor {
+			useSourceAuthor = true
+		}
+	}
+
+	events, err := parseEventQueryInput(eventsRaw)
+	if err != nil {
+		return authoredReplyChainInput{}, err
+	}
+	var derivedPubkeys []string
+	for _, source := range sources {
+		if source.latestEventTags == nil {
+			continue
+		}
+		values, err := r.resolveLatestEventTagPubkeys(ctx, *source.latestEventTags)
+		if err != nil {
+			return authoredReplyChainInput{}, err
+		}
+		derivedPubkeys = append(derivedPubkeys, values...)
+	}
+	events.PubKeys = uniqueStrings(append(events.PubKeys, derivedPubkeys...))
+
+	via := graphTagPredicateFrom(m["via"])
+	if via.Key == "" {
+		via.Key = "e"
+	}
+	maxDepth := intValue(m["maxDepth"], 8)
+	if maxDepth <= 0 {
+		maxDepth = 8
+	} else if maxDepth > 8 {
+		maxDepth = 8
+	}
+	maxBranchFanout := intValue(m["maxBranchFanout"], 32)
+	if maxBranchFanout <= 0 {
+		maxBranchFanout = 32
+	} else if maxBranchFanout > 100 {
+		maxBranchFanout = 100
+	}
+	events.Limit = uint64(maxBranchFanout)
+
+	target := strings.ToUpper(stringValue(m["target"]))
+	if target == "" {
+		target = "EVENT_ID"
+	}
+
+	return authoredReplyChainInput{
+		Events:               events,
+		Via:                  via,
+		Target:               target,
+		UseSourceEventAuthor: useSourceAuthor,
+		MaxDepth:             maxDepth,
+		MaxBranchFanout:      maxBranchFanout,
+	}, nil
+}
+
 func (c *eventRelationCache) aggregateReferencedByBatchQuery(ctx context.Context, raw any) (aggregateReferencedByBatchInput, error) {
 	m, _ := raw.(map[string]any)
 	var out aggregateReferencedByBatchInput
@@ -1465,6 +1803,7 @@ func weightedRankTerms(
 		shuffleInput(rankRaw["shuffle"]).Seed != "" ||
 		rankRaw["pubkeyScore"] != nil ||
 		stringValue(rankRaw["candidateField"]) != "" ||
+		stringValue(rankRaw["derivedMetric"]) != "" ||
 		!legacyRankMetricSupported(rankRaw["metric"]) ||
 		floatValue(rankRaw["weight"], 1) != 1 ||
 		rankTransform(rankRaw["transform"]) != "IDENTITY"
@@ -1514,6 +1853,11 @@ func weightedRankTermFrom(
 	if candidateField := strings.ToUpper(stringValue(raw["candidateField"])); candidateField != "" {
 		out.Kind = weightedRankTermCandidateField
 		out.CandidateField = candidateField
+		return out, nil
+	}
+	if derivedMetric := strings.TrimSpace(stringValue(raw["derivedMetric"])); derivedMetric != "" {
+		out.Kind = weightedRankTermDerivedMetric
+		out.DerivedMetric = derivedMetric
 		return out, nil
 	}
 	referencesRaw, ok := raw["references"].(map[string]any)
@@ -1745,6 +2089,11 @@ func weightedRankCandidateIDs(
 		case weightedRankTermCandidateField:
 			applyCandidateFieldRankTerm(candidates, scores, term)
 			continue
+		case weightedRankTermDerivedMetric:
+			if err := applyDerivedMetricRankTerm(ctx, store, candidateIDs, scores, term); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		if term.References.Empty {
 			continue
@@ -1845,6 +2194,27 @@ func applyCandidateFieldRankTerm(candidates []chstore.EventView, scores map[stri
 		}
 		scores[candidate.ID] += value * term.Weight
 	}
+}
+
+func applyDerivedMetricRankTerm(
+	ctx context.Context,
+	store Store,
+	candidateIDs []string,
+	scores map[string]float64,
+	term weightedRankTerm,
+) error {
+	values, err := store.DerivedMetricValues(ctx, term.DerivedMetric, candidateIDs)
+	if err != nil {
+		return err
+	}
+	for _, candidateID := range candidateIDs {
+		value, ok := values[candidateID]
+		if !ok {
+			continue
+		}
+		scores[candidateID] += transformedFloatRankValue(value, term.Transform) * term.Weight
+	}
+	return nil
 }
 
 func candidateFieldValue(candidate chstore.EventView, term weightedRankTerm, now time.Time) (float64, bool) {
@@ -2554,6 +2924,51 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 	return input, validateHexFilters(input.IDs, input.PubKeys)
 }
 
+func parseTrendingInput(raw map[string]any) chstore.TrendingInput {
+	input := chstore.TrendingInput{
+		Window: "H24",
+		Limit:  20,
+	}
+	if raw == nil {
+		return input
+	}
+	if window := strings.ToUpper(strings.TrimSpace(stringValue(raw["window"]))); window == "H8" || window == "H24" || window == "D7" {
+		input.Window = window
+	}
+	input.Category = strings.TrimSpace(stringValue(raw["category"]))
+	if limit := intValue(raw["limit"], 20); limit > 0 {
+		input.Limit = uint64(limit)
+	}
+	return input
+}
+
+func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, error) {
+	input := chstore.NotificationInput{
+		Tab:    "ALL",
+		Policy: "STRICT",
+		Limit:  50,
+	}
+	if raw == nil {
+		return input, fmt.Errorf("notification viewer is required")
+	}
+	input.Viewer = strings.ToLower(strings.TrimSpace(stringValue(raw["viewer"])))
+	if err := validateHex64(input.Viewer); err != nil {
+		return input, fmt.Errorf("notification viewer: %w", err)
+	}
+	if tab := strings.ToUpper(strings.TrimSpace(stringValue(raw["tab"]))); tab == "ALL" || tab == "MENTIONS" {
+		input.Tab = tab
+	}
+	if policy := strings.ToUpper(strings.TrimSpace(stringValue(raw["policy"]))); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" {
+		input.Policy = policy
+	}
+	input.Since = int64(intValue(raw["since"], 0))
+	input.Until = int64(intValue(raw["until"], 0))
+	if limit := intValue(raw["limit"], 50); limit > 0 {
+		input.Limit = uint64(limit)
+	}
+	return input, nil
+}
+
 func parseAggregateInput(raw map[string]any) (chstore.AggregateInput, error) {
 	input := chstore.AggregateInput{
 		Dataset: fmt.Sprint(raw["dataset"]),
@@ -2632,9 +3047,11 @@ func tagFilters(v any) []chstore.TagFilter {
 			continue
 		}
 		out = append(out, chstore.TagFilter{
-			Key:    fmt.Sprint(raw["key"]),
-			Value:  stringValue(raw["value"]),
-			Values: stringList(raw["values"]),
+			Key:           fmt.Sprint(raw["key"]),
+			Value:         stringValue(raw["value"]),
+			Values:        stringList(raw["values"]),
+			ExcludeValues: stringList(raw["excludeValues"]),
+			Dataset:       strings.ToUpper(strings.TrimSpace(stringValue(raw["dataset"]))),
 		})
 	}
 	return out
@@ -2665,6 +3082,14 @@ func intList(v any) []int {
 		case float64:
 			out = append(out, int(n))
 		}
+	}
+	return out
+}
+
+func anyIntList(values []int) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
 	}
 	return out
 }
@@ -2744,6 +3169,26 @@ func eventField(fn func(chstore.EventView) any) graphql.FieldResolveFn {
 	}
 }
 
+func trendingClusterField(fn func(chstore.TrendingClusterRow) any) graphql.FieldResolveFn {
+	return func(p graphql.ResolveParams) (any, error) {
+		switch cluster := p.Source.(type) {
+		case trendingClusterNode:
+			return fn(cluster.row), nil
+		case *trendingClusterNode:
+			if cluster != nil {
+				return fn(cluster.row), nil
+			}
+		case chstore.TrendingClusterRow:
+			return fn(cluster), nil
+		case *chstore.TrendingClusterRow:
+			if cluster != nil {
+				return fn(*cluster), nil
+			}
+		}
+		return nil, nil
+	}
+}
+
 func eventFromSource(source any) (chstore.EventView, bool) {
 	switch value := source.(type) {
 	case eventNode:
@@ -2788,6 +3233,23 @@ func newEventConnectionWithPubkeyScoreMinFollowers(store Store, events []chstore
 
 func newEventConnectionWithCaches(events []chstore.EventView, relations *pubkeyRelationCache, eventRelations *eventRelationCache) eventConnectionSource {
 	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations, eventRelations)}
+}
+
+func newNotificationConnection(store Store, rows []chstore.NotificationRow, pubkeyScoreMinFollowers uint64) notificationConnectionSource {
+	events := make([]chstore.EventView, 0, len(rows))
+	for _, row := range rows {
+		events = append(events, row.Event)
+	}
+	relations := newPubkeyRelationCache(store, events)
+	eventRelations := newEventRelationCacheWithPubkeyScoreMinFollowers(store, events, pubkeyScoreMinFollowers)
+	nodes := make([]notificationNode, 0, len(rows))
+	for _, row := range rows {
+		nodes = append(nodes, notificationNode{
+			row:   row,
+			event: wrapEvent(row.Event, relations, eventRelations),
+		})
+	}
+	return notificationConnectionSource{rows: rows, nodes: nodes}
 }
 
 func newEventConnectionCaches(store Store, grouped map[string][]chstore.EventView) eventConnectionCaches {
@@ -2845,8 +3307,10 @@ func newEventRelationCacheWithPubkeyScoreMinFollowers(store Store, events []chst
 		aggregateByTarget:       map[string]map[string][]chstore.AggregateRow{},
 		selectedReferences:      map[string]map[string][]chstore.EventView{},
 		rankedReferencedBy:      map[string]map[string][]chstore.EventView{},
+		authoredReplyChains:     map[string]map[string][]chstore.EventView{},
 		selectedConnections:     map[string]eventConnectionCaches{},
 		rankedConnections:       map[string]eventConnectionCaches{},
+		authoredConnections:     map[string]eventConnectionCaches{},
 	}
 }
 
@@ -3415,6 +3879,245 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	return out, nil
 }
 
+func (c *eventRelationCache) loadAuthoredReplyChain(ctx context.Context, r *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {
+	if c == nil {
+		return r.eventAuthoredReplyChain(ctx, event, raw)
+	}
+	key := "authoredReplyChain:" + graphInputSignature(raw)
+
+	c.mu.Lock()
+	cached, ok := c.authoredReplyChains[key]
+	connectionCaches := c.authoredConnections[key]
+	c.mu.Unlock()
+	if !ok {
+		value, err, _ := c.group.Do(key, func() (any, error) {
+			c.mu.Lock()
+			if existing, exists := c.authoredReplyChains[key]; exists {
+				connectionCaches = c.authoredConnections[key]
+				c.mu.Unlock()
+				return existing, nil
+			}
+			c.mu.Unlock()
+
+			started := time.Now()
+			loaded, err := c.loadAuthoredReplyChainsBatch(ctx, r, raw)
+			if err != nil {
+				return nil, err
+			}
+
+			c.mu.Lock()
+			c.authoredReplyChains[key] = loaded
+			c.authoredConnections[key] = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, loaded, c.pubkeyScoreMinFollowers)
+			c.mu.Unlock()
+
+			slog.Debug(
+				"graphql batched authored reply chains loaded",
+				"parents", len(c.events),
+				"results", eventViewMapLen(loaded),
+				"duration_ms", time.Since(started).Milliseconds(),
+			)
+			return loaded, nil
+		})
+		if err != nil {
+			return eventConnectionSource{}, err
+		}
+		cached, _ = value.(map[string][]chstore.EventView)
+		c.mu.Lock()
+		connectionCaches = c.authoredConnections[key]
+		c.mu.Unlock()
+	}
+	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
+		connectionCaches = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, cached, c.pubkeyScoreMinFollowers)
+		c.mu.Lock()
+		c.authoredConnections[key] = connectionCaches
+		c.mu.Unlock()
+	}
+	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
+}
+
+type authoredReplyChainState struct {
+	source         chstore.EventView
+	current        chstore.EventView
+	allowedPubKeys map[string]struct{}
+	visited        map[string]struct{}
+	done           bool
+}
+
+func (c *eventRelationCache) loadAuthoredReplyChainsBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.EventView, error) {
+	out := make(map[string][]chstore.EventView, len(c.events))
+	for _, event := range c.events {
+		out[event.ID] = nil
+	}
+
+	input, err := r.authoredReplyChainQuery(ctx, raw)
+	if err != nil {
+		return nil, err
+	}
+	if input.Events.Empty {
+		return out, nil
+	}
+
+	states := make(map[string]*authoredReplyChainState, len(c.events))
+	for _, event := range c.events {
+		allowed := make(map[string]struct{}, len(input.Events.PubKeys)+1)
+		for _, pubkey := range input.Events.PubKeys {
+			allowed[pubkey] = struct{}{}
+		}
+		if input.UseSourceEventAuthor {
+			allowed[event.PubKey] = struct{}{}
+		}
+		if len(allowed) == 0 {
+			continue
+		}
+		states[event.ID] = &authoredReplyChainState{
+			source:         event,
+			current:        event,
+			allowedPubKeys: allowed,
+			visited:        map[string]struct{}{event.ID: {}},
+		}
+	}
+	if len(states) == 0 {
+		return out, nil
+	}
+
+	for depth := 0; depth < input.MaxDepth; depth++ {
+		targets := make([]string, 0, len(states))
+		targetToSourceID := make(map[string][]string, len(states))
+		seenTargets := map[string]struct{}{}
+		queryPubKeys := map[string]struct{}{}
+		for sourceID, state := range states {
+			if state.done {
+				continue
+			}
+			target := targetValue(state.current, input.Target)
+			if input.Via.Value != "" {
+				target = input.Via.Value
+			}
+			if target == "" {
+				state.done = true
+				continue
+			}
+			if _, ok := seenTargets[target]; !ok {
+				seenTargets[target] = struct{}{}
+				targets = append(targets, target)
+			}
+			targetToSourceID[target] = append(targetToSourceID[target], sourceID)
+			for pubkey := range state.allowedPubKeys {
+				queryPubKeys[pubkey] = struct{}{}
+			}
+		}
+		if len(targets) == 0 {
+			break
+		}
+		sort.Strings(targets)
+
+		query := input.Events
+		query.PubKeys = mapKeys(queryPubKeys)
+		query.Limit = uint64(input.MaxBranchFanout)
+		candidatesByTarget, err := c.store.QueryEventsByTagTargets(ctx, query, chstore.TagFilter{Key: input.Via.Key}, targets, query.Limit)
+		if err != nil {
+			return nil, err
+		}
+
+		advanced := false
+		for _, target := range targets {
+			for _, sourceID := range targetToSourceID[target] {
+				state := states[sourceID]
+				if state == nil || state.done {
+					continue
+				}
+				child, ok := bestAuthoredDirectChild(candidatesByTarget[target], target, state.allowedPubKeys, input.Via, state.visited)
+				if !ok {
+					state.done = true
+					continue
+				}
+				state.visited[child.ID] = struct{}{}
+				out[sourceID] = append(out[sourceID], child)
+				state.current = child
+				advanced = true
+			}
+		}
+		if !advanced {
+			break
+		}
+	}
+	return out, nil
+}
+
+func bestAuthoredDirectChild(
+	candidates []chstore.EventView,
+	parentTarget string,
+	allowedPubKeys map[string]struct{},
+	via graphTagPredicate,
+	visited map[string]struct{},
+) (chstore.EventView, bool) {
+	var best chstore.EventView
+	found := false
+	for _, candidate := range candidates {
+		if candidate.ID == "" {
+			continue
+		}
+		if _, seen := visited[candidate.ID]; seen {
+			continue
+		}
+		if _, allowed := allowedPubKeys[candidate.PubKey]; !allowed {
+			continue
+		}
+		if !directChildMatches(candidate, parentTarget, via) {
+			continue
+		}
+		if !found || candidate.CreatedAt.Before(best.CreatedAt) || (candidate.CreatedAt.Equal(best.CreatedAt) && candidate.ID < best.ID) {
+			best = candidate
+			found = true
+		}
+	}
+	return best, found
+}
+
+func directChildMatches(candidate chstore.EventView, parentTarget string, via graphTagPredicate) bool {
+	if via.Key == "e" {
+		if parentID := directReplyParentID(candidate); parentID != "" {
+			return parentID == parentTarget
+		}
+	}
+	for _, tag := range candidate.Tags {
+		predicate := via
+		predicate.Value = parentTarget
+		predicate.Values = nil
+		if sourceTagMatches(tag, predicate) {
+			return true
+		}
+	}
+	return false
+}
+
+func directReplyParentID(event chstore.EventView) string {
+	var firstE string
+	var lastUnmarkedE string
+	for _, tag := range event.Tags {
+		if len(tag) < 2 || tag[0] != "e" || !hex64Pattern.MatchString(tag[1]) {
+			continue
+		}
+		if firstE == "" {
+			firstE = tag[1]
+		}
+		marker := ""
+		if len(tag) >= 4 {
+			marker = strings.ToLower(tag[3])
+		}
+		switch marker {
+		case "reply":
+			return tag[1]
+		case "":
+			lastUnmarkedE = tag[1]
+		}
+	}
+	if lastUnmarkedE != "" {
+		return lastUnmarkedE
+	}
+	return firstE
+}
+
 func (c *eventRelationCache) parseEventQueryInput(ctx context.Context, raw map[string]any) (chstore.EventQueryInput, error) {
 	input, err := parseEventQueryInput(raw)
 	if err != nil {
@@ -3569,6 +4272,17 @@ func uniqueStrings(values []string) []string {
 		}
 		seen[value] = struct{}{}
 		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func mapKeys(values map[string]struct{}) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		if value != "" {
+			out = append(out, value)
+		}
 	}
 	sort.Strings(out)
 	return out

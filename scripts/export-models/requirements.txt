@@ -1,0 +1,4 @@
+optimum[onnxruntime]>=1.27.0
+transformers>=4.52.0
+sentence-transformers>=4.1.0
+pillow>=11.0.0

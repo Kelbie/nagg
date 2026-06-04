@@ -18,6 +18,7 @@ var Names = []string{
 	"graphql.selectedReferences",
 	"graphql.referencedBy",
 	"graphql.rankedReferencedBy",
+	"graphql.authoredReplyChain",
 	"graphql.aggregateReferencedBy",
 	"graphql.pubkeyEvents",
 	"graphql.pubkeysFrom.latestEventTags",
@@ -26,7 +27,13 @@ var Names = []string{
 	"graphql.rank.candidatePubkeyBoosts",
 	"graphql.rank.pubkeyScoreTerms",
 	"graphql.rank.candidateFieldTerms",
+	"graphql.rank.derivedMetricTerms",
 	"graphql.rank.shuffle",
+	"graphql.tags.derivedDataset",
+	"graphql.tags.excludeValues",
+	"graphql.availableTopics",
+	"graphql.trending",
+	"graphql.notifications",
 	"appview.v1",
 }
 

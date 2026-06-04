@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+preDeployCommand = []
+startCommand = "./nagg-enricher"
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10

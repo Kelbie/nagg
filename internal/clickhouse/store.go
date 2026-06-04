@@ -23,6 +23,15 @@ var appviewMigration string
 //go:embed migrations/003_ranking.sql
 var rankingMigration string
 
+//go:embed migrations/004_derived.sql
+var derivedMigration string
+
+//go:embed migrations/005_trending.sql
+var trendingMigration string
+
+//go:embed migrations/006_notifications.sql
+var notificationsMigration string
+
 type Config struct {
 	Addr         string
 	Database     string
@@ -89,7 +98,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration} {
+	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration, derivedMigration, trendingMigration, notificationsMigration} {
 		for _, stmt := range splitSQLStatements(migration) {
 			if err := s.conn.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("migration failed: %w", err)
@@ -107,6 +116,7 @@ func (s *Store) Backfill(ctx context.Context) error {
 		"TRUNCATE TABLE IF EXISTS note_zaps",
 		"TRUNCATE TABLE IF EXISTS note_zap_totals",
 		"TRUNCATE TABLE IF EXISTS profiles_latest",
+		"TRUNCATE TABLE IF EXISTS notification_candidates",
 		`INSERT INTO note_like_counts
 		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS likes
 		 FROM event_tags
@@ -139,6 +149,25 @@ func (s *Store) Backfill(ctx context.Context) error {
 		   content AS raw_json
 		 FROM nostr_events FINAL
 		 WHERE kind = 0`,
+		`INSERT INTO notification_candidates
+		 SELECT
+		   tag_value AS viewer,
+		   event_id,
+		   pubkey AS actor_pubkey,
+		   kind,
+		   created_at,
+		   multiIf(
+		     kind = 1, 'mention',
+		     kind IN (6, 16), 'repost',
+		     kind = 7, 'reaction',
+		     kind = 9735, 'zap',
+		     'mention'
+		   ) AS reason
+		 FROM event_tags
+		 WHERE tag_key = 'p'
+		   AND length(tag_value) = 64
+		   AND kind IN (1, 6, 7, 16, 9735)
+		   AND pubkey != tag_value`,
 	}
 	for _, stmt := range statements {
 		if err := s.conn.Exec(ctx, stmt); err != nil {

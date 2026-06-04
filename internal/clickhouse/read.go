@@ -27,9 +27,11 @@ type EventView struct {
 }
 
 type TagFilter struct {
-	Key    string
-	Value  string
-	Values []string
+	Key           string
+	Value         string
+	Values        []string
+	ExcludeValues []string
+	Dataset       string
 }
 
 type EventQueryInput struct {
@@ -112,6 +114,48 @@ type PubkeyScore struct {
 	Followers uint64    `json:"followers"`
 	Nodes     uint64    `json:"nodes"`
 	FetchedAt time.Time `json:"fetchedAt"`
+}
+
+type TopicRow struct {
+	Value     string `json:"value"`
+	Parent    string `json:"parent"`
+	Label     string `json:"label"`
+	IsDefault bool   `json:"isDefault"`
+	Count     uint64 `json:"count"`
+}
+
+type TrendingInput struct {
+	Window   string
+	Category string
+	Limit    uint64
+}
+
+type TrendingClusterRow struct {
+	ID          string    `json:"id"`
+	Window      string    `json:"window"`
+	StartedAt   time.Time `json:"startedAt"`
+	Category    string    `json:"category"`
+	Subcategory string    `json:"subcategory"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	EventCount  uint64    `json:"eventCount"`
+	Score       float64   `json:"score"`
+	ComputedAt  time.Time `json:"computedAt"`
+}
+
+type NotificationInput struct {
+	Viewer string
+	Tab    string
+	Policy string
+	Since  int64
+	Until  int64
+	Limit  uint64
+}
+
+type NotificationRow struct {
+	Event            EventView `json:"event"`
+	Reason           string    `json:"reason"`
+	ActorVertexScore float64   `json:"actorVertexScore"`
 }
 
 type ProfileRow struct {
@@ -263,29 +307,116 @@ func (s *Store) mergeCount(ctx context.Context, table, column string, ids []stri
 }
 
 func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, error) {
-	var out FollowCounts
-	latest, err := s.QueryLatestEventsByPubKeys(ctx, []string{pubkey}, []int{3}, 1)
+	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
 	if err != nil {
-		return out, err
+		return FollowCounts{}, err
 	}
-	seenFollows := map[string]struct{}{}
-	for _, event := range latest[pubkey] {
-		for _, tag := range event.Tags {
-			if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
-				seenFollows[tag[1]] = struct{}{}
+	return counts[pubkey], nil
+}
+
+func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[string]FollowCounts, error) {
+	pubkeys = uniqueStrings(pubkeys)
+	out := make(map[string]FollowCounts, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		out[pubkey] = FollowCounts{}
+	}
+	if len(pubkeys) == 0 {
+		return out, nil
+	}
+	latest, err := s.QueryLatestEventsByPubKeys(ctx, pubkeys, []int{3}, 1)
+	if err != nil {
+		return nil, err
+	}
+	for _, pubkey := range pubkeys {
+		seenFollows := map[string]struct{}{}
+		for _, event := range latest[pubkey] {
+			for _, tag := range event.Tags {
+				if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
+					seenFollows[tag[1]] = struct{}{}
+				}
 			}
 		}
+		counts := out[pubkey]
+		counts.Follows = uint64(len(seenFollows))
+		out[pubkey] = counts
 	}
-	out.Follows = uint64(len(seenFollows))
 
-	if err := s.conn.QueryRow(ctx, `
-		SELECT uniqExact(pubkey)
+	rows, err := s.conn.Query(ctx, `
+		SELECT tag_value, uniqExact(pubkey)
 		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND tag_value = ?
-	`, pubkey).Scan(&out.Followers); err != nil {
-		return out, err
+		WHERE kind = 3 AND tag_key = 'p' AND tag_value IN (?)
+		GROUP BY tag_value
+	`, pubkeys)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	defer rows.Close()
+	for rows.Next() {
+		var pubkey string
+		var followers uint64
+		if err := rows.Scan(&pubkey, &followers); err != nil {
+			return nil, err
+		}
+		counts := out[pubkey]
+		counts.Followers = followers
+		out[pubkey] = counts
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error) {
+	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
+	if err != nil {
+		return 0, err
+	}
+	return counts[pubkey].Followers, nil
+}
+
+func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT recent.pubkey
+		FROM
+		(
+			SELECT pubkey, max(created_at) AS last_event_at
+			FROM nostr_events FINAL
+			WHERE length(pubkey) = 64 AND created_at >= now() - INTERVAL 30 DAY
+			GROUP BY pubkey
+		) AS recent
+		INNER JOIN
+		(
+			SELECT tag_value AS pubkey, uniqExact(pubkey) AS followers
+			FROM event_tags
+			WHERE kind = 3 AND tag_key = 'p' AND length(tag_value) = 64
+			GROUP BY tag_value
+			HAVING followers >= ?
+		) AS follower_counts ON follower_counts.pubkey = recent.pubkey
+		LEFT JOIN
+		(
+			SELECT pubkey, max(fetched_at) AS fetched_at
+			FROM vertex_scores FINAL
+			WHERE source = 'vertex'
+			GROUP BY pubkey
+		) AS scores ON scores.pubkey = recent.pubkey
+		WHERE ifNull(scores.fetched_at, toDateTime(0)) < now() - INTERVAL 6 HOUR
+		ORDER BY recent.last_event_at DESC
+		LIMIT ?
+	`, minFollowers, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var pubkey string
+		if err := rows.Scan(&pubkey); err != nil {
+			return nil, err
+		}
+		out = append(out, pubkey)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) ProfileFirstEventCreatedAt(ctx context.Context, pubkey string) (*time.Time, error) {
@@ -366,6 +497,10 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 	`, "vertex", pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
 }
 
+func (s *Store) AuthorVertexScores(ctx context.Context, pubkeys []string) (map[string]PubkeyScore, error) {
+	return s.PubkeyScores(ctx, "vertex", pubkeys)
+}
+
 func (s *Store) PubkeyScores(ctx context.Context, source string, pubkeys []string) (map[string]PubkeyScore, error) {
 	source = strings.TrimSpace(strings.ToLower(source))
 	if source == "" {
@@ -401,6 +536,235 @@ func (s *Store) PubkeyScores(ctx context.Context, source string, pubkeys []strin
 		out[score.PubKey] = score
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) DerivedMetricValues(ctx context.Context, metric string, eventIDs []string) (map[string]float64, error) {
+	metric = strings.TrimSpace(metric)
+	eventIDs = uniqueStrings(eventIDs)
+	out := make(map[string]float64, len(eventIDs))
+	if metric == "" || len(eventIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT event_id, argMax(value, computed_at)
+		FROM derived_metrics FINAL
+		WHERE metric = ? AND event_id IN (?)
+		GROUP BY event_id
+	`, metric, eventIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var eventID string
+		var value float64
+		if err := rows.Scan(&eventID, &value); err != nil {
+			return nil, err
+		}
+		out[eventID] = value
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AvailableTopics(ctx context.Context, input EventQueryInput) ([]TopicRow, error) {
+	if input.Empty {
+		return []TopicRow{}, nil
+	}
+	if input.Limit == 0 || input.Limit > 500 {
+		input.Limit = 100
+	}
+	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	if input.Since > 0 {
+		where += " AND e.created_at >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		where += " AND e.created_at < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
+	args = append(args, input.Limit)
+	rows, err := s.conn.Query(ctx, `
+		SELECT
+			dt.tag_value,
+			anyLast(ifNull(tt.parent, '')),
+			anyLast(ifNull(tt.label, dt.tag_value)),
+			max(ifNull(tt.is_default, 0)),
+			uniqExact(dt.event_id) AS event_count
+		FROM derived_tags AS dt
+		INNER JOIN nostr_events AS e FINAL ON e.id = dt.event_id
+		LEFT JOIN topic_taxonomy AS tt FINAL ON tt.value = dt.tag_value
+		`+where+`
+		  AND dt.tag_key = 'topic'
+		GROUP BY dt.tag_value
+		ORDER BY event_count DESC, dt.tag_value ASC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TopicRow
+	for rows.Next() {
+		var row TopicRow
+		var isDefault uint8
+		if err := rows.Scan(&row.Value, &row.Parent, &row.Label, &isDefault, &row.Count); err != nil {
+			return nil, err
+		}
+		row.IsDefault = isDefault != 0
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) TrendingClusters(ctx context.Context, input TrendingInput) ([]TrendingClusterRow, error) {
+	window := strings.TrimSpace(strings.ToUpper(input.Window))
+	if window == "" {
+		window = "H24"
+	}
+	if input.Limit == 0 || input.Limit > 50 {
+		input.Limit = 20
+	}
+
+	where := "WHERE window = ?"
+	args := []any{window}
+	if category := strings.TrimSpace(input.Category); category != "" {
+		where += " AND category = ?"
+		args = append(args, category)
+	}
+	args = append(args, input.Limit)
+	rows, err := s.conn.Query(ctx, `
+		SELECT id, window, started_at, category, subcategory, title, description, event_count, score, computed_at
+		FROM trending_clusters FINAL
+		`+where+`
+		ORDER BY score DESC, event_count DESC, started_at DESC, id ASC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []TrendingClusterRow
+	for rows.Next() {
+		var row TrendingClusterRow
+		if err := rows.Scan(
+			&row.ID,
+			&row.Window,
+			&row.StartedAt,
+			&row.Category,
+			&row.Subcategory,
+			&row.Title,
+			&row.Description,
+			&row.EventCount,
+			&row.Score,
+			&row.ComputedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]NotificationRow, error) {
+	input.Viewer = strings.TrimSpace(strings.ToLower(input.Viewer))
+	if input.Viewer == "" {
+		return []NotificationRow{}, nil
+	}
+	if input.Limit == 0 || input.Limit > 100 {
+		input.Limit = 50
+	}
+	tab := strings.ToUpper(strings.TrimSpace(input.Tab))
+	if tab == "" {
+		tab = "ALL"
+	}
+	policy := strings.ToUpper(strings.TrimSpace(input.Policy))
+	if policy == "" {
+		policy = "STRICT"
+	}
+
+	where := "WHERE n.viewer = ?"
+	args := []any{input.Viewer}
+	if tab == "MENTIONS" {
+		where += " AND n.reason = 'mention'"
+	}
+	if input.Since > 0 {
+		where += " AND n.created_at >= ?"
+		args = append(args, time.Unix(input.Since, 0).UTC())
+	}
+	if input.Until > 0 {
+		where += " AND n.created_at < ?"
+		args = append(args, time.Unix(input.Until, 0).UTC())
+	}
+	actorThreshold, viewerThreshold := notificationPolicyThresholds(policy)
+	if actorThreshold > 0 || viewerThreshold > 0 {
+		where += " AND (ifNull(actor_score.score, 0) >= ? OR ifNull(viewer_score.score, 0) >= ?)"
+		args = append(args, actorThreshold, viewerThreshold)
+	}
+	args = append(args, input.Limit)
+
+	rows, err := s.conn.Query(ctx, `
+		SELECT
+			e.id,
+			e.pubkey,
+			e.kind,
+			e.created_at,
+			e.content,
+			e.tags_json,
+			e.sig,
+			e.last_seen_at,
+			n.reason,
+			ifNull(actor_score.score, 0) AS actor_vertex_score
+		FROM notification_candidates AS n FINAL
+		INNER JOIN nostr_events AS e FINAL ON e.id = n.event_id
+		LEFT JOIN vertex_scores AS actor_score FINAL
+			ON actor_score.source = 'vertex' AND actor_score.pubkey = n.actor_pubkey
+		LEFT JOIN vertex_scores AS viewer_score FINAL
+			ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
+		`+where+`
+		ORDER BY n.created_at DESC, n.event_id DESC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []NotificationRow{}
+	for rows.Next() {
+		var row NotificationRow
+		var tagsJSON string
+		var kind uint32
+		if err := rows.Scan(
+			&row.Event.ID,
+			&row.Event.PubKey,
+			&kind,
+			&row.Event.CreatedAt,
+			&row.Event.Content,
+			&tagsJSON,
+			&row.Event.Sig,
+			&row.Event.UpdatedAt,
+			&row.Reason,
+			&row.ActorVertexScore,
+		); err != nil {
+			return nil, err
+		}
+		row.Event.Kind = int(kind)
+		_ = json.Unmarshal([]byte(tagsJSON), &row.Event.Tags)
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func notificationPolicyThresholds(policy string) (float64, float64) {
+	switch strings.ToUpper(strings.TrimSpace(policy)) {
+	case "RELAXED":
+		return 0, 0
+	case "MODERATE":
+		return 20, 60
+	default:
+		return 50, 80
+	}
 }
 
 func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[string]ProfileRow, error) {
@@ -1213,9 +1577,9 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 	case "EVENTS":
 		spec.from = "nostr_events AS e FINAL"
 		spec.where, args = eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
-	case "TAGS":
-		spec.from = "event_tags t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id"
-		spec.where, args = tagWhere(input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	case "TAGS", "DERIVED_TAGS":
+		spec.from = tagDatasetTable(dataset) + " t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id"
+		spec.where, args = tagWhere(dataset, input.IDs, input.PubKeys, input.Kinds, input.Tags)
 	case "RELAYS":
 		spec.from = "event_seen_relays r"
 		spec.where = "WHERE 1 = 1"
@@ -1408,7 +1772,7 @@ func aggregateTimeColumn(dataset string) (string, error) {
 	switch dataset {
 	case "EVENTS":
 		return "e.created_at", nil
-	case "TAGS":
+	case "TAGS", "DERIVED_TAGS":
 		return "t.created_at", nil
 	case "RELAYS":
 		return "r.last_seen_at", nil
@@ -1433,10 +1797,20 @@ func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilt
 	}
 	for i, tag := range tags {
 		subAlias := fmt.Sprintf("tf%d", i)
-		clause := fmt.Sprintf("%s.id IN (SELECT %s.event_id FROM event_tags %s WHERE %s.tag_key = ?", alias, subAlias, subAlias, subAlias)
-		args = append(args, tag.Key)
-		clause, args = addTagValueClause(clause, args, subAlias, tag)
-		clauses = append(clauses, clause+")")
+		table := tagDatasetTable(tag.Dataset)
+		hasIncludeFilter := tag.Value != "" || len(tag.Values) > 0 || len(tag.ExcludeValues) == 0
+		if tag.Key != "" && hasIncludeFilter {
+			clause := fmt.Sprintf("%s.id IN (SELECT %s.event_id FROM %s %s WHERE %s.tag_key = ?", alias, subAlias, table, subAlias, subAlias)
+			args = append(args, tag.Key)
+			clause, args = addTagValueClause(clause, args, subAlias, tag)
+			clauses = append(clauses, clause+")")
+		}
+		if tag.Key != "" && len(tag.ExcludeValues) > 0 {
+			excludeAlias := fmt.Sprintf("%sx", subAlias)
+			clause := fmt.Sprintf("%s.id NOT IN (SELECT %s.event_id FROM %s %s WHERE %s.tag_key = ? AND %s.tag_value IN (?))", alias, excludeAlias, table, excludeAlias, excludeAlias, excludeAlias)
+			args = append(args, tag.Key, tag.ExcludeValues)
+			clauses = append(clauses, clause)
+		}
 	}
 	return strings.Join(clauses, " AND "), args
 }
@@ -1445,7 +1819,7 @@ func whereBody(where string) string {
 	return strings.TrimPrefix(where, "WHERE ")
 }
 
-func tagWhere(ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
+func tagWhere(dataset string, ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
 	clauses := []string{"WHERE 1 = 1"}
 	var args []any
 	if len(ids) > 0 {
@@ -1460,6 +1834,9 @@ func tagWhere(ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []a
 		clauses = append(clauses, "t.kind IN ("+ints(kinds)+")")
 	}
 	for _, tag := range tags {
+		if strings.ToUpper(strings.TrimSpace(tag.Dataset)) == "DERIVED_TAGS" && dataset != "DERIVED_TAGS" {
+			continue
+		}
 		clause := "t.tag_key = ?"
 		args = append(args, tag.Key)
 		clause, args = addTagValueClause(clause, args, "t", tag)
@@ -1479,6 +1856,15 @@ func addTagValueClause(clause string, args []any, alias string, tag TagFilter) (
 	return clause, args
 }
 
+func tagDatasetTable(dataset string) string {
+	switch strings.ToUpper(strings.TrimSpace(dataset)) {
+	case "DERIVED_TAGS":
+		return "derived_tags"
+	default:
+		return "event_tags"
+	}
+}
+
 func dimensionExpr(dataset, key string) (string, error) {
 	switch key {
 	case "DAY":
@@ -1490,7 +1876,7 @@ func dimensionExpr(dataset, key string) (string, error) {
 	case "PUBKEY", "AUTHOR":
 		return eventOrTagExpr(dataset, "pubkey")
 	case "EVENT_ID":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "t.event_id", nil
 		}
 		if dataset == "RELAYS" {
@@ -1498,15 +1884,15 @@ func dimensionExpr(dataset, key string) (string, error) {
 		}
 		return "e.id", nil
 	case "CONTENT":
-		if dataset == "EVENTS" || dataset == "TAGS" {
+		if dataset == "EVENTS" || dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "e.content", nil
 		}
 	case "TAG_KEY":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "t.tag_key", nil
 		}
 	case "TAG_VALUE":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "t.tag_value", nil
 		}
 	case "RELAY":
@@ -1522,7 +1908,7 @@ func metricExpr(dataset, key string) (string, error) {
 	case "COUNT":
 		return "count()", nil
 	case "UNIQUE_EVENTS":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "uniqExact(t.event_id)", nil
 		}
 		if dataset == "RELAYS" {
@@ -1530,14 +1916,14 @@ func metricExpr(dataset, key string) (string, error) {
 		}
 		return "uniqExact(e.id)", nil
 	case "UNIQUE_PUBKEYS", "UNIQUE_AUTHORS":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "uniqExact(t.pubkey)", nil
 		}
 		if dataset == "EVENTS" {
 			return "uniqExact(e.pubkey)", nil
 		}
 	case "UNIQUE_TAG_VALUES":
-		if dataset == "TAGS" {
+		if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 			return "uniqExact(t.tag_value)", nil
 		}
 	case "UNIQUE_RELAYS":
@@ -1550,7 +1936,7 @@ func metricExpr(dataset, key string) (string, error) {
 
 func timeExpr(dataset, fn string) (string, error) {
 	switch dataset {
-	case "TAGS":
+	case "TAGS", "DERIVED_TAGS":
 		return fn + "(t.created_at)", nil
 	case "RELAYS":
 		return fn + "(r.last_seen_at)", nil
@@ -1560,7 +1946,7 @@ func timeExpr(dataset, fn string) (string, error) {
 }
 
 func eventOrTagExpr(dataset, col string) (string, error) {
-	if dataset == "TAGS" {
+	if dataset == "TAGS" || dataset == "DERIVED_TAGS" {
 		return "t." + col, nil
 	}
 	if dataset == "EVENTS" {

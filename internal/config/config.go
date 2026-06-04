@@ -12,6 +12,7 @@ import (
 	"time"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
 )
@@ -23,6 +24,7 @@ type Config struct {
 	Vertex     VertexConfig
 	OnDemand   OnDemandConfig
 	Viewer     ViewerConfig
+	Enrich     EnrichConfig
 }
 
 type VertexConfig struct {
@@ -31,10 +33,22 @@ type VertexConfig struct {
 	ValidateNIP05       bool
 	ProfileMinFollowers int
 	RankMinFollowers    int
+	SyncBatch           int
 }
 
 type ViewerConfig struct {
 	PubKey string
+}
+
+type EnrichConfig struct {
+	Tasks                    []string
+	BatchSize                int
+	PollInterval             time.Duration
+	ModelDir                 string
+	ModelVersion             string
+	ModelBackend             string
+	OnnxLibraryPath          string
+	TrendingDedupeSimilarity float64
 }
 
 type OnDemandConfig struct {
@@ -79,6 +93,7 @@ func Load() (Config, error) {
 			ValidateNIP05:       parseBool(env("NAGG_NIP05_VALIDATE", "true")),
 			ProfileMinFollowers: parseInt(env("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "500")),
 			RankMinFollowers:    parseInt(env("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "500")),
+			SyncBatch:           parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
@@ -92,6 +107,16 @@ func Load() (Config, error) {
 		},
 		Viewer: ViewerConfig{
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),
+		},
+		Enrich: EnrichConfig{
+			Tasks:                    splitCSV(env("NAGG_ENRICH_TASKS", "topics,embeddings,trending,stance,sentiment,quality,controversy,nsfw")),
+			BatchSize:                parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
+			PollInterval:             parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
+			ModelDir:                 strings.TrimSpace(os.Getenv("NAGG_ENRICH_MODEL_DIR")),
+			ModelVersion:             env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
+			ModelBackend:             strings.ToLower(env("NAGG_ENRICH_MODEL_BACKEND", "go")),
+			OnnxLibraryPath:          strings.TrimSpace(os.Getenv("NAGG_ENRICH_ONNX_LIBRARY_PATH")),
+			TrendingDedupeSimilarity: parseFloat(env("NAGG_TRENDING_DEDUPE_SIM", "0.82")),
 		},
 	}
 
@@ -135,6 +160,9 @@ func (c Config) validate() error {
 	if c.Vertex.RankMinFollowers < 0 {
 		return errors.New("NAGG_VERTEX_RANK_MIN_FOLLOWERS must be non-negative")
 	}
+	if c.Vertex.SyncBatch < 1 {
+		return errors.New("NAGG_VERTEX_SYNC_BATCH must be positive")
+	}
 	if c.Viewer.PubKey != "" {
 		if len(c.Viewer.PubKey) != 64 {
 			return errors.New("NAGG_VIEWER_PUBKEY must be 64 hex characters")
@@ -143,7 +171,33 @@ func (c Config) validate() error {
 			return fmt.Errorf("NAGG_VIEWER_PUBKEY: %w", err)
 		}
 	}
+	if c.Enrich.BatchSize < 1 {
+		return errors.New("NAGG_ENRICH_BATCH_SIZE must be positive")
+	}
+	if c.Enrich.PollInterval <= 0 {
+		return errors.New("NAGG_ENRICH_POLL_INTERVAL must be positive")
+	}
+	if strings.TrimSpace(c.Enrich.ModelVersion) == "" {
+		return errors.New("NAGG_ENRICH_MODEL_VERSION must be non-empty")
+	}
+	if c.Enrich.TrendingDedupeSimilarity <= 0 || c.Enrich.TrendingDedupeSimilarity > 1 {
+		return errors.New("NAGG_TRENDING_DEDUPE_SIM must be greater than 0 and less than or equal to 1")
+	}
+	switch c.Enrich.ModelBackend {
+	case "", "go", "gomlx", "ort", "onnx", "onnxruntime":
+	default:
+		return errors.New("NAGG_ENRICH_MODEL_BACKEND must be go or ort")
+	}
+	for _, task := range c.Enrich.Tasks {
+		if !validEnrichTask(task) {
+			return fmt.Errorf("NAGG_ENRICH_TASKS contains unsupported task %q", task)
+		}
+	}
 	return nil
+}
+
+func validEnrichTask(task string) bool {
+	return enrich.SupportedTask(task)
 }
 
 func env(key, fallback string) string {
@@ -217,6 +271,14 @@ func parseInt(value string) int {
 
 func parseInt64(value string) int64 {
 	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func parseFloat(value string) float64 {
+	n, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return 0
 	}

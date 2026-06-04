@@ -35,6 +35,14 @@ type fakeStore struct {
 	aggregateInputs             []chstore.AggregateInput
 	pubkeyScoreRows             map[string]chstore.PubkeyScore
 	pubkeyScoreInputs           []pubkeyScoreInput
+	derivedMetricRows           map[string]map[string]float64
+	derivedMetricInputs         []derivedMetricInput
+	topicRows                   []chstore.TopicRow
+	availableTopicInputs        []chstore.EventQueryInput
+	trendingRows                []chstore.TrendingClusterRow
+	trendingInputs              []chstore.TrendingInput
+	notificationRows            []chstore.NotificationRow
+	notificationInputs          []chstore.NotificationInput
 }
 
 type latestEventsInput struct {
@@ -58,6 +66,11 @@ type rankedTargetAggregateInput struct {
 type pubkeyScoreInput struct {
 	source  string
 	pubkeys []string
+}
+
+type derivedMetricInput struct {
+	metric   string
+	eventIDs []string
 }
 
 func (s *fakeStore) EventByID(_ context.Context, id string) (*chstore.EventView, error) {
@@ -213,6 +226,39 @@ func (s *fakeStore) PubkeyScores(_ context.Context, source string, pubkeys []str
 	return out, nil
 }
 
+func (s *fakeStore) DerivedMetricValues(_ context.Context, metric string, eventIDs []string) (map[string]float64, error) {
+	s.derivedMetricInputs = append(s.derivedMetricInputs, derivedMetricInput{
+		metric:   metric,
+		eventIDs: append([]string(nil), eventIDs...),
+	})
+	out := make(map[string]float64, len(eventIDs))
+	if s.derivedMetricRows == nil {
+		return out, nil
+	}
+	values := s.derivedMetricRows[metric]
+	for _, eventID := range eventIDs {
+		if value, ok := values[eventID]; ok {
+			out[eventID] = value
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) AvailableTopics(_ context.Context, input chstore.EventQueryInput) ([]chstore.TopicRow, error) {
+	s.availableTopicInputs = append(s.availableTopicInputs, input)
+	return s.topicRows, nil
+}
+
+func (s *fakeStore) TrendingClusters(_ context.Context, input chstore.TrendingInput) ([]chstore.TrendingClusterRow, error) {
+	s.trendingInputs = append(s.trendingInputs, input)
+	return s.trendingRows, nil
+}
+
+func (s *fakeStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
+	s.notificationInputs = append(s.notificationInputs, input)
+	return s.notificationRows, nil
+}
+
 func (s *fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return nil, nil, nil
 }
@@ -300,6 +346,100 @@ func TestHandlerWritesCapabilityHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Nagg-App-View-Version"); got != "v1" {
 		t.Fatalf("app view version header = %q", got)
+	}
+}
+
+func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
+	rootID := testHex("1")
+	replyID := testHex("2")
+	secondReplyID := testHex("3")
+	otherParentID := testHex("4")
+	author := testPubkey
+	otherPubkey := testHex("a")
+	root := chstore.EventView{
+		ID:        rootID,
+		PubKey:    author,
+		Kind:      1,
+		CreatedAt: time.Unix(100, 0).UTC(),
+	}
+	firstReply := chstore.EventView{
+		ID:        replyID,
+		PubKey:    author,
+		Kind:      1,
+		CreatedAt: time.Unix(110, 0).UTC(),
+		Tags:      [][]string{{"e", rootID, "", "reply"}},
+	}
+	nonAuthorReply := chstore.EventView{
+		ID:        testHex("5"),
+		PubKey:    otherPubkey,
+		Kind:      1,
+		CreatedAt: time.Unix(105, 0).UTC(),
+		Tags:      [][]string{{"e", rootID, "", "reply"}},
+	}
+	decoyNestedReply := chstore.EventView{
+		ID:        testHex("6"),
+		PubKey:    author,
+		Kind:      1,
+		CreatedAt: time.Unix(106, 0).UTC(),
+		Tags:      [][]string{{"e", rootID, "", "root"}, {"e", otherParentID, "", "reply"}},
+	}
+	secondReply := chstore.EventView{
+		ID:        secondReplyID,
+		PubKey:    author,
+		Kind:      1,
+		CreatedAt: time.Unix(120, 0).UTC(),
+		Tags:      [][]string{{"e", rootID, "", "root"}, {"e", replyID, "", "reply"}},
+	}
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{rootID: root},
+		events: [][]chstore.EventView{
+			{nonAuthorReply, decoyNestedReply, firstReply},
+			{secondReply},
+			{},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query($id: String!) {
+			event(id: $id) {
+				authoredReplyChain(input: { maxDepth: 8, maxBranchFanout: 32 }) {
+					nodes { id pubkey }
+				}
+			}
+		}`,
+		VariableValues: map[string]any{"id": rootID},
+		Context:        context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	event := data["event"].(map[string]any)
+	chain := event["authoredReplyChain"].(map[string]any)
+	nodes := chain["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes = %+v, want 2 author replies", nodes)
+	}
+	if got := nodes[0].(map[string]any)["id"]; got != replyID {
+		t.Fatalf("first chain id = %v, want %s", got, replyID)
+	}
+	if got := nodes[1].(map[string]any)["id"]; got != secondReplyID {
+		t.Fatalf("second chain id = %v, want %s", got, secondReplyID)
+	}
+	if len(store.referenceInputs) < 2 {
+		t.Fatalf("reference inputs = %d, want at least 2", len(store.referenceInputs))
+	}
+	if got := store.referenceInputs[0].limitPerTarget; got != 32 {
+		t.Fatalf("fanout limit = %d, want 32", got)
+	}
+	if got := store.referenceInputs[0].input.PubKeys; len(got) != 1 || got[0] != author {
+		t.Fatalf("query pubkeys = %+v, want author only", got)
 	}
 }
 
@@ -1905,6 +2045,377 @@ func TestRankedReferencedBySupportsPubkeyScoreTermWithFollowerThreshold(t *testi
 	scoreInput := store.pubkeyScoreInputs[0]
 	if scoreInput.source != "vertex" || len(scoreInput.pubkeys) != 2 {
 		t.Fatalf("score input = %+v", scoreInput)
+	}
+}
+
+func TestRankedReferencedByUsesDerivedMetricRankTerm(t *testing.T) {
+	rootID := testHex("1")
+	replyAID := testHex("2")
+	replyBID := testHex("3")
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        replyAID,
+				PubKey:    testHex("a"),
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "low contribution",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("7", 128),
+			},
+			{
+				ID:        replyBID,
+				PubKey:    testHex("b"),
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "high contribution",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("6", 128),
+			},
+		}},
+		derivedMetricRows: map[string]map[string]float64{
+			"contribution_quality": {
+				replyAID: 0.2,
+				replyBID: 0.9,
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				rankedReferencedBy(input:{
+					via:{key:"e"}
+					events:{kinds:[1], limit:10}
+					rank:{
+						references:{kinds:[7], limit:500}
+						via:{key:"e"}
+						metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+						terms:[{
+							derivedMetric:"contribution_quality"
+							weight:10
+						}]
+					}
+					limit:2
+				}) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 || nodes[0].(map[string]any)["id"] != replyBID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	if len(store.derivedMetricInputs) != 1 {
+		t.Fatalf("derived metric inputs = %+v", store.derivedMetricInputs)
+	}
+	input := store.derivedMetricInputs[0]
+	if input.metric != "contribution_quality" || len(input.eventIDs) != 2 {
+		t.Fatalf("derived metric input = %+v", input)
+	}
+}
+
+func TestEventsAcceptsDerivedTagExcludeValues(t *testing.T) {
+	store := &fakeStore{
+		events: [][]chstore.EventView{{
+			{
+				ID:        testHex("1"),
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "untagged still eligible",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{
+				kinds:[1]
+				tags:[{key:"topic", dataset:"DERIVED_TAGS", excludeValues:["crypto"]}]
+				limit:10
+			}) { nodes { id } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	tags := store.eventInputs[0].Tags
+	if len(tags) != 1 {
+		t.Fatalf("tags = %+v", tags)
+	}
+	tag := tags[0]
+	if tag.Key != "topic" || tag.Dataset != "DERIVED_TAGS" || len(tag.ExcludeValues) != 1 || tag.ExcludeValues[0] != "crypto" {
+		t.Fatalf("tag filter = %+v", tag)
+	}
+}
+
+func TestAvailableTopicsReturnsDerivedTopicRows(t *testing.T) {
+	store := &fakeStore{
+		topicRows: []chstore.TopicRow{
+			{Value: "crypto.bitcoin", Parent: "crypto", Label: "Bitcoin", IsDefault: true, Count: 42},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			availableTopics(input:{kinds:[1], limit:25}) {
+				value
+				parent
+				label
+				isDefault
+				count
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	topics := data["availableTopics"].([]any)
+	if len(topics) != 1 {
+		t.Fatalf("topics = %+v", topics)
+	}
+	topic := topics[0].(map[string]any)
+	if topic["value"] != "crypto.bitcoin" || topic["label"] != "Bitcoin" || topic["count"] != 42 {
+		t.Fatalf("topic = %+v", topic)
+	}
+	if len(store.availableTopicInputs) != 1 {
+		t.Fatalf("available topic inputs = %+v", store.availableTopicInputs)
+	}
+	input := store.availableTopicInputs[0]
+	if len(input.Kinds) != 1 || input.Kinds[0] != 1 || input.Limit != 25 {
+		t.Fatalf("available topic input = %+v", input)
+	}
+}
+
+func TestTrendingReturnsClustersWithSampleEvents(t *testing.T) {
+	clusterID := "cluster-h24-crypto"
+	sampleID := testHex("9")
+	store := &fakeStore{
+		events: [][]chstore.EventView{{
+			{
+				ID:        sampleID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "sample",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("9", 128),
+			},
+		}},
+		trendingRows: []chstore.TrendingClusterRow{
+			{
+				ID:          clusterID,
+				Window:      "H24",
+				StartedAt:   time.Unix(1_710_000_000, 0),
+				Category:    "crypto",
+				Subcategory: "bitcoin",
+				Title:       "Bitcoin relay chatter",
+				Description: "Clustered Bitcoin notes",
+				EventCount:  12,
+				Score:       4.5,
+				ComputedAt:  time.Unix(1_710_000_100, 0),
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			trending(input:{window:H24, category:"crypto", limit:2}) {
+				id
+				window
+				category
+				subcategory
+				title
+				eventCount
+				score
+				sampleEvents(limit:1) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	clusters := data["trending"].([]any)
+	if len(clusters) != 1 {
+		t.Fatalf("clusters = %+v", clusters)
+	}
+	cluster := clusters[0].(map[string]any)
+	if cluster["id"] != clusterID || cluster["title"] != "Bitcoin relay chatter" || cluster["eventCount"] != 12 {
+		t.Fatalf("cluster = %+v", cluster)
+	}
+	nodes := cluster["sampleEvents"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != sampleID {
+		t.Fatalf("sample nodes = %+v", nodes)
+	}
+	if len(store.trendingInputs) != 1 {
+		t.Fatalf("trending inputs = %+v", store.trendingInputs)
+	}
+	input := store.trendingInputs[0]
+	if input.Window != "H24" || input.Category != "crypto" || input.Limit != 2 {
+		t.Fatalf("trending input = %+v", input)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("sample event inputs = %+v", store.eventInputs)
+	}
+	sampleInput := store.eventInputs[0]
+	if sampleInput.Limit != 1 || len(sampleInput.Tags) != 1 {
+		t.Fatalf("sample input = %+v", sampleInput)
+	}
+	tag := sampleInput.Tags[0]
+	if tag.Key != "cluster" || tag.Value != clusterID || tag.Dataset != "DERIVED_TAGS" {
+		t.Fatalf("sample tag = %+v", tag)
+	}
+}
+
+func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
+	eventID := testHex("8")
+	actorPubkey := testHex("a")
+	store := &fakeStore{
+		notificationRows: []chstore.NotificationRow{
+			{
+				Event: chstore.EventView{
+					ID:        eventID,
+					PubKey:    actorPubkey,
+					Kind:      1,
+					CreatedAt: time.Unix(1_710_000_000, 0),
+					Content:   "mention",
+					Tags:      [][]string{{"p", testPubkey}},
+					Sig:       strings.Repeat("8", 128),
+					UpdatedAt: time.Unix(1_710_000_001, 0),
+				},
+				Reason:           "mention",
+				ActorVertexScore: 77,
+			},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			notifications(input:{
+				viewer:"` + testPubkey + `"
+				tab:MENTIONS
+				policy:STRICT
+				since:1710000000
+				limit:2
+			}) {
+				nodes {
+					reason
+					actorVertexScore
+					event { id pubkey kind }
+				}
+				pageInfo { hasNextPage endCursor }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	connection := data["notifications"].(map[string]any)
+	nodes := connection["nodes"].([]any)
+	if len(nodes) != 1 {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	node := nodes[0].(map[string]any)
+	if node["reason"] != "mention" || node["actorVertexScore"] != float64(77) {
+		t.Fatalf("notification = %+v", node)
+	}
+	event := node["event"].(map[string]any)
+	if event["id"] != eventID || event["pubkey"] != actorPubkey || event["kind"] != 1 {
+		t.Fatalf("event = %+v", event)
+	}
+	pageInfo := connection["pageInfo"].(map[string]any)
+	if pageInfo["hasNextPage"] != false || pageInfo["endCursor"] == "" {
+		t.Fatalf("pageInfo = %+v", pageInfo)
+	}
+	if len(store.notificationInputs) != 1 {
+		t.Fatalf("notification inputs = %+v", store.notificationInputs)
+	}
+	input := store.notificationInputs[0]
+	if input.Viewer != testPubkey || input.Tab != "MENTIONS" || input.Policy != "STRICT" || input.Since != 1_710_000_000 || input.Limit != 2 {
+		t.Fatalf("notification input = %+v", input)
+	}
+}
+
+func TestNotificationsDefaultsToAllStrict(t *testing.T) {
+	store := &fakeStore{}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema:        schema,
+		RequestString: `query { notifications(input:{viewer:"` + testPubkey + `"}) { nodes { reason } } }`,
+		Context:       context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.notificationInputs) != 1 {
+		t.Fatalf("notification inputs = %+v", store.notificationInputs)
+	}
+	input := store.notificationInputs[0]
+	if input.Tab != "ALL" || input.Policy != "STRICT" || input.Limit != 50 {
+		t.Fatalf("notification input defaults = %+v", input)
 	}
 }
 

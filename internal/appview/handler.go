@@ -659,9 +659,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 	}
 	var dvmProfile vertex.ProfileResult
 	var fromCache bool
-	if counts.Followers >= h.vertexProfileMinFollowers {
-		dvmProfile, fromCache = h.vertexProfile(ctx, pubkey)
-	}
+	dvmProfile, fromCache = h.vertexProfile(ctx, pubkey, counts.Followers)
 	topFollowers, err := h.enrichTopFollowers(ctx, dvmProfile.TopFollowers)
 	if err != nil {
 		writeError(w, err)
@@ -1210,26 +1208,14 @@ func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchR
 	return out, nil
 }
 
-func (h *Handler) vertexProfile(ctx context.Context, pubkey string) (vertex.ProfileResult, bool) {
-	if h.vertex != nil {
-		profile, err := h.vertex.ProfileRefresh(ctx, pubkey)
-		if err == nil {
-			if saveErr := h.store.SaveVertexProfile(ctx, profile); saveErr != nil {
-				slog.Warn("vertex profile cache save failed", "pubkey", pubkey, "error", saveErr)
-			}
-			return profile, false
-		}
-		slog.Warn("vertex profile refresh failed", "pubkey", pubkey, "error", err)
-	}
-	profile, ok, err := h.store.CachedVertexProfile(ctx, pubkey)
+func (h *Handler) vertexProfile(ctx context.Context, pubkey string, followers uint64) (vertex.ProfileResult, bool) {
+	provider := vertex.NewScoreProvider(h.store, h.vertex, h.vertexProfileMinFollowers)
+	profile, ok, err := provider.AuthorProfileWithFollowers(ctx, pubkey, followers)
 	if err != nil {
 		slog.Warn("vertex profile cache read failed", "pubkey", pubkey, "error", err)
 		return vertex.ProfileResult{}, false
 	}
-	if ok {
-		return profile, true
-	}
-	return vertex.ProfileResult{}, false
+	return profile, ok
 }
 
 func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, localProfile chstore.ProfileRow) (*int64, error) {
