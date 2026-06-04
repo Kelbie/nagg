@@ -154,12 +154,13 @@ type TrendingClusterRow struct {
 }
 
 type NotificationInput struct {
-	Viewer string
-	Tab    string
-	Policy string
-	Since  int64
-	Until  int64
-	Limit  uint64
+	Viewer     string
+	Tab        string
+	Policy     string
+	ReplyScope string
+	Since      int64
+	Until      int64
+	Limit      uint64
 }
 
 type NotificationRow struct {
@@ -732,25 +733,73 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	if policy == "" {
 		policy = "STRICT"
 	}
+	replyScope := strings.ToUpper(strings.TrimSpace(input.ReplyScope))
+	if replyScope == "" {
+		replyScope = "THREAD"
+	}
 
 	where := "WHERE 1 = 1"
 	args := []any{input.Viewer}
+	whereArgs := []any{}
 	if tab == "MENTIONS" {
 		where += " AND n.reason = 'mention'"
 	}
 	if input.Since > 0 {
 		where += " AND n.created_at >= ?"
-		args = append(args, time.Unix(input.Since, 0).UTC())
+		whereArgs = append(whereArgs, time.Unix(input.Since, 0).UTC())
 	}
 	if input.Until > 0 {
 		where += " AND n.created_at < ?"
-		args = append(args, time.Unix(input.Until, 0).UTC())
+		whereArgs = append(whereArgs, time.Unix(input.Until, 0).UTC())
 	}
 	actorThreshold, viewerThreshold := notificationPolicyThresholds(policy)
 	if actorThreshold > 0 || viewerThreshold > 0 {
 		where += " AND (ifNull(actor_score.score, 0) >= ? OR ifNull(viewer_score.score, 0) >= ?)"
-		args = append(args, actorThreshold, viewerThreshold)
+		whereArgs = append(whereArgs, actorThreshold, viewerThreshold)
 	}
+	replyReferenceJoin := ""
+	if replyScope == "DIRECT" || replyScope == "THREAD" {
+		replyReferenceJoin = `
+			LEFT JOIN (
+				SELECT
+					event_id,
+					countIf(marker IN ('', 'root', 'reply')) > 0 AS is_reply,
+					coalesce(
+						nullIf(argMinIf(tag_value, tag_index, marker = 'reply'), ''),
+						nullIf(argMaxIf(tag_value, tag_index, marker = ''), ''),
+						nullIf(argMinIf(tag_value, tag_index, marker = 'root'), '')
+					) AS direct_parent_id
+				FROM (
+					SELECT
+						event_id,
+						tag_value,
+						tag_index,
+						lower(if(length(tag_extra) >= 2, tag_extra[2], '')) AS marker
+					FROM event_tags
+					WHERE tag_key = 'e' AND length(tag_value) = 64
+				)
+				GROUP BY event_id
+			) AS reply_meta ON reply_meta.event_id = e.id
+			LEFT JOIN nostr_events AS reply_parent FINAL ON reply_parent.id = reply_meta.direct_parent_id
+			LEFT JOIN (
+				SELECT rt.event_id, count() > 0 AS has_viewer_reply_reference
+				FROM event_tags AS rt
+				INNER JOIN nostr_events AS referenced FINAL ON referenced.id = rt.tag_value
+				WHERE rt.tag_key = 'e'
+				  AND length(rt.tag_value) = 64
+				  AND lower(if(length(rt.tag_extra) >= 2, rt.tag_extra[2], '')) IN ('', 'root', 'reply')
+				  AND referenced.pubkey = ?
+				GROUP BY rt.event_id
+			) AS viewer_reply_refs ON viewer_reply_refs.event_id = e.id`
+		args = append(args, input.Viewer)
+	}
+	switch replyScope {
+	case "DIRECT":
+		where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR reply_parent.pubkey = n.viewer)"
+	case "THREAD":
+		where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR ifNull(viewer_reply_refs.has_viewer_reply_reference, 0) = 1)"
+	}
+	args = append(args, whereArgs...)
 	args = append(args, input.Limit)
 
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
@@ -804,10 +853,11 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			LEFT JOIN vertex_scores AS viewer_score FINAL
 				ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
 			%s
+			%s
 		)
 		ORDER BY notification_created_at DESC, notification_event_id DESC
 		LIMIT ?
-	`, where), args...)
+	`, replyReferenceJoin, where), args...)
 	if err != nil {
 		return nil, err
 	}

@@ -2508,6 +2508,7 @@ func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
 				viewer:"` + testPubkey + `"
 				tab:MENTIONS
 				policy:STRICT
+				replyScope:DIRECT
 				since:1710000000
 				limit:2
 			}) {
@@ -2547,7 +2548,7 @@ func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
 		t.Fatalf("notification inputs = %+v", store.notificationInputs)
 	}
 	input := store.notificationInputs[0]
-	if input.Viewer != testPubkey || input.Tab != "MENTIONS" || input.Policy != "STRICT" || input.Since != 1_710_000_000 || input.Limit != 2 {
+	if input.Viewer != testPubkey || input.Tab != "MENTIONS" || input.Policy != "STRICT" || input.ReplyScope != "DIRECT" || input.Since != 1_710_000_000 || input.Limit != 2 {
 		t.Fatalf("notification input = %+v", input)
 	}
 }
@@ -2572,7 +2573,7 @@ func TestNotificationsDefaultsToAllStrict(t *testing.T) {
 		t.Fatalf("notification inputs = %+v", store.notificationInputs)
 	}
 	input := store.notificationInputs[0]
-	if input.Tab != "ALL" || input.Policy != "STRICT" || input.Limit != 50 {
+	if input.Tab != "ALL" || input.Policy != "STRICT" || input.ReplyScope != "THREAD" || input.Limit != 50 {
 		t.Fatalf("notification input defaults = %+v", input)
 	}
 }

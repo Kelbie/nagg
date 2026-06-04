@@ -688,15 +688,23 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"STRICT":   &graphql.EnumValueConfig{Value: "STRICT"},
 		},
 	})
+	notificationReplyScopeEnumType := graphql.NewEnum(graphql.EnumConfig{
+		Name: "NotificationReplyScope",
+		Values: graphql.EnumValueConfigMap{
+			"DIRECT": &graphql.EnumValueConfig{Value: "DIRECT"},
+			"THREAD": &graphql.EnumValueConfig{Value: "THREAD"},
+		},
+	})
 	notificationInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "NotificationInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"viewer": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
-			"tab":    &graphql.InputObjectFieldConfig{Type: notificationTabEnumType, DefaultValue: "ALL"},
-			"policy": &graphql.InputObjectFieldConfig{Type: notificationPolicyEnumType, DefaultValue: "STRICT"},
-			"since":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"until":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+			"viewer":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"tab":        &graphql.InputObjectFieldConfig{Type: notificationTabEnumType, DefaultValue: "ALL"},
+			"policy":     &graphql.InputObjectFieldConfig{Type: notificationPolicyEnumType, DefaultValue: "STRICT"},
+			"replyScope": &graphql.InputObjectFieldConfig{Type: notificationReplyScopeEnumType, DefaultValue: "THREAD"},
+			"since":      &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":      &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"limit":      &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
 		},
 	})
 	notificationType := graphql.NewObject(graphql.ObjectConfig{
@@ -2984,9 +2992,10 @@ func parseTrendingInput(raw map[string]any) chstore.TrendingInput {
 
 func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, error) {
 	input := chstore.NotificationInput{
-		Tab:    "ALL",
-		Policy: "STRICT",
-		Limit:  50,
+		Tab:        "ALL",
+		Policy:     "STRICT",
+		ReplyScope: "THREAD",
+		Limit:      50,
 	}
 	if raw == nil {
 		return input, fmt.Errorf("notification viewer is required")
@@ -3000,6 +3009,9 @@ func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, erro
 	}
 	if policy := strings.ToUpper(strings.TrimSpace(stringValue(raw["policy"]))); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" {
 		input.Policy = policy
+	}
+	if replyScope := strings.ToUpper(strings.TrimSpace(stringValue(raw["replyScope"]))); replyScope == "DIRECT" || replyScope == "THREAD" {
+		input.ReplyScope = replyScope
 	}
 	input.Since = int64(intValue(raw["since"], 0))
 	input.Until = int64(intValue(raw["until"], 0))
