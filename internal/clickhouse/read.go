@@ -633,10 +633,10 @@ func (s *Store) TrendingClusters(ctx context.Context, input TrendingInput) ([]Tr
 		input.Limit = 20
 	}
 
-	where := "WHERE window = ?"
+	where := "WHERE tc.window = ?"
 	args := []any{window}
 	if category := strings.TrimSpace(input.Category); category != "" {
-		where += " AND category = ?"
+		where += " AND tc.category = ?"
 		args = append(args, category)
 	}
 	args = append(args, input.Limit)
@@ -644,19 +644,19 @@ func (s *Store) TrendingClusters(ctx context.Context, input TrendingInput) ([]Tr
 		SELECT id, window, started_at, category, subcategory, title, description, event_count, score, computed_at
 		FROM (
 			SELECT
-				id,
-				argMax(window, computed_at) AS window,
-				argMax(started_at, computed_at) AS started_at,
-				argMax(category, computed_at) AS category,
-				argMax(subcategory, computed_at) AS subcategory,
-				argMax(title, computed_at) AS title,
-				argMax(description, computed_at) AS description,
-				argMax(event_count, computed_at) AS event_count,
-				argMax(score, computed_at) AS score,
-				max(computed_at) AS computed_at
-			FROM trending_clusters
+				tc.id AS id,
+				argMax(tc.window, tc.computed_at) AS window,
+				argMax(tc.started_at, tc.computed_at) AS started_at,
+				argMax(tc.category, tc.computed_at) AS category,
+				argMax(tc.subcategory, tc.computed_at) AS subcategory,
+				argMax(tc.title, tc.computed_at) AS title,
+				argMax(tc.description, tc.computed_at) AS description,
+				argMax(tc.event_count, tc.computed_at) AS event_count,
+				argMax(tc.score, tc.computed_at) AS score,
+				max(tc.computed_at) AS computed_at
+			FROM trending_clusters AS tc
 			`+where+`
-			GROUP BY id
+			GROUP BY tc.id
 		)
 		ORDER BY score DESC, event_count DESC, started_at DESC, id ASC
 		LIMIT ?
