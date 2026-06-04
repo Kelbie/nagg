@@ -22,6 +22,7 @@ type Config struct {
 	Ingest     ingest.Config
 	Vertex     VertexConfig
 	OnDemand   OnDemandConfig
+	Viewer     ViewerConfig
 }
 
 type VertexConfig struct {
@@ -29,6 +30,11 @@ type VertexConfig struct {
 	Relay               string
 	ValidateNIP05       bool
 	ProfileMinFollowers int
+	RankMinFollowers    int
+}
+
+type ViewerConfig struct {
+	PubKey string
 }
 
 type OnDemandConfig struct {
@@ -72,6 +78,7 @@ func Load() (Config, error) {
 			Relay:               env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
 			ValidateNIP05:       parseBool(env("NAGG_NIP05_VALIDATE", "true")),
 			ProfileMinFollowers: parseInt(env("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "500")),
+			RankMinFollowers:    parseInt(env("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "500")),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
@@ -82,6 +89,9 @@ func Load() (Config, error) {
 			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
 			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
 			FollowLimit:     parseInt(env("NAGG_ON_DEMAND_FOLLOW_LIMIT", "1000")),
+		},
+		Viewer: ViewerConfig{
+			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),
 		},
 	}
 
@@ -121,6 +131,17 @@ func (c Config) validate() error {
 	}
 	if c.Vertex.ProfileMinFollowers < 0 {
 		return errors.New("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS must be non-negative")
+	}
+	if c.Vertex.RankMinFollowers < 0 {
+		return errors.New("NAGG_VERTEX_RANK_MIN_FOLLOWERS must be non-negative")
+	}
+	if c.Viewer.PubKey != "" {
+		if len(c.Viewer.PubKey) != 64 {
+			return errors.New("NAGG_VIEWER_PUBKEY must be 64 hex characters")
+		}
+		if _, err := hex.DecodeString(c.Viewer.PubKey); err != nil {
+			return fmt.Errorf("NAGG_VIEWER_PUBKEY: %w", err)
+		}
 	}
 	return nil
 }

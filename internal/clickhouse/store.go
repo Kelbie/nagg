@@ -20,6 +20,9 @@ var ingestionMigration string
 //go:embed migrations/002_appview.sql
 var appviewMigration string
 
+//go:embed migrations/003_ranking.sql
+var rankingMigration string
+
 type Config struct {
 	Addr         string
 	Database     string
@@ -86,7 +89,7 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	for _, migration := range []string{ingestionMigration, appviewMigration} {
+	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration} {
 		for _, stmt := range splitSQLStatements(migration) {
 			if err := s.conn.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("migration failed: %w", err)

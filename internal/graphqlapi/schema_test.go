@@ -2,6 +2,8 @@ package graphqlapi
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +33,8 @@ type fakeStore struct {
 	latestInputs                []latestEventsInput
 	rankedTargetAggregateInputs []rankedTargetAggregateInput
 	aggregateInputs             []chstore.AggregateInput
+	pubkeyScoreRows             map[string]chstore.PubkeyScore
+	pubkeyScoreInputs           []pubkeyScoreInput
 }
 
 type latestEventsInput struct {
@@ -49,6 +53,11 @@ type referencingEventsInput struct {
 type rankedTargetAggregateInput struct {
 	references chstore.AggregateInput
 	target     chstore.EventQueryInput
+}
+
+type pubkeyScoreInput struct {
+	source  string
+	pubkeys []string
 }
 
 func (s *fakeStore) EventByID(_ context.Context, id string) (*chstore.EventView, error) {
@@ -187,6 +196,23 @@ func (s *fakeStore) AggregateEventsByTagTargets(_ context.Context, input chstore
 	return out, true, nil
 }
 
+func (s *fakeStore) PubkeyScores(_ context.Context, source string, pubkeys []string) (map[string]chstore.PubkeyScore, error) {
+	s.pubkeyScoreInputs = append(s.pubkeyScoreInputs, pubkeyScoreInput{
+		source:  source,
+		pubkeys: append([]string(nil), pubkeys...),
+	})
+	out := make(map[string]chstore.PubkeyScore, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		if s.pubkeyScoreRows == nil {
+			continue
+		}
+		if row, ok := s.pubkeyScoreRows[pubkey]; ok {
+			out[pubkey] = row
+		}
+	}
+	return out, nil
+}
+
 func (s *fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return nil, nil, nil
 }
@@ -222,6 +248,59 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func TestServiceInfoExposesCapabilities(t *testing.T) {
+	store := &fakeStore{}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			serviceInfo {
+				graphqlSchemaVersion
+				appViewVersion
+				capabilities
+				appViews { version routes }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	info := data["serviceInfo"].(map[string]any)
+	if info["graphqlSchemaVersion"] == "" || info["appViewVersion"] != "v1" {
+		t.Fatalf("serviceInfo = %+v", info)
+	}
+	caps := info["capabilities"].([]any)
+	if len(caps) == 0 {
+		t.Fatalf("capabilities empty: %+v", info)
+	}
+}
+
+func TestHandlerWritesCapabilityHeaders(t *testing.T) {
+	store := &fakeStore{}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(`{"query":"{ serviceInfo { appViewVersion } }"}`))
+
+	Handler(schema)(rec, req)
+
+	if got := rec.Header().Get("X-Nagg-Capabilities"); !strings.Contains(got, "graphql.rank.pubkeyScoreTerms") {
+		t.Fatalf("capability header = %q", got)
+	}
+	if got := rec.Header().Get("X-Nagg-App-View-Version"); got != "v1" {
+		t.Fatalf("app view version header = %q", got)
+	}
 }
 
 func TestEventsQueryBackfillsAuthorWhenFirstPageShort(t *testing.T) {
@@ -1738,6 +1817,94 @@ func TestRankedReferencedBySupportsWeightedTermsAndCandidateBoosts(t *testing.T)
 	}
 	if len(store.aggregateInputs) != 0 {
 		t.Fatalf("legacy aggregate inputs = %+v", store.aggregateInputs)
+	}
+}
+
+func TestRankedReferencedBySupportsPubkeyScoreTermWithFollowerThreshold(t *testing.T) {
+	rootID := testHex("1")
+	replyAID := testHex("2")
+	replyBID := testHex("3")
+	authorA := testHex("a")
+	authorB := testHex("b")
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		},
+		events: [][]chstore.EventView{{
+			{
+				ID:        replyBID,
+				PubKey:    authorB,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_003, 0),
+				Content:   "high score but below threshold",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("6", 128),
+			},
+			{
+				ID:        replyAID,
+				PubKey:    authorA,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "eligible cached score",
+				Tags:      [][]string{{"e", rootID}},
+				Sig:       strings.Repeat("7", 128),
+			},
+		}},
+		pubkeyScoreRows: map[string]chstore.PubkeyScore{
+			authorA: {PubKey: authorA, Source: "vertex", Score: 20, Followers: 500},
+			authorB: {PubKey: authorB, Source: "vertex", Score: 90, Followers: 499},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				rankedReferencedBy(input:{
+					via:{key:"e"}
+					events:{kinds:[1], limit:10}
+					rank:{
+						references:{kinds:[7], limit:500}
+						via:{key:"e"}
+						metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+						terms:[{
+							pubkeyScore:{source:"vertex", target:"AUTHOR", minFollowers:500}
+							weight:1.0
+						}]
+					}
+					limit:2
+				}) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 || nodes[0].(map[string]any)["id"] != replyAID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	if len(store.pubkeyScoreInputs) != 1 {
+		t.Fatalf("pubkey score inputs = %+v", store.pubkeyScoreInputs)
+	}
+	scoreInput := store.pubkeyScoreInputs[0]
+	if scoreInput.source != "vertex" || len(scoreInput.pubkeys) != 2 {
+		t.Fatalf("score input = %+v", scoreInput)
 	}
 }
 

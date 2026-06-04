@@ -65,7 +65,9 @@ func main() {
 		})
 	}
 
-	schemaOpts := []graphqlapi.Option{}
+	schemaOpts := []graphqlapi.Option{
+		graphqlapi.WithPubkeyScoreMinFollowers(cfg.Vertex.RankMinFollowers),
+	}
 	if userFeedBackfiller != nil {
 		schemaOpts = append(schemaOpts, graphqlapi.WithUserFeedBackfill(userFeedBackfiller))
 	}

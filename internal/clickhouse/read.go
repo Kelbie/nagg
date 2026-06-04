@@ -104,6 +104,16 @@ type FollowCounts struct {
 	Followers uint64 `json:"followers"`
 }
 
+type PubkeyScore struct {
+	PubKey    string    `json:"pubkey"`
+	Source    string    `json:"source"`
+	Score     float64   `json:"score"`
+	Rank      float64   `json:"rank"`
+	Followers uint64    `json:"followers"`
+	Nodes     uint64    `json:"nodes"`
+	FetchedAt time.Time `json:"fetchedAt"`
+}
+
 type ProfileRow struct {
 	PubKey      string    `json:"pubkey"`
 	EventID     string    `json:"event_id"`
@@ -332,10 +342,65 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 	if err != nil {
 		return err
 	}
-	return s.conn.Exec(ctx, `
+	fetchedAt := time.Now().UTC()
+	if err := s.conn.Exec(ctx, `
 		INSERT INTO vertex_profile_cache (pubkey, fetched_at, payload)
 		VALUES (?, ?, ?)
-	`, pubkey, time.Now().UTC(), string(payload))
+	`, pubkey, fetchedAt, string(payload)); err != nil {
+		return err
+	}
+	if profile.Score == nil {
+		return nil
+	}
+	var followers uint64
+	if profile.Followers != nil {
+		followers = *profile.Followers
+	}
+	var nodes uint64
+	if profile.Nodes != nil && *profile.Nodes > 0 {
+		nodes = uint64(*profile.Nodes)
+	}
+	return s.conn.Exec(ctx, `
+		INSERT INTO vertex_scores (source, pubkey, score, rank, followers, nodes, fetched_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, "vertex", pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
+}
+
+func (s *Store) PubkeyScores(ctx context.Context, source string, pubkeys []string) (map[string]PubkeyScore, error) {
+	source = strings.TrimSpace(strings.ToLower(source))
+	if source == "" {
+		source = "vertex"
+	}
+	pubkeys = uniqueStrings(pubkeys)
+	out := make(map[string]PubkeyScore, len(pubkeys))
+	if len(pubkeys) == 0 {
+		return out, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT source, pubkey, score, rank, followers, nodes, fetched_at
+		FROM vertex_scores FINAL
+		WHERE source = ? AND pubkey IN (?)
+	`, source, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var score PubkeyScore
+		if err := rows.Scan(
+			&score.Source,
+			&score.PubKey,
+			&score.Score,
+			&score.Rank,
+			&score.Followers,
+			&score.Nodes,
+			&score.FetchedAt,
+		); err != nil {
+			return nil, err
+		}
+		out[score.PubKey] = score
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[string]ProfileRow, error) {

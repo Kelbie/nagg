@@ -15,6 +15,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
@@ -133,6 +134,7 @@ func (h *Handler) setOptionalBackfillers(backfiller any) {
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("/nostr/capabilities", h.withMiddleware(h.capabilities))
 	mux.HandleFunc("/nostr/feed", h.withMiddleware(h.feed))
 	mux.HandleFunc("/nostr/feed/user", h.withMiddleware(h.userFeed))
 	mux.HandleFunc("/nostr/notes/stats", h.withMiddleware(h.noteStats))
@@ -145,8 +147,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/nostr/recommended", h.withMiddleware(h.recommended))
 }
 
+func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, capabilities.ServiceInfo())
+}
+
 func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		capabilities.WriteHeaders(w)
 		if !h.rateLimiter.allow(r) {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return

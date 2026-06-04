@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/graphql-go/graphql"
 	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
+	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"golang.org/x/sync/singleflight"
 )
@@ -28,10 +30,13 @@ type Store interface {
 	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
+	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
 
 var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
+
+const defaultPubkeyScoreMinFollowers uint64 = 500
 
 type referenceAggregateStore interface {
 	AggregateEventsByTagTargets(context.Context, chstore.ReferenceAggregateInput) (map[string][]chstore.AggregateRow, bool, error)
@@ -40,8 +45,9 @@ type referenceAggregateStore interface {
 var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type resolver struct {
-	store          Store
-	userBackfiller UserFeedBackfiller
+	store                   Store
+	userBackfiller          UserFeedBackfiller
+	pubkeyScoreMinFollowers uint64
 }
 
 type UserFeedBackfiller interface {
@@ -64,6 +70,14 @@ func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 	}
 }
 
+func WithPubkeyScoreMinFollowers(minFollowers int) Option {
+	return func(r *resolver) {
+		if minFollowers >= 0 {
+			r.pubkeyScoreMinFollowers = uint64(minFollowers)
+		}
+	}
+}
+
 type eventNode struct {
 	event          chstore.EventView
 	relations      *pubkeyRelationCache
@@ -76,8 +90,9 @@ type eventConnectionSource struct {
 }
 
 type eventRelationCache struct {
-	store  Store
-	events []chstore.EventView
+	store                   Store
+	events                  []chstore.EventView
+	pubkeyScoreMinFollowers uint64
 
 	group singleflight.Group
 
@@ -109,7 +124,7 @@ type pubkeyRelationCache struct {
 }
 
 func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
-	r := &resolver{store: store}
+	r := &resolver{store: store, pubkeyScoreMinFollowers: defaultPubkeyScoreMinFollowers}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -125,6 +140,8 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var selectedReferenceInputType *graphql.InputObject
 	var reverseReferenceInputType *graphql.InputObject
 	var aggregateReferencedByInputType *graphql.InputObject
+	var pubkeyScoreRankInputType *graphql.InputObject
+	var shuffleInputType *graphql.InputObject
 	var weightedRankTermInputType *graphql.InputObject
 	var candidatePubkeyBoostInputType *graphql.InputObject
 	var referenceRankInputType *graphql.InputObject
@@ -380,14 +397,38 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"orderBy": &graphql.InputObjectFieldConfig{Type: graphql.String},
 		},
 	})
+	pubkeyScoreRankInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "PubkeyScoreRankInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "vertex"},
+			"target":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "AUTHOR"},
+			"minFollowers": &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"fallback":     &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.0},
+		},
+	})
+	shuffleInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ShuffleInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"seed":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"counter":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
+			"strength": &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.15},
+		},
+	})
 	weightedRankTermInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "WeightedRankTermInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"references": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
-			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
-			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
-			"weight":     &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
-			"transform":  &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
+			"references":     &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"via":            &graphql.InputObjectFieldConfig{Type: tagFilterType},
+			"metric":         &graphql.InputObjectFieldConfig{Type: metricInputType},
+			"pubkeyScore":    &graphql.InputObjectFieldConfig{Type: pubkeyScoreRankInputType},
+			"candidateField": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"weight":         &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 1.0},
+			"transform":      &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
+			"halfLifeSeconds": &graphql.InputObjectFieldConfig{
+				Type:         graphql.Int,
+				DefaultValue: 86400,
+				Description:  "Used by RECENCY_HALFLIFE transforms on candidate time fields.",
+			},
 		},
 	})
 	candidatePubkeyBoostInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -408,6 +449,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"transform":             &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "IDENTITY"},
 			"terms":                 &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(weightedRankTermInputType))},
 			"candidatePubkeyBoosts": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(candidatePubkeyBoostInputType))},
+			"shuffle":               &graphql.InputObjectFieldConfig{Type: shuffleInputType},
 		},
 	})
 	rankedReverseReferenceInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -457,14 +499,42 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
 			"target":     &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
 			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
-			"limit":      &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 30},
-			"offset":     &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"terms":      &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(weightedRankTermInputType))},
+			"candidatePubkeyBoosts": &graphql.InputObjectFieldConfig{
+				Type: graphql.NewList(graphql.NewNonNull(candidatePubkeyBoostInputType)),
+			},
+			"shuffle": &graphql.InputObjectFieldConfig{Type: shuffleInputType},
+			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 30},
+			"offset":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+		},
+	})
+
+	appViewCapabilityType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "AppViewCapability",
+		Fields: graphql.Fields{
+			"version": &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"routes":  &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String)))},
+		},
+	})
+	serviceInfoType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "ServiceInfo",
+		Fields: graphql.Fields{
+			"graphqlSchemaVersion": &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"appViewVersion":       &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"capabilities":         &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String)))},
+			"appViews":             &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(appViewCapabilityType)))},
 		},
 	})
 
 	queryType := graphql.NewObject(graphql.ObjectConfig{
 		Name: "Query",
 		Fields: graphql.Fields{
+			"serviceInfo": &graphql.Field{
+				Type: graphql.NewNonNull(serviceInfoType),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					return serviceInfo(), nil
+				},
+			},
 			"event": &graphql.Field{
 				Type: eventType,
 				Args: graphql.FieldConfigArgument{"id": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)}},
@@ -478,7 +548,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return nil, err
 					}
 					relations := newPubkeyRelationCache(r.store, []chstore.EventView{*event})
-					eventRelations := newEventRelationCache(r.store, []chstore.EventView{*event})
+					eventRelations := newEventRelationCacheWithPubkeyScoreMinFollowers(r.store, []chstore.EventView{*event}, r.pubkeyScoreMinFollowers)
 					return wrapEvent(*event, relations, eventRelations), nil
 				},
 			},
@@ -505,7 +575,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 							}
 						}
 					}
-					return newEventConnection(r.store, events), nil
+					return r.newEventConnection(events), nil
 				},
 			},
 			"aggregateEvents": &graphql.Field{
@@ -613,7 +683,7 @@ func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[
 	all = append(all, *root)
 	all = append(all, events...)
 	relations := newPubkeyRelationCache(r.store, all)
-	eventRelations := newEventRelationCache(r.store, all)
+	eventRelations := newEventRelationCacheWithPubkeyScoreMinFollowers(r.store, all, r.pubkeyScoreMinFollowers)
 	return map[string]any{
 		"root":   wrapEvent(*root, relations, eventRelations),
 		"events": wrapEvents(events, relations, eventRelations),
@@ -686,11 +756,11 @@ func (r *resolver) eventReferences(ctx context.Context, event chstore.EventView,
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	return newEventConnection(r.store, events), nil
+	return r.newEventConnection(events), nil
 }
 
 func (r *resolver) eventSelectedReferences(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
-	cache := newEventRelationCache(r.store, []chstore.EventView{event})
+	cache := newEventRelationCacheWithPubkeyScoreMinFollowers(r.store, []chstore.EventView{event}, r.pubkeyScoreMinFollowers)
 	return cache.loadSelectedReferences(ctx, r, event, raw)
 }
 
@@ -703,7 +773,7 @@ func (r *resolver) eventReferencedBy(ctx context.Context, event chstore.EventVie
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	return newEventConnection(r.store, events), nil
+	return r.newEventConnection(events), nil
 }
 
 func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.EventView, raw any) (eventConnectionSource, error) {
@@ -736,8 +806,8 @@ func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.Ev
 		}
 	}
 	var targetIDs []string
-	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) {
-		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, candidates, input.WeightedTerms, input.CandidateBoosts, input.Offset, input.Limit)
+	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) {
+		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, candidates, input.WeightedTerms, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
 	} else {
 		rows, err := r.store.AggregateEvents(ctx, rankAggregate)
 		if err != nil {
@@ -763,7 +833,7 @@ func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.Ev
 			ordered = append(ordered, event)
 		}
 	}
-	return newEventConnection(r.store, ordered), nil
+	return r.newEventConnection(ordered), nil
 }
 
 func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore.EventView, raw any) (map[string]any, error) {
@@ -847,7 +917,7 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	targetIDs := rankedTargetIDs(rows, input.Offset, input.Limit)
+	targetIDs := rankedTargetIDs(rows, 0, max(input.Limit+input.Offset, input.Limit))
 	if len(targetIDs) == 0 {
 		return eventConnectionSource{}, nil
 	}
@@ -864,6 +934,14 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
+	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) {
+		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, events, input.WeightedTerms, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
+		if err != nil {
+			return eventConnectionSource{}, err
+		}
+	} else {
+		targetIDs = rankedCandidateIDs(rows, events, input.Offset, input.Limit)
+	}
 	eventsByID := make(map[string]chstore.EventView, len(events))
 	for _, event := range events {
 		eventsByID[event.ID] = event
@@ -874,7 +952,7 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 			ordered = append(ordered, event)
 		}
 	}
-	return newEventConnection(r.store, ordered), nil
+	return r.newEventConnection(ordered), nil
 }
 
 func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput) ([]chstore.AggregateRow, error) {
@@ -901,10 +979,15 @@ type referenceInput struct {
 }
 
 type rankedEventsInput struct {
-	References chstore.AggregateInput
-	Target     chstore.EventQueryInput
-	Limit      int
-	Offset     int
+	References      chstore.AggregateInput
+	Candidates      chstore.EventQueryInput
+	Target          chstore.EventQueryInput
+	RankVia         graphTagPredicate
+	WeightedTerms   []weightedRankTerm
+	CandidateBoosts []candidatePubkeyBoost
+	Shuffle         shuffleSpec
+	Limit           int
+	Offset          int
 }
 
 type rankedReverseReferenceInput struct {
@@ -913,6 +996,7 @@ type rankedReverseReferenceInput struct {
 	RankVia         graphTagPredicate
 	WeightedTerms   []weightedRankTerm
 	CandidateBoosts []candidatePubkeyBoost
+	Shuffle         shuffleSpec
 	Limit           int
 	Offset          int
 }
@@ -925,21 +1009,47 @@ type rankedReverseReferenceBatchInput struct {
 	RankVia         graphTagPredicate
 	WeightedTerms   []weightedRankTerm
 	CandidateBoosts []candidatePubkeyBoost
+	Shuffle         shuffleSpec
 	Limit           int
 	Offset          int
 }
 
+type weightedRankTermKind int
+
+const (
+	weightedRankTermReferences weightedRankTermKind = iota
+	weightedRankTermPubkeyScore
+	weightedRankTermCandidateField
+)
+
 type weightedRankTerm struct {
-	References chstore.EventQueryInput
-	Via        graphTagPredicate
-	Metric     genericMetric
-	Weight     float64
-	Transform  string
+	Kind            weightedRankTermKind
+	References      chstore.EventQueryInput
+	Via             graphTagPredicate
+	Metric          genericMetric
+	PubkeyScore     pubkeyScoreRankTerm
+	CandidateField  string
+	Weight          float64
+	Transform       string
+	HalfLifeSeconds float64
 }
 
 type candidatePubkeyBoost struct {
 	PubKeys map[string]struct{}
 	Weight  float64
+}
+
+type pubkeyScoreRankTerm struct {
+	Source       string
+	Target       string
+	MinFollowers uint64
+	Fallback     float64
+}
+
+type shuffleSpec struct {
+	Seed     string
+	Counter  int
+	Strength float64
 }
 
 type aggregateReferencedByBatchInput struct {
@@ -1089,7 +1199,7 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 		Limit:   references.Limit,
 		Empty:   references.Empty,
 	}
-	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, r.parseEventQueryInput)
+	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, r.parseEventQueryInput, r.pubkeyScoreMinFollowers)
 	if err != nil {
 		return out, err
 	}
@@ -1097,6 +1207,7 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 	if err != nil {
 		return out, err
 	}
+	out.Shuffle = shuffleInput(rankRaw["shuffle"])
 	out.Limit = intValue(m["limit"], 1)
 	if out.Limit <= 0 {
 		out.Limit = 1
@@ -1160,7 +1271,7 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 		Limit:   references.Limit,
 		Empty:   references.Empty,
 	}
-	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, c.parseEventQueryInput)
+	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, c.parseEventQueryInput, c.pubkeyScoreMinFollowers)
 	if err != nil {
 		return out, err
 	}
@@ -1168,6 +1279,7 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 	if err != nil {
 		return out, err
 	}
+	out.Shuffle = shuffleInput(rankRaw["shuffle"])
 	out.Limit = intValue(m["limit"], 1)
 	if out.Limit <= 0 {
 		out.Limit = 1
@@ -1268,9 +1380,15 @@ func (r *resolver) parseRankedEventsInput(ctx context.Context, raw any) (rankedE
 			Limit: uint64(aggregateLimit),
 			Empty: references.Empty,
 		},
-		Target: chstore.EventQueryInput{Limit: uint64(limit)},
-		Limit:  limit,
-		Offset: offset,
+		Candidates: chstore.EventQueryInput{
+			Kinds: references.Kinds,
+			Limit: uint64(aggregateLimit),
+		},
+		Target:  chstore.EventQueryInput{Limit: uint64(limit)},
+		RankVia: via,
+		Shuffle: shuffleInput(m["shuffle"]),
+		Limit:   limit,
+		Offset:  offset,
 	}
 	if targetRaw, ok := m["target"].(map[string]any); ok {
 		target, err := r.parseEventQueryInput(ctx, targetRaw)
@@ -1280,6 +1398,14 @@ func (r *resolver) parseRankedEventsInput(ctx context.Context, raw any) (rankedE
 		out.Target = target
 	}
 	out.Target.Limit = uint64(limit)
+	out.WeightedTerms, err = weightedRankTerms(ctx, m, r.parseEventQueryInput, r.pubkeyScoreMinFollowers)
+	if err != nil {
+		return out, err
+	}
+	out.CandidateBoosts, err = r.candidatePubkeyBoosts(ctx, m["candidatePubkeyBoosts"])
+	if err != nil {
+		return out, err
+	}
 	return out, nil
 }
 
@@ -1314,6 +1440,10 @@ func rankMetricName(raw any) string {
 	}
 }
 
+func serviceInfo() map[string]any {
+	return capabilities.ServiceInfo()
+}
+
 func legacyRankMetricSupported(raw any) bool {
 	metric := genericMetricFromRaw(raw, "value")
 	switch metric.Op {
@@ -1328,9 +1458,13 @@ func weightedRankTerms(
 	ctx context.Context,
 	rankRaw map[string]any,
 	parseEventQuery func(context.Context, map[string]any) (chstore.EventQueryInput, error),
+	defaultPubkeyScoreMinFollowers uint64,
 ) ([]weightedRankTerm, error) {
 	useWeighted := len(anyList(rankRaw["terms"])) > 0 ||
 		len(anyList(rankRaw["candidatePubkeyBoosts"])) > 0 ||
+		shuffleInput(rankRaw["shuffle"]).Seed != "" ||
+		rankRaw["pubkeyScore"] != nil ||
+		stringValue(rankRaw["candidateField"]) != "" ||
 		!legacyRankMetricSupported(rankRaw["metric"]) ||
 		floatValue(rankRaw["weight"], 1) != 1 ||
 		rankTransform(rankRaw["transform"]) != "IDENTITY"
@@ -1338,7 +1472,7 @@ func weightedRankTerms(
 		return nil, nil
 	}
 
-	base, err := weightedRankTermFrom(ctx, rankRaw, parseEventQuery)
+	base, err := weightedRankTermFrom(ctx, rankRaw, parseEventQuery, defaultPubkeyScoreMinFollowers)
 	if err != nil {
 		return nil, err
 	}
@@ -1348,7 +1482,7 @@ func weightedRankTerms(
 		if !ok {
 			continue
 		}
-		term, err := weightedRankTermFrom(ctx, raw, parseEventQuery)
+		term, err := weightedRankTermFrom(ctx, raw, parseEventQuery, defaultPubkeyScoreMinFollowers)
 		if err != nil {
 			return nil, err
 		}
@@ -1361,8 +1495,27 @@ func weightedRankTermFrom(
 	ctx context.Context,
 	raw map[string]any,
 	parseEventQuery func(context.Context, map[string]any) (chstore.EventQueryInput, error),
+	defaultPubkeyScoreMinFollowers uint64,
 ) (weightedRankTerm, error) {
-	var out weightedRankTerm
+	out := weightedRankTerm{
+		Kind:            weightedRankTermReferences,
+		Weight:          floatValue(raw["weight"], 1),
+		Transform:       rankTransform(raw["transform"]),
+		HalfLifeSeconds: floatValue(raw["halfLifeSeconds"], 86400),
+	}
+	if out.HalfLifeSeconds <= 0 {
+		out.HalfLifeSeconds = 86400
+	}
+	if pubkeyScoreRaw, ok := raw["pubkeyScore"].(map[string]any); ok {
+		out.Kind = weightedRankTermPubkeyScore
+		out.PubkeyScore = pubkeyScoreRankTermFrom(pubkeyScoreRaw, defaultPubkeyScoreMinFollowers)
+		return out, nil
+	}
+	if candidateField := strings.ToUpper(stringValue(raw["candidateField"])); candidateField != "" {
+		out.Kind = weightedRankTermCandidateField
+		out.CandidateField = candidateField
+		return out, nil
+	}
 	referencesRaw, ok := raw["references"].(map[string]any)
 	if !ok {
 		return out, fmt.Errorf("rank term references input is required")
@@ -1378,9 +1531,28 @@ func weightedRankTermFrom(
 	out.References = references
 	out.Via = via
 	out.Metric = genericMetricFromRaw(raw["metric"], "value")
-	out.Weight = floatValue(raw["weight"], 1)
-	out.Transform = rankTransform(raw["transform"])
 	return out, nil
+}
+
+func pubkeyScoreRankTermFrom(raw map[string]any, defaultMinFollowers uint64) pubkeyScoreRankTerm {
+	source := strings.ToLower(strings.TrimSpace(stringValue(raw["source"])))
+	if source == "" {
+		source = "vertex"
+	}
+	target := strings.ToUpper(strings.TrimSpace(stringValue(raw["target"])))
+	if target == "" {
+		target = "AUTHOR"
+	}
+	minFollowers := intValue(raw["minFollowers"], int(defaultMinFollowers))
+	if minFollowers < 0 {
+		minFollowers = 0
+	}
+	return pubkeyScoreRankTerm{
+		Source:       source,
+		Target:       target,
+		MinFollowers: uint64(minFollowers),
+		Fallback:     floatValue(raw["fallback"], 0),
+	}
 }
 
 func genericMetricFromRaw(raw any, fallbackName string) genericMetric {
@@ -1411,8 +1583,29 @@ func rankTransform(raw any) string {
 	switch strings.ToUpper(stringValue(raw)) {
 	case "LOG1P":
 		return "LOG1P"
+	case "RECENCY_HALFLIFE":
+		return "RECENCY_HALFLIFE"
 	default:
 		return "IDENTITY"
+	}
+}
+
+func shuffleInput(raw any) shuffleSpec {
+	m, _ := raw.(map[string]any)
+	if len(m) == 0 {
+		return shuffleSpec{}
+	}
+	strength := floatValue(m["strength"], 0.15)
+	if strength < 0 {
+		strength = 0
+	}
+	if strength > 1 {
+		strength = 1
+	}
+	return shuffleSpec{
+		Seed:     stringValue(m["seed"]),
+		Counter:  intValue(m["counter"], 0),
+		Strength: strength,
 	}
 }
 
@@ -1498,8 +1691,8 @@ func rankedCandidateIDs(rows []chstore.AggregateRow, candidates []chstore.EventV
 	return ordered
 }
 
-func useWeightedRanking(terms []weightedRankTerm, boosts []candidatePubkeyBoost) bool {
-	return len(terms) > 0 || len(boosts) > 0
+func useWeightedRanking(terms []weightedRankTerm, boosts []candidatePubkeyBoost, shuffle shuffleSpec) bool {
+	return len(terms) > 0 || len(boosts) > 0 || shuffle.Seed != ""
 }
 
 type candidateRank struct {
@@ -1513,6 +1706,7 @@ func weightedRankCandidateIDs(
 	candidates []chstore.EventView,
 	terms []weightedRankTerm,
 	boosts []candidatePubkeyBoost,
+	shuffle shuffleSpec,
 	offset int,
 	limit int,
 ) ([]string, error) {
@@ -1542,6 +1736,16 @@ func weightedRankCandidateIDs(
 		return nil, nil
 	}
 	for _, term := range terms {
+		switch term.Kind {
+		case weightedRankTermPubkeyScore:
+			if err := applyPubkeyScoreRankTerm(ctx, store, candidates, candidateIDs, scores, term); err != nil {
+				return nil, err
+			}
+			continue
+		case weightedRankTermCandidateField:
+			applyCandidateFieldRankTerm(candidates, scores, term)
+			continue
+		}
 		if term.References.Empty {
 			continue
 		}
@@ -1572,8 +1776,10 @@ func weightedRankCandidateIDs(
 		ranked = append(ranked, candidateRank{event: candidate, score: scores[candidate.ID]})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
-		if ranked[i].score != ranked[j].score {
-			return ranked[i].score > ranked[j].score
+		scoreI := ranked[i].score + shuffleJitter(ranked[i].event.ID, shuffle)
+		scoreJ := ranked[j].score + shuffleJitter(ranked[j].event.ID, shuffle)
+		if scoreI != scoreJ {
+			return scoreI > scoreJ
 		}
 		if !ranked[i].event.CreatedAt.Equal(ranked[j].event.CreatedAt) {
 			return ranked[i].event.CreatedAt.After(ranked[j].event.CreatedAt)
@@ -1595,6 +1801,66 @@ func weightedRankCandidateIDs(
 		out = append(out, entry.event.ID)
 	}
 	return out, nil
+}
+
+func applyPubkeyScoreRankTerm(
+	ctx context.Context,
+	store Store,
+	candidates []chstore.EventView,
+	candidateIDs []string,
+	scores map[string]float64,
+	term weightedRankTerm,
+) error {
+	pubkeys := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		pubkeys = append(pubkeys, candidate.PubKey)
+	}
+	scoreRows, err := store.PubkeyScores(ctx, term.PubkeyScore.Source, pubkeys)
+	if err != nil {
+		return err
+	}
+	candidateSet := make(map[string]struct{}, len(candidateIDs))
+	for _, id := range candidateIDs {
+		candidateSet[id] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		if _, ok := candidateSet[candidate.ID]; !ok {
+			continue
+		}
+		value := term.PubkeyScore.Fallback
+		if row, ok := scoreRows[candidate.PubKey]; ok && row.Followers >= term.PubkeyScore.MinFollowers {
+			value = row.Score
+		}
+		scores[candidate.ID] += value * term.Weight
+	}
+	return nil
+}
+
+func applyCandidateFieldRankTerm(candidates []chstore.EventView, scores map[string]float64, term weightedRankTerm) {
+	now := time.Now().UTC()
+	for _, candidate := range candidates {
+		value, ok := candidateFieldValue(candidate, term, now)
+		if !ok {
+			continue
+		}
+		scores[candidate.ID] += value * term.Weight
+	}
+}
+
+func candidateFieldValue(candidate chstore.EventView, term weightedRankTerm, now time.Time) (float64, bool) {
+	switch term.CandidateField {
+	case "CREATED_AT":
+		if term.Transform == "RECENCY_HALFLIFE" {
+			ageSeconds := now.Sub(candidate.CreatedAt).Seconds()
+			if ageSeconds < 0 {
+				ageSeconds = 0
+			}
+			return math.Pow(0.5, ageSeconds/term.HalfLifeSeconds), true
+		}
+		return transformedFloatRankValue(float64(candidate.CreatedAt.Unix()), term.Transform), true
+	default:
+		return 0, false
+	}
 }
 
 func weightedRankRowsByCandidate(
@@ -1637,12 +1903,30 @@ func weightedRankRowsByCandidate(
 }
 
 func transformedRankValue(value uint64, transform string) float64 {
+	return transformedFloatRankValue(float64(value), transform)
+}
+
+func transformedFloatRankValue(value float64, transform string) float64 {
 	switch transform {
 	case "LOG1P":
-		return math.Log1p(float64(value))
+		return math.Log1p(value)
 	default:
-		return float64(value)
+		return value
 	}
+}
+
+func shuffleJitter(id string, shuffle shuffleSpec) float64 {
+	if shuffle.Seed == "" || shuffle.Strength <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(shuffle.Seed))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strconv.Itoa(shuffle.Counter)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(id))
+	const maxUint64AsFloat = float64(^uint64(0))
+	return (float64(h.Sum64()) / maxUint64AsFloat) * shuffle.Strength
 }
 
 func rankTagValues(predicate graphTagPredicate, candidateIDs []string) []string {
@@ -2180,6 +2464,7 @@ func Handler(schema graphql.Schema) http.HandlerFunc {
 		Variables     map[string]any `json:"variables"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		capabilities.WriteHeaders(w)
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST /graphql only", http.StatusMethodNotAllowed)
 			return
@@ -2487,9 +2772,17 @@ func asEventNode(source any) (eventNode, bool) {
 	return eventNode{}, false
 }
 
+func (r *resolver) newEventConnection(events []chstore.EventView) eventConnectionSource {
+	return newEventConnectionWithPubkeyScoreMinFollowers(r.store, events, r.pubkeyScoreMinFollowers)
+}
+
 func newEventConnection(store Store, events []chstore.EventView) eventConnectionSource {
+	return newEventConnectionWithPubkeyScoreMinFollowers(store, events, defaultPubkeyScoreMinFollowers)
+}
+
+func newEventConnectionWithPubkeyScoreMinFollowers(store Store, events []chstore.EventView, pubkeyScoreMinFollowers uint64) eventConnectionSource {
 	relations := newPubkeyRelationCache(store, events)
-	eventRelations := newEventRelationCache(store, events)
+	eventRelations := newEventRelationCacheWithPubkeyScoreMinFollowers(store, events, pubkeyScoreMinFollowers)
 	return newEventConnectionWithCaches(events, relations, eventRelations)
 }
 
@@ -2498,10 +2791,14 @@ func newEventConnectionWithCaches(events []chstore.EventView, relations *pubkeyR
 }
 
 func newEventConnectionCaches(store Store, grouped map[string][]chstore.EventView) eventConnectionCaches {
+	return newEventConnectionCachesWithPubkeyScoreMinFollowers(store, grouped, defaultPubkeyScoreMinFollowers)
+}
+
+func newEventConnectionCachesWithPubkeyScoreMinFollowers(store Store, grouped map[string][]chstore.EventView, pubkeyScoreMinFollowers uint64) eventConnectionCaches {
 	events := uniqueGroupedEvents(grouped)
 	return eventConnectionCaches{
 		relations:      newPubkeyRelationCache(store, events),
-		eventRelations: newEventRelationCache(store, events),
+		eventRelations: newEventRelationCacheWithPubkeyScoreMinFollowers(store, events, pubkeyScoreMinFollowers),
 	}
 }
 
@@ -2536,15 +2833,20 @@ func wrapEvents(events []chstore.EventView, relations *pubkeyRelationCache, even
 }
 
 func newEventRelationCache(store Store, events []chstore.EventView) *eventRelationCache {
+	return newEventRelationCacheWithPubkeyScoreMinFollowers(store, events, defaultPubkeyScoreMinFollowers)
+}
+
+func newEventRelationCacheWithPubkeyScoreMinFollowers(store Store, events []chstore.EventView, pubkeyScoreMinFollowers uint64) *eventRelationCache {
 	return &eventRelationCache{
-		store:               store,
-		events:              append([]chstore.EventView(nil), events...),
-		latestEventTags:     map[string][]string{},
-		aggregateByTarget:   map[string]map[string][]chstore.AggregateRow{},
-		selectedReferences:  map[string]map[string][]chstore.EventView{},
-		rankedReferencedBy:  map[string]map[string][]chstore.EventView{},
-		selectedConnections: map[string]eventConnectionCaches{},
-		rankedConnections:   map[string]eventConnectionCaches{},
+		store:                   store,
+		events:                  append([]chstore.EventView(nil), events...),
+		pubkeyScoreMinFollowers: pubkeyScoreMinFollowers,
+		latestEventTags:         map[string][]string{},
+		aggregateByTarget:       map[string]map[string][]chstore.AggregateRow{},
+		selectedReferences:      map[string]map[string][]chstore.EventView{},
+		rankedReferencedBy:      map[string]map[string][]chstore.EventView{},
+		selectedConnections:     map[string]eventConnectionCaches{},
+		rankedConnections:       map[string]eventConnectionCaches{},
 	}
 }
 
@@ -2700,7 +3002,7 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 
 			c.mu.Lock()
 			c.selectedReferences[key] = loaded
-			c.selectedConnections[key] = newEventConnectionCaches(c.store, loaded)
+			c.selectedConnections[key] = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, loaded, c.pubkeyScoreMinFollowers)
 			c.mu.Unlock()
 
 			slog.Debug(
@@ -2720,7 +3022,7 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 		c.mu.Unlock()
 	}
 	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
-		connectionCaches = newEventConnectionCaches(c.store, cached)
+		connectionCaches = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, cached, c.pubkeyScoreMinFollowers)
 		c.mu.Lock()
 		c.selectedConnections[key] = connectionCaches
 		c.mu.Unlock()
@@ -2951,7 +3253,7 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 
 			c.mu.Lock()
 			c.rankedReferencedBy[key] = loaded
-			c.rankedConnections[key] = newEventConnectionCaches(c.store, loaded)
+			c.rankedConnections[key] = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, loaded, c.pubkeyScoreMinFollowers)
 			c.mu.Unlock()
 
 			slog.Debug(
@@ -2971,7 +3273,7 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 		c.mu.Unlock()
 	}
 	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
-		connectionCaches = newEventConnectionCaches(c.store, cached)
+		connectionCaches = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, cached, c.pubkeyScoreMinFollowers)
 		c.mu.Lock()
 		c.rankedConnections[key] = connectionCaches
 		c.mu.Unlock()
@@ -3041,7 +3343,7 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	sort.Strings(candidateIDs)
 
 	var rows []chstore.AggregateRow
-	if !useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) && !input.RankReferences.Empty {
+	if !useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) && !input.RankReferences.Empty {
 		rankAggregate := input.RankReferences
 		rankAggregate.Tags = append(rankAggregate.Tags, chstore.TagFilter{
 			Key: input.RankVia.Key, Value: input.RankVia.Value, Values: rankTagValues(input.RankVia, candidateIDs),
@@ -3060,8 +3362,8 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	seenSelectedIDs := map[string]struct{}{}
 	for _, target := range targets {
 		var targetIDs []string
-		if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts) {
-			targetIDs, err = weightedRankCandidateIDs(ctx, c.store, candidatesByTarget[target], input.WeightedTerms, input.CandidateBoosts, input.Offset, input.Limit)
+		if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) {
+			targetIDs, err = weightedRankCandidateIDs(ctx, c.store, candidatesByTarget[target], input.WeightedTerms, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
 			if err != nil {
 				return nil, err
 			}
