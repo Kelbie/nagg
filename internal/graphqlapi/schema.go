@@ -1098,8 +1098,10 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 		return out, err
 	}
 	out.Limit = intValue(m["limit"], 1)
-	if out.Limit <= 0 || out.Limit > 50 {
+	if out.Limit <= 0 {
 		out.Limit = 1
+	} else if out.Limit > 50 {
+		out.Limit = 50
 	}
 	out.Offset = intValue(m["offset"], 0)
 	if out.Offset < 0 {
@@ -1167,8 +1169,10 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 		return out, err
 	}
 	out.Limit = intValue(m["limit"], 1)
-	if out.Limit <= 0 || out.Limit > 50 {
+	if out.Limit <= 0 {
 		out.Limit = 1
+	} else if out.Limit > 50 {
+		out.Limit = 50
 	}
 	out.Offset = intValue(m["offset"], 0)
 	if out.Offset < 0 {

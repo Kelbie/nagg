@@ -1545,6 +1545,79 @@ func TestRankedReferencedByRanksCandidateEventsByGenericReferences(t *testing.T)
 	}
 }
 
+func TestRankedReferencedByCapsLargeLimitInsteadOfDefaultingToOne(t *testing.T) {
+	rootID := testHex("1")
+	replyAID := testHex("2")
+	replyBID := testHex("3")
+	replyA := chstore.EventView{
+		ID:        replyAID,
+		PubKey:    testHex("a"),
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_002, 0),
+		Content:   "reply a",
+		Tags:      [][]string{{"e", rootID}},
+		Sig:       strings.Repeat("a", 128),
+	}
+	replyB := chstore.EventView{
+		ID:        replyBID,
+		PubKey:    testHex("b"),
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_003, 0),
+		Content:   "reply b",
+		Tags:      [][]string{{"e", rootID}},
+		Sig:       strings.Repeat("b", 128),
+	}
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			rootID: {
+				ID:        rootID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "root",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+		},
+		events: [][]chstore.EventView{
+			{replyA, replyB},
+			{replyB, replyA},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + rootID + `") {
+				rankedReferencedBy(input:{
+					via:{key:"e"}
+					events:{kinds:[1], limit:10}
+					rank:{
+						references:{kinds:[7], limit:500}
+						via:{key:"e"}
+						metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+					}
+					limit:100
+				}) { nodes { id } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["event"].(map[string]any)["rankedReferencedBy"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes len = %d, nodes = %+v", len(nodes), nodes)
+	}
+}
+
 func TestRankedReferencedBySupportsWeightedTermsAndCandidateBoosts(t *testing.T) {
 	rootID := testHex("1")
 	replyAID := testHex("2")
