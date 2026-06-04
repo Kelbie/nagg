@@ -733,7 +733,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		policy = "STRICT"
 	}
 
-	where := "WHERE n.viewer = ?"
+	where := "WHERE 1 = 1"
 	args := []any{input.Viewer}
 	if tab == "MENTIONS" {
 		where += " AND n.reason = 'mention'"
@@ -753,28 +753,69 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	}
 	args = append(args, input.Limit)
 
-	rows, err := s.conn.Query(ctx, `
+	reasonRankExpr := "0 AS reason_rank"
+	orderBy := "notification_created_at DESC, notification_event_id DESC"
+	if tab != "MENTIONS" {
+		reasonRankExpr = "row_number() OVER (PARTITION BY n.reason ORDER BY n.created_at DESC, n.event_id DESC) AS reason_rank"
+		orderBy = "reason_rank ASC, notification_created_at DESC, notification_event_id DESC"
+	}
+
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		SELECT
-			e.id,
-			e.pubkey,
-			e.kind,
-			e.created_at,
-			e.content,
-			e.tags_json,
-			e.sig,
-			e.last_seen_at,
-			n.reason,
-			ifNull(actor_score.score, 0) AS actor_vertex_score
-		FROM notification_candidates AS n FINAL
-		INNER JOIN nostr_events AS e FINAL ON e.id = n.event_id
-		LEFT JOIN vertex_scores AS actor_score FINAL
-			ON actor_score.source = 'vertex' AND actor_score.pubkey = n.actor_pubkey
-		LEFT JOIN vertex_scores AS viewer_score FINAL
-			ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
-		`+where+`
-		ORDER BY n.created_at DESC, n.event_id DESC
+			id,
+			pubkey,
+			kind,
+			created_at,
+			content,
+			tags_json,
+			sig,
+			last_seen_at,
+			reason,
+			actor_vertex_score
+		FROM (
+			SELECT
+				e.id AS id,
+				e.pubkey AS pubkey,
+				e.kind AS kind,
+				e.created_at AS created_at,
+				e.content AS content,
+				e.tags_json AS tags_json,
+				e.sig AS sig,
+				e.last_seen_at AS last_seen_at,
+				n.reason AS reason,
+				ifNull(actor_score.score, 0) AS actor_vertex_score,
+				n.created_at AS notification_created_at,
+				n.event_id AS notification_event_id,
+				%s
+			FROM (
+				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+				FROM (
+					SELECT
+						viewer,
+						event_id,
+						actor_pubkey,
+						kind,
+						created_at,
+						reason,
+						row_number() OVER (
+							PARTITION BY viewer, reason, actor_pubkey
+							ORDER BY created_at DESC, event_id DESC
+						) AS actor_reason_rank
+					FROM notification_candidates FINAL
+					WHERE viewer = ?
+				)
+				WHERE reason != 'follow' OR actor_reason_rank = 1
+			) AS n
+			INNER JOIN nostr_events AS e FINAL ON e.id = n.event_id
+			LEFT JOIN vertex_scores AS actor_score FINAL
+				ON actor_score.source = 'vertex' AND actor_score.pubkey = n.actor_pubkey
+			LEFT JOIN vertex_scores AS viewer_score FINAL
+				ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
+			%s
+		)
+		ORDER BY %s
 		LIMIT ?
-	`, args...)
+	`, reasonRankExpr, where, orderBy), args...)
 	if err != nil {
 		return nil, err
 	}
