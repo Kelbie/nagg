@@ -11,6 +11,8 @@ ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (viewer, created_at, event_id, reason);
 
+DROP TABLE IF EXISTS mv_notification_candidates;
+
 CREATE MATERIALIZED VIEW IF NOT EXISTS mv_notification_candidates
 TO notification_candidates
 AS
@@ -21,6 +23,7 @@ SELECT
     kind,
     created_at,
     multiIf(
+        kind = 3, 'follow',
         kind = 1, 'mention',
         kind IN (6, 16), 'repost',
         kind = 7, 'reaction',
@@ -30,5 +33,5 @@ SELECT
 FROM event_tags
 WHERE tag_key = 'p'
   AND length(tag_value) = 64
-  AND kind IN (1, 6, 7, 16, 9735)
+  AND kind IN (1, 3, 6, 7, 16, 9735)
   AND pubkey != tag_value;

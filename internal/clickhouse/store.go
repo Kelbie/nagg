@@ -168,6 +168,7 @@ func (s *Store) Backfill(ctx context.Context) error {
 		   kind,
 		   created_at,
 		   multiIf(
+		     kind = 3, 'follow',
 		     kind = 1, 'mention',
 		     kind IN (6, 16), 'repost',
 		     kind = 7, 'reaction',
@@ -177,7 +178,7 @@ func (s *Store) Backfill(ctx context.Context) error {
 		 FROM event_tags
 		 WHERE tag_key = 'p'
 		   AND length(tag_value) = 64
-		   AND kind IN (1, 6, 7, 16, 9735)
+		   AND kind IN (1, 3, 6, 7, 16, 9735)
 		   AND pubkey != tag_value`,
 	}
 	for _, stmt := range statements {

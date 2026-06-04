@@ -801,9 +801,45 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		}
 		row.Event.Kind = int(kind)
 		_ = json.Unmarshal([]byte(tagsJSON), &row.Event.Tags)
+		row.Reason = notificationReasonForEvent(row.Event, row.Reason)
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func notificationReasonForEvent(event EventView, fallback string) string {
+	switch event.Kind {
+	case 3:
+		return "follow"
+	case 1:
+		if notificationEventHasTag(event.Tags, "e") {
+			return "reply"
+		}
+		return "mention"
+	case 6, 16:
+		return "repost"
+	case 7:
+		return "reaction"
+	case 9735:
+		return "zap"
+	default:
+		if fallback != "" {
+			return fallback
+		}
+		return "mention"
+	}
+}
+
+func notificationEventHasTag(tags [][]string, key string) bool {
+	for _, tag := range tags {
+		if len(tag) <= 1 || tag[0] != key || len(tag[1]) != 64 {
+			continue
+		}
+		if key != "e" || len(tag) < 4 || tag[3] == "" || tag[3] == "root" || tag[3] == "reply" {
+			return true
+		}
+	}
+	return false
 }
 
 func notificationPolicyThresholds(policy string) (float64, float64) {
