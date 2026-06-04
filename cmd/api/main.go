@@ -88,6 +88,7 @@ func main() {
 	appviewOpts := []appview.Option{
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
+		appview.WithViewerPubkey(cfg.Viewer.PubKey),
 	}
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))

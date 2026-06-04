@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -76,5 +77,49 @@ func TestNotificationPolicyThresholds(t *testing.T) {
 		if actor != want.actor || viewer != want.viewer {
 			t.Fatalf("%q thresholds = %.1f/%.1f, want %.1f/%.1f", policy, actor, viewer, want.actor, want.viewer)
 		}
+	}
+}
+
+func TestEventOrderByAddsShuffleTieBreaker(t *testing.T) {
+	orderBy, args := eventOrderBy("e.created_at", "e.id", ShuffleInput{
+		Seed:     "seed-a",
+		Counter:  4,
+		Strength: 0.2,
+	})
+
+	if !strings.Contains(orderBy, "cityHash64") {
+		t.Fatalf("orderBy = %q", orderBy)
+	}
+	if len(args) != 2 || args[0] != "seed-a" || args[1] != 4 {
+		t.Fatalf("args = %+v", args)
+	}
+}
+
+func TestEventOrderByPreservesDefaultOrderWithoutShuffle(t *testing.T) {
+	orderBy, args := eventOrderBy("e.created_at", "e.id", ShuffleInput{})
+
+	if orderBy != "ORDER BY e.created_at DESC, e.id DESC" {
+		t.Fatalf("orderBy = %q", orderBy)
+	}
+	if len(args) != 0 {
+		t.Fatalf("args = %+v", args)
+	}
+}
+
+func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
+	orderBy, args := aggregateOrderBy(aggSpec{
+		groupDims:   []string{"tag_value"},
+		orderMetric: "unique_pubkeys",
+	}, ShuffleInput{
+		Seed:     "agg-seed",
+		Counter:  2,
+		Strength: 0.5,
+	})
+
+	if !strings.Contains(orderBy, "unique_pubkeys DESC, cityHash64") {
+		t.Fatalf("orderBy = %q", orderBy)
+	}
+	if len(args) != 2 || args[0] != "agg-seed" || args[1] != 2 {
+		t.Fatalf("args = %+v", args)
 	}
 }

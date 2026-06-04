@@ -68,6 +68,8 @@ go run ./cmd/api
 
 The API listens on `:8080` by default and serves `POST /graphql`, `GET /graphiql`, `GET /healthz`, and the app-view REST routes under `/nostr/*`. Set `NAGG_API_ADDR=:9090` to change the bind address. If `NAGG_API_ADDR` is unset and Railway provides `PORT`, the API listens on that port.
 
+Set `NAGG_VIEWER_PUBKEY` to a 64-hex pubkey when you want app-view viewer routes to work without an explicit viewer parameter. It is used as the fallback for `/nostr/feed`, `/nostr/feed/user`, `/nostr/follows`, and `/nostr/profile`; explicit invalid pubkeys still return `400`.
+
 The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local Nagg profile data when available; it only calls Vertex for profiles with at least `NAGG_VERTEX_PROFILE_MIN_FOLLOWERS` local followers, default `500`, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails. GraphQL ranking reads the columnar `vertex_scores` cache only; when the Vertex client is configured, the API service warms recent high-follower authors in the background using `NAGG_VERTEX_RANK_MIN_FOLLOWERS` and `NAGG_VERTEX_SYNC_BATCH`.
 
 ```sh
@@ -76,6 +78,7 @@ NAGG_VERTEX_RELAY=wss://relay.vertexlab.io \
 NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500 \
 NAGG_VERTEX_RANK_MIN_FOLLOWERS=500 \
 NAGG_VERTEX_SYNC_BATCH=200 \
+NAGG_VIEWER_PUBKEY=<64-hex-pubkey> \
 NAGG_NIP05_VALIDATE=true \
 go run ./cmd/api
 ```
@@ -114,7 +117,9 @@ NAGG_VERTEX_RELAY=wss://relay.vertexlab.io
 NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500
 NAGG_VERTEX_RANK_MIN_FOLLOWERS=500
 NAGG_VERTEX_SYNC_BATCH=200
+NAGG_VIEWER_PUBKEY=<64-hex-pubkey>
 NAGG_NIP05_VALIDATE=true
+NAGG_GRAPHQL_TIMEOUT=30s
 NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_COOLDOWN=5m
 NAGG_ON_DEMAND_TIMEOUT=5s

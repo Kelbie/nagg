@@ -43,7 +43,14 @@ type EventQueryInput struct {
 	Until   int64
 	Limit   uint64
 	Offset  uint64
+	Shuffle ShuffleInput
 	Empty   bool
+}
+
+type ShuffleInput struct {
+	Seed     string
+	Counter  int
+	Strength float64
 }
 
 type AggregateInput struct {
@@ -57,6 +64,7 @@ type AggregateInput struct {
 	Since   int64
 	Until   int64
 	Limit   uint64
+	Shuffle ShuffleInput
 	Empty   bool
 }
 
@@ -993,12 +1001,14 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 		where += " AND e.created_at < ?"
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
+	orderBy, orderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
+	args = append(args, orderArgs...)
 	args = append(args, input.Limit)
 	query := `
 		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
 		FROM nostr_events AS e FINAL
 		` + where + `
-		ORDER BY e.created_at DESC, e.id DESC
+		` + orderBy + `
 		LIMIT ?
 	`
 	if input.Offset > 0 {
@@ -1036,6 +1046,8 @@ func (s *Store) queryEventsByIDFilter(ctx context.Context, input EventQueryInput
 		where += " AND e.created_at < ?"
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
+	orderBy, orderArgs := eventOrderBy("created_at", "id", input.Shuffle)
+	args = append(args, orderArgs...)
 	args = append(args, input.Limit)
 	query := `
 		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
@@ -1046,7 +1058,7 @@ func (s *Store) queryEventsByIDFilter(ctx context.Context, input EventQueryInput
 			ORDER BY e.id ASC, e.last_seen_at DESC
 			LIMIT 1 BY e.id
 		)
-		ORDER BY created_at DESC, id DESC
+		` + orderBy + `
 		LIMIT ?
 	`
 	if input.Offset > 0 {
@@ -1059,6 +1071,35 @@ func (s *Store) queryEventsByIDFilter(ctx context.Context, input EventQueryInput
 	}
 	defer rows.Close()
 	return scanEventRows(rows)
+}
+
+func eventOrderBy(createdAtColumn, idColumn string, shuffle ShuffleInput) (string, []any) {
+	if !shuffleEnabled(shuffle) {
+		return fmt.Sprintf("ORDER BY %s DESC, %s DESC", createdAtColumn, idColumn), nil
+	}
+	return fmt.Sprintf(
+		"ORDER BY %s DESC, cityHash64(concat(%s, ?, toString(?))) DESC, %s DESC",
+		createdAtColumn,
+		idColumn,
+		idColumn,
+	), []any{strings.TrimSpace(shuffle.Seed), shuffle.Counter}
+}
+
+func aggregateOrderBy(spec aggSpec, shuffle ShuffleInput) (string, []any) {
+	base := spec.orderMetric + " DESC"
+	if !shuffleEnabled(shuffle) {
+		return base, nil
+	}
+	parts := make([]string, 0, len(spec.groupDims)+2)
+	for _, dim := range spec.groupDims {
+		parts = append(parts, "toString("+dim+")")
+	}
+	parts = append(parts, "?", "toString(?)")
+	return base + ", cityHash64(concat(" + strings.Join(parts, ", ") + ")) DESC", []any{strings.TrimSpace(shuffle.Seed), shuffle.Counter}
+}
+
+func shuffleEnabled(shuffle ShuffleInput) bool {
+	return strings.TrimSpace(shuffle.Seed) != "" && shuffle.Strength > 0
 }
 
 func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInput, tag TagFilter, targets []string, limitPerTarget uint64) (map[string][]EventView, error) {
@@ -1102,6 +1143,10 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 	where += " AND rt.tag_key = ? AND rt.tag_value IN (?)"
 	args = append(args, tag.Key, targets)
 
+	innerOrderBy, innerOrderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
+	outerOrderBy, outerOrderArgs := eventOrderBy("created_at", "id", input.Shuffle)
+	args = append(args, innerOrderArgs...)
+	args = append(args, outerOrderArgs...)
 	query := fmt.Sprintf(`
 		SELECT target_value, id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
 		FROM (
@@ -1118,11 +1163,11 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 			FROM event_tags AS rt
 			INNER JOIN nostr_events AS e FINAL ON e.id = rt.event_id
 			%s
-			ORDER BY rt.tag_value ASC, e.created_at DESC, e.id DESC
+			ORDER BY rt.tag_value ASC, %s
 			LIMIT %d BY rt.tag_value
 		)
-		ORDER BY target_value ASC, created_at DESC, id DESC
-	`, where, queryLimit)
+		ORDER BY target_value ASC, %s
+	`, where, strings.TrimPrefix(innerOrderBy, "ORDER BY "), queryLimit, strings.TrimPrefix(outerOrderBy, "ORDER BY "))
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
@@ -1200,6 +1245,10 @@ func (s *Store) queryEventsByTagTargetsFromTags(ctx context.Context, out map[str
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
 
+	innerOrderBy, innerOrderArgs := eventOrderBy("rt.created_at", "rt.event_id", input.Shuffle)
+	outerOrderBy, outerOrderArgs := eventOrderBy("created_at", "event_id", input.Shuffle)
+	args = append(args, innerOrderArgs...)
+	args = append(args, outerOrderArgs...)
 	query := fmt.Sprintf(`
 		SELECT target_value, event_id, created_at
 		FROM (
@@ -1209,11 +1258,11 @@ func (s *Store) queryEventsByTagTargetsFromTags(ctx context.Context, out map[str
 				rt.created_at AS created_at
 			FROM event_tags AS rt
 			%s
-			ORDER BY rt.tag_value ASC, rt.created_at DESC, rt.event_id DESC
+			ORDER BY rt.tag_value ASC, %s
 			LIMIT %d BY rt.tag_value
 		)
-		ORDER BY target_value ASC, created_at DESC, event_id DESC
-	`, strings.Join(clauses, " AND "), queryLimit)
+		ORDER BY target_value ASC, %s
+	`, strings.Join(clauses, " AND "), strings.TrimPrefix(innerOrderBy, "ORDER BY "), queryLimit, strings.TrimPrefix(outerOrderBy, "ORDER BY "))
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
@@ -1435,13 +1484,15 @@ func (s *Store) AggregateEvents(ctx context.Context, input AggregateInput) ([]Ag
 		return nil, err
 	}
 
-	query := fmt.Sprintf("SELECT %s, %s FROM %s %s GROUP BY %s ORDER BY %s DESC LIMIT %d",
+	orderBy, orderArgs := aggregateOrderBy(spec, input.Shuffle)
+	args = append(args, orderArgs...)
+	query := fmt.Sprintf("SELECT %s, %s FROM %s %s GROUP BY %s ORDER BY %s LIMIT %d",
 		strings.Join(spec.selectDims, ", "),
 		strings.Join(spec.selectMetrics, ", "),
 		spec.from,
 		spec.where,
 		strings.Join(spec.groupDims, ", "),
-		spec.orderMetric,
+		orderBy,
 		input.Limit,
 	)
 
@@ -1511,13 +1562,15 @@ func (s *Store) AggregateEventReferencesToTargets(ctx context.Context, reference
 		args = append(args, time.Unix(target.Until, 0).UTC())
 	}
 
-	query := fmt.Sprintf("SELECT %s, %s FROM %s %s GROUP BY %s ORDER BY %s DESC LIMIT %d",
+	orderBy, orderArgs := aggregateOrderBy(spec, references.Shuffle)
+	args = append(args, orderArgs...)
+	query := fmt.Sprintf("SELECT %s, %s FROM %s %s GROUP BY %s ORDER BY %s LIMIT %d",
 		strings.Join(spec.selectDims, ", "),
 		strings.Join(spec.selectMetrics, ", "),
 		spec.from,
 		spec.where,
 		strings.Join(spec.groupDims, ", "),
-		spec.orderMetric,
+		orderBy,
 		references.Limit,
 	)
 

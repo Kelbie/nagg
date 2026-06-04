@@ -375,6 +375,15 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
+	shuffleInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ShuffleInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"seed":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"counter":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
+			"strength": &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.15},
+		},
+	})
+
 	eventQueryInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "EventQueryInput",
 		Fields: graphql.InputObjectConfigFieldMap{
@@ -387,6 +396,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"until":       &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"limit":       &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
 			"offset":      &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"shuffle":     &graphql.InputObjectFieldConfig{Type: shuffleInputType},
 		},
 	})
 
@@ -460,14 +470,6 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"target":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "AUTHOR"},
 			"minFollowers": &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"fallback":     &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.0},
-		},
-	})
-	shuffleInputType = graphql.NewInputObject(graphql.InputObjectConfig{
-		Name: "ShuffleInput",
-		Fields: graphql.InputObjectConfigFieldMap{
-			"seed":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
-			"counter":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
-			"strength": &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.15},
 		},
 	})
 	weightedRankTermInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -559,6 +561,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 100},
+			"shuffle": &graphql.InputObjectFieldConfig{Type: shuffleInputType},
 		},
 	})
 	rankedEventsInputType = graphql.NewInputObject(graphql.InputObjectConfig{
@@ -1967,6 +1970,15 @@ func shuffleInput(raw any) shuffleSpec {
 	}
 }
 
+func chstoreShuffleInput(raw any) chstore.ShuffleInput {
+	shuffle := shuffleInput(raw)
+	return chstore.ShuffleInput{
+		Seed:     shuffle.Seed,
+		Counter:  shuffle.Counter,
+		Strength: shuffle.Strength,
+	}
+}
+
 func rankedTargetIDs(rows []chstore.AggregateRow, offset, limit int) []string {
 	if offset < 0 {
 		offset = 0
@@ -2938,6 +2950,7 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 		Until:   int64(intValue(raw["until"], 0)),
 		Limit:   uint64(intValue(raw["limit"], 50)),
 		Offset:  uint64(intValue(raw["offset"], 0)),
+		Shuffle: chstoreShuffleInput(raw["shuffle"]),
 	}
 	return input, validateHexFilters(input.IDs, input.PubKeys)
 }
@@ -2999,6 +3012,7 @@ func parseAggregateInput(raw map[string]any) (chstore.AggregateInput, error) {
 		Since:   int64(intValue(raw["since"], 0)),
 		Until:   int64(intValue(raw["until"], 0)),
 		Limit:   uint64(intValue(raw["limit"], 100)),
+		Shuffle: chstoreShuffleInput(raw["shuffle"]),
 	}
 	return input, validateHexFilters(input.IDs, input.PubKeys)
 }

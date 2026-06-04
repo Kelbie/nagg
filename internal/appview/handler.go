@@ -45,6 +45,7 @@ type Handler struct {
 	nip05Validator            *nip05Validator
 	rateLimiter               *rateLimiter
 	vertexProfileMinFollowers uint64
+	viewerPubkey              string
 }
 
 type VertexClient interface {
@@ -69,6 +70,15 @@ func WithVertexProfileMinFollowers(minFollowers int) Option {
 			minFollowers = 0
 		}
 		h.vertexProfileMinFollowers = uint64(minFollowers)
+	}
+}
+
+func WithViewerPubkey(pubkey string) Option {
+	return func(h *Handler) {
+		normalized, err := normalizePubkey(pubkey)
+		if err == nil {
+			h.viewerPubkey = normalized
+		}
 	}
 }
 
@@ -286,7 +296,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		req.Offset = uint64(intParam(r, "offset", 0))
 	}
 
-	authors, trending := authorsFromFeedRequest(req.Spec, r)
+	authors, trending := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
 	var events []chstore.EventView
 	var err error
 	if trending || len(authors) == 0 {
@@ -310,10 +320,17 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	h.writeFeedResponse(w, r, events)
 }
 
-func authorsFromFeedRequest(spec string, r *http.Request) ([]string, bool) {
+func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) ([]string, bool) {
 	if r.Method == http.MethodGet {
 		kind := r.URL.Query().Get("kind")
-		return normalizePubkeys(csv(r.URL.Query().Get("pubkeys"))), kind == "trending"
+		if kind == "trending" {
+			return nil, true
+		}
+		authors := normalizePubkeys(csv(r.URL.Query().Get("pubkeys")))
+		if len(authors) == 0 && h.viewerPubkey != "" {
+			authors = []string{h.viewerPubkey}
+		}
+		return authors, false
 	}
 	var parsed struct {
 		ID      string   `json:"id"`
@@ -331,7 +348,19 @@ func authorsFromFeedRequest(spec string, r *http.Request) ([]string, bool) {
 			return []string{pubkey}, false
 		}
 	}
+	if userPubkey != "" {
+		if pubkey, err := normalizePubkey(userPubkey); err == nil {
+			return []string{pubkey}, false
+		}
+	}
+	if h.viewerPubkey != "" && !isTrendingFeedID(parsed.ID) {
+		return []string{h.viewerPubkey}, false
+	}
 	return nil, true
+}
+
+func isTrendingFeedID(id string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(id)), "trending")
 }
 
 func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
@@ -339,7 +368,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/feed/user only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := normalizePubkey(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -567,7 +596,7 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/follows only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := normalizePubkey(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -634,7 +663,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profile only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := normalizePubkey(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1398,6 +1427,13 @@ func normalizePubkey(input string) (string, error) {
 		return value.(string), nil
 	}
 	return "", fmt.Errorf("unsupported pubkey prefix %q", prefix)
+}
+
+func (h *Handler) viewerPubkeyOr(input string) (string, error) {
+	if strings.TrimSpace(input) == "" && h.viewerPubkey != "" {
+		return h.viewerPubkey, nil
+	}
+	return normalizePubkey(input)
 }
 
 func normalizeEventID(input string) (string, error) {

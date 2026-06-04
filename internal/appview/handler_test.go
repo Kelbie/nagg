@@ -73,11 +73,13 @@ func (s fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventVie
 
 type followCountSpyStore struct {
 	fakeStore
-	calls int
+	calls   int
+	pubkeys []string
 }
 
 func (s *followCountSpyStore) FollowCounts(ctx context.Context, pubkey string) (chstore.FollowCounts, error) {
 	s.calls++
+	s.pubkeys = append(s.pubkeys, pubkey)
 	return s.fakeStore.FollowCounts(ctx, pubkey)
 }
 
@@ -99,11 +101,14 @@ func (s *profilePolicySpyStore) SaveVertexProfile(_ context.Context, profile ver
 
 type sequencedFeedStore struct {
 	fakeStore
-	feeds [][]chstore.EventView
-	calls int
+	feeds         [][]chstore.EventView
+	calls         int
+	authors       [][]string
+	trendingCalls int
 }
 
-func (s *sequencedFeedStore) FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error) {
+func (s *sequencedFeedStore) FollowsFeed(_ context.Context, authors []string, _ int64, _ uint64, _ uint64) ([]chstore.EventView, error) {
+	s.authors = append(s.authors, append([]string(nil), authors...))
 	if len(s.feeds) == 0 {
 		s.calls++
 		return nil, nil
@@ -114,6 +119,11 @@ func (s *sequencedFeedStore) FollowsFeed(context.Context, []string, int64, uint6
 	}
 	s.calls++
 	return s.feeds[idx], nil
+}
+
+func (s *sequencedFeedStore) TrendingFeed(context.Context, time.Time, uint64) ([]chstore.EventView, error) {
+	s.trendingCalls++
+	return nil, nil
 }
 
 type sequencedEventStore struct {
@@ -286,6 +296,120 @@ func (v fakeVertex) ProfileRefresh(context.Context, string) (vertex.ProfileResul
 		return vertex.ProfileResult{}, v.profileErr
 	}
 	return v.profile, nil
+}
+
+func TestConfiguredViewerPubkeyFallsBackForUserFeed(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+	}
+	handler := New(
+		store,
+		WithViewerPubkey(testPubkey),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?limit=5", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.authors) != 1 || len(store.authors[0]) != 1 || store.authors[0][0] != testPubkey {
+		t.Fatalf("authors = %+v", store.authors)
+	}
+}
+
+func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+	}
+	handler := New(
+		store,
+		WithViewerPubkey(testPubkey),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed?limit=5", nil)
+	handler.feed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.trendingCalls != 0 {
+		t.Fatalf("trending calls = %d", store.trendingCalls)
+	}
+	if len(store.authors) != 1 || len(store.authors[0]) != 1 || store.authors[0][0] != testPubkey {
+		t.Fatalf("authors = %+v", store.authors)
+	}
+}
+
+func TestConfiguredViewerPubkeyDoesNotOverrideTrendingFeedSpec(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+	}
+	handler := New(
+		store,
+		WithViewerPubkey(testPubkey),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/nostr/feed",
+		strings.NewReader(`{"spec":"{\"id\":\"trending-cluster\"}","limit":5}`),
+	)
+	handler.feed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.trendingCalls != 1 {
+		t.Fatalf("trending calls = %d", store.trendingCalls)
+	}
+	if len(store.authors) != 0 {
+		t.Fatalf("authors = %+v", store.authors)
+	}
+}
+
+func TestConfiguredViewerPubkeyFallsBackForFollows(t *testing.T) {
+	store := &followCountSpyStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+	}
+	handler := New(
+		store,
+		WithViewerPubkey(testPubkey),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/follows", nil)
+	handler.follows(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.pubkeys) != 1 || store.pubkeys[0] != testPubkey {
+		t.Fatalf("pubkeys = %+v", store.pubkeys)
+	}
+}
+
+func TestExplicitInvalidPubkeyStillFailsWithViewerFallback(t *testing.T) {
+	handler := New(
+		fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		WithViewerPubkey(testPubkey),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey=not-a-pubkey", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {

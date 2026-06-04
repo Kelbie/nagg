@@ -529,6 +529,41 @@ func TestEventsQueryBackfillsAuthorWhenFirstPageShort(t *testing.T) {
 	}
 }
 
+func TestEventsQueryAcceptsShuffle(t *testing.T) {
+	store := &fakeStore{
+		events: [][]chstore.EventView{{}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{
+				kinds:[1]
+				limit:2
+				shuffle:{seed:"viewer-seed", counter:7, strength:0.25}
+			}) {
+				nodes { id }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	shuffle := store.eventInputs[0].Shuffle
+	if shuffle.Seed != "viewer-seed" || shuffle.Counter != 7 || shuffle.Strength != 0.25 {
+		t.Fatalf("shuffle = %+v", shuffle)
+	}
+}
+
 func TestEventsQueryReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	store := &fakeStore{
 		events: [][]chstore.EventView{
@@ -1264,6 +1299,7 @@ func TestAggregateEventsAcceptsTimeBounds(t *testing.T) {
 				groupBy:["TAG_VALUE"]
 				metrics:["UNIQUE_PUBKEYS"]
 				limit:5
+				shuffle:{seed:"agg-seed", counter:3, strength:0.5}
 			}) {
 				rows { dimensions metrics }
 			}
@@ -1280,6 +1316,9 @@ func TestAggregateEventsAcceptsTimeBounds(t *testing.T) {
 	input := store.aggregateInputs[0]
 	if input.Since != 1_710_000_000 || input.Until != 1_710_086_400 {
 		t.Fatalf("time bounds = %d/%d", input.Since, input.Until)
+	}
+	if input.Shuffle.Seed != "agg-seed" || input.Shuffle.Counter != 3 || input.Shuffle.Strength != 0.5 {
+		t.Fatalf("shuffle = %+v", input.Shuffle)
 	}
 }
 
