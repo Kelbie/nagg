@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/graphql-go/graphql"
+	"github.com/graphql-go/graphql/gqlerrors"
 	"github.com/graphql-go/graphql/language/ast"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"golang.org/x/sync/singleflight"
@@ -29,6 +30,8 @@ type Store interface {
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
+
+var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
 
 type referenceAggregateStore interface {
 	AggregateEventsByTagTargets(context.Context, chstore.ReferenceAggregateInput) (map[string][]chstore.AggregateRow, bool, error)
@@ -2182,6 +2185,14 @@ func Handler(schema graphql.Schema) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		operation := graphqlRequestOperationName(req.OperationName, req.Query)
+		started := time.Now()
+		slog.Info(
+			"graphql request started",
+			"operation", operation,
+			"variables", len(req.Variables),
+			"query_bytes", len(req.Query),
+		)
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 		result := graphql.Do(graphql.Params{
@@ -2191,9 +2202,53 @@ func Handler(schema graphql.Schema) http.HandlerFunc {
 			VariableValues: req.Variables,
 			Context:        ctx,
 		})
+		duration := time.Since(started)
+		attrs := []any{
+			"operation", operation,
+			"duration_ms", duration.Milliseconds(),
+			"errors", len(result.Errors),
+			"variables", len(req.Variables),
+			"query_bytes", len(req.Query),
+		}
+		if ctx.Err() != nil {
+			attrs = append(attrs, "context_error", ctx.Err().Error())
+		}
+		if len(result.Errors) > 0 {
+			attrs = append(attrs, "messages", graphqlErrorMessages(result.Errors, 3))
+			slog.Warn("graphql request completed with errors", attrs...)
+		} else if ctx.Err() != nil || duration >= 3*time.Second {
+			slog.Warn("graphql request completed slowly", attrs...)
+		} else {
+			slog.Info("graphql request completed", attrs...)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	}
+}
+
+func graphqlRequestOperationName(operationName, query string) string {
+	if strings.TrimSpace(operationName) != "" {
+		return operationName
+	}
+	match := graphqlOperationNamePattern.FindStringSubmatch(query)
+	if len(match) >= 2 {
+		return match[1]
+	}
+	return "anonymous"
+}
+
+func graphqlErrorMessages(errors []gqlerrors.FormattedError, limit int) []string {
+	if limit <= 0 || len(errors) == 0 {
+		return nil
+	}
+	if len(errors) < limit {
+		limit = len(errors)
+	}
+	messages := make([]string, 0, limit)
+	for _, err := range errors[:limit] {
+		messages = append(messages, err.Message)
+	}
+	return messages
 }
 
 func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
