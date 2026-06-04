@@ -349,6 +349,38 @@ func TestHandlerWritesCapabilityHeaders(t *testing.T) {
 	}
 }
 
+func TestHandlerUsesConfiguredRequestTimeout(t *testing.T) {
+	schema, err := graphql.NewSchema(graphql.SchemaConfig{
+		Query: graphql.NewObject(graphql.ObjectConfig{
+			Name: "Query",
+			Fields: graphql.Fields{
+				"slow": &graphql.Field{
+					Type: graphql.String,
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						select {
+						case <-time.After(50 * time.Millisecond):
+							return "done", nil
+						case <-p.Context.Done():
+							return nil, p.Context.Err()
+						}
+					},
+				},
+			},
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/graphql", strings.NewReader(`{"query":"{ slow }"}`))
+
+	Handler(schema, WithRequestTimeout(time.Nanosecond))(rec, req)
+
+	if body := rec.Body.String(); !strings.Contains(body, "context deadline exceeded") {
+		t.Fatalf("body = %s", body)
+	}
+}
+
 func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
 	rootID := testHex("1")
 	replyID := testHex("2")

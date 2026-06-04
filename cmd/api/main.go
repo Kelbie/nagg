@@ -83,7 +83,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/graphql", graphqlapi.Handler(schema))
+	mux.HandleFunc("/graphql", graphqlapi.Handler(schema, graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout)))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
 	appviewOpts := []appview.Option{
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),

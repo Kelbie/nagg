@@ -19,12 +19,17 @@ import (
 
 type Config struct {
 	ClickHouse chstore.Config
+	API        APIConfig
 	Firehose   firehose.Config
 	Ingest     ingest.Config
 	Vertex     VertexConfig
 	OnDemand   OnDemandConfig
 	Viewer     ViewerConfig
 	Enrich     EnrichConfig
+}
+
+type APIConfig struct {
+	GraphQLTimeout time.Duration
 }
 
 type VertexConfig struct {
@@ -71,6 +76,9 @@ func Load() (Config, error) {
 			Password:     os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
 			MaxOpenConns: parseInt(env("NAGG_CLICKHOUSE_MAX_OPEN_CONNS", "30")),
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
+		},
+		API: APIConfig{
+			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
@@ -138,6 +146,9 @@ func (c Config) validate() error {
 	}
 	if c.Ingest.FlushInterval <= 0 {
 		return errors.New("NAGG_FLUSH_INTERVAL must be positive")
+	}
+	if c.API.GraphQLTimeout <= 0 {
+		return errors.New("NAGG_GRAPHQL_TIMEOUT must be positive")
 	}
 	if c.Vertex.PrivateKey != "" {
 		if len(c.Vertex.PrivateKey) != 64 {

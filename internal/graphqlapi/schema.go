@@ -82,6 +82,20 @@ func WithPubkeyScoreMinFollowers(minFollowers int) Option {
 	}
 }
 
+type HandlerOption func(*handlerConfig)
+
+type handlerConfig struct {
+	requestTimeout time.Duration
+}
+
+func WithRequestTimeout(timeout time.Duration) HandlerOption {
+	return func(c *handlerConfig) {
+		if timeout > 0 {
+			c.requestTimeout = timeout
+		}
+	}
+}
+
 type eventNode struct {
 	event          chstore.EventView
 	relations      *pubkeyRelationCache
@@ -2827,7 +2841,11 @@ func pubkeySourcesUseSourceEventAuthor(v any) bool {
 	return false
 }
 
-func Handler(schema graphql.Schema) http.HandlerFunc {
+func Handler(schema graphql.Schema, opts ...HandlerOption) http.HandlerFunc {
+	cfg := handlerConfig{requestTimeout: 10 * time.Second}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	type request struct {
 		Query         string         `json:"query"`
 		OperationName string         `json:"operationName"`
@@ -2852,7 +2870,7 @@ func Handler(schema graphql.Schema) http.HandlerFunc {
 			"variables", len(req.Variables),
 			"query_bytes", len(req.Query),
 		)
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.requestTimeout)
 		defer cancel()
 		result := graphql.Do(graphql.Params{
 			Schema:         schema,
