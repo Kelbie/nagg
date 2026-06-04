@@ -55,11 +55,62 @@ type HugotModelProvider struct {
 	closeErr  error
 }
 
+type HugotModelInventory struct {
+	Root       string
+	RootExists bool
+	Available  []string
+	Missing    []string
+}
+
+type hugotModelSpec struct {
+	key     string
+	aliases []string
+}
+
+var hugotModelSpecs = []hugotModelSpec{
+	{key: "embeddings", aliases: []string{"embeddings", "embedding", "feature-extraction", "minilm"}},
+	{key: "sentiment", aliases: []string{"sentiment", "twitter-roberta-sentiment", "roberta-sentiment"}},
+	{key: "stance", aliases: []string{"stance", "nli", "zero-shot-stance", "zero-shot"}},
+	{key: "nsfw-text", aliases: []string{"nsfw-text", "nsfw", "nsfw-text-classifier"}},
+	{key: "nsfw-image", aliases: []string{"nsfw-image", "nsfw-image-classifier"}},
+}
+
 func NewHugotModelProvider(config HugotModelConfig) *HugotModelProvider {
 	config.ModelDir = strings.TrimSpace(config.ModelDir)
 	config.Backend = strings.ToLower(strings.TrimSpace(config.Backend))
 	config.OnnxLibraryPath = strings.TrimSpace(config.OnnxLibraryPath)
 	return &HugotModelProvider{config: config}
+}
+
+func DiscoverHugotModelInventory(modelDir string) HugotModelInventory {
+	root := strings.TrimSpace(modelDir)
+	inventory := HugotModelInventory{
+		Root:      root,
+		Available: []string{},
+		Missing:   []string{},
+	}
+	if root == "" {
+		for _, spec := range hugotModelSpecs {
+			inventory.Missing = append(inventory.Missing, spec.key)
+		}
+		return inventory
+	}
+	info, err := os.Stat(root)
+	if err != nil || !info.IsDir() {
+		for _, spec := range hugotModelSpecs {
+			inventory.Missing = append(inventory.Missing, spec.key)
+		}
+		return inventory
+	}
+	inventory.RootExists = true
+	for _, spec := range hugotModelSpecs {
+		if _, ok := findModelPath(root, spec.aliases...); ok {
+			inventory.Available = append(inventory.Available, spec.key)
+			continue
+		}
+		inventory.Missing = append(inventory.Missing, spec.key)
+	}
+	return inventory
 }
 
 func (p *HugotModelProvider) Embed(ctx context.Context, inputs []string) ([][]float32, bool, error) {
@@ -167,7 +218,7 @@ func (p *HugotModelProvider) sessionFor(ctx context.Context) (*hugot.Session, er
 
 func (p *HugotModelProvider) embeddingPipeline(ctx context.Context) (*pipelines.FeatureExtractionPipeline, bool, error) {
 	p.embeddingOnce.Do(func() {
-		path, ok := p.modelPath("embeddings", "embedding", "feature-extraction", "minilm")
+		path, ok := p.modelPath("embeddings")
 		if !ok {
 			return
 		}
@@ -188,7 +239,7 @@ func (p *HugotModelProvider) embeddingPipeline(ctx context.Context) (*pipelines.
 
 func (p *HugotModelProvider) sentimentPipeline(ctx context.Context) (*pipelines.TextClassificationPipeline, bool, error) {
 	p.sentimentOnce.Do(func() {
-		path, ok := p.modelPath("sentiment", "twitter-roberta-sentiment", "roberta-sentiment")
+		path, ok := p.modelPath("sentiment")
 		if !ok {
 			return
 		}
@@ -209,7 +260,7 @@ func (p *HugotModelProvider) sentimentPipeline(ctx context.Context) (*pipelines.
 
 func (p *HugotModelProvider) stancePipeline(ctx context.Context, labels []string) (*pipelines.ZeroShotClassificationPipeline, bool, error) {
 	p.stanceOnce.Do(func() {
-		path, ok := p.modelPath("stance", "nli", "zero-shot-stance", "zero-shot")
+		path, ok := p.modelPath("stance")
 		if !ok {
 			return
 		}
@@ -234,7 +285,7 @@ func (p *HugotModelProvider) stancePipeline(ctx context.Context, labels []string
 
 func (p *HugotModelProvider) nsfwTextPipeline(ctx context.Context) (*pipelines.TextClassificationPipeline, bool, error) {
 	p.nsfwTextOnce.Do(func() {
-		path, ok := p.modelPath("nsfw-text", "nsfw", "nsfw-text-classifier")
+		path, ok := p.modelPath("nsfw-text")
 		if !ok {
 			return
 		}
@@ -255,7 +306,7 @@ func (p *HugotModelProvider) nsfwTextPipeline(ctx context.Context) (*pipelines.T
 
 func (p *HugotModelProvider) nsfwImagePipeline(ctx context.Context) (*pipelines.ImageClassificationPipeline, bool, error) {
 	p.nsfwImageOnce.Do(func() {
-		path, ok := p.modelPath("nsfw-image", "nsfw-image-classifier")
+		path, ok := p.modelPath("nsfw-image")
 		if !ok {
 			return
 		}
@@ -279,6 +330,18 @@ func (p *HugotModelProvider) modelPath(names ...string) (string, bool) {
 	if root == "" {
 		return "", false
 	}
+	for _, name := range names {
+		for _, spec := range hugotModelSpecs {
+			if spec.key != name {
+				continue
+			}
+			return findModelPath(root, spec.aliases...)
+		}
+	}
+	return findModelPath(root, names...)
+}
+
+func findModelPath(root string, names ...string) (string, bool) {
 	for _, name := range names {
 		path := filepath.Join(root, name)
 		info, err := os.Stat(path)

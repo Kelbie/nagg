@@ -3,6 +3,8 @@ package enrich
 import (
 	"context"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +290,27 @@ func TestProcessorsUseModelProviderWhenAvailable(t *testing.T) {
 	}
 	if len(nsfw[0].Annotation.Tags) != 1 || nsfw[0].Annotation.Tags[0].Value != "explicit" {
 		t.Fatalf("nsfw tags = %+v, want provider explicit tag", nsfw[0].Annotation.Tags)
+	}
+}
+
+func TestDiscoverHugotModelInventoryReportsAvailableAliases(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"minilm", "roberta-sentiment", "nsfw-image-classifier"} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	inventory := DiscoverHugotModelInventory(root)
+
+	if !inventory.RootExists {
+		t.Fatalf("root exists = false, want true")
+	}
+	if got, want := strings.Join(inventory.Available, ","), "embeddings,sentiment,nsfw-image"; got != want {
+		t.Fatalf("available = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(inventory.Missing, ","), "stance,nsfw-text"; got != want {
+		t.Fatalf("missing = %q, want %q", got, want)
 	}
 }
 

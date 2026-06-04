@@ -71,6 +71,13 @@ func main() {
 		"model_backend", cfg.Enrich.ModelBackend,
 		"trending_dedupe_similarity", cfg.Enrich.TrendingDedupeSimilarity,
 	)
+	modelInventory := enrich.DiscoverHugotModelInventory(cfg.Enrich.ModelDir)
+	slog.Info("enricher model inventory",
+		"model_dir", modelInventory.Root,
+		"model_dir_exists", modelInventory.RootExists,
+		"available_models", modelInventory.Available,
+		"missing_models", modelInventory.Missing,
+	)
 	runner := enrich.NewRunner(store, processors, enrich.RunnerConfig{
 		BatchSize:    cfg.Enrich.BatchSize,
 		PollInterval: cfg.Enrich.PollInterval,
