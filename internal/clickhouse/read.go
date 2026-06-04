@@ -753,13 +753,6 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	}
 	args = append(args, input.Limit)
 
-	reasonRankExpr := "0 AS reason_rank"
-	orderBy := "notification_created_at DESC, notification_event_id DESC"
-	if tab != "MENTIONS" {
-		reasonRankExpr = "row_number() OVER (PARTITION BY n.reason ORDER BY n.created_at DESC, n.event_id DESC) AS reason_rank"
-		orderBy = "reason_rank ASC, notification_created_at DESC, notification_event_id DESC"
-	}
-
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		SELECT
 			id,
@@ -785,8 +778,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				n.reason AS reason,
 				ifNull(actor_score.score, 0) AS actor_vertex_score,
 				n.created_at AS notification_created_at,
-				n.event_id AS notification_event_id,
-				%s
+				n.event_id AS notification_event_id
 			FROM (
 				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
 				FROM (
@@ -799,7 +791,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 						reason,
 						row_number() OVER (
 							PARTITION BY viewer, reason, actor_pubkey
-							ORDER BY created_at DESC, event_id DESC
+							ORDER BY created_at ASC, event_id ASC
 						) AS actor_reason_rank
 					FROM notification_candidates FINAL
 					WHERE viewer = ?
@@ -813,9 +805,9 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
 			%s
 		)
-		ORDER BY %s
+		ORDER BY notification_created_at DESC, notification_event_id DESC
 		LIMIT ?
-	`, reasonRankExpr, where, orderBy), args...)
+	`, where), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -853,8 +845,11 @@ func notificationReasonForEvent(event EventView, fallback string) string {
 	case 3:
 		return "follow"
 	case 1:
-		if notificationEventHasTag(event.Tags, "e") {
+		if notificationHasReplyReference(event.Tags) {
 			return "reply"
+		}
+		if notificationHasQuoteReference(event.Tags) {
+			return "quote"
 		}
 		return "mention"
 	case 6, 16:
@@ -871,12 +866,27 @@ func notificationReasonForEvent(event EventView, fallback string) string {
 	}
 }
 
-func notificationEventHasTag(tags [][]string, key string) bool {
+func notificationHasReplyReference(tags [][]string) bool {
 	for _, tag := range tags {
-		if len(tag) <= 1 || tag[0] != key || len(tag[1]) != 64 {
+		if len(tag) <= 1 || tag[0] != "e" || len(tag[1]) != 64 {
 			continue
 		}
-		if key != "e" || len(tag) < 4 || tag[3] == "" || tag[3] == "root" || tag[3] == "reply" {
+		if len(tag) < 4 || tag[3] == "" || tag[3] == "root" || tag[3] == "reply" {
+			return true
+		}
+	}
+	return false
+}
+
+func notificationHasQuoteReference(tags [][]string) bool {
+	for _, tag := range tags {
+		if len(tag) <= 1 || len(tag[1]) != 64 {
+			continue
+		}
+		if tag[0] == "q" {
+			return true
+		}
+		if tag[0] == "e" && len(tag) >= 4 && tag[3] == "mention" {
 			return true
 		}
 	}

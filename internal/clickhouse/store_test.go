@@ -98,9 +98,13 @@ func TestNotificationReasonForEvent(t *testing.T) {
 			event: EventView{Kind: 1, Tags: [][]string{{"e", validEventID}, {"p", strings.Repeat("b", 64)}}},
 			want:  "reply",
 		},
-		"quote mention marker stays mention": {
+		"quote mention marker": {
 			event: EventView{Kind: 1, Tags: [][]string{{"e", validEventID, "", "mention"}}},
-			want:  "mention",
+			want:  "quote",
+		},
+		"q tag quote": {
+			event: EventView{Kind: 1, Tags: [][]string{{"q", validEventID}, {"p", strings.Repeat("b", 64)}}},
+			want:  "quote",
 		},
 		"reaction": {
 			event: EventView{Kind: 7},
