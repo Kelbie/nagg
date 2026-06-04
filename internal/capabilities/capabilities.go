@@ -24,6 +24,7 @@ var Names = []string{
 	"graphql.pubkeysFrom.latestEventTags",
 	"graphql.pubkeysFrom.sourceEventAuthor",
 	"graphql.events.shuffle",
+	"graphql.events.excludeIdsPubkeys",
 	"graphql.aggregateEvents.shuffle",
 	"graphql.rank.weightedTerms",
 	"graphql.rank.candidatePubkeyBoosts",

@@ -35,16 +35,18 @@ type TagFilter struct {
 }
 
 type EventQueryInput struct {
-	IDs     []string
-	PubKeys []string
-	Kinds   []int
-	Tags    []TagFilter
-	Since   int64
-	Until   int64
-	Limit   uint64
-	Offset  uint64
-	Shuffle ShuffleInput
-	Empty   bool
+	IDs            []string
+	PubKeys        []string
+	ExcludeIDs     []string
+	ExcludePubKeys []string
+	Kinds          []int
+	Tags           []TagFilter
+	Since          int64
+	Until          int64
+	Limit          uint64
+	Offset         uint64
+	Shuffle        ShuffleInput
+	Empty          bool
 }
 
 type ShuffleInput struct {
@@ -581,7 +583,7 @@ func (s *Store) AvailableTopics(ctx context.Context, input EventQueryInput) ([]T
 	if input.Limit == 0 || input.Limit > 500 {
 		input.Limit = 100
 	}
-	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	where, args := eventWhereInput("e", input)
 	if input.Since > 0 {
 		where += " AND e.created_at >= ?"
 		args = append(args, time.Unix(input.Since, 0).UTC())
@@ -1032,7 +1034,7 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 		return s.queryEventsByIDFilter(ctx, input)
 	}
 
-	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	where, args := eventWhereInput("e", input)
 	if input.Since > 0 {
 		where += " AND e.created_at >= ?"
 		args = append(args, time.Unix(input.Since, 0).UTC())
@@ -1077,7 +1079,7 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 }
 
 func (s *Store) queryEventsByIDFilter(ctx context.Context, input EventQueryInput) ([]EventView, error) {
-	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	where, args := eventWhereInput("e", input)
 	if input.Since > 0 {
 		where += " AND e.created_at >= ?"
 		args = append(args, time.Unix(input.Since, 0).UTC())
@@ -1171,7 +1173,7 @@ func (s *Store) QueryEventsByTagTargets(ctx context.Context, input EventQueryInp
 		queryLimit = limitPerTarget
 	}
 
-	where, args := eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+	where, args := eventWhereInput("e", input)
 	if input.Since > 0 {
 		where += " AND e.created_at >= ?"
 		args = append(args, time.Unix(input.Since, 0).UTC())
@@ -1411,7 +1413,7 @@ func (s *Store) AggregateEventsByTagTargets(ctx context.Context, input Reference
 		return nil, false, nil
 	}
 
-	where, args := eventWhere("e", input.Events.IDs, input.Events.PubKeys, input.Events.Kinds, input.Events.Tags)
+	where, args := eventWhereInput("e", input.Events)
 	if input.Events.Since > 0 {
 		where += " AND e.created_at >= ?"
 		args = append(args, time.Unix(input.Events.Since, 0).UTC())
@@ -1590,7 +1592,7 @@ func (s *Store) AggregateEventReferencesToTargets(ctx context.Context, reference
 	}
 	spec.from = "event_tags t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id INNER JOIN nostr_events AS target FINAL ON target.id = t.tag_value"
 
-	targetWhere, targetArgs := eventWhere("target", target.IDs, target.PubKeys, target.Kinds, target.Tags)
+	targetWhere, targetArgs := eventWhereInput("target", target)
 	spec.where += " AND " + whereBody(targetWhere)
 	args = append(args, targetArgs...)
 	if target.Since > 0 {
@@ -1875,6 +1877,14 @@ func aggregateTimeColumn(dataset string) (string, error) {
 }
 
 func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
+	return eventWhereWithExclusions(alias, ids, pubkeys, nil, nil, kinds, tags)
+}
+
+func eventWhereInput(alias string, input EventQueryInput) (string, []any) {
+	return eventWhereWithExclusions(alias, input.IDs, input.PubKeys, input.ExcludeIDs, input.ExcludePubKeys, input.Kinds, input.Tags)
+}
+
+func eventWhereWithExclusions(alias string, ids, pubkeys, excludeIDs, excludePubkeys []string, kinds []int, tags []TagFilter) (string, []any) {
 	clauses := []string{"WHERE 1 = 1"}
 	var args []any
 	if len(ids) > 0 {
@@ -1884,6 +1894,14 @@ func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilt
 	if len(pubkeys) > 0 {
 		clauses = append(clauses, alias+".pubkey IN (?)")
 		args = append(args, pubkeys)
+	}
+	if len(excludeIDs) > 0 {
+		clauses = append(clauses, alias+".id NOT IN (?)")
+		args = append(args, excludeIDs)
+	}
+	if len(excludePubkeys) > 0 {
+		clauses = append(clauses, alias+".pubkey NOT IN (?)")
+		args = append(args, excludePubkeys)
 	}
 	if len(kinds) > 0 {
 		clauses = append(clauses, alias+".kind IN ("+ints(kinds)+")")

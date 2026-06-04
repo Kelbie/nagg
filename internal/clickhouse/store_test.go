@@ -106,6 +106,23 @@ func TestEventOrderByPreservesDefaultOrderWithoutShuffle(t *testing.T) {
 	}
 }
 
+func TestEventWhereAddsNegativeEventFilters(t *testing.T) {
+	where, args := eventWhereInput("e", EventQueryInput{
+		ExcludeIDs:     []string{"event-a"},
+		ExcludePubKeys: []string{"pubkey-a"},
+	})
+
+	if !strings.Contains(where, "e.id NOT IN (?)") {
+		t.Fatalf("where = %q", where)
+	}
+	if !strings.Contains(where, "e.pubkey NOT IN (?)") {
+		t.Fatalf("where = %q", where)
+	}
+	if len(args) != 2 {
+		t.Fatalf("args = %+v", args)
+	}
+}
+
 func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
 	orderBy, args := aggregateOrderBy(aggSpec{
 		groupDims:   []string{"tag_value"},

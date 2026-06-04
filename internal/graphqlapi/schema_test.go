@@ -97,7 +97,14 @@ func (s *fakeStore) QueryEvents(_ context.Context, input chstore.EventQueryInput
 		idx = len(s.events) - 1
 	}
 	s.calls++
-	return s.events[idx], nil
+	out := make([]chstore.EventView, 0, len(s.events[idx]))
+	for _, event := range s.events[idx] {
+		if eventExcludedByInput(event, input) {
+			continue
+		}
+		out = append(out, event)
+	}
+	return out, nil
 }
 
 func (s *fakeStore) QueryEventsByTagTargets(_ context.Context, input chstore.EventQueryInput, tag chstore.TagFilter, targets []string, limitPerTarget uint64) (map[string][]chstore.EventView, error) {
@@ -127,6 +134,9 @@ func (s *fakeStore) QueryEventsByTagTargets(_ context.Context, input chstore.Eve
 	}
 	s.calls++
 	for _, event := range s.events[idx] {
+		if eventExcludedByInput(event, input) {
+			continue
+		}
 		if len(input.PubKeys) > 0 && !containsString(input.PubKeys, event.PubKey) {
 			continue
 		}
@@ -141,6 +151,10 @@ func (s *fakeStore) QueryEventsByTagTargets(_ context.Context, input chstore.Eve
 		}
 	}
 	return out, nil
+}
+
+func eventExcludedByInput(event chstore.EventView, input chstore.EventQueryInput) bool {
+	return containsString(input.ExcludeIDs, event.ID) || containsString(input.ExcludePubKeys, event.PubKey)
 }
 
 func (s *fakeStore) QueryLatestEventsByPubKeys(_ context.Context, pubkeys []string, kinds []int, limit uint64) (map[string][]chstore.EventView, error) {
@@ -2251,6 +2265,79 @@ func TestEventsAcceptsDerivedTagExcludeValues(t *testing.T) {
 	tag := tags[0]
 	if tag.Key != "topic" || tag.Dataset != "DERIVED_TAGS" || len(tag.ExcludeValues) != 1 || tag.ExcludeValues[0] != "crypto" {
 		t.Fatalf("tag filter = %+v", tag)
+	}
+}
+
+func TestEventsAcceptsNegativeEventFilters(t *testing.T) {
+	hiddenID := testHex("1")
+	hiddenPubkey := testHex("2")
+	visibleID := testHex("3")
+	store := &fakeStore{
+		events: [][]chstore.EventView{{
+			{
+				ID:        hiddenID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "hidden by id",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("1", 128),
+			},
+			{
+				ID:        testHex("4"),
+				PubKey:    hiddenPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "hidden by pubkey",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("2", 128),
+			},
+			{
+				ID:        visibleID,
+				PubKey:    testHex("5"),
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_002, 0),
+				Content:   "visible",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("3", 128),
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{
+				kinds:[1]
+				excludeIds:["` + hiddenID + `"]
+				excludePubkeys:["` + hiddenPubkey + `"]
+				limit:10
+			}) { nodes { id } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != visibleID {
+		t.Fatalf("nodes = %+v", nodes)
+	}
+	if len(store.eventInputs) != 1 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	input := store.eventInputs[0]
+	if len(input.ExcludeIDs) != 1 || input.ExcludeIDs[0] != hiddenID {
+		t.Fatalf("exclude ids = %+v", input.ExcludeIDs)
+	}
+	if len(input.ExcludePubKeys) != 1 || input.ExcludePubKeys[0] != hiddenPubkey {
+		t.Fatalf("exclude pubkeys = %+v", input.ExcludePubKeys)
 	}
 }
 

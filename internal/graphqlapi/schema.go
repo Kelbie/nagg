@@ -390,13 +390,17 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"ids":         &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"pubkeys":     &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
 			"pubkeysFrom": &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(pubkeySourceInputType))},
-			"kinds":       &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
-			"tags":        &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
-			"since":       &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"until":       &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"limit":       &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
-			"offset":      &graphql.InputObjectFieldConfig{Type: graphql.Int},
-			"shuffle":     &graphql.InputObjectFieldConfig{Type: shuffleInputType},
+			"excludeIds":  &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.String))},
+			"excludePubkeys": &graphql.InputObjectFieldConfig{
+				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
+			},
+			"kinds":   &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
+			"tags":    &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
+			"offset":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			"shuffle": &graphql.InputObjectFieldConfig{Type: shuffleInputType},
 		},
 	})
 
@@ -2942,17 +2946,22 @@ func graphqlErrorMessages(errors []gqlerrors.FormattedError, limit int) []string
 
 func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 	input := chstore.EventQueryInput{
-		IDs:     stringList(raw["ids"]),
-		PubKeys: stringList(raw["pubkeys"]),
-		Kinds:   intList(raw["kinds"]),
-		Tags:    tagFilters(raw["tags"]),
-		Since:   int64(intValue(raw["since"], 0)),
-		Until:   int64(intValue(raw["until"], 0)),
-		Limit:   uint64(intValue(raw["limit"], 50)),
-		Offset:  uint64(intValue(raw["offset"], 0)),
-		Shuffle: chstoreShuffleInput(raw["shuffle"]),
+		IDs:            stringList(raw["ids"]),
+		PubKeys:        stringList(raw["pubkeys"]),
+		ExcludeIDs:     stringList(raw["excludeIds"]),
+		ExcludePubKeys: stringList(raw["excludePubkeys"]),
+		Kinds:          intList(raw["kinds"]),
+		Tags:           tagFilters(raw["tags"]),
+		Since:          int64(intValue(raw["since"], 0)),
+		Until:          int64(intValue(raw["until"], 0)),
+		Limit:          uint64(intValue(raw["limit"], 50)),
+		Offset:         uint64(intValue(raw["offset"], 0)),
+		Shuffle:        chstoreShuffleInput(raw["shuffle"]),
 	}
-	return input, validateHexFilters(input.IDs, input.PubKeys)
+	return input, validateHexFilters(
+		append(append([]string(nil), input.IDs...), input.ExcludeIDs...),
+		append(append([]string(nil), input.PubKeys...), input.ExcludePubKeys...),
+	)
 }
 
 func parseTrendingInput(raw map[string]any) chstore.TrendingInput {
