@@ -10,6 +10,7 @@ import (
 
 	"github.com/graphql-go/graphql"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 const testPubkey = "50d94fc2d8580c682b071a542f8b1e31a200b0508bab95a33bef0855df281d63"
@@ -35,6 +36,8 @@ type fakeStore struct {
 	aggregateInputs             []chstore.AggregateInput
 	pubkeyScoreRows             map[string]chstore.PubkeyScore
 	pubkeyScoreInputs           []pubkeyScoreInput
+	profileRows                 map[string]chstore.ProfileRow
+	vertexProfileRows           map[string]vertex.ProfileResult
 	derivedMetricRows           map[string]map[string]float64
 	derivedMetricInputs         []derivedMetricInput
 	topicRows                   []chstore.TopicRow
@@ -71,6 +74,21 @@ type pubkeyScoreInput struct {
 type derivedMetricInput struct {
 	metric   string
 	eventIDs []string
+}
+
+type fakeProfileSearcher struct {
+	rows      []vertex.SearchResult
+	fromCache bool
+	inputs    []vertex.SearchArgs
+	err       error
+}
+
+func (s *fakeProfileSearcher) Search(_ context.Context, input vertex.SearchArgs) ([]vertex.SearchResult, bool, error) {
+	s.inputs = append(s.inputs, input)
+	if s.err != nil {
+		return nil, false, s.err
+	}
+	return s.rows, s.fromCache, nil
 }
 
 func (s *fakeStore) EventByID(_ context.Context, id string) (*chstore.EventView, error) {
@@ -223,6 +241,32 @@ func (s *fakeStore) AggregateEventsByTagTargets(_ context.Context, input chstore
 	return out, true, nil
 }
 
+func (s *fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[string]chstore.ProfileRow, error) {
+	out := make(map[string]chstore.ProfileRow, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		if s.profileRows == nil {
+			continue
+		}
+		if row, ok := s.profileRows[pubkey]; ok {
+			out[pubkey] = row
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) CachedVertexProfiles(_ context.Context, pubkeys []string) (map[string]vertex.ProfileResult, error) {
+	out := make(map[string]vertex.ProfileResult, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		if s.vertexProfileRows == nil {
+			continue
+		}
+		if row, ok := s.vertexProfileRows[pubkey]; ok {
+			out[pubkey] = row
+		}
+	}
+	return out, nil
+}
+
 func (s *fakeStore) PubkeyScores(_ context.Context, source string, pubkeys []string) (map[string]chstore.PubkeyScore, error) {
 	s.pubkeyScoreInputs = append(s.pubkeyScoreInputs, pubkeyScoreInput{
 		source:  source,
@@ -360,6 +404,111 @@ func TestHandlerWritesCapabilityHeaders(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Nagg-App-View-Version"); got != "v1" {
 		t.Fatalf("app view version header = %q", got)
+	}
+}
+
+func TestProfileSearchReturnsSearchAndProfileScores(t *testing.T) {
+	searchRank := 0.01
+	searchScore := 42.5
+	profileScore := 88.25
+	followers := uint64(1234)
+	follows := uint64(99)
+	createdAt := int64(1_720_000_000)
+	searcher := &fakeProfileSearcher{
+		rows: []vertex.SearchResult{{
+			PubKey: testPubkey,
+			Npub:   vertex.Npub(testPubkey),
+			Rank:   &searchRank,
+			Score:  &searchScore,
+		}},
+		fromCache: true,
+	}
+	store := &fakeStore{
+		profileRows: map[string]chstore.ProfileRow{
+			testPubkey: {
+				PubKey:      testPubkey,
+				Name:        "jack",
+				DisplayName: "Jack",
+				Picture:     "https://example.test/avatar.png",
+				NIP05:       "jack@example.test",
+			},
+		},
+		vertexProfileRows: map[string]vertex.ProfileResult{
+			testPubkey: {
+				PubKey:    testPubkey,
+				Npub:      vertex.Npub(testPubkey),
+				Rank:      0.2,
+				Score:     &profileScore,
+				Followers: &followers,
+				Follows:   &follows,
+				CreatedAt: &createdAt,
+			},
+		},
+	}
+	schema, err := NewSchema(store, WithProfileSearch(searcher))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query ProfileSearch($input: ProfileSearchInput!) {
+			profileSearch(input: $input) {
+				query
+				limit
+				sort
+				fromCache
+				nodes {
+					pubkey
+					npub
+					rank
+					score
+					searchRank
+					searchScore
+					profileRank
+					profileScore
+					followers
+					follows
+					name
+					displayName
+					picture
+					nip05
+				}
+			}
+		}`,
+		VariableValues: map[string]any{
+			"input": map[string]any{"query": "jack", "limit": 1},
+		},
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(searcher.inputs) != 1 {
+		t.Fatalf("profile search inputs = %+v", searcher.inputs)
+	}
+	if searcher.inputs[0].Sort != vertex.DefaultSearchSort {
+		t.Fatalf("sort = %q, want %q", searcher.inputs[0].Sort, vertex.DefaultSearchSort)
+	}
+	data := result.Data.(map[string]any)
+	connection := data["profileSearch"].(map[string]any)
+	if connection["fromCache"] != true {
+		t.Fatalf("fromCache = %v", connection["fromCache"])
+	}
+	nodes := connection["nodes"].([]any)
+	if len(nodes) != 1 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	node := nodes[0].(map[string]any)
+	if node["pubkey"] != testPubkey || node["name"] != "jack" {
+		t.Fatalf("node = %+v", node)
+	}
+	if node["searchScore"] != searchScore || node["profileScore"] != profileScore || node["score"] != profileScore {
+		t.Fatalf("scores = %+v", node)
+	}
+	if node["followers"] != int(followers) || node["follows"] != int(follows) {
+		t.Fatalf("social counts = %+v", node)
 	}
 }
 

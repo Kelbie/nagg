@@ -72,6 +72,9 @@ func main() {
 
 	schemaOpts := []graphqlapi.Option{
 		graphqlapi.WithPubkeyScoreMinFollowers(cfg.Vertex.RankMinFollowers),
+		graphqlapi.WithProfileSearch(vertex.NewSearchProvider(store, vertexClient, vertex.SearchProviderConfig{
+			MaxAge: 7 * 24 * time.Hour,
+		}, logger)),
 	}
 	if userFeedBackfiller != nil {
 		schemaOpts = append(schemaOpts, graphqlapi.WithUserFeedBackfill(userFeedBackfiller))

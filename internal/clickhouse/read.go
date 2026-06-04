@@ -126,6 +126,11 @@ type PubkeyScore struct {
 	FetchedAt time.Time `json:"fetchedAt"`
 }
 
+type VertexSearchCacheEntry struct {
+	Rows      []vertex.SearchResult
+	FetchedAt time.Time
+}
+
 type TopicRow struct {
 	Value     string `json:"value"`
 	Parent    string `json:"parent"`
@@ -471,6 +476,42 @@ func (s *Store) CachedVertexProfile(ctx context.Context, pubkey string) (vertex.
 	return profile, true, nil
 }
 
+func (s *Store) CachedVertexProfiles(ctx context.Context, pubkeys []string) (map[string]vertex.ProfileResult, error) {
+	pubkeys = uniqueStrings(pubkeys)
+	out := make(map[string]vertex.ProfileResult, len(pubkeys))
+	if len(pubkeys) == 0 {
+		return out, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT pubkey, payload
+		FROM vertex_profile_cache FINAL
+		WHERE pubkey IN (?)
+	`, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pubkey string
+		var payload string
+		if err := rows.Scan(&pubkey, &payload); err != nil {
+			return nil, err
+		}
+		var profile vertex.ProfileResult
+		if err := json.Unmarshal([]byte(payload), &profile); err != nil {
+			return nil, err
+		}
+		if profile.PubKey == "" {
+			profile.PubKey = pubkey
+		}
+		if profile.Npub == "" {
+			profile.Npub = vertex.Npub(profile.PubKey)
+		}
+		out[pubkey] = profile
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileResult) error {
 	pubkey, ok := vertex.NormalizePubkey(profile.PubKey)
 	if !ok {
@@ -506,6 +547,117 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 		INSERT INTO vertex_scores (source, pubkey, score, rank, followers, nodes, fetched_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, "vertex", pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
+}
+
+func (s *Store) CachedVertexSearch(ctx context.Context, args vertex.SearchArgs) ([]vertex.SearchResult, time.Time, bool, error) {
+	args = vertex.NormalizeSearchArgs(args)
+	queryNorm := strings.ToLower(args.Query)
+	var fetchedAt sql.NullTime
+	if err := s.conn.QueryRow(ctx, `
+		SELECT maxOrNull(fetched_at)
+		FROM vertex_search_cache FINAL
+		WHERE query_norm = ? AND sort = ? AND source = ? AND requested_limit = ?
+	`, queryNorm, args.Sort, args.Source, uint64(args.Limit)).Scan(&fetchedAt); err != nil {
+		return nil, time.Time{}, false, err
+	}
+	if !fetchedAt.Valid {
+		return nil, time.Time{}, false, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT pubkey, rank, score, nodes
+		FROM vertex_search_cache FINAL
+		WHERE query_norm = ? AND sort = ? AND source = ? AND requested_limit = ? AND fetched_at = ?
+		ORDER BY position ASC
+	`, queryNorm, args.Sort, args.Source, uint64(args.Limit), fetchedAt.Time)
+	if err != nil {
+		return nil, time.Time{}, false, err
+	}
+	defer rows.Close()
+	out := make([]vertex.SearchResult, 0, args.Limit)
+	for rows.Next() {
+		var pubkey string
+		var rank sql.NullFloat64
+		var score sql.NullFloat64
+		var nodes uint64
+		if err := rows.Scan(&pubkey, &rank, &score, &nodes); err != nil {
+			return nil, time.Time{}, false, err
+		}
+		result := vertex.SearchResult{
+			PubKey: pubkey,
+			Npub:   vertex.Npub(pubkey),
+		}
+		if rank.Valid {
+			value := rank.Float64
+			result.Rank = &value
+		}
+		if score.Valid {
+			value := score.Float64
+			result.Score = &value
+		}
+		if nodes > 0 {
+			value := int(nodes)
+			result.Nodes = &value
+		}
+		out = append(out, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, time.Time{}, false, err
+	}
+	if len(out) == 0 {
+		return nil, time.Time{}, false, nil
+	}
+	return out, fetchedAt.Time.UTC(), true, nil
+}
+
+func (s *Store) SaveVertexSearch(ctx context.Context, args vertex.SearchArgs, results []vertex.SearchResult) error {
+	args = vertex.NormalizeSearchArgs(args)
+	if len(results) == 0 {
+		return nil
+	}
+	batch, err := s.prepareInsertBatch(ctx, `
+		INSERT INTO vertex_search_cache
+			(query_norm, sort, source, requested_limit, position, pubkey, rank, score, nodes, fetched_at)
+		VALUES
+	`)
+	if err != nil {
+		return err
+	}
+	defer closeUnsentBatch(batch)
+	queryNorm := strings.ToLower(args.Query)
+	fetchedAt := time.Now().UTC()
+	for position, row := range results {
+		pubkey, ok := vertex.NormalizePubkey(row.PubKey)
+		if !ok {
+			continue
+		}
+		var rank any
+		if row.Rank != nil {
+			rank = *row.Rank
+		}
+		var score any
+		if row.Score != nil {
+			score = *row.Score
+		}
+		var nodes uint64
+		if row.Nodes != nil && *row.Nodes > 0 {
+			nodes = uint64(*row.Nodes)
+		}
+		if err := batch.Append(
+			queryNorm,
+			args.Sort,
+			args.Source,
+			uint64(args.Limit),
+			uint64(position),
+			pubkey,
+			rank,
+			score,
+			nodes,
+			fetchedAt,
+		); err != nil {
+			return err
+		}
+	}
+	return batch.Send()
 }
 
 func (s *Store) AuthorVertexScores(ctx context.Context, pubkeys []string) (map[string]PubkeyScore, error) {

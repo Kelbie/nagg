@@ -20,6 +20,7 @@ import (
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/vertex"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -30,6 +31,8 @@ type Store interface {
 	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
+	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
+	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
 	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
 	AvailableTopics(context.Context, chstore.EventQueryInput) ([]chstore.TopicRow, error)
@@ -51,7 +54,12 @@ var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 type resolver struct {
 	store                   Store
 	userBackfiller          UserFeedBackfiller
+	profileSearcher         ProfileSearcher
 	pubkeyScoreMinFollowers uint64
+}
+
+type ProfileSearcher interface {
+	Search(context.Context, vertex.SearchArgs) ([]vertex.SearchResult, bool, error)
 }
 
 type UserFeedBackfiller interface {
@@ -71,6 +79,12 @@ type Option func(*resolver)
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 	return func(r *resolver) {
 		r.userBackfiller = backfiller
+	}
+}
+
+func WithProfileSearch(searcher ProfileSearcher) Option {
+	return func(r *resolver) {
+		r.profileSearcher = searcher
 	}
 }
 
@@ -115,6 +129,21 @@ type notificationNode struct {
 type notificationConnectionSource struct {
 	rows  []chstore.NotificationRow
 	nodes []notificationNode
+}
+
+type profileSearchResultNode struct {
+	row     vertex.SearchResult
+	profile chstore.ProfileRow
+	vertex  *vertex.ProfileResult
+}
+
+type profileSearchConnectionSource struct {
+	query     string
+	limit     int
+	sort      string
+	source    string
+	fromCache bool
+	nodes     []profileSearchResultNode
 }
 
 type eventConnectionSource struct {
@@ -184,6 +213,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	var rankedReverseReferenceInputType *graphql.InputObject
 	var rankedEventsInputType *graphql.InputObject
 	var notificationInputType *graphql.InputObject
+	var profileSearchInputType *graphql.InputObject
 
 	var eventType *graphql.Object
 	eventType = graphql.NewObject(graphql.ObjectConfig{
@@ -707,6 +737,90 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"limit":      &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
 		},
 	})
+	profileSearchInputType = graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "ProfileSearchInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"query":  &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"limit":  &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 10},
+			"sort":   &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: vertex.DefaultSearchSort},
+			"source": &graphql.InputObjectFieldConfig{Type: graphql.String},
+		},
+	})
+	profileSearchResultType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "ProfileSearchResult",
+		Fields: graphql.Fields{
+			"pubkey":      &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return n.row.PubKey })},
+			"npub":        &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return n.row.Npub })},
+			"rank":        &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return profileSearchLegacyRank(n) })},
+			"score":       &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return profileSearchLegacyScore(n) })},
+			"searchRank":  &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return floatPtrValue(n.row.Rank) })},
+			"searchScore": &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return floatPtrValue(n.row.Score) })},
+			"profileRank": &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any {
+				if n.vertex == nil {
+					return nil
+				}
+				return n.vertex.Rank
+			})},
+			"profileScore": &graphql.Field{Type: graphql.Float, Resolve: profileSearchResultField(func(n profileSearchResultNode) any {
+				if n.vertex == nil {
+					return nil
+				}
+				return floatPtrValue(n.vertex.Score)
+			})},
+			"followers": &graphql.Field{Type: graphql.Int, Resolve: profileSearchResultField(func(n profileSearchResultNode) any {
+				if n.vertex == nil {
+					return nil
+				}
+				return uintPtrIntValue(n.vertex.Followers)
+			})},
+			"follows": &graphql.Field{Type: graphql.Int, Resolve: profileSearchResultField(func(n profileSearchResultNode) any {
+				if n.vertex == nil {
+					return nil
+				}
+				return uintPtrIntValue(n.vertex.Follows)
+			})},
+			"createdAt":   &graphql.Field{Type: graphql.DateTime, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return profileSearchCreatedAt(n) })},
+			"name":        &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.Name) })},
+			"displayName": &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.DisplayName) })},
+			"picture":     &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.Picture) })},
+			"image":       &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.Picture) })},
+			"banner":      &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.Banner) })},
+			"about":       &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.About) })},
+			"nip05":       &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.NIP05) })},
+			"nip05Valid":  &graphql.Field{Type: graphql.Boolean, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return nil })},
+			"website":     &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.Website) })},
+			"lud16":       &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.LUD16) })},
+			"lud06":       &graphql.Field{Type: graphql.String, Resolve: profileSearchResultField(func(n profileSearchResultNode) any { return emptyStringNil(n.profile.LUD06) })},
+		},
+	})
+	profileSearchConnectionType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "ProfileSearchConnection",
+		Fields: graphql.Fields{
+			"query":     &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: profileSearchConnectionField(func(s profileSearchConnectionSource) any { return s.query })},
+			"limit":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: profileSearchConnectionField(func(s profileSearchConnectionSource) any { return s.limit })},
+			"sort":      &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: profileSearchConnectionField(func(s profileSearchConnectionSource) any { return s.sort })},
+			"source":    &graphql.Field{Type: graphql.String, Resolve: profileSearchConnectionField(func(s profileSearchConnectionSource) any { return emptyStringNil(s.source) })},
+			"fromCache": &graphql.Field{Type: graphql.NewNonNull(graphql.Boolean), Resolve: profileSearchConnectionField(func(s profileSearchConnectionSource) any { return s.fromCache })},
+			"nodes": &graphql.Field{
+				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(profileSearchResultType))),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					source, _ := p.Source.(profileSearchConnectionSource)
+					return source.nodes, nil
+				},
+			},
+			"pageInfo": &graphql.Field{
+				Type: graphql.NewNonNull(pageInfoType),
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					source, _ := p.Source.(profileSearchConnectionSource)
+					endCursor := ""
+					if len(source.nodes) > 0 {
+						endCursor = source.nodes[len(source.nodes)-1].row.PubKey
+					}
+					return map[string]any{"hasNextPage": false, "endCursor": endCursor}, nil
+				},
+			},
+		},
+	})
 	notificationType := graphql.NewObject(graphql.ObjectConfig{
 		Name: "Notification",
 		Fields: graphql.Fields{
@@ -855,6 +969,17 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					return nodes, nil
 				},
 			},
+			"profileSearch": &graphql.Field{
+				Type: graphql.NewNonNull(profileSearchConnectionType),
+				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(profileSearchInputType)}},
+				Resolve: func(p graphql.ResolveParams) (any, error) {
+					input, err := parseProfileSearchInput(p.Args["input"].(map[string]any))
+					if err != nil {
+						return nil, err
+					}
+					return r.profileSearch(p.Context, input)
+				},
+			},
 			"notifications": &graphql.Field{
 				Type: graphql.NewNonNull(notificationConnectionType),
 				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: graphql.NewNonNull(notificationInputType)}},
@@ -947,6 +1072,53 @@ func (r *resolver) hydrateAuthors(ctx context.Context, pubkeys []string, limit u
 		}
 	}
 	return true, nil
+}
+
+func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (profileSearchConnectionSource, error) {
+	if r.profileSearcher == nil {
+		return profileSearchConnectionSource{}, vertex.ErrUnavailable
+	}
+	rows, fromCache, err := r.profileSearcher.Search(ctx, input)
+	if err != nil {
+		return profileSearchConnectionSource{}, err
+	}
+	pubkeys := make([]string, 0, len(rows))
+	for _, row := range rows {
+		pubkeys = append(pubkeys, row.PubKey)
+	}
+	if r.userBackfiller != nil && len(pubkeys) > 0 {
+		if _, err := r.hydrateAuthors(ctx, pubkeys, 1); err != nil {
+			slog.Warn("graphql profile search profile backfill failed", "pubkeys", len(pubkeys), "error", err)
+		}
+	}
+	profiles, err := r.store.LatestProfiles(ctx, pubkeys)
+	if err != nil {
+		return profileSearchConnectionSource{}, err
+	}
+	vertexProfiles, err := r.store.CachedVertexProfiles(ctx, pubkeys)
+	if err != nil {
+		return profileSearchConnectionSource{}, err
+	}
+	nodes := make([]profileSearchResultNode, 0, len(rows))
+	for _, row := range rows {
+		node := profileSearchResultNode{
+			row:     row,
+			profile: profiles[row.PubKey],
+		}
+		if profile, ok := vertexProfiles[row.PubKey]; ok {
+			node.vertex = &profile
+		}
+		nodes = append(nodes, node)
+	}
+	args := vertex.NormalizeSearchArgs(input)
+	return profileSearchConnectionSource{
+		query:     args.Query,
+		limit:     args.Limit,
+		sort:      args.Sort,
+		source:    args.Source,
+		fromCache: fromCache,
+		nodes:     nodes,
+	}, nil
 }
 
 func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {
@@ -3021,6 +3193,19 @@ func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, erro
 	return input, nil
 }
 
+func parseProfileSearchInput(raw map[string]any) (vertex.SearchArgs, error) {
+	input := vertex.NormalizeSearchArgs(vertex.SearchArgs{
+		Query:  stringValue(raw["query"]),
+		Limit:  intValue(raw["limit"], 10),
+		Sort:   stringValue(raw["sort"]),
+		Source: stringValue(raw["source"]),
+	})
+	if len(input.Query) < 3 {
+		return input, fmt.Errorf("profileSearch query must be at least 3 characters")
+	}
+	return input, nil
+}
+
 func parseAggregateInput(raw map[string]any) (chstore.AggregateInput, error) {
 	input := chstore.AggregateInput{
 		Dataset: fmt.Sprint(raw["dataset"]),
@@ -3240,6 +3425,79 @@ func trendingClusterField(fn func(chstore.TrendingClusterRow) any) graphql.Field
 		}
 		return nil, nil
 	}
+}
+
+func profileSearchResultField(fn func(profileSearchResultNode) any) graphql.FieldResolveFn {
+	return func(p graphql.ResolveParams) (any, error) {
+		switch node := p.Source.(type) {
+		case profileSearchResultNode:
+			return fn(node), nil
+		case *profileSearchResultNode:
+			if node != nil {
+				return fn(*node), nil
+			}
+		}
+		return nil, nil
+	}
+}
+
+func profileSearchConnectionField(fn func(profileSearchConnectionSource) any) graphql.FieldResolveFn {
+	return func(p graphql.ResolveParams) (any, error) {
+		source, ok := p.Source.(profileSearchConnectionSource)
+		if !ok {
+			return nil, nil
+		}
+		return fn(source), nil
+	}
+}
+
+func profileSearchLegacyRank(node profileSearchResultNode) any {
+	if node.vertex != nil {
+		return node.vertex.Rank
+	}
+	return floatPtrValue(node.row.Rank)
+}
+
+func profileSearchLegacyScore(node profileSearchResultNode) any {
+	if node.vertex != nil && node.vertex.Score != nil {
+		return *node.vertex.Score
+	}
+	return floatPtrValue(node.row.Score)
+}
+
+func profileSearchCreatedAt(node profileSearchResultNode) any {
+	if node.vertex != nil && node.vertex.CreatedAt != nil {
+		return time.Unix(*node.vertex.CreatedAt, 0).UTC()
+	}
+	if !node.profile.CreatedAt.IsZero() {
+		return node.profile.CreatedAt.UTC()
+	}
+	return nil
+}
+
+func floatPtrValue(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func uintPtrIntValue(value *uint64) any {
+	if value == nil {
+		return nil
+	}
+	maxInt := int(^uint(0) >> 1)
+	if *value > uint64(maxInt) {
+		return maxInt
+	}
+	return int(*value)
+}
+
+func emptyStringNil(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func eventFromSource(source any) (chstore.EventView, bool) {

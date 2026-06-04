@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	GraphQLSchemaVersion = "2026-06-04"
+	GraphQLSchemaVersion = "2026-06-05"
 	AppViewVersion       = "v1"
 )
 
@@ -37,6 +37,7 @@ var Names = []string{
 	"graphql.availableTopics",
 	"graphql.trending",
 	"graphql.notifications",
+	"graphql.profileSearch",
 	"appview.v1",
 }
 

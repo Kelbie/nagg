@@ -22,9 +22,10 @@ type Config struct {
 }
 
 type SearchArgs struct {
-	Query string
-	Limit int
-	Sort  string
+	Query  string
+	Limit  int
+	Sort   string
+	Source string
 }
 
 type RecommendedArgs struct {
@@ -98,11 +99,7 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	c.search, err = newCachedCall(c.performSearch, func(args SearchArgs) string {
-		sortKey := args.Sort
-		if sortKey == "" {
-			sortKey = "globalPagerank"
-		}
-		return strings.ToLower(strings.TrimSpace(args.Query)) + "|" + strconv.Itoa(args.Limit) + "|" + sortKey
+		return SearchCacheKey(args)
 	}, func(results []SearchResult) bool {
 		return len(results) > 0
 	}, time.Hour, 48*time.Hour, 2_000)
@@ -129,9 +126,12 @@ func New(cfg Config) (*Client, error) {
 }
 
 func (c *Client) Search(ctx context.Context, args SearchArgs) ([]SearchResult, bool, error) {
-	args.Query = strings.TrimSpace(args.Query)
-	args.Limit = clampLimit(args.Limit, 5)
+	args = NormalizeSearchArgs(args)
 	return c.search.Get(ctx, args)
+}
+
+func (c *Client) SearchRefresh(ctx context.Context, args SearchArgs) ([]SearchResult, error) {
+	return c.search.Refresh(ctx, NormalizeSearchArgs(args))
 }
 
 func (c *Client) Recommended(ctx context.Context, args RecommendedArgs) ([]SearchResult, bool, error) {
@@ -172,12 +172,16 @@ func (c *Client) RecommendedStats() CacheStats {
 }
 
 func (c *Client) performSearch(ctx context.Context, args SearchArgs) ([]SearchResult, error) {
+	args = NormalizeSearchArgs(args)
 	tags := nostr.Tags{
 		{"param", "search", args.Query},
 		{"param", "limit", strconv.Itoa(args.Limit)},
 	}
 	if args.Sort != "" {
 		tags = append(tags, nostr.Tag{"param", "sort", args.Sort})
+	}
+	if args.Source != "" {
+		tags = append(tags, nostr.Tag{"param", "source", args.Source})
 	}
 	return runDVM(ctx, c, SearchRequestKind, SearchResponseKind, tags, func(event *nostr.Event) ([]SearchResult, error) {
 		return parseSearchResults(event, args.Limit)
@@ -371,4 +375,22 @@ func clampLimit(value int, fallback int) int {
 		return 100
 	}
 	return value
+}
+
+const DefaultSearchSort = "globalPagerank"
+
+func NormalizeSearchArgs(args SearchArgs) SearchArgs {
+	args.Query = strings.TrimSpace(args.Query)
+	args.Limit = clampLimit(args.Limit, 5)
+	args.Sort = strings.TrimSpace(args.Sort)
+	if args.Sort == "" {
+		args.Sort = DefaultSearchSort
+	}
+	args.Source = strings.TrimSpace(args.Source)
+	return args
+}
+
+func SearchCacheKey(args SearchArgs) string {
+	args = NormalizeSearchArgs(args)
+	return strings.ToLower(args.Query) + "|" + strconv.Itoa(args.Limit) + "|" + args.Sort + "|" + args.Source
 }
