@@ -11,6 +11,7 @@ import (
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
+	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/nbd-wtf/go-nostr"
 )
 
@@ -95,6 +96,16 @@ func positiveOrDefault(value int, fallback int) int {
 
 func (s *Store) Close() error {
 	return s.conn.Close()
+}
+
+func (s *Store) prepareInsertBatch(ctx context.Context, query string) (chdriver.Batch, error) {
+	return s.conn.PrepareBatch(ctx, query, chdriver.WithReleaseConnection())
+}
+
+func closeUnsentBatch(batch chdriver.Batch) {
+	if batch != nil && !batch.IsSent() {
+		_ = batch.Close()
+	}
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
@@ -199,10 +210,11 @@ func (s *Store) backfillZaps(ctx context.Context) error {
 		return nil
 	}
 
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO note_zaps")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO note_zaps")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(batch)
 	appended := false
 	for _, event := range events {
 		zap, ok := extractNoteZap(eventViewToNostrEvent(event), event.CreatedAt)
@@ -231,22 +243,26 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 		return nil
 	}
 
-	eventsBatch, err := s.conn.PrepareBatch(ctx, "INSERT INTO nostr_events")
+	eventsBatch, err := s.prepareInsertBatch(ctx, "INSERT INTO nostr_events")
 	if err != nil {
 		return err
 	}
-	relaysBatch, err := s.conn.PrepareBatch(ctx, "INSERT INTO event_seen_relays")
+	defer closeUnsentBatch(eventsBatch)
+	relaysBatch, err := s.prepareInsertBatch(ctx, "INSERT INTO event_seen_relays")
 	if err != nil {
 		return err
 	}
-	tagsBatch, err := s.conn.PrepareBatch(ctx, "INSERT INTO event_tags")
+	defer closeUnsentBatch(relaysBatch)
+	tagsBatch, err := s.prepareInsertBatch(ctx, "INSERT INTO event_tags")
 	if err != nil {
 		return err
 	}
-	zapsBatch, err := s.conn.PrepareBatch(ctx, "INSERT INTO note_zaps")
+	defer closeUnsentBatch(tagsBatch)
+	zapsBatch, err := s.prepareInsertBatch(ctx, "INSERT INTO note_zaps")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(zapsBatch)
 	zapsAppended := false
 
 	for _, record := range records {

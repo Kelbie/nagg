@@ -171,10 +171,11 @@ func countAnnotationRows(annotations []enrich.Annotation) (int, int, int, int) {
 }
 
 func (s *Store) writeDerivedTags(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO derived_tags")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO derived_tags")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(batch)
 	for _, annotation := range annotations {
 		event := annotation.Event
 		computedAt := annotationComputedAt(annotation)
@@ -204,10 +205,11 @@ func (s *Store) writeDerivedTags(ctx context.Context, annotations []enrich.Annot
 }
 
 func (s *Store) writeDerivedMetrics(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO derived_metrics")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO derived_metrics")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(batch)
 	for _, annotation := range annotations {
 		event := annotation.Event
 		computedAt := annotationComputedAt(annotation)
@@ -235,10 +237,11 @@ func (s *Store) writeDerivedMetrics(ctx context.Context, annotations []enrich.An
 }
 
 func (s *Store) writeEventEmbeddings(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO event_embeddings")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO event_embeddings")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(batch)
 	for _, annotation := range annotations {
 		if len(annotation.Embedding) == 0 {
 			continue
@@ -260,10 +263,11 @@ func (s *Store) writeEventEmbeddings(ctx context.Context, annotations []enrich.A
 }
 
 func (s *Store) writeTrendingClusters(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO trending_clusters")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO trending_clusters")
 	if err != nil {
 		return err
 	}
+	defer closeUnsentBatch(batch)
 	seen := map[string]struct{}{}
 	for _, annotation := range annotations {
 		for _, cluster := range annotation.Clusters {
