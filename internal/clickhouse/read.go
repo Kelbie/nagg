@@ -642,8 +642,22 @@ func (s *Store) TrendingClusters(ctx context.Context, input TrendingInput) ([]Tr
 	args = append(args, input.Limit)
 	rows, err := s.conn.Query(ctx, `
 		SELECT id, window, started_at, category, subcategory, title, description, event_count, score, computed_at
-		FROM trending_clusters FINAL
-		`+where+`
+		FROM (
+			SELECT
+				id,
+				argMax(window, computed_at) AS window,
+				argMax(started_at, computed_at) AS started_at,
+				argMax(category, computed_at) AS category,
+				argMax(subcategory, computed_at) AS subcategory,
+				argMax(title, computed_at) AS title,
+				argMax(description, computed_at) AS description,
+				argMax(event_count, computed_at) AS event_count,
+				argMax(score, computed_at) AS score,
+				max(computed_at) AS computed_at
+			FROM trending_clusters
+			`+where+`
+			GROUP BY id
+		)
 		ORDER BY score DESC, event_count DESC, started_at DESC, id ASC
 		LIMIT ?
 	`, args...)
@@ -671,7 +685,33 @@ func (s *Store) TrendingClusters(ctx context.Context, input TrendingInput) ([]Tr
 		}
 		out = append(out, row)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dedupeTrendingClusterRows(out, input.Limit), nil
+}
+
+func dedupeTrendingClusterRows(rows []TrendingClusterRow, limit uint64) []TrendingClusterRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	out := make([]TrendingClusterRow, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		id := strings.TrimSpace(row.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, row)
+		if limit > 0 && uint64(len(out)) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]NotificationRow, error) {

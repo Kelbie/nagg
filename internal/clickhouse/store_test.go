@@ -123,3 +123,21 @@ func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
 		t.Fatalf("args = %+v", args)
 	}
 }
+
+func TestDedupeTrendingClusterRowsKeepsFirstUniqueIDs(t *testing.T) {
+	rows := []TrendingClusterRow{
+		{ID: "cluster:a", Score: 10, EventCount: 10},
+		{ID: "cluster:b", Score: 9, EventCount: 9},
+		{ID: "cluster:a", Score: 8, EventCount: 8},
+		{ID: "cluster:c", Score: 7, EventCount: 7},
+	}
+
+	got := dedupeTrendingClusterRows(rows, 3)
+
+	if len(got) != 3 {
+		t.Fatalf("rows = %+v", got)
+	}
+	if got[0].ID != "cluster:a" || got[1].ID != "cluster:b" || got[2].ID != "cluster:c" {
+		t.Fatalf("rows = %+v", got)
+	}
+}
