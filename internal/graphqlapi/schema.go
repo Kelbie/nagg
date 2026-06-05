@@ -1078,34 +1078,12 @@ func (r *resolver) hydrateAuthors(ctx context.Context, pubkeys []string, limit u
 
 func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (profileSearchConnectionSource, error) {
 	args := vertex.NormalizeSearchArgs(input)
-	localRows, err := r.store.SearchProfiles(ctx, args.Query, uint64(args.Limit))
-	if err != nil {
-		return profileSearchConnectionSource{}, err
-	}
 	rows := make([]vertex.SearchResult, 0, args.Limit)
-	profiles := make(map[string]chstore.ProfileRow, len(localRows))
-	seen := make(map[string]struct{}, len(localRows))
-	for _, local := range localRows {
-		pubkey, ok := vertex.NormalizePubkey(local.Profile.PubKey)
-		if !ok {
-			continue
-		}
-		profile := local.Profile
-		profile.PubKey = pubkey
-		rank := local.Rank
-		score := local.Score
-		rows = append(rows, vertex.SearchResult{
-			PubKey: pubkey,
-			Npub:   vertex.Npub(pubkey),
-			Rank:   &rank,
-			Score:  &score,
-		})
-		profiles[pubkey] = profile
-		seen[pubkey] = struct{}{}
-	}
+	profiles := make(map[string]chstore.ProfileRow)
+	seen := make(map[string]struct{})
 
 	fromCache := true
-	if r.profileSearcher != nil && len(rows) < args.Limit {
+	if r.profileSearcher != nil {
 		vertexRows, vertexFromCache, err := r.profileSearcher.Search(ctx, args)
 		if err != nil {
 			slog.Warn("graphql profile search vertex lookup failed", "query", args.Query, "sort", args.Sort, "source", args.Source, "error", err)
@@ -1128,6 +1106,38 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 				if len(rows) >= args.Limit {
 					break
 				}
+			}
+		}
+	}
+
+	if len(rows) < args.Limit {
+		remaining := args.Limit - len(rows)
+		localRows, err := r.store.SearchProfiles(ctx, args.Query, uint64(remaining))
+		if err != nil {
+			return profileSearchConnectionSource{}, err
+		}
+		for _, local := range localRows {
+			pubkey, ok := vertex.NormalizePubkey(local.Profile.PubKey)
+			if !ok {
+				continue
+			}
+			if _, ok := seen[pubkey]; ok {
+				continue
+			}
+			profile := local.Profile
+			profile.PubKey = pubkey
+			rank := local.Rank
+			score := local.Score
+			rows = append(rows, vertex.SearchResult{
+				PubKey: pubkey,
+				Npub:   vertex.Npub(pubkey),
+				Rank:   &rank,
+				Score:  &score,
+			})
+			profiles[pubkey] = profile
+			seen[pubkey] = struct{}{}
+			if len(rows) >= args.Limit {
+				break
 			}
 		}
 	}

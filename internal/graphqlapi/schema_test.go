@@ -593,6 +593,83 @@ func TestProfileSearchReturnsLocalProfileEventsWithoutVertex(t *testing.T) {
 	}
 }
 
+func TestProfileSearchPreservesVertexOrderBeforeLocalFallback(t *testing.T) {
+	localPubkey := testHex("1")
+	vertexScore := 99.76
+	searcher := &fakeProfileSearcher{
+		fromCache: true,
+		rows: []vertex.SearchResult{{
+			PubKey: testPubkey,
+			Npub:   vertex.Npub(testPubkey),
+			Score:  &vertexScore,
+		}},
+	}
+	store := &fakeStore{
+		profileRows: map[string]chstore.ProfileRow{
+			testPubkey: {
+				PubKey:      testPubkey,
+				Name:        "calle",
+				DisplayName: "calle",
+				NIP05:       "calle@cashu.me",
+			},
+		},
+		profileSearchRows: []chstore.ProfileSearchRow{{
+			Profile: chstore.ProfileRow{
+				PubKey:      localPubkey,
+				Name:        "calle1cashume",
+				DisplayName: "calle",
+			},
+			Rank:  100,
+			Score: 100,
+		}},
+	}
+	schema, err := NewSchema(store, WithProfileSearch(searcher))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			profileSearch(input: {query:"calle", limit:3}) {
+				nodes {
+					pubkey
+					name
+					searchScore
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(searcher.inputs) != 1 {
+		t.Fatalf("profile search inputs = %+v", searcher.inputs)
+	}
+	if len(store.profileSearchInputs) != 1 {
+		t.Fatalf("local profile search inputs = %+v", store.profileSearchInputs)
+	}
+	if store.profileSearchInputs[0].limit != 2 {
+		t.Fatalf("local profile search limit = %d, want 2", store.profileSearchInputs[0].limit)
+	}
+	data := result.Data.(map[string]any)
+	connection := data["profileSearch"].(map[string]any)
+	nodes := connection["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	first := nodes[0].(map[string]any)
+	second := nodes[1].(map[string]any)
+	if first["pubkey"] != testPubkey || first["name"] != "calle" {
+		t.Fatalf("first node = %+v", first)
+	}
+	if second["pubkey"] != localPubkey || second["name"] != "calle1cashume" {
+		t.Fatalf("second node = %+v", second)
+	}
+}
+
 func TestEventsQueryAcceptsContentSearch(t *testing.T) {
 	store := &fakeStore{
 		events: [][]chstore.EventView{{
