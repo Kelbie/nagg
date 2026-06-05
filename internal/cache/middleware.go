@@ -208,6 +208,8 @@ func restTTL(path string, def time.Duration) time.Duration {
 		return 300 * time.Second
 	case strings.HasSuffix(path, "/thread"):
 		return 30 * time.Second
+	case strings.Contains(path, "/dm/"):
+		return 10 * time.Second
 	case strings.Contains(path, "/feed"), strings.HasSuffix(path, "/notes/stats"),
 		strings.HasSuffix(path, "/events"):
 		return 20 * time.Second

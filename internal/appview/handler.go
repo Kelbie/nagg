@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -167,6 +168,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/thread", h.thread},
 		{"/nostr/follows", h.follows},
 		{"/nostr/events", h.events},
+		{"/nostr/dm/envelopes", h.dmEnvelopes},
 		{"/nostr/profiles", h.profiles},
 		{"/nostr/profile", h.profile},
 		{"/nostr/search", h.search},
@@ -668,6 +670,101 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		quoted[id] = event
 	}
 	writeJSON(w, EnrichmentResponse{Metrics: hydration.Metrics, Profiles: hydration.Profiles, Quoted: quoted})
+}
+
+// DmEnvelopesResponse is the REST app-view shape for the DM/contacts page.
+type DmEnvelopesResponse struct {
+	Envelopes   []chstore.EventView `json:"envelopes"`
+	HasNextPage bool                `json:"hasNextPage"`
+}
+
+// dmEnvelopes is the REST app-view counterpart of the GraphQL dmEnvelopes
+// resolver, purpose-built for the contacts/DM page: it returns the viewer's
+// recent DM envelopes (gift wraps by default), paginated by `until`. nagg never
+// decrypts — the client decrypts and buckets by counterparty. Unions
+// author=viewer with p-tag=viewer (the one shape the generic events query can't
+// OR), dedupes by id, orders createdAt DESC, truncates to limit.
+func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "GET or POST /nostr/dm/envelopes only", http.StatusMethodNotAllowed)
+		return
+	}
+	viewer, err := h.viewerPubkeyOr(r.URL.Query().Get("viewer"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	kinds := parseDmKinds(r.URL.Query().Get("kinds"))
+	limit := clampDmLimit(intParam(r, "limit", 50))
+	until := int64(intParam(r, "until", 0))
+
+	authored, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+		PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	received, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+		Tags: []chstore.TagFilter{{Key: "p", Value: viewer}}, Kinds: kinds, Until: until, Limit: uint64(limit),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	merged := mergeDmEnvelopes(limit, authored, received)
+	writeJSON(w, DmEnvelopesResponse{Envelopes: merged, HasNextPage: len(merged) >= limit})
+}
+
+// parseDmKinds reads a CSV `kinds` param, defaulting to NIP-17 gift wraps.
+func parseDmKinds(raw string) []int {
+	values := csv(raw)
+	kinds := make([]int, 0, len(values))
+	for _, v := range values {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			kinds = append(kinds, n)
+		}
+	}
+	if len(kinds) == 0 {
+		return []int{1059}
+	}
+	return kinds
+}
+
+func clampDmLimit(n int) int {
+	if n <= 0 {
+		return 50
+	}
+	if n > 200 {
+		return 200
+	}
+	return n
+}
+
+// mergeDmEnvelopes merges, dedupes by id, orders createdAt DESC (id DESC
+// tiebreak), and truncates to limit — mirroring the GraphQL resolver.
+func mergeDmEnvelopes(limit int, lists ...[]chstore.EventView) []chstore.EventView {
+	seen := make(map[string]struct{})
+	merged := make([]chstore.EventView, 0)
+	for _, list := range lists {
+		for _, ev := range list {
+			if _, ok := seen[ev.ID]; ok {
+				continue
+			}
+			seen[ev.ID] = struct{}{}
+			merged = append(merged, ev)
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		if merged[i].CreatedAt.Equal(merged[j].CreatedAt) {
+			return merged[i].ID > merged[j].ID
+		}
+		return merged[i].CreatedAt.After(merged[j].CreatedAt)
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
