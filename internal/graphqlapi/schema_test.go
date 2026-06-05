@@ -404,6 +404,25 @@ func (f *fakeDMEnvelopeBackfiller) HydrateDMEnvelopes(ctx context.Context, pubke
 	return f.completed, f.BackfillDMEnvelopes(ctx, pubkey, kinds, until, limit)
 }
 
+type fakeRelayBackfiller struct {
+	fakeUserBackfiller
+	completed  bool
+	relayCalls int
+	labels     []string
+	inputs     []chstore.EventQueryInput
+}
+
+func (f *fakeRelayBackfiller) BackfillRelayEvents(_ context.Context, input chstore.EventQueryInput, label string) error {
+	f.relayCalls++
+	f.inputs = append(f.inputs, input)
+	f.labels = append(f.labels, label)
+	return nil
+}
+
+func (f *fakeRelayBackfiller) HydrateRelayEvents(ctx context.Context, input chstore.EventQueryInput, label string) (bool, error) {
+	return f.completed, f.BackfillRelayEvents(ctx, input, label)
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -1027,6 +1046,134 @@ func TestEventsQueryReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	nodes := events["nodes"].([]any)
 	if len(nodes) != 0 {
 		t.Fatalf("nodes len = %d, want 0", len(nodes))
+	}
+}
+
+func TestEventsQueryHydratesRelaySafeTagRange(t *testing.T) {
+	store := &fakeStore{events: [][]chstore.EventView{{}}}
+	backfiller := &fakeRelayBackfiller{completed: true}
+	schema, err := NewSchema(store, WithUserFeedBackfill(backfiller))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{
+				kinds:[1],
+				tags:[{key:"p", value:"` + testPubkey + `"}],
+				since:1710000000,
+				until:1710000100,
+				limit:20
+			}) { nodes { id } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if backfiller.relayCalls != 1 || len(backfiller.inputs) != 1 || backfiller.labels[0] != "events" {
+		t.Fatalf("relay hydration = calls %d labels %+v inputs %+v", backfiller.relayCalls, backfiller.labels, backfiller.inputs)
+	}
+	input := backfiller.inputs[0]
+	if len(input.Tags) != 1 || input.Tags[0].Key != "p" || input.Tags[0].Value != testPubkey {
+		t.Fatalf("hydrated tags = %+v", input.Tags)
+	}
+	if input.Since != 1_710_000_000 || input.Until != 1_710_000_100 || input.Limit != 20 {
+		t.Fatalf("hydrated bounds = %+v", input)
+	}
+	if backfiller.calls != 0 {
+		t.Fatalf("legacy author backfill should not run when generic hydration is available: %+v", backfiller)
+	}
+}
+
+func TestEventQueryHydratesByID(t *testing.T) {
+	id := testHex("a")
+	store := &fakeStore{
+		eventByID: map[string]chstore.EventView{
+			id: {
+				ID:     id,
+				PubKey: testPubkey,
+				Kind:   1,
+			},
+		},
+	}
+	backfiller := &fakeRelayBackfiller{completed: true}
+	schema, err := NewSchema(store, WithUserFeedBackfill(backfiller))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			event(id:"` + id + `") { id kind pubkey }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if backfiller.relayCalls != 1 || backfiller.labels[0] != "event" {
+		t.Fatalf("relay hydration = calls %d labels %+v inputs %+v", backfiller.relayCalls, backfiller.labels, backfiller.inputs)
+	}
+	if len(backfiller.inputs[0].IDs) != 1 || backfiller.inputs[0].IDs[0] != id || backfiller.inputs[0].Limit != 1 {
+		t.Fatalf("hydrated event input = %+v", backfiller.inputs[0])
+	}
+}
+
+func TestAggregateEventsHydratesRelaySafeInput(t *testing.T) {
+	store := &fakeStore{}
+	backfiller := &fakeRelayBackfiller{completed: true}
+	schema, err := NewSchema(store, WithUserFeedBackfill(backfiller))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			aggregateEvents(input:{
+				dataset:"TAGS",
+				groupBy:["TAG_VALUE"],
+				kinds:[7],
+				tags:[{key:"e", value:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],
+				since:1710000000,
+				limit:10
+			}) { rows { dimensions metrics } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if backfiller.relayCalls != 1 || backfiller.labels[0] != "aggregateEvents" {
+		t.Fatalf("relay hydration = calls %d labels %+v inputs %+v", backfiller.relayCalls, backfiller.labels, backfiller.inputs)
+	}
+	input := backfiller.inputs[0]
+	if len(input.Kinds) != 1 || input.Kinds[0] != 7 || input.Since != 1_710_000_000 || input.Limit != 10 {
+		t.Fatalf("hydrated aggregate input = %+v", input)
+	}
+}
+
+func TestRelayHydrationBudgetCapsGraphQLRequest(t *testing.T) {
+	backfiller := &fakeRelayBackfiller{completed: true}
+	ctx := context.WithValue(context.Background(), relayHydrationBudgetKey{}, &relayHydrationBudget{remaining: 1})
+	resolver := &resolver{relayEventBackfiller: backfiller}
+	query := chstore.EventQueryInput{Kinds: []int{1}, Limit: 20}
+
+	if !resolver.hydrateRelayEventQuery(ctx, query, "first") {
+		t.Fatal("first hydration should run")
+	}
+	if resolver.hydrateRelayEventQuery(ctx, query, "second") {
+		t.Fatal("second hydration should be budget-capped")
+	}
+	if backfiller.relayCalls != 1 || backfiller.labels[0] != "first" {
+		t.Fatalf("relay hydration = calls %d labels %+v", backfiller.relayCalls, backfiller.labels)
 	}
 }
 

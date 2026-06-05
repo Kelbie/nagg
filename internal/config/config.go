@@ -65,19 +65,23 @@ type EnrichConfig struct {
 }
 
 type OnDemandConfig struct {
-	UserFeed        bool
-	Cooldown        time.Duration
-	Timeout         time.Duration
-	Wait            time.Duration
-	AuthorLimit     int
-	EngagementLimit int
-	ThreadLimit     int
-	FollowLimit     int
-	DMLimit         int
-	DMBackfillPages int
+	UserFeed                 bool
+	GraphQLHydration         bool
+	Cooldown                 time.Duration
+	Timeout                  time.Duration
+	Wait                     time.Duration
+	AuthorLimit              int
+	EngagementLimit          int
+	ThreadLimit              int
+	FollowLimit              int
+	DMLimit                  int
+	DMBackfillPages          int
+	GraphQLLimit             int
+	GraphQLMaxJobsPerRequest int
 }
 
 func Load() (Config, error) {
+	onDemandUserFeed := parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false"))
 	cfg := Config{
 		ClickHouse: chstore.Config{
 			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
@@ -114,16 +118,19 @@ func Load() (Config, error) {
 			SyncBatch:           parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
 		},
 		OnDemand: OnDemandConfig{
-			UserFeed:        parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false")),
-			Cooldown:        parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
-			Timeout:         parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
-			Wait:            parseDuration(env("NAGG_ON_DEMAND_WAIT", "0s")),
-			AuthorLimit:     parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
-			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
-			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
-			FollowLimit:     parseInt(env("NAGG_ON_DEMAND_FOLLOW_LIMIT", "1000")),
-			DMLimit:         parseInt(env("NAGG_ON_DEMAND_DM_LIMIT", "200")),
-			DMBackfillPages: parseInt(env("NAGG_ON_DEMAND_DM_BACKFILL_PAGES", "2")),
+			UserFeed:                 onDemandUserFeed,
+			GraphQLHydration:         parseBool(env("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", strconv.FormatBool(onDemandUserFeed))),
+			Cooldown:                 parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
+			Timeout:                  parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
+			Wait:                     parseDuration(env("NAGG_ON_DEMAND_WAIT", "0s")),
+			AuthorLimit:              parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
+			EngagementLimit:          parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
+			ThreadLimit:              parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
+			FollowLimit:              parseInt(env("NAGG_ON_DEMAND_FOLLOW_LIMIT", "1000")),
+			DMLimit:                  parseInt(env("NAGG_ON_DEMAND_DM_LIMIT", "200")),
+			DMBackfillPages:          parseInt(env("NAGG_ON_DEMAND_DM_BACKFILL_PAGES", "2")),
+			GraphQLLimit:             parseInt(env("NAGG_ON_DEMAND_GRAPHQL_LIMIT", "100")),
+			GraphQLMaxJobsPerRequest: parseInt(env("NAGG_ON_DEMAND_GRAPHQL_MAX_JOBS_PER_REQUEST", "4")),
 		},
 		Viewer: ViewerConfig{
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),

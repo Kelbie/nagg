@@ -12,6 +12,7 @@ const (
 
 var Names = []string{
 	"graphql.events",
+	"graphql.relayHydration",
 	"graphql.events.search",
 	"graphql.aggregateEvents",
 	"graphql.rankedEvents",
@@ -44,6 +45,7 @@ var Names = []string{
 	"graphql.followStatus",
 	"graphql.ownProfiles",
 	"appview.dmEnvelopes",
+	"appview.relayHydration",
 	"appview.v1",
 }
 

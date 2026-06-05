@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 )
 
@@ -179,6 +180,71 @@ func TestOldestRelayEventCreatedAt(t *testing.T) {
 	}
 	if got := oldestRelayEventCreatedAt(events); got != 1_710_000_050 {
 		t.Fatalf("oldest = %d", got)
+	}
+}
+
+func TestRelayFilterFromEventQueryMapsRelaySafeFields(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(nil, UserFeedBackfillConfig{GraphQLLimit: 25})
+	filter, ok := backfiller.relayFilterFromEventQuery(chstore.EventQueryInput{
+		PubKeys: []string{"82341f05fdb1dffbc78894993292171ed03abbed34a95f22f55f9b6371723ee6"},
+		Kinds:   []int{1, 7, 1},
+		Tags: []chstore.TagFilter{
+			{Key: "p", Value: "50d94fc2d8580c682b071a542f8b1e31a200b0508bab95a33bef0855df281d63"},
+			{Key: "e", Values: []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+			{Key: "cluster", Value: "local-only", Dataset: "DERIVED_TAGS"},
+			{Key: "x", ExcludeValues: []string{"not-relay-safe"}},
+		},
+		Since:  1_710_000_000,
+		Until:  1_710_086_400,
+		Limit:  100,
+		Search: "local search only",
+	})
+
+	if !ok {
+		t.Fatal("relay filter was not built")
+	}
+	if got := filter["limit"]; got != 25 {
+		t.Fatalf("limit = %v", got)
+	}
+	if got := filter["since"]; got != int64(1_710_000_000) {
+		t.Fatalf("since = %v", got)
+	}
+	if got := filter["until"]; got != int64(1_710_086_400) {
+		t.Fatalf("until = %v", got)
+	}
+	if got := filter["kinds"].([]int); !equalInts(got, []int{1, 7}) {
+		t.Fatalf("kinds = %+v", got)
+	}
+	if got := filter["#p"].([]string); !equalStrings(got, []string{"50d94fc2d8580c682b071a542f8b1e31a200b0508bab95a33bef0855df281d63"}) {
+		t.Fatalf("#p = %+v", got)
+	}
+	if _, ok := filter["#cluster"]; ok {
+		t.Fatalf("derived tag should not be relay-filtered: %+v", filter)
+	}
+	if _, ok := filter["#x"]; ok {
+		t.Fatalf("exclude-only tag should not be relay-filtered: %+v", filter)
+	}
+}
+
+func TestRelayFilterFromEventQuerySkipsUnboundedLocalOnlyQuery(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(nil, UserFeedBackfillConfig{})
+	if filter, ok := backfiller.relayFilterFromEventQuery(chstore.EventQueryInput{Limit: 50, Search: "calle"}); ok {
+		t.Fatalf("unexpected relay filter: %+v", filter)
+	}
+}
+
+func TestRelayFilterFromEventQueryHydratesPaginationWindow(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(nil, UserFeedBackfillConfig{GraphQLLimit: 100})
+	filter, ok := backfiller.relayFilterFromEventQuery(chstore.EventQueryInput{
+		PubKeys: []string{"82341f05fdb1dffbc78894993292171ed03abbed34a95f22f55f9b6371723ee6"},
+		Limit:   20,
+		Offset:  40,
+	})
+	if !ok {
+		t.Fatal("relay filter was not built")
+	}
+	if got := filter["limit"]; got != 60 {
+		t.Fatalf("limit = %v, want 60", got)
 	}
 }
 

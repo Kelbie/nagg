@@ -58,6 +58,7 @@ type resolver struct {
 	store                   Store
 	userBackfiller          UserFeedBackfiller
 	dmEnvelopeBackfiller    DMEnvelopeBackfiller
+	relayEventBackfiller    RelayEventBackfiller
 	profileSearcher         ProfileSearcher
 	pubkeyScoreMinFollowers uint64
 }
@@ -86,6 +87,14 @@ type DMEnvelopeHydrator interface {
 	HydrateDMEnvelopes(context.Context, string, []int, int64, uint64) (bool, error)
 }
 
+type RelayEventBackfiller interface {
+	BackfillRelayEvents(context.Context, chstore.EventQueryInput, string) error
+}
+
+type RelayEventHydrator interface {
+	HydrateRelayEvents(context.Context, chstore.EventQueryInput, string) (bool, error)
+}
+
 type Option func(*resolver)
 
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
@@ -93,6 +102,9 @@ func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 		r.userBackfiller = backfiller
 		if b, ok := backfiller.(DMEnvelopeBackfiller); ok {
 			r.dmEnvelopeBackfiller = b
+		}
+		if b, ok := backfiller.(RelayEventBackfiller); ok {
+			r.relayEventBackfiller = b
 		}
 	}
 }
@@ -114,7 +126,8 @@ func WithPubkeyScoreMinFollowers(minFollowers int) Option {
 type HandlerOption func(*handlerConfig)
 
 type handlerConfig struct {
-	requestTimeout time.Duration
+	requestTimeout        time.Duration
+	relayHydrationMaxJobs int
 }
 
 func WithRequestTimeout(timeout time.Duration) HandlerOption {
@@ -123,6 +136,35 @@ func WithRequestTimeout(timeout time.Duration) HandlerOption {
 			c.requestTimeout = timeout
 		}
 	}
+}
+
+func WithRelayHydrationMaxJobs(maxJobs int) HandlerOption {
+	return func(c *handlerConfig) {
+		if maxJobs >= 0 {
+			c.relayHydrationMaxJobs = maxJobs
+		}
+	}
+}
+
+type relayHydrationBudgetKey struct{}
+
+type relayHydrationBudget struct {
+	mu        sync.Mutex
+	remaining int
+}
+
+func consumeRelayHydrationBudget(ctx context.Context) bool {
+	budget, _ := ctx.Value(relayHydrationBudgetKey{}).(*relayHydrationBudget)
+	if budget == nil {
+		return true
+	}
+	budget.mu.Lock()
+	defer budget.mu.Unlock()
+	if budget.remaining <= 0 {
+		return false
+	}
+	budget.remaining--
+	return true
 }
 
 type eventNode struct {
@@ -904,6 +946,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					if err := validateHex64(id); err != nil {
 						return nil, err
 					}
+					r.hydrateRelayEventQuery(p.Context, chstore.EventQueryInput{IDs: []string{id}, Limit: 1}, "event")
 					event, err := r.store.EventByID(p.Context, id)
 					if err != nil {
 						return nil, err
@@ -925,7 +968,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
-					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, len(events), input.Limit) {
+					if r.relayEventBackfiller == nil && r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, len(events), input.Limit) {
 						completed, err := r.hydrateAuthors(p.Context, input.PubKeys, input.Limit)
 						if err != nil {
 							slog.Warn("graphql author backfill failed", "pubkeys", input.PubKeys, "error", err)
@@ -947,7 +990,8 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
-					if r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, 0, 1) {
+					r.hydrateAggregateInput(p.Context, input, "aggregateEvents")
+					if r.relayEventBackfiller == nil && r.shouldBackfillAuthorQuery(input.PubKeys, input.IDs, input.Tags, input.Kinds, 0, 1) {
 						if _, err := r.hydrateAuthors(p.Context, input.PubKeys, 100); err != nil {
 							slog.Warn("graphql aggregate author backfill failed", "pubkeys", input.PubKeys, "error", err)
 						}
@@ -965,6 +1009,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
+					r.hydrateRelayEventQuery(p.Context, input, "availableTopics")
 					return r.store.AvailableTopics(p.Context, input)
 				},
 			},
@@ -1004,6 +1049,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					if err != nil {
 						return nil, err
 					}
+					r.hydrateNotificationInput(p.Context, input)
 					rows, err := r.store.Notifications(p.Context, input)
 					if err != nil {
 						return nil, err
@@ -1338,6 +1384,7 @@ func (r *resolver) eventRankedReferencedBy(ctx context.Context, event chstore.Ev
 	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) {
 		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, candidates, input.WeightedTerms, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
 	} else {
+		r.hydrateAggregateInput(ctx, rankAggregate, "rankedReferencedBy.rank")
 		rows, err := r.store.AggregateEvents(ctx, rankAggregate)
 		if err != nil {
 			return eventConnectionSource{}, err
@@ -1491,8 +1538,11 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 
 func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput) ([]chstore.AggregateRow, error) {
 	if rankedTargetHasFilters(input.Target) {
+		r.hydrateAggregateInput(ctx, input.References, "rankedEvents.references")
+		r.hydrateRelayEventQuery(ctx, input.Target, "rankedEvents.target")
 		return r.store.AggregateEventReferencesToTargets(ctx, input.References, input.Target)
 	}
+	r.hydrateAggregateInput(ctx, input.References, "rankedEvents.references")
 	return r.store.AggregateEvents(ctx, input.References)
 }
 
@@ -2971,7 +3021,69 @@ func (r *resolver) queryEvents(ctx context.Context, input chstore.EventQueryInpu
 	if input.Empty {
 		return []chstore.EventView{}, nil
 	}
+	r.hydrateRelayEventQuery(ctx, input, "events")
 	return r.store.QueryEvents(ctx, input)
+}
+
+func (r *resolver) hydrateAggregateInput(ctx context.Context, input chstore.AggregateInput, label string) bool {
+	eventInput := chstore.EventQueryInput{
+		IDs:     input.IDs,
+		PubKeys: input.PubKeys,
+		Kinds:   input.Kinds,
+		Tags:    input.Tags,
+		Since:   input.Since,
+		Until:   input.Until,
+		Limit:   input.Limit,
+		Shuffle: input.Shuffle,
+		Empty:   input.Empty,
+	}
+	return r.hydrateRelayEventQuery(ctx, eventInput, label)
+}
+
+func (r *resolver) hydrateNotificationInput(ctx context.Context, input chstore.NotificationInput) bool {
+	if input.Viewer == "" {
+		return false
+	}
+	return r.hydrateRelayEventQuery(ctx, chstore.EventQueryInput{
+		Tags:  []chstore.TagFilter{{Key: "p", Value: input.Viewer}},
+		Kinds: []int{1, 3, 6, 7, 16, 9735},
+		Since: input.Since,
+		Until: input.Until,
+		Limit: input.Limit,
+	}, "notifications")
+}
+
+func (r *resolver) hydrateRelayEventQuery(ctx context.Context, input chstore.EventQueryInput, label string) bool {
+	if r.relayEventBackfiller == nil || input.Empty {
+		return false
+	}
+	if !consumeRelayHydrationBudget(ctx) {
+		return false
+	}
+	if hydrator, ok := r.relayEventBackfiller.(RelayEventHydrator); ok {
+		completed, err := hydrator.HydrateRelayEvents(ctx, input, label)
+		if err != nil {
+			slog.Warn("graphql relay hydration failed", "label", label, "error", err)
+			return false
+		}
+		return completed
+	}
+	if err := r.relayEventBackfiller.BackfillRelayEvents(ctx, input, label); err != nil {
+		slog.Warn("graphql relay backfill failed", "label", label, "error", err)
+		return false
+	}
+	return true
+}
+
+func relayQueryWithTagValues(input chstore.EventQueryInput, key string, values []string) chstore.EventQueryInput {
+	out := input
+	key = strings.TrimSpace(key)
+	values = uniqueStrings(values)
+	if key == "" || len(values) == 0 {
+		return out
+	}
+	out.Tags = append(append([]chstore.TagFilter(nil), input.Tags...), chstore.TagFilter{Key: key, Values: values})
+	return out
 }
 
 func (r *resolver) parseEventQueryInput(ctx context.Context, raw map[string]any) (chstore.EventQueryInput, error) {
@@ -3120,7 +3232,7 @@ func pubkeySourcesUseSourceEventAuthor(v any) bool {
 }
 
 func Handler(schema graphql.Schema, opts ...HandlerOption) http.HandlerFunc {
-	cfg := handlerConfig{requestTimeout: 10 * time.Second}
+	cfg := handlerConfig{requestTimeout: 10 * time.Second, relayHydrationMaxJobs: 4}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -3150,6 +3262,7 @@ func Handler(schema graphql.Schema, opts ...HandlerOption) http.HandlerFunc {
 		)
 		ctx, cancel := context.WithTimeout(r.Context(), cfg.requestTimeout)
 		defer cancel()
+		ctx = context.WithValue(ctx, relayHydrationBudgetKey{}, &relayHydrationBudget{remaining: cfg.relayHydrationMaxJobs})
 		result := graphql.Do(graphql.Params{
 			Schema:         schema,
 			RequestString:  req.Query,
@@ -3730,7 +3843,7 @@ func (c *eventRelationCache) loadAggregateReferencedBy(ctx context.Context, r *r
 			c.mu.Unlock()
 
 			started := time.Now()
-			loaded, err := c.loadAggregateReferencedByBatch(ctx, raw)
+			loaded, err := c.loadAggregateReferencedByBatch(ctx, r, raw)
 			if err != nil {
 				return nil, err
 			}
@@ -3755,7 +3868,7 @@ func (c *eventRelationCache) loadAggregateReferencedBy(ctx context.Context, r *r
 	return map[string]any{"rows": cached[event.ID]}, nil
 }
 
-func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context, raw any) (map[string][]chstore.AggregateRow, error) {
+func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.AggregateRow, error) {
 	out := make(map[string][]chstore.AggregateRow, len(c.events))
 	input, err := c.aggregateReferencedByBatchQuery(ctx, raw)
 	if err != nil {
@@ -3783,6 +3896,9 @@ func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context,
 	}
 	if len(targets) > 0 {
 		sort.Strings(targets)
+		if r != nil {
+			r.hydrateRelayEventQuery(ctx, relayQueryWithTagValues(input.Events, input.Via.Key, targets), "aggregateReferencedBy")
+		}
 		if aggregateStore, ok := c.store.(referenceAggregateStore); ok {
 			first := uint64(0)
 			if input.First > 0 {
@@ -3835,7 +3951,7 @@ func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context,
 	return out, nil
 }
 
-func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {
+func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, r *resolver, event chstore.EventView, raw any) (eventConnectionSource, error) {
 	if c == nil {
 		return eventConnectionSource{}, nil
 	}
@@ -3856,7 +3972,7 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 			c.mu.Unlock()
 
 			started := time.Now()
-			loaded, err := c.loadSelectedReferencesBatch(ctx, raw)
+			loaded, err := c.loadSelectedReferencesBatch(ctx, r, raw)
 			if err != nil {
 				return nil, err
 			}
@@ -3891,7 +4007,7 @@ func (c *eventRelationCache) loadSelectedReferences(ctx context.Context, _ *reso
 	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
 }
 
-func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, raw any) (map[string][]chstore.EventView, error) {
+func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.EventView, error) {
 	out := make(map[string][]chstore.EventView, len(c.events))
 	for _, event := range c.events {
 		out[event.ID] = nil
@@ -3914,7 +4030,7 @@ func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, ra
 	for depth := 0; ; depth++ {
 		fetchIDs := selectedReferenceFetchIDs(selectedBySource, fetched)
 		if len(fetchIDs) > 0 {
-			eventsByID, err := c.queryEventsByIDs(ctx, fetchIDs)
+			eventsByID, err := c.queryEventsByIDs(ctx, r, fetchIDs)
 			if err != nil {
 				return nil, err
 			}
@@ -3985,7 +4101,7 @@ func (c *eventRelationCache) loadSelectedReferencesBatch(ctx context.Context, ra
 	return out, nil
 }
 
-func (c *eventRelationCache) queryEventsByIDs(ctx context.Context, ids []string) (map[string]chstore.EventView, error) {
+func (c *eventRelationCache) queryEventsByIDs(ctx context.Context, r *resolver, ids []string) (map[string]chstore.EventView, error) {
 	ids = uniqueStrings(ids)
 	out := make(map[string]chstore.EventView, len(ids))
 	for start := 0; start < len(ids); start += 500 {
@@ -3994,7 +4110,14 @@ func (c *eventRelationCache) queryEventsByIDs(ctx context.Context, ids []string)
 			end = len(ids)
 		}
 		batch := ids[start:end]
-		events, err := c.store.QueryEvents(ctx, chstore.EventQueryInput{IDs: batch, Limit: uint64(len(batch))})
+		query := chstore.EventQueryInput{IDs: batch, Limit: uint64(len(batch))}
+		var events []chstore.EventView
+		var err error
+		if r != nil {
+			events, err = r.queryEvents(ctx, query)
+		} else {
+			events, err = c.store.QueryEvents(ctx, query)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -4107,7 +4230,7 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 			c.mu.Unlock()
 
 			started := time.Now()
-			loaded, err := c.loadRankedReferencedByBatch(ctx, raw)
+			loaded, err := c.loadRankedReferencedByBatch(ctx, r, raw)
 			if err != nil {
 				return nil, err
 			}
@@ -4142,7 +4265,7 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
 }
 
-func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, raw any) (map[string][]chstore.EventView, error) {
+func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.EventView, error) {
 	out := make(map[string][]chstore.EventView, len(c.events))
 	for _, event := range c.events {
 		out[event.ID] = nil
@@ -4179,6 +4302,9 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 	}
 	sort.Strings(targets)
 
+	if r != nil {
+		r.hydrateRelayEventQuery(ctx, relayQueryWithTagValues(input.Events, input.Via.Key, targets), "rankedReferencedBy.events")
+	}
 	candidatesByTarget, err := c.store.QueryEventsByTagTargets(ctx, input.Events, chstore.TagFilter{Key: input.Via.Key}, targets, input.Events.Limit)
 	if err != nil {
 		return nil, err
@@ -4211,6 +4337,9 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 		})
 		if rankAggregate.Limit == 0 || rankAggregate.Limit < uint64(len(candidateIDs)) || rankAggregate.Limit > 1000 {
 			rankAggregate.Limit = uint64(len(candidateIDs))
+		}
+		if r != nil {
+			r.hydrateAggregateInput(ctx, rankAggregate, "rankedReferencedBy.rank")
 		}
 		rows, err = c.store.AggregateEvents(ctx, rankAggregate)
 		if err != nil {
@@ -4249,7 +4378,13 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, ra
 		return out, nil
 	}
 
-	targetEvents, err := c.store.QueryEvents(ctx, chstore.EventQueryInput{IDs: selectedIDs, Limit: uint64(len(selectedIDs))})
+	targetQuery := chstore.EventQueryInput{IDs: selectedIDs, Limit: uint64(len(selectedIDs))}
+	var targetEvents []chstore.EventView
+	if r != nil {
+		targetEvents, err = r.queryEvents(ctx, targetQuery)
+	} else {
+		targetEvents, err = c.store.QueryEvents(ctx, targetQuery)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -4411,6 +4546,7 @@ func (c *eventRelationCache) loadAuthoredReplyChainsBatch(ctx context.Context, r
 		query := input.Events
 		query.PubKeys = mapKeys(queryPubKeys)
 		query.Limit = uint64(input.MaxBranchFanout)
+		r.hydrateRelayEventQuery(ctx, relayQueryWithTagValues(query, input.Via.Key, targets), "authoredReplyChain")
 		candidatesByTarget, err := c.store.QueryEventsByTagTargets(ctx, query, chstore.TagFilter{Key: input.Via.Key}, targets, query.Limit)
 		if err != nil {
 			return nil, err

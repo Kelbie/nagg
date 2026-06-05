@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"sort"
@@ -77,6 +78,14 @@ type DMEnvelopeHydrator interface {
 	HydrateDMEnvelopes(context.Context, string, []int, int64, uint64) (bool, error)
 }
 
+type RelayEventBackfiller interface {
+	BackfillRelayEvents(context.Context, chstore.EventQueryInput, string) error
+}
+
+type RelayEventHydrator interface {
+	HydrateRelayEvents(context.Context, chstore.EventQueryInput, string) (bool, error)
+}
+
 type AppViewBackfiller interface {
 	UserFeedBackfiller
 	EventBackfiller
@@ -102,6 +111,7 @@ type UserFeedBackfillConfig struct {
 	FollowLimit     int
 	DMLimit         int
 	DMBackfillPages int
+	GraphQLLimit    int
 }
 
 type RelayUserFeedBackfiller struct {
@@ -138,6 +148,9 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 	}
 	if cfg.DMBackfillPages <= 0 {
 		cfg.DMBackfillPages = 2
+	}
+	if cfg.GraphQLLimit <= 0 {
+		cfg.GraphQLLimit = 100
 	}
 	return &RelayUserFeedBackfiller{
 		store: store,
@@ -235,6 +248,20 @@ func (b *RelayUserFeedBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey
 	key := "dm:" + pubkey + ":" + strconv.FormatInt(until, 10) + ":" + kindSignature(kinds)
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, key, func(jobCtx context.Context) error {
 		return b.BackfillDMEnvelopes(jobCtx, pubkey, kinds, until, limit)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateRelayEvents(ctx context.Context, input chstore.EventQueryInput, label string) (bool, error) {
+	if b == nil || b.store == nil {
+		return true, nil
+	}
+	filter, ok := b.relayFilterFromEventQuery(input)
+	if !ok {
+		return true, nil
+	}
+	key := "relay-query:" + strings.TrimSpace(label) + ":" + relayFilterSignature(filter)
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, key, func(jobCtx context.Context) error {
+		return b.backfillRelayEventsWithFilter(jobCtx, input, label, filter, key)
 	})})
 }
 
@@ -414,6 +441,34 @@ func (b *RelayUserFeedBackfiller) BackfillDMEnvelopes(ctx context.Context, pubke
 		cursor = oldest
 	}
 	return b.insertCollected(baseCtx, "dm envelope backfill inserted", collector.records, "pubkey", pubkey, "kinds", kindSignature(kinds))
+}
+
+func (b *RelayUserFeedBackfiller) BackfillRelayEvents(ctx context.Context, input chstore.EventQueryInput, label string) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	filter, ok := b.relayFilterFromEventQuery(input)
+	if !ok {
+		return nil
+	}
+	key := "relay-query:" + strings.TrimSpace(label) + ":" + relayFilterSignature(filter)
+	return b.backfillRelayEventsWithFilter(ctx, input, label, filter, key)
+}
+
+func (b *RelayUserFeedBackfiller) backfillRelayEventsWithFilter(ctx context.Context, _ chstore.EventQueryInput, label string, filter map[string]any, attemptKey string) error {
+	if !b.shouldAttempt(attemptKey) {
+		return nil
+	}
+	queryCtx, baseCtx, cancelQuery, timeout := b.queryContext(ctx)
+	defer cancelQuery()
+
+	events, err := b.query.Query(queryCtx, filter, timeout)
+	if err != nil {
+		return err
+	}
+	collector := newEventCollector()
+	collector.add(events)
+	return b.insertCollected(baseCtx, "graphql relay hydration inserted", collector.records, "label", strings.TrimSpace(label))
 }
 
 func (b *RelayUserFeedBackfiller) queryContext(ctx context.Context) (context.Context, context.Context, context.CancelFunc, time.Duration) {
@@ -773,6 +828,144 @@ func validPubkeys(values []string) []string {
 		seen[value] = struct{}{}
 	}
 	return sortedKeys(seen)
+}
+
+func (b *RelayUserFeedBackfiller) relayFilterFromEventQuery(input chstore.EventQueryInput) (map[string]any, bool) {
+	if input.Empty {
+		return nil, false
+	}
+	filter := map[string]any{}
+	safe := false
+	if ids := validHexIDs(input.IDs); len(ids) > 0 {
+		filter["ids"] = ids
+		safe = true
+	}
+	if pubkeys := validPubkeys(input.PubKeys); len(pubkeys) > 0 {
+		filter["authors"] = pubkeys
+		safe = true
+	}
+	if kinds := relayKinds(input.Kinds); len(kinds) > 0 {
+		filter["kinds"] = kinds
+		safe = true
+	}
+	for key, values := range relayTagFilters(input.Tags) {
+		filter["#"+key] = values
+		safe = true
+	}
+	if input.Since > 0 {
+		filter["since"] = input.Since
+		safe = true
+	}
+	if input.Until > 0 {
+		filter["until"] = input.Until
+		safe = true
+	}
+	if !safe {
+		return nil, false
+	}
+	filter["limit"] = b.graphqlRelayLimit(input)
+	return filter, true
+}
+
+func (b *RelayUserFeedBackfiller) graphqlRelayLimit(input chstore.EventQueryInput) int {
+	capLimit := b.cfg.GraphQLLimit
+	if capLimit <= 0 {
+		capLimit = 100
+	}
+	limit := input.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	if input.Offset > 0 && input.Limit > 0 {
+		if input.Offset > ^uint64(0)-limit {
+			limit = uint64(capLimit)
+		} else {
+			limit += input.Offset
+		}
+	}
+	if ids := uint64(len(input.IDs)); ids > limit {
+		limit = ids
+	}
+	if limit > uint64(capLimit) {
+		limit = uint64(capLimit)
+	}
+	if limit <= 0 {
+		return 50
+	}
+	return int(limit)
+}
+
+func relayKinds(kinds []int) []int {
+	seen := map[int]struct{}{}
+	for _, kind := range kinds {
+		if kind < 0 {
+			continue
+		}
+		seen[kind] = struct{}{}
+	}
+	out := make([]int, 0, len(seen))
+	for kind := range seen {
+		out = append(out, kind)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func relayTagFilters(tags []chstore.TagFilter) map[string][]string {
+	out := map[string][]string{}
+	for _, tag := range tags {
+		if strings.EqualFold(strings.TrimSpace(tag.Dataset), "DERIVED_TAGS") {
+			continue
+		}
+		key := strings.TrimSpace(tag.Key)
+		if len(key) != 1 {
+			continue
+		}
+		values := relayTagValues(tag)
+		if len(values) == 0 {
+			continue
+		}
+		out[key] = uniqueStrings(append(out[key], values...))
+	}
+	return out
+}
+
+func relayTagValues(tag chstore.TagFilter) []string {
+	values := make([]string, 0, 1+len(tag.Values))
+	if value := strings.TrimSpace(tag.Value); value != "" {
+		values = append(values, value)
+	}
+	for _, value := range tag.Values {
+		if value := strings.TrimSpace(value); value != "" {
+			values = append(values, value)
+		}
+	}
+	return uniqueStrings(values)
+}
+
+func relayFilterSignature(filter map[string]any) string {
+	parts := make([]string, 0, len(filter))
+	for key, value := range filter {
+		switch v := value.(type) {
+		case []string:
+			values := append([]string(nil), v...)
+			sort.Strings(values)
+			parts = append(parts, key+"="+strings.Join(values, ","))
+		case []int:
+			values := append([]int(nil), v...)
+			sort.Ints(values)
+			intParts := make([]string, 0, len(values))
+			for _, n := range values {
+				intParts = append(intParts, strconv.Itoa(n))
+			}
+			parts = append(parts, key+"="+strings.Join(intParts, ","))
+		default:
+			parts = append(parts, key+"="+fmt.Sprint(value))
+		}
+	}
+	sort.Strings(parts)
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:8])
 }
 
 func uniqueStrings(values []string) []string {

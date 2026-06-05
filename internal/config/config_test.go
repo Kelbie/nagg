@@ -19,6 +19,9 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeed {
 		t.Fatal("on-demand user feed backfill should be opt-in by default")
 	}
+	if cfg.OnDemand.GraphQLHydration {
+		t.Fatal("graphql relay hydration should follow the disabled user-feed default")
+	}
 	if cfg.OnDemand.Wait != 0 {
 		t.Fatalf("on-demand wait = %s, want instant default", cfg.OnDemand.Wait)
 	}
@@ -36,6 +39,12 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	}
 	if cfg.OnDemand.DMBackfillPages != 2 {
 		t.Fatalf("on-demand DM backfill pages = %d, want 2", cfg.OnDemand.DMBackfillPages)
+	}
+	if cfg.OnDemand.GraphQLLimit != 100 {
+		t.Fatalf("graphql hydration limit = %d, want 100", cfg.OnDemand.GraphQLLimit)
+	}
+	if cfg.OnDemand.GraphQLMaxJobsPerRequest != 4 {
+		t.Fatalf("graphql hydration max jobs = %d, want 4", cfg.OnDemand.GraphQLMaxJobsPerRequest)
 	}
 	if cfg.Vertex.ProfileMinFollowers != 500 {
 		t.Fatalf("profile min followers = %d, want 500", cfg.Vertex.ProfileMinFollowers)
@@ -56,6 +65,41 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
 			t.Fatalf("default relay set includes external cache host %q", relay)
 		}
+	}
+}
+
+func TestLoadGraphQLHydrationFollowsUserFeedDefault(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ON_DEMAND_USER_FEED", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OnDemand.UserFeed || !cfg.OnDemand.GraphQLHydration {
+		t.Fatalf("on-demand flags = userFeed %v graphql %v", cfg.OnDemand.UserFeed, cfg.OnDemand.GraphQLHydration)
+	}
+}
+
+func TestLoadGraphQLHydrationOverride(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ON_DEMAND_USER_FEED", "false")
+	t.Setenv("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", "true")
+	t.Setenv("NAGG_ON_DEMAND_GRAPHQL_LIMIT", "75")
+	t.Setenv("NAGG_ON_DEMAND_GRAPHQL_MAX_JOBS_PER_REQUEST", "2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OnDemand.UserFeed {
+		t.Fatal("user feed should remain disabled")
+	}
+	if !cfg.OnDemand.GraphQLHydration {
+		t.Fatal("graphql relay hydration should be enabled by explicit override")
+	}
+	if cfg.OnDemand.GraphQLLimit != 75 || cfg.OnDemand.GraphQLMaxJobsPerRequest != 2 {
+		t.Fatalf("graphql hydration config = limit %d jobs %d", cfg.OnDemand.GraphQLLimit, cfg.OnDemand.GraphQLMaxJobsPerRequest)
 	}
 }
 

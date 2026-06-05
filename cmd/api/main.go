@@ -57,7 +57,7 @@ func main() {
 	}
 
 	var userFeedBackfiller *appview.RelayUserFeedBackfiller
-	if cfg.OnDemand.UserFeed {
+	if cfg.OnDemand.UserFeed || cfg.OnDemand.GraphQLHydration {
 		userFeedBackfiller = appview.NewRelayUserFeedBackfiller(store, appview.UserFeedBackfillConfig{
 			Relays:          cfg.Firehose.Relays,
 			ReadLimit:       cfg.Firehose.ReadLimit,
@@ -70,6 +70,7 @@ func main() {
 			FollowLimit:     cfg.OnDemand.FollowLimit,
 			DMLimit:         cfg.OnDemand.DMLimit,
 			DMBackfillPages: cfg.OnDemand.DMBackfillPages,
+			GraphQLLimit:    cfg.OnDemand.GraphQLLimit,
 		})
 	}
 
@@ -94,7 +95,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	gqlHandler := graphqlapi.Handler(schema, graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout))
+	gqlHandler := graphqlapi.Handler(
+		schema,
+		graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout),
+		graphqlapi.WithRelayHydrationMaxJobs(cfg.OnDemand.GraphQLMaxJobsPerRequest),
+	)
 	mux.HandleFunc("/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
 	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
@@ -107,7 +112,7 @@ func main() {
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}
-	if userFeedBackfiller != nil {
+	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)

@@ -121,6 +121,7 @@ NAGG_VIEWER_PUBKEY=<64-hex-pubkey>
 NAGG_NIP05_VALIDATE=true
 NAGG_GRAPHQL_TIMEOUT=30s
 NAGG_ON_DEMAND_USER_FEED=false
+NAGG_ON_DEMAND_GRAPHQL_HYDRATION=false
 NAGG_ON_DEMAND_COOLDOWN=5m
 NAGG_ON_DEMAND_TIMEOUT=5s
 NAGG_ON_DEMAND_WAIT=0s
@@ -132,6 +133,8 @@ NAGG_ON_DEMAND_THREAD_LIMIT=1000
 NAGG_ON_DEMAND_FOLLOW_LIMIT=1000
 NAGG_ON_DEMAND_DM_LIMIT=200
 NAGG_ON_DEMAND_DM_BACKFILL_PAGES=2
+NAGG_ON_DEMAND_GRAPHQL_LIMIT=100
+NAGG_ON_DEMAND_GRAPHQL_MAX_JOBS_PER_REQUEST=4
 NAGG_ENRICH_TASKS=topics,embeddings,trending,stance,sentiment,quality,controversy,nsfw
 NAGG_ENRICH_BATCH_SIZE=256
 NAGG_ENRICH_POLL_INTERVAL=30s
@@ -144,7 +147,7 @@ NAGG_TRENDING_DEDUPE_SIM=0.82
 
 Do not set `PORT` yourself on Railway; Railway injects it for the web service. Set `NAGG_API_ADDR` only when you intentionally want to override the bind address outside Railway.
 
-Set `NAGG_ON_DEMAND_USER_FEED=true` on the API service to opportunistically hydrate app-view reads from `NAGG_RELAYS`. The API inserts fetched author notes/reposts, matching originals, engagement events, replies, profiles, follow/contact-list events, and DM envelopes into ClickHouse. For NIP-17, Nagg fetches the relay-facing `kind:1059` gift wraps p-tagged to the viewer plus the viewer's `kind:10050` DM inbox relay list; it does not decrypt inner `kind:14` chat messages, `kind:15` file messages, or wrapped reactions. `NAGG_ON_DEMAND_DM_LIMIT` controls the per-page relay query size and `NAGG_ON_DEMAND_DM_BACKFILL_PAGES` controls how many older pages each DM request hydrates. By default `NAGG_ON_DEMAND_WAIT=0s`, so reads return the indexed data already available while targeted hydration continues in the background for the next matching request. Set `NAGG_ON_DEMAND_WAIT=500ms` or similar only if you want a request to briefly wait and re-read when hydration finishes quickly. This covers `/graphql` author and DM queries plus `/nostr/feed`, `/nostr/feed/user`, `/nostr/events`, `/nostr/dm/envelopes`, `/nostr/profiles`, `/nostr/profile`, `/nostr/follows`, `/nostr/notes/stats`, and `/nostr/thread`. Keep the cooldown enabled in production so repeated requests for the same missing data do not fan out to relays every time.
+Set `NAGG_ON_DEMAND_USER_FEED=true` on the API service to opportunistically hydrate app-view reads from `NAGG_RELAYS`. `NAGG_ON_DEMAND_GRAPHQL_HYDRATION` defaults to the same value and can be enabled separately for GraphQL-only relay hydration. The API inserts fetched author notes/reposts, matching originals, engagement events, replies, profiles, follow/contact-list events, DM envelopes, and relay-safe GraphQL event-query matches into ClickHouse. GraphQL hydration maps relay-safe filters such as ids, pubkeys/authors, kinds, tag values, `since`, `until`, and the requested pagination window to Nostr relay filters, then returns ClickHouse-indexed results as usual; search, ranking, shuffle, exclusions, and derived tags remain local-only filters. `NAGG_ON_DEMAND_GRAPHQL_LIMIT` caps each relay query and `NAGG_ON_DEMAND_GRAPHQL_MAX_JOBS_PER_REQUEST` caps the number of background relay jobs a single GraphQL request can schedule. For NIP-17, Nagg fetches the relay-facing `kind:1059` gift wraps p-tagged to the viewer plus the viewer's `kind:10050` DM inbox relay list; it does not decrypt inner `kind:14` chat messages, `kind:15` file messages, or wrapped reactions. `NAGG_ON_DEMAND_DM_LIMIT` controls the per-page relay query size and `NAGG_ON_DEMAND_DM_BACKFILL_PAGES` controls how many older pages each DM request hydrates. By default `NAGG_ON_DEMAND_WAIT=0s`, so reads return the indexed data already available while targeted hydration continues in the background for the next matching request. Set `NAGG_ON_DEMAND_WAIT=500ms` or similar only if you want a request to briefly wait and re-read when hydration finishes quickly. This covers `/graphql` event, aggregate, notification, reference, ranking, and DM queries plus `/nostr/feed`, `/nostr/feed/user`, `/nostr/events`, `/nostr/dm/envelopes`, `/nostr/profiles`, `/nostr/profile`, `/nostr/follows`, `/nostr/notes/stats`, and `/nostr/thread`. Keep the cooldown enabled in production so repeated requests for the same missing data do not fan out to relays every time.
 
 The pre-deploy command only migrates schemas. After first deploy, or after changing app-view aggregate logic, run the backfill command once from the Railway shell or a one-off command:
 
