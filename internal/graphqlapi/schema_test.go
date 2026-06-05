@@ -37,6 +37,8 @@ type fakeStore struct {
 	pubkeyScoreRows             map[string]chstore.PubkeyScore
 	pubkeyScoreInputs           []pubkeyScoreInput
 	profileRows                 map[string]chstore.ProfileRow
+	profileSearchRows           []chstore.ProfileSearchRow
+	profileSearchInputs         []profileSearchInput
 	vertexProfileRows           map[string]vertex.ProfileResult
 	derivedMetricRows           map[string]map[string]float64
 	derivedMetricInputs         []derivedMetricInput
@@ -69,6 +71,11 @@ type rankedTargetAggregateInput struct {
 type pubkeyScoreInput struct {
 	source  string
 	pubkeys []string
+}
+
+type profileSearchInput struct {
+	query string
+	limit uint64
 }
 
 type derivedMetricInput struct {
@@ -172,7 +179,13 @@ func (s *fakeStore) QueryEventsByTagTargets(_ context.Context, input chstore.Eve
 }
 
 func eventExcludedByInput(event chstore.EventView, input chstore.EventQueryInput) bool {
-	return containsString(input.ExcludeIDs, event.ID) || containsString(input.ExcludePubKeys, event.PubKey)
+	if containsString(input.ExcludeIDs, event.ID) || containsString(input.ExcludePubKeys, event.PubKey) {
+		return true
+	}
+	if input.Search != "" && !strings.Contains(strings.ToLower(event.Content), strings.ToLower(input.Search)) {
+		return true
+	}
+	return false
 }
 
 func (s *fakeStore) QueryLatestEventsByPubKeys(_ context.Context, pubkeys []string, kinds []int, limit uint64) (map[string][]chstore.EventView, error) {
@@ -252,6 +265,11 @@ func (s *fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[str
 		}
 	}
 	return out, nil
+}
+
+func (s *fakeStore) SearchProfiles(_ context.Context, query string, limit uint64) ([]chstore.ProfileSearchRow, error) {
+	s.profileSearchInputs = append(s.profileSearchInputs, profileSearchInput{query: query, limit: limit})
+	return s.profileSearchRows, nil
 }
 
 func (s *fakeStore) CachedVertexProfiles(_ context.Context, pubkeys []string) (map[string]vertex.ProfileResult, error) {
@@ -509,6 +527,123 @@ func TestProfileSearchReturnsSearchAndProfileScores(t *testing.T) {
 	}
 	if node["followers"] != int(followers) || node["follows"] != int(follows) {
 		t.Fatalf("social counts = %+v", node)
+	}
+}
+
+func TestProfileSearchReturnsLocalProfileEventsWithoutVertex(t *testing.T) {
+	store := &fakeStore{
+		profileSearchRows: []chstore.ProfileSearchRow{{
+			Profile: chstore.ProfileRow{
+				PubKey:      testPubkey,
+				Name:        "calle",
+				DisplayName: "calle BTC",
+				Picture:     "https://example.test/avatar.png",
+				NIP05:       "calle@example.test",
+			},
+			Rank:  100,
+			Score: 100,
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			profileSearch(input: {query:"calle", limit:5}) {
+				fromCache
+				nodes {
+					pubkey
+					npub
+					name
+					displayName
+					searchScore
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.profileSearchInputs) != 1 {
+		t.Fatalf("profile search inputs = %+v", store.profileSearchInputs)
+	}
+	if store.profileSearchInputs[0].query != "calle" || store.profileSearchInputs[0].limit != 5 {
+		t.Fatalf("profile search input = %+v", store.profileSearchInputs[0])
+	}
+	data := result.Data.(map[string]any)
+	connection := data["profileSearch"].(map[string]any)
+	if connection["fromCache"] != true {
+		t.Fatalf("fromCache = %v", connection["fromCache"])
+	}
+	nodes := connection["nodes"].([]any)
+	if len(nodes) != 1 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	node := nodes[0].(map[string]any)
+	if node["pubkey"] != testPubkey || node["name"] != "calle" || node["displayName"] != "calle BTC" {
+		t.Fatalf("node = %+v", node)
+	}
+	if node["searchScore"] != float64(100) {
+		t.Fatalf("searchScore = %+v", node["searchScore"])
+	}
+}
+
+func TestEventsQueryAcceptsContentSearch(t *testing.T) {
+	store := &fakeStore{
+		events: [][]chstore.EventView{{
+			{
+				ID:        testHex("a"),
+				PubKey:    testPubkey,
+				Kind:      0,
+				CreatedAt: time.Unix(2, 0),
+				Content:   `{"name":"calle"}`,
+				Tags:      [][]string{},
+				Sig:       testHex("b") + testHex("c"),
+			},
+			{
+				ID:        testHex("d"),
+				PubKey:    testHex("e"),
+				Kind:      0,
+				CreatedAt: time.Unix(1, 0),
+				Content:   `{"name":"jack"}`,
+				Tags:      [][]string{},
+				Sig:       testHex("f") + testHex("a"),
+			},
+		}},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[0], search:"calle", limit:10}) {
+				nodes { id kind content }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.eventInputs) != 1 || store.eventInputs[0].Search != "calle" {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	data := result.Data.(map[string]any)
+	nodes := data["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 1 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	if got := nodes[0].(map[string]any)["content"]; got != `{"name":"calle"}` {
+		t.Fatalf("content = %v", got)
 	}
 }
 

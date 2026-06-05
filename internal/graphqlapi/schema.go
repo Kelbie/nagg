@@ -32,6 +32,7 @@ type Store interface {
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
+	SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
 	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
@@ -426,6 +427,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			},
 			"kinds":   &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(graphql.Int))},
 			"tags":    &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(tagFilterType))},
+			"search":  &graphql.InputObjectFieldConfig{Type: graphql.String},
 			"since":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"until":   &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
@@ -1075,13 +1077,61 @@ func (r *resolver) hydrateAuthors(ctx context.Context, pubkeys []string, limit u
 }
 
 func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (profileSearchConnectionSource, error) {
-	if r.profileSearcher == nil {
-		return profileSearchConnectionSource{}, vertex.ErrUnavailable
-	}
-	rows, fromCache, err := r.profileSearcher.Search(ctx, input)
+	args := vertex.NormalizeSearchArgs(input)
+	localRows, err := r.store.SearchProfiles(ctx, args.Query, uint64(args.Limit))
 	if err != nil {
 		return profileSearchConnectionSource{}, err
 	}
+	rows := make([]vertex.SearchResult, 0, args.Limit)
+	profiles := make(map[string]chstore.ProfileRow, len(localRows))
+	seen := make(map[string]struct{}, len(localRows))
+	for _, local := range localRows {
+		pubkey, ok := vertex.NormalizePubkey(local.Profile.PubKey)
+		if !ok {
+			continue
+		}
+		profile := local.Profile
+		profile.PubKey = pubkey
+		rank := local.Rank
+		score := local.Score
+		rows = append(rows, vertex.SearchResult{
+			PubKey: pubkey,
+			Npub:   vertex.Npub(pubkey),
+			Rank:   &rank,
+			Score:  &score,
+		})
+		profiles[pubkey] = profile
+		seen[pubkey] = struct{}{}
+	}
+
+	fromCache := true
+	if r.profileSearcher != nil && len(rows) < args.Limit {
+		vertexRows, vertexFromCache, err := r.profileSearcher.Search(ctx, args)
+		if err != nil {
+			slog.Warn("graphql profile search vertex lookup failed", "query", args.Query, "sort", args.Sort, "source", args.Source, "error", err)
+		} else {
+			fromCache = vertexFromCache
+			for _, row := range vertexRows {
+				pubkey, ok := vertex.NormalizePubkey(row.PubKey)
+				if !ok {
+					continue
+				}
+				if _, ok := seen[pubkey]; ok {
+					continue
+				}
+				row.PubKey = pubkey
+				if row.Npub == "" {
+					row.Npub = vertex.Npub(pubkey)
+				}
+				rows = append(rows, row)
+				seen[pubkey] = struct{}{}
+				if len(rows) >= args.Limit {
+					break
+				}
+			}
+		}
+	}
+
 	pubkeys := make([]string, 0, len(rows))
 	for _, row := range rows {
 		pubkeys = append(pubkeys, row.PubKey)
@@ -1091,9 +1141,14 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 			slog.Warn("graphql profile search profile backfill failed", "pubkeys", len(pubkeys), "error", err)
 		}
 	}
-	profiles, err := r.store.LatestProfiles(ctx, pubkeys)
+	latestProfiles, err := r.store.LatestProfiles(ctx, pubkeys)
 	if err != nil {
 		return profileSearchConnectionSource{}, err
+	}
+	for pubkey, profile := range latestProfiles {
+		if profile.PubKey != "" {
+			profiles[pubkey] = profile
+		}
 	}
 	vertexProfiles, err := r.store.CachedVertexProfiles(ctx, pubkeys)
 	if err != nil {
@@ -1110,7 +1165,6 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 		}
 		nodes = append(nodes, node)
 	}
-	args := vertex.NormalizeSearchArgs(input)
 	return profileSearchConnectionSource{
 		query:     args.Query,
 		limit:     args.Limit,
@@ -3132,11 +3186,15 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 		ExcludePubKeys: stringList(raw["excludePubkeys"]),
 		Kinds:          intList(raw["kinds"]),
 		Tags:           tagFilters(raw["tags"]),
+		Search:         strings.TrimSpace(stringValue(raw["search"])),
 		Since:          int64(intValue(raw["since"], 0)),
 		Until:          int64(intValue(raw["until"], 0)),
 		Limit:          uint64(intValue(raw["limit"], 50)),
 		Offset:         uint64(intValue(raw["offset"], 0)),
 		Shuffle:        chstoreShuffleInput(raw["shuffle"]),
+	}
+	if input.Search != "" && len(input.Search) < 3 {
+		return input, fmt.Errorf("events search must be at least 3 characters")
 	}
 	return input, validateHexFilters(
 		append(append([]string(nil), input.IDs...), input.ExcludeIDs...),

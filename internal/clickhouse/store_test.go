@@ -169,6 +169,17 @@ func TestEventWhereAddsNegativeEventFilters(t *testing.T) {
 	}
 }
 
+func TestEventWhereAddsContentSearch(t *testing.T) {
+	where, args := eventWhereInput("e", EventQueryInput{Search: "calle"})
+
+	if !strings.Contains(where, "positionCaseInsensitiveUTF8(e.content, ?) > 0") {
+		t.Fatalf("where = %q", where)
+	}
+	if len(args) != 1 || args[0] != "calle" {
+		t.Fatalf("args = %+v", args)
+	}
+}
+
 func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
 	orderBy, args := aggregateOrderBy(aggSpec{
 		groupDims:   []string{"tag_value"},

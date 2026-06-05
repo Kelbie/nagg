@@ -41,6 +41,7 @@ type EventQueryInput struct {
 	ExcludePubKeys []string
 	Kinds          []int
 	Tags           []TagFilter
+	Search         string
 	Since          int64
 	Until          int64
 	Limit          uint64
@@ -188,6 +189,12 @@ type ProfileRow struct {
 	Banner      string    `json:"banner"`
 	Website     string    `json:"website"`
 	RawJSON     string    `json:"raw_json"`
+}
+
+type ProfileSearchRow struct {
+	Profile ProfileRow `json:"profile"`
+	Rank    float64    `json:"rank"`
+	Score   float64    `json:"score"`
 }
 
 func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string, kinds []int, limitPerPubKey uint64) (map[string][]EventView, error) {
@@ -1141,6 +1148,89 @@ func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[strin
 			return nil, err
 		}
 		out[profile.PubKey] = profile
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SearchProfiles(ctx context.Context, query string, limit uint64) ([]ProfileSearchRow, error) {
+	query = strings.TrimSpace(query)
+	if len(query) < 3 {
+		return []ProfileSearchRow{}, nil
+	}
+	if limit == 0 || limit > 100 {
+		limit = 10
+	}
+	if pubkey, ok := vertex.NormalizePubkey(query); ok {
+		profiles, err := s.LatestProfiles(ctx, []string{pubkey})
+		if err != nil {
+			return nil, err
+		}
+		profile := profiles[pubkey]
+		if profile.PubKey == "" {
+			profile.PubKey = pubkey
+		}
+		return []ProfileSearchRow{{Profile: profile, Rank: 100, Score: 100}}, nil
+	}
+
+	queryLower := strings.ToLower(query)
+	scoreExpr := `
+		greatest(
+			if(lowerUTF8(name) = ?, 100.0, 0.0),
+			if(lowerUTF8(display_name) = ?, 98.0, 0.0),
+			if(lowerUTF8(nip05) = ?, 96.0, 0.0),
+			if(startsWith(lowerUTF8(name), ?), 90.0, 0.0),
+			if(startsWith(lowerUTF8(display_name), ?), 88.0, 0.0),
+			if(startsWith(lowerUTF8(nip05), ?), 86.0, 0.0),
+			if(positionCaseInsensitiveUTF8(name, ?) > 0, 76.0, 0.0),
+			if(positionCaseInsensitiveUTF8(display_name, ?) > 0, 74.0, 0.0),
+			if(positionCaseInsensitiveUTF8(nip05, ?) > 0, 72.0, 0.0),
+			if(positionCaseInsensitiveUTF8(lud16, ?) > 0, 60.0, 0.0),
+			if(positionCaseInsensitiveUTF8(website, ?) > 0, 50.0, 0.0),
+			if(positionCaseInsensitiveUTF8(about, ?) > 0, 30.0, 0.0),
+			if(positionCaseInsensitiveUTF8(raw_json, ?) > 0, 10.0, 0.0)
+		)
+	`
+	args := []any{
+		queryLower, queryLower, queryLower,
+		queryLower, queryLower, queryLower,
+		query, query, query, query, query, query, query,
+		query,
+		limit,
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT pubkey, event_id, created_at, name, display_name, picture, about, nip05, lud16, lud06, banner, website, raw_json, `+scoreExpr+` AS relevance
+		FROM profiles_latest FINAL
+		WHERE positionCaseInsensitiveUTF8(concat(name, ' ', display_name, ' ', nip05, ' ', lud16, ' ', website, ' ', about, ' ', raw_json), ?) > 0
+		ORDER BY relevance DESC, created_at DESC, pubkey ASC
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]ProfileSearchRow, 0, limit)
+	for rows.Next() {
+		var row ProfileSearchRow
+		if err := rows.Scan(
+			&row.Profile.PubKey,
+			&row.Profile.EventID,
+			&row.Profile.CreatedAt,
+			&row.Profile.Name,
+			&row.Profile.DisplayName,
+			&row.Profile.Picture,
+			&row.Profile.About,
+			&row.Profile.NIP05,
+			&row.Profile.LUD16,
+			&row.Profile.LUD06,
+			&row.Profile.Banner,
+			&row.Profile.Website,
+			&row.Profile.RawJSON,
+			&row.Score,
+		); err != nil {
+			return nil, err
+		}
+		row.Rank = row.Score
+		out = append(out, row)
 	}
 	return out, rows.Err()
 }
@@ -2170,7 +2260,12 @@ func eventWhere(alias string, ids, pubkeys []string, kinds []int, tags []TagFilt
 }
 
 func eventWhereInput(alias string, input EventQueryInput) (string, []any) {
-	return eventWhereWithExclusions(alias, input.IDs, input.PubKeys, input.ExcludeIDs, input.ExcludePubKeys, input.Kinds, input.Tags)
+	where, args := eventWhereWithExclusions(alias, input.IDs, input.PubKeys, input.ExcludeIDs, input.ExcludePubKeys, input.Kinds, input.Tags)
+	if search := strings.TrimSpace(input.Search); search != "" {
+		where += fmt.Sprintf(" AND positionCaseInsensitiveUTF8(%s.content, ?) > 0", alias)
+		args = append(args, search)
+	}
+	return where, args
 }
 
 func eventWhereWithExclusions(alias string, ids, pubkeys, excludeIDs, excludePubkeys []string, kinds []int, tags []TagFilter) (string, []any) {

@@ -6,12 +6,13 @@ import (
 )
 
 const (
-	GraphQLSchemaVersion = "2026-06-05"
+	GraphQLSchemaVersion = "2026-06-06"
 	AppViewVersion       = "v1"
 )
 
 var Names = []string{
 	"graphql.events",
+	"graphql.events.search",
 	"graphql.aggregateEvents",
 	"graphql.rankedEvents",
 	"graphql.references",
