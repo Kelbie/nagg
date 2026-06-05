@@ -28,6 +28,15 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if !containsKind(cfg.Firehose.Kinds, 38000) {
 		t.Fatalf("default kinds = %v, want mint review kind 38000", cfg.Firehose.Kinds)
 	}
+	if !containsKind(cfg.Firehose.Kinds, 10050) {
+		t.Fatalf("default kinds = %v, want NIP-17 DM inbox relay kind 10050", cfg.Firehose.Kinds)
+	}
+	if cfg.OnDemand.DMLimit != 200 {
+		t.Fatalf("on-demand DM limit = %d, want 200", cfg.OnDemand.DMLimit)
+	}
+	if cfg.OnDemand.DMBackfillPages != 2 {
+		t.Fatalf("on-demand DM backfill pages = %d, want 2", cfg.OnDemand.DMBackfillPages)
+	}
 	if cfg.Vertex.ProfileMinFollowers != 500 {
 		t.Fatalf("profile min followers = %d, want 500", cfg.Vertex.ProfileMinFollowers)
 	}

@@ -44,6 +44,7 @@ type Handler struct {
 	engagementBackfiller      EngagementBackfiller
 	threadBackfiller          ThreadBackfiller
 	followBackfiller          FollowBackfiller
+	dmEnvelopeBackfiller      DMEnvelopeBackfiller
 	nip05Validator            *nip05Validator
 	rateLimiter               *rateLimiter
 	vertexProfileMinFollowers uint64
@@ -122,6 +123,9 @@ func WithAppViewBackfill(backfiller AppViewBackfiller) Option {
 		h.engagementBackfiller = backfiller
 		h.threadBackfiller = backfiller
 		h.followBackfiller = backfiller
+		if b, ok := any(backfiller).(DMEnvelopeBackfiller); ok {
+			h.dmEnvelopeBackfiller = b
+		}
 	}
 }
 
@@ -153,6 +157,9 @@ func (h *Handler) setOptionalBackfillers(backfiller any) {
 	}
 	if b, ok := backfiller.(FollowBackfiller); ok {
 		h.followBackfiller = b
+	}
+	if b, ok := backfiller.(DMEnvelopeBackfiller); ok {
+		h.dmEnvelopeBackfiller = b
 	}
 }
 
@@ -698,6 +705,7 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 	limit := clampDmLimit(intParam(r, "limit", 50))
 	until := int64(intParam(r, "until", 0))
 
+	h.tryBackfillDMEnvelopes(r.Context(), viewer, kinds, until, uint64(limit))
 	authored, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
 		PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
 	})
@@ -1243,6 +1251,25 @@ func (h *Handler) tryBackfillFollows(ctx context.Context, pubkey string) bool {
 	}
 	if err := h.followBackfiller.BackfillFollows(ctx, pubkey); err != nil {
 		slog.Warn("follow graph backfill failed", "pubkey", pubkey, "error", err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) tryBackfillDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) bool {
+	if h.dmEnvelopeBackfiller == nil || pubkey == "" {
+		return false
+	}
+	if hydrator, ok := h.dmEnvelopeBackfiller.(DMEnvelopeHydrator); ok {
+		completed, err := hydrator.HydrateDMEnvelopes(ctx, pubkey, kinds, until, limit)
+		if err != nil {
+			slog.Warn("dm envelope hydration failed", "pubkey", pubkey, "error", err)
+			return false
+		}
+		return completed
+	}
+	if err := h.dmEnvelopeBackfiller.BackfillDMEnvelopes(ctx, pubkey, kinds, until, limit); err != nil {
+		slog.Warn("dm envelope backfill failed", "pubkey", pubkey, "error", err)
 		return false
 	}
 	return true

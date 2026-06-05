@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +69,14 @@ type FollowHydrator interface {
 	HydrateFollows(context.Context, string) (bool, error)
 }
 
+type DMEnvelopeBackfiller interface {
+	BackfillDMEnvelopes(context.Context, string, []int, int64, uint64) error
+}
+
+type DMEnvelopeHydrator interface {
+	HydrateDMEnvelopes(context.Context, string, []int, int64, uint64) (bool, error)
+}
+
 type AppViewBackfiller interface {
 	UserFeedBackfiller
 	EventBackfiller
@@ -90,6 +100,8 @@ type UserFeedBackfillConfig struct {
 	EngagementLimit int
 	ThreadLimit     int
 	FollowLimit     int
+	DMLimit         int
+	DMBackfillPages int
 }
 
 type RelayUserFeedBackfiller struct {
@@ -120,6 +132,12 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 	}
 	if cfg.FollowLimit <= 0 {
 		cfg.FollowLimit = 1000
+	}
+	if cfg.DMLimit <= 0 {
+		cfg.DMLimit = 200
+	}
+	if cfg.DMBackfillPages <= 0 {
+		cfg.DMBackfillPages = 2
 	}
 	return &RelayUserFeedBackfiller{
 		store: store,
@@ -201,6 +219,22 @@ func (b *RelayUserFeedBackfiller) HydrateFollows(ctx context.Context, pubkey str
 	pubkey = pubkeys[0]
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, "follows:"+pubkey, func(jobCtx context.Context) error {
 		return b.BackfillFollows(jobCtx, pubkey)
+	})})
+}
+
+func (b *RelayUserFeedBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) (bool, error) {
+	pubkeys := validPubkeys([]string{pubkey})
+	if b == nil || b.store == nil || len(pubkeys) != 1 {
+		return true, nil
+	}
+	pubkey = pubkeys[0]
+	kinds = dmRelayKinds(kinds)
+	if len(kinds) == 0 {
+		return true, nil
+	}
+	key := "dm:" + pubkey + ":" + strconv.FormatInt(until, 10) + ":" + kindSignature(kinds)
+	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, key, func(jobCtx context.Context) error {
+		return b.BackfillDMEnvelopes(jobCtx, pubkey, kinds, until, limit)
 	})})
 }
 
@@ -339,6 +373,49 @@ func (b *RelayUserFeedBackfiller) BackfillFollows(ctx context.Context, pubkey st
 	return b.insertCollected(baseCtx, "follow graph backfill inserted", collector.records, "pubkey", pubkey)
 }
 
+func (b *RelayUserFeedBackfiller) BackfillDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) error {
+	pubkeys := validPubkeys([]string{pubkey})
+	if len(pubkeys) != 1 {
+		return nil
+	}
+	pubkey = pubkeys[0]
+	kinds = dmRelayKinds(kinds)
+	if b == nil || b.store == nil || len(kinds) == 0 {
+		return nil
+	}
+	attemptKey := "dm:" + pubkey + ":" + strconv.FormatInt(until, 10) + ":" + kindSignature(kinds)
+	if !b.shouldAttempt(attemptKey) {
+		return nil
+	}
+
+	queryCtx, baseCtx, cancelQuery, timeout := b.queryContext(ctx)
+	defer cancelQuery()
+
+	collector := newEventCollector()
+	inboxRelays := b.queryDMInboxRelays(queryCtx, collector, pubkey, timeout)
+	query := b.query
+	query.Relays = uniqueStrings(append(append([]string(nil), query.Relays...), inboxRelays...))
+
+	pageLimit := dmBackfillLimit(limit, b.cfg.DMLimit)
+	cursor := until
+	for page := 0; page < b.cfg.DMBackfillPages; page++ {
+		if queryCtx.Err() != nil {
+			break
+		}
+		pageEvents := b.queryDMEnvelopePage(queryCtx, query, pubkey, kinds, cursor, pageLimit, timeout)
+		if len(pageEvents) == 0 {
+			break
+		}
+		collector.add(pageEvents)
+		oldest := oldestRelayEventCreatedAt(pageEvents)
+		if oldest <= 0 || len(pageEvents) < pageLimit {
+			break
+		}
+		cursor = oldest
+	}
+	return b.insertCollected(baseCtx, "dm envelope backfill inserted", collector.records, "pubkey", pubkey, "kinds", kindSignature(kinds))
+}
+
 func (b *RelayUserFeedBackfiller) queryContext(ctx context.Context) (context.Context, context.Context, context.CancelFunc, time.Duration) {
 	timeout := b.cfg.Timeout
 	if timeout <= 0 {
@@ -380,6 +457,70 @@ func (b *RelayUserFeedBackfiller) queryEngagement(ctx context.Context, collector
 		}
 		collector.add(events)
 	}
+}
+
+func (b *RelayUserFeedBackfiller) queryDMInboxRelays(ctx context.Context, collector *eventCollector, pubkey string, timeout time.Duration) []string {
+	events, err := b.query.Query(ctx, map[string]any{
+		"authors": []string{pubkey},
+		"kinds":   []int{10050},
+		"limit":   3,
+	}, timeout)
+	if err != nil {
+		slog.Debug("dm inbox relay discovery failed", "pubkey", pubkey, "error", err)
+		return nil
+	}
+	collector.add(events)
+	return dmInboxRelays(events)
+}
+
+func (b *RelayUserFeedBackfiller) queryDMEnvelopePage(ctx context.Context, query relayquery.Client, pubkey string, kinds []int, until int64, limit int, timeout time.Duration) []relayquery.Event {
+	var out []relayquery.Event
+	if containsInt(kinds, 1059) || containsInt(kinds, 21059) {
+		wrapKinds := intersectKinds(kinds, []int{1059, 21059})
+		filter := map[string]any{
+			"#p":    []string{pubkey},
+			"kinds": wrapKinds,
+			"limit": limit,
+		}
+		if until > 0 {
+			filter["until"] = until
+		}
+		events, err := query.Query(ctx, filter, timeout)
+		if err != nil {
+			slog.Debug("dm gift-wrap backfill failed", "pubkey", pubkey, "error", err)
+		}
+		out = append(out, events...)
+	}
+	if containsInt(kinds, 4) {
+		receivedFilter := map[string]any{
+			"#p":    []string{pubkey},
+			"kinds": []int{4},
+			"limit": limit,
+		}
+		if until > 0 {
+			receivedFilter["until"] = until
+		}
+		received, err := query.Query(ctx, receivedFilter, timeout)
+		if err != nil {
+			slog.Debug("nip04 received dm backfill failed", "pubkey", pubkey, "error", err)
+		}
+		out = append(out, received...)
+
+		sentFilter := map[string]any{
+			"authors": []string{pubkey},
+			"kinds":   []int{4},
+			"limit":   limit,
+		}
+		if until > 0 {
+			sentFilter["until"] = until
+		}
+		sent, err := query.Query(ctx, sentFilter, timeout)
+		if err != nil {
+			slog.Debug("nip04 sent dm backfill failed", "pubkey", pubkey, "error", err)
+		}
+		out = append(out, sent...)
+	}
+	return out
 }
 
 func (b *RelayUserFeedBackfiller) queryProfiles(ctx context.Context, collector *eventCollector, pubkeys []string, timeout time.Duration) {
@@ -625,13 +766,153 @@ func validHexIDs(values []string) []string {
 func validPubkeys(values []string) []string {
 	seen := map[string]struct{}{}
 	for _, value := range values {
-		value = strings.TrimSpace(value)
+		value = strings.ToLower(strings.TrimSpace(value))
 		if !nostr.IsValidPublicKey(value) {
 			continue
 		}
 		seen[value] = struct{}{}
 	}
 	return sortedKeys(seen)
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		seen[value] = struct{}{}
+	}
+	return sortedKeys(seen)
+}
+
+func dmRelayKinds(kinds []int) []int {
+	if len(kinds) == 0 {
+		return []int{4, 1059}
+	}
+	seen := map[int]struct{}{}
+	for _, kind := range kinds {
+		switch kind {
+		case 4, 1059, 21059:
+			seen[kind] = struct{}{}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for kind := range seen {
+		out = append(out, kind)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func dmBackfillLimit(requested uint64, configured int) int {
+	limit := int(requested)
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	if configured > 0 {
+		limit = min(limit, configured)
+	}
+	if limit <= 0 {
+		return 200
+	}
+	return limit
+}
+
+func dmInboxRelays(events []relayquery.Event) []string {
+	seen := map[string]struct{}{}
+	for _, wrapped := range events {
+		event := wrapped.Event
+		if event == nil || event.Kind != 10050 {
+			continue
+		}
+		for _, tag := range event.Tags {
+			if len(tag) < 2 || tag[0] != "relay" {
+				continue
+			}
+			relay := normalizeRelayURL(tag[1])
+			if relay == "" {
+				continue
+			}
+			seen[relay] = struct{}{}
+		}
+	}
+	return sortedKeys(seen)
+}
+
+func normalizeRelayURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme != "wss" && parsed.Scheme != "ws" {
+		return ""
+	}
+	if parsed.Host == "" {
+		return ""
+	}
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func kindSignature(kinds []int) string {
+	kinds = append([]int(nil), kinds...)
+	sort.Ints(kinds)
+	parts := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		parts = append(parts, strconv.Itoa(kind))
+	}
+	return strings.Join(parts, ",")
+}
+
+func containsInt(values []int, target int) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func intersectKinds(values []int, allowed []int) []int {
+	allowedSet := map[int]struct{}{}
+	for _, kind := range allowed {
+		allowedSet[kind] = struct{}{}
+	}
+	seen := map[int]struct{}{}
+	for _, kind := range values {
+		if _, ok := allowedSet[kind]; ok {
+			seen[kind] = struct{}{}
+		}
+	}
+	out := make([]int, 0, len(seen))
+	for kind := range seen {
+		out = append(out, kind)
+	}
+	sort.Ints(out)
+	return out
+}
+
+func oldestRelayEventCreatedAt(events []relayquery.Event) int64 {
+	var oldest int64
+	for _, wrapped := range events {
+		if wrapped.Event == nil {
+			continue
+		}
+		createdAt := wrapped.Event.CreatedAt.Time().Unix()
+		if createdAt <= 0 {
+			continue
+		}
+		if oldest == 0 || createdAt < oldest {
+			oldest = createdAt
+		}
+	}
+	return oldest
 }
 
 func chunks[T any](items []T, size int) [][]T {

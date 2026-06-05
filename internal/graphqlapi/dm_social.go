@@ -3,6 +3,7 @@ package graphqlapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 
@@ -25,6 +26,7 @@ func (r *resolver) dmEnvelopes(ctx context.Context, raw map[string]any) (eventCo
 	limit := clampLimit(intValue(raw["limit"], 50), 200)
 	until := int64(intValue(raw["until"], 0))
 
+	r.tryBackfillDMEnvelopes(ctx, viewer, kinds, until, uint64(limit))
 	authored, err := r.queryEvents(ctx, chstore.EventQueryInput{
 		PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
 	})
@@ -61,6 +63,7 @@ func (r *resolver) dmConversation(ctx context.Context, raw map[string]any) (even
 	limit := clampLimit(intValue(raw["limit"], 50), 200)
 	until := int64(intValue(raw["until"], 0))
 
+	r.tryBackfillDMEnvelopes(ctx, viewer, kinds, until, uint64(limit))
 	// Split kinds: kind 4 can be scoped to the pair; everything else (gift
 	// wraps) is opaque and is returned as the full viewer inbox.
 	var directKinds, opaqueKinds []int
@@ -300,6 +303,25 @@ func dmKinds(raw any) []int {
 		return []int{4, 1059}
 	}
 	return kinds
+}
+
+func (r *resolver) tryBackfillDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) bool {
+	if r.dmEnvelopeBackfiller == nil || pubkey == "" {
+		return false
+	}
+	if hydrator, ok := r.dmEnvelopeBackfiller.(DMEnvelopeHydrator); ok {
+		completed, err := hydrator.HydrateDMEnvelopes(ctx, pubkey, kinds, until, limit)
+		if err != nil {
+			slog.Warn("graphql dm envelope hydration failed", "pubkey", pubkey, "error", err)
+			return false
+		}
+		return completed
+	}
+	if err := r.dmEnvelopeBackfiller.BackfillDMEnvelopes(ctx, pubkey, kinds, until, limit); err != nil {
+		slog.Warn("graphql dm envelope backfill failed", "pubkey", pubkey, "error", err)
+		return false
+	}
+	return true
 }
 
 func clampLimit(limit, max int) int {

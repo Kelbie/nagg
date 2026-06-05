@@ -5,6 +5,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/vertex-lab/nagg/internal/relayquery"
 )
 
 func TestHydrationJobCompletesInsideWait(t *testing.T) {
@@ -135,4 +138,70 @@ func waitForHydrationJob(t *testing.T, job *hydrationJob) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for hydration job")
 	}
+}
+
+func TestDMRelayKindsKeepsOnlyRelayFacingDMKinds(t *testing.T) {
+	if got := dmRelayKinds(nil); !equalInts(got, []int{4, 1059}) {
+		t.Fatalf("default dm relay kinds = %+v", got)
+	}
+	got := dmRelayKinds([]int{14, 15, 7, 1059, 4, 21059, 1059})
+	if !equalInts(got, []int{4, 1059, 21059}) {
+		t.Fatalf("dm relay kinds = %+v", got)
+	}
+}
+
+func TestDMInboxRelaysParsesKind10050RelayTags(t *testing.T) {
+	events := []relayquery.Event{
+		{Event: &nostr.Event{
+			Kind: 10050,
+			Tags: nostr.Tags{
+				{"relay", " wss://inbox.nostr.wine "},
+				{"relay", "https://not-a-relay.example"},
+				{"relay", "ws://localhost:7777/path#frag"},
+				{"relay", "wss://inbox.nostr.wine"},
+			},
+		}},
+		{Event: &nostr.Event{Kind: 1, Tags: nostr.Tags{{"relay", "wss://ignored.example"}}}},
+	}
+
+	got := dmInboxRelays(events)
+	want := []string{"ws://localhost:7777/path", "wss://inbox.nostr.wine"}
+	if !equalStrings(got, want) {
+		t.Fatalf("dm inbox relays = %+v, want %+v", got, want)
+	}
+}
+
+func TestOldestRelayEventCreatedAt(t *testing.T) {
+	events := []relayquery.Event{
+		{Event: &nostr.Event{CreatedAt: nostr.Timestamp(1_710_000_100)}},
+		{Event: &nostr.Event{CreatedAt: nostr.Timestamp(1_710_000_050)}},
+		{Event: nil},
+	}
+	if got := oldestRelayEventCreatedAt(events); got != 1_710_000_050 {
+		t.Fatalf("oldest = %d", got)
+	}
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

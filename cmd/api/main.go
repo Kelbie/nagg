@@ -68,6 +68,8 @@ func main() {
 			EngagementLimit: cfg.OnDemand.EngagementLimit,
 			ThreadLimit:     cfg.OnDemand.ThreadLimit,
 			FollowLimit:     cfg.OnDemand.FollowLimit,
+			DMLimit:         cfg.OnDemand.DMLimit,
+			DMBackfillPages: cfg.OnDemand.DMBackfillPages,
 		})
 	}
 

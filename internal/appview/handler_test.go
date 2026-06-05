@@ -128,11 +128,13 @@ func (s *sequencedFeedStore) TrendingFeed(context.Context, time.Time, uint64) ([
 
 type sequencedEventStore struct {
 	fakeStore
-	events [][]chstore.EventView
-	calls  int
+	events      [][]chstore.EventView
+	calls       int
+	eventInputs []chstore.EventQueryInput
 }
 
-func (s *sequencedEventStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error) {
+func (s *sequencedEventStore) QueryEvents(_ context.Context, input chstore.EventQueryInput) ([]chstore.EventView, error) {
+	s.eventInputs = append(s.eventInputs, input)
 	if len(s.events) == 0 {
 		s.calls++
 		return nil, nil
@@ -214,6 +216,31 @@ type fakeHydratingUserBackfiller struct {
 func (f *fakeHydratingUserBackfiller) HydrateUserFeed(ctx context.Context, pubkey string, limit uint64) (bool, error) {
 	f.hydrated++
 	return f.completed, f.BackfillUserFeed(ctx, pubkey, limit)
+}
+
+type fakeDMEnvelopeBackfiller struct {
+	fakeUserBackfiller
+	completed bool
+	calls     int
+	hydrated  int
+	pubkey    string
+	kinds     []int
+	until     int64
+	limit     uint64
+}
+
+func (f *fakeDMEnvelopeBackfiller) BackfillDMEnvelopes(_ context.Context, pubkey string, kinds []int, until int64, limit uint64) error {
+	f.calls++
+	f.pubkey = pubkey
+	f.kinds = append([]int(nil), kinds...)
+	f.until = until
+	f.limit = limit
+	return nil
+}
+
+func (f *fakeDMEnvelopeBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) (bool, error) {
+	f.hydrated++
+	return f.completed, f.BackfillDMEnvelopes(ctx, pubkey, kinds, until, limit)
 }
 
 type fakeAppBackfiller struct {
@@ -499,6 +526,39 @@ func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	}
 	if len(response.Items) != 0 {
 		t.Fatalf("items = %+v, want stale empty response", response.Items)
+	}
+}
+
+func TestDMEnvelopesHydratesViewerInbox(t *testing.T) {
+	store := &sequencedEventStore{fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}}}
+	backfiller := &fakeDMEnvelopeBackfiller{}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/dm/envelopes?viewer="+testPubkey+"&limit=25&until=1710000000", nil)
+	handler.dmEnvelopes(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.hydrated != 1 || backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.until != 1_710_000_000 || backfiller.limit != 25 {
+		t.Fatalf("dm hydration = %+v", backfiller)
+	}
+	if len(backfiller.kinds) != 1 || backfiller.kinds[0] != 1059 {
+		t.Fatalf("dm kinds = %+v", backfiller.kinds)
+	}
+	if len(store.eventInputs) != 2 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	if len(store.eventInputs[0].PubKeys) != 1 || store.eventInputs[0].PubKeys[0] != testPubkey {
+		t.Fatalf("authored input = %+v", store.eventInputs[0])
+	}
+	if len(store.eventInputs[1].Tags) != 1 || store.eventInputs[1].Tags[0].Key != "p" || store.eventInputs[1].Tags[0].Value != testPubkey {
+		t.Fatalf("received input = %+v", store.eventInputs[1])
 	}
 }
 

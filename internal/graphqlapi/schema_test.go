@@ -379,6 +379,31 @@ func (f *fakeHydratingUserBackfiller) HydrateUserFeed(ctx context.Context, pubke
 	return f.completed, f.BackfillUserFeed(ctx, pubkey, limit)
 }
 
+type fakeDMEnvelopeBackfiller struct {
+	fakeUserBackfiller
+	completed bool
+	calls     int
+	hydrated  int
+	pubkey    string
+	kinds     []int
+	until     int64
+	limit     uint64
+}
+
+func (f *fakeDMEnvelopeBackfiller) BackfillDMEnvelopes(_ context.Context, pubkey string, kinds []int, until int64, limit uint64) error {
+	f.calls++
+	f.pubkey = pubkey
+	f.kinds = append([]int(nil), kinds...)
+	f.until = until
+	f.limit = limit
+	return nil
+}
+
+func (f *fakeDMEnvelopeBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) (bool, error) {
+	f.hydrated++
+	return f.completed, f.BackfillDMEnvelopes(ctx, pubkey, kinds, until, limit)
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {
@@ -1002,6 +1027,47 @@ func TestEventsQueryReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	nodes := events["nodes"].([]any)
 	if len(nodes) != 0 {
 		t.Fatalf("nodes len = %d, want 0", len(nodes))
+	}
+}
+
+func TestDMEnvelopesQueryHydratesViewerInbox(t *testing.T) {
+	store := &fakeStore{}
+	backfiller := &fakeDMEnvelopeBackfiller{}
+	schema, err := NewSchema(store, WithUserFeedBackfill(backfiller))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			dmEnvelopes(input:{
+				viewer:"` + testPubkey + `",
+				kinds:[1059],
+				until:1710000000,
+				limit:25
+			}) { nodes { id kind pubkey } }
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if backfiller.hydrated != 1 || backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.until != 1_710_000_000 || backfiller.limit != 25 {
+		t.Fatalf("dm hydration = %+v", backfiller)
+	}
+	if len(backfiller.kinds) != 1 || backfiller.kinds[0] != 1059 {
+		t.Fatalf("dm kinds = %+v", backfiller.kinds)
+	}
+	if len(store.eventInputs) != 2 {
+		t.Fatalf("event inputs = %+v", store.eventInputs)
+	}
+	if len(store.eventInputs[0].PubKeys) != 1 || store.eventInputs[0].PubKeys[0] != testPubkey {
+		t.Fatalf("authored input = %+v", store.eventInputs[0])
+	}
+	if len(store.eventInputs[1].Tags) != 1 || store.eventInputs[1].Tags[0].Key != "p" || store.eventInputs[1].Tags[0].Value != testPubkey {
+		t.Fatalf("received input = %+v", store.eventInputs[1])
 	}
 }
 

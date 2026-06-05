@@ -73,6 +73,8 @@ type OnDemandConfig struct {
 	EngagementLimit int
 	ThreadLimit     int
 	FollowLimit     int
+	DMLimit         int
+	DMBackfillPages int
 }
 
 func Load() (Config, error) {
@@ -90,7 +92,7 @@ func Load() (Config, error) {
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
-			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10051,30078,38000")),
+			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
 			SeenCacheSize: parseInt(env("NAGG_SEEN_CACHE_SIZE", "200000")),
@@ -120,6 +122,8 @@ func Load() (Config, error) {
 			EngagementLimit: parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
 			ThreadLimit:     parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
 			FollowLimit:     parseInt(env("NAGG_ON_DEMAND_FOLLOW_LIMIT", "1000")),
+			DMLimit:         parseInt(env("NAGG_ON_DEMAND_DM_LIMIT", "200")),
+			DMBackfillPages: parseInt(env("NAGG_ON_DEMAND_DM_BACKFILL_PAGES", "2")),
 		},
 		Viewer: ViewerConfig{
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),

@@ -57,6 +57,7 @@ var hex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 type resolver struct {
 	store                   Store
 	userBackfiller          UserFeedBackfiller
+	dmEnvelopeBackfiller    DMEnvelopeBackfiller
 	profileSearcher         ProfileSearcher
 	pubkeyScoreMinFollowers uint64
 }
@@ -77,11 +78,22 @@ type UserFeedsHydrator interface {
 	HydrateUserFeeds(context.Context, []string, uint64) (bool, error)
 }
 
+type DMEnvelopeBackfiller interface {
+	BackfillDMEnvelopes(context.Context, string, []int, int64, uint64) error
+}
+
+type DMEnvelopeHydrator interface {
+	HydrateDMEnvelopes(context.Context, string, []int, int64, uint64) (bool, error)
+}
+
 type Option func(*resolver)
 
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 	return func(r *resolver) {
 		r.userBackfiller = backfiller
+		if b, ok := backfiller.(DMEnvelopeBackfiller); ok {
+			r.dmEnvelopeBackfiller = b
+		}
 	}
 }
 

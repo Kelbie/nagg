@@ -43,6 +43,7 @@ var Names = []string{
 	"graphql.dmConversation",
 	"graphql.followStatus",
 	"graphql.ownProfiles",
+	"appview.dmEnvelopes",
 	"appview.v1",
 }
 
@@ -54,6 +55,7 @@ var AppViewRoutes = []string{
 	"/nostr/thread",
 	"/nostr/follows",
 	"/nostr/events",
+	"/nostr/dm/envelopes",
 	"/nostr/profiles",
 	"/nostr/profile",
 	"/nostr/search",
