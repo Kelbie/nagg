@@ -39,6 +39,10 @@ var Names = []string{
 	"graphql.trending",
 	"graphql.notifications",
 	"graphql.profileSearch",
+	"graphql.dmEnvelopes",
+	"graphql.dmConversation",
+	"graphql.followStatus",
+	"graphql.ownProfiles",
 	"appview.v1",
 }
 

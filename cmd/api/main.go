@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vertex-lab/nagg/internal/appview"
+	"github.com/vertex-lab/nagg/internal/cache"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
@@ -85,13 +86,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	responseCache := cache.New(cfg.Cache.URL, logger)
+	if responseCache.Enabled() {
+		slog.Info("response cache enabled", "default_ttl", cfg.Cache.DefaultTTL)
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/graphql", graphqlapi.Handler(schema, graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout)))
+	gqlHandler := graphqlapi.Handler(schema, graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout))
+	mux.HandleFunc("/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
+	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
 	appviewOpts := []appview.Option{
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
+		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL),
 	}
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))

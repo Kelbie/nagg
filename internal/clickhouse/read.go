@@ -387,6 +387,67 @@ func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[st
 	return out, rows.Err()
 }
 
+// FollowEdge describes the directional follow relationship between a viewer and
+// a candidate pubkey.
+type FollowEdge struct {
+	Following  bool `json:"following"`  // viewer -> candidate
+	FollowsYou bool `json:"followsYou"` // candidate -> viewer
+}
+
+// FollowEdges reports, for each candidate, whether the viewer follows them and
+// whether they follow the viewer. Both directions are derived from the latest
+// kind-3 contact list of the relevant author (not raw tag history) so a contact
+// dropped from a newer list is not reported as a stale follow.
+func (s *Store) FollowEdges(ctx context.Context, viewer string, candidates []string) (map[string]FollowEdge, error) {
+	candidates = uniqueStrings(candidates)
+	out := make(map[string]FollowEdge, len(candidates))
+	for _, candidate := range candidates {
+		out[candidate] = FollowEdge{}
+	}
+	if viewer == "" || len(candidates) == 0 {
+		return out, nil
+	}
+
+	// viewer -> candidate, from the viewer's latest kind-3 p-tags.
+	viewerLatest, err := s.QueryLatestEventsByPubKeys(ctx, []string{viewer}, []int{3}, 1)
+	if err != nil {
+		return nil, err
+	}
+	viewerFollows := map[string]struct{}{}
+	for _, event := range viewerLatest[viewer] {
+		for _, tag := range event.Tags {
+			if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
+				viewerFollows[tag[1]] = struct{}{}
+			}
+		}
+	}
+
+	// candidate -> viewer, from each candidate's latest kind-3 p-tags.
+	candidateLatest, err := s.QueryLatestEventsByPubKeys(ctx, candidates, []int{3}, 1)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range candidates {
+		edge := out[candidate]
+		if _, ok := viewerFollows[candidate]; ok {
+			edge.Following = true
+		}
+		for _, event := range candidateLatest[candidate] {
+			for _, tag := range event.Tags {
+				if len(tag) >= 2 && tag[0] == "p" && tag[1] == viewer {
+					edge.FollowsYou = true
+					break
+				}
+			}
+			if edge.FollowsYou {
+				break
+			}
+		}
+		out[candidate] = edge
+	}
+	return out, nil
+}
+
 func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error) {
 	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
 	if err != nil {

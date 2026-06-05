@@ -15,6 +15,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/vertex-lab/nagg/internal/cache"
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -46,6 +47,8 @@ type Handler struct {
 	rateLimiter               *rateLimiter
 	vertexProfileMinFollowers uint64
 	viewerPubkey              string
+	cache                     cache.Cache
+	cacheTTL                  time.Duration
 }
 
 type VertexClient interface {
@@ -85,6 +88,15 @@ func WithViewerPubkey(pubkey string) Option {
 func WithNIP05Validation(enabled bool) Option {
 	return func(h *Handler) {
 		h.nip05Validator = newNIP05Validator(enabled)
+	}
+}
+
+// WithResponseCache enables the shared Redis response cache for the REST
+// app-view routes. A disabled cache is a no-op.
+func WithResponseCache(c cache.Cache, defaultTTL time.Duration) Option {
+	return func(h *Handler) {
+		h.cache = c
+		h.cacheTTL = defaultTTL
 	}
 }
 
@@ -144,17 +156,28 @@ func (h *Handler) setOptionalBackfillers(backfiller any) {
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
-	mux.HandleFunc("/nostr/capabilities", h.withMiddleware(h.capabilities))
-	mux.HandleFunc("/nostr/feed", h.withMiddleware(h.feed))
-	mux.HandleFunc("/nostr/feed/user", h.withMiddleware(h.userFeed))
-	mux.HandleFunc("/nostr/notes/stats", h.withMiddleware(h.noteStats))
-	mux.HandleFunc("/nostr/thread", h.withMiddleware(h.thread))
-	mux.HandleFunc("/nostr/follows", h.withMiddleware(h.follows))
-	mux.HandleFunc("/nostr/events", h.withMiddleware(h.events))
-	mux.HandleFunc("/nostr/profiles", h.withMiddleware(h.profiles))
-	mux.HandleFunc("/nostr/profile", h.withMiddleware(h.profile))
-	mux.HandleFunc("/nostr/search", h.withMiddleware(h.search))
-	mux.HandleFunc("/nostr/recommended", h.withMiddleware(h.recommended))
+	routes := []struct {
+		path    string
+		handler http.HandlerFunc
+	}{
+		{"/nostr/capabilities", h.capabilities},
+		{"/nostr/feed", h.feed},
+		{"/nostr/feed/user", h.userFeed},
+		{"/nostr/notes/stats", h.noteStats},
+		{"/nostr/thread", h.thread},
+		{"/nostr/follows", h.follows},
+		{"/nostr/events", h.events},
+		{"/nostr/profiles", h.profiles},
+		{"/nostr/profile", h.profile},
+		{"/nostr/search", h.search},
+		{"/nostr/recommended", h.recommended},
+	}
+	for _, route := range routes {
+		wrapped := h.withMiddleware(route.handler)
+		mux.HandleFunc(route.path, wrapped)
+		// Forward-looking versioned alias; both share the same cache + middleware.
+		mux.HandleFunc("/v1"+route.path, wrapped)
+	}
 }
 
 func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
@@ -162,6 +185,12 @@ func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	// Capabilities headers and rate limiting always run; the response cache wraps
+	// the underlying handler so hits still carry the standard headers.
+	handler := next
+	if h.cache != nil && h.cache.Enabled() {
+		handler = cache.WrapREST(next, h.cache, h.cacheTTL)
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		capabilities.WriteHeaders(w)
 		if !h.rateLimiter.allow(r) {
@@ -170,7 +199,7 @@ func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		next(w, r.WithContext(ctx))
+		handler(w, r.WithContext(ctx))
 	}
 }
 

@@ -26,10 +26,18 @@ type Config struct {
 	OnDemand   OnDemandConfig
 	Viewer     ViewerConfig
 	Enrich     EnrichConfig
+	Cache      CacheConfig
 }
 
 type APIConfig struct {
 	GraphQLTimeout time.Duration
+}
+
+// CacheConfig configures the optional shared Redis response cache. When URL is
+// empty the cache is disabled and every request is computed as before.
+type CacheConfig struct {
+	URL        string
+	DefaultTTL time.Duration
 }
 
 type VertexConfig struct {
@@ -82,7 +90,7 @@ func Load() (Config, error) {
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
-			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,6,7,16,9735,38000")),
+			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,444,445,1059,1063,9735,30078,38000")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
 			SeenCacheSize: parseInt(env("NAGG_SEEN_CACHE_SIZE", "200000")),
@@ -125,6 +133,10 @@ func Load() (Config, error) {
 			ModelBackend:             strings.ToLower(env("NAGG_ENRICH_MODEL_BACKEND", "go")),
 			OnnxLibraryPath:          strings.TrimSpace(os.Getenv("NAGG_ENRICH_ONNX_LIBRARY_PATH")),
 			TrendingDedupeSimilarity: parseFloat(env("NAGG_TRENDING_DEDUPE_SIM", "0.82")),
+		},
+		Cache: CacheConfig{
+			URL:        strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
+			DefaultTTL: parseDuration(env("NAGG_CACHE_DEFAULT_TTL", "30s")),
 		},
 	}
 
@@ -204,6 +216,9 @@ func (c Config) validate() error {
 			return fmt.Errorf("NAGG_ENRICH_TASKS contains unsupported task %q", task)
 		}
 	}
+	// NAGG_REDIS_URL is intentionally not validated here: the cache is
+	// best-effort, so an empty or malformed URL just disables it (see cache.New)
+	// rather than failing the process.
 	return nil
 }
 

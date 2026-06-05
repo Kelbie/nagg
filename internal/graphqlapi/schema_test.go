@@ -272,6 +272,22 @@ func (s *fakeStore) SearchProfiles(_ context.Context, query string, limit uint64
 	return s.profileSearchRows, nil
 }
 
+func (s *fakeStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
+	out := make(map[string]chstore.FollowCounts, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		out[pubkey] = chstore.FollowCounts{}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) FollowEdges(_ context.Context, _ string, candidates []string) (map[string]chstore.FollowEdge, error) {
+	out := make(map[string]chstore.FollowEdge, len(candidates))
+	for _, candidate := range candidates {
+		out[candidate] = chstore.FollowEdge{}
+	}
+	return out, nil
+}
+
 func (s *fakeStore) CachedVertexProfiles(_ context.Context, pubkeys []string) (map[string]vertex.ProfileResult, error) {
 	out := make(map[string]vertex.ProfileResult, len(pubkeys))
 	for _, pubkey := range pubkeys {

@@ -32,6 +32,8 @@ type Store interface {
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
+	BatchFollowCounts(context.Context, []string) (map[string]chstore.FollowCounts, error)
+	FollowEdges(context.Context, string, []string) (map[string]chstore.FollowEdge, error)
 	SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
@@ -1024,6 +1026,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			},
 		},
 	})
+
+	for name, field := range socialQueryFields(r, eventConnectionType) {
+		queryType.AddFieldConfig(name, field)
+	}
 
 	return graphql.NewSchema(graphql.SchemaConfig{Query: queryType})
 }
