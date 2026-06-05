@@ -98,6 +98,14 @@ func (s *Store) Close() error {
 	return s.conn.Close()
 }
 
+func (s *Store) EventCount(ctx context.Context) (uint64, error) {
+	var count uint64
+	if err := s.conn.QueryRow(ctx, "SELECT count() FROM nostr_events").Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *Store) prepareInsertBatch(ctx context.Context, query string) (chdriver.Batch, error) {
 	return s.conn.PrepareBatch(ctx, query, chdriver.WithReleaseConnection())
 }

@@ -116,9 +116,7 @@ func main() {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
-	})
+	mux.HandleFunc("/healthz", healthHandler(store))
 
 	addr := listenAddr(os.Getenv)
 	server := &http.Server{
@@ -139,6 +137,32 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+}
+
+type eventCounter interface {
+	EventCount(context.Context) (uint64, error)
+}
+
+type healthResponse struct {
+	OK         string `json:"ok"`
+	EventCount uint64 `json:"eventCount,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+func healthHandler(counter eventCounter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		eventCount, err := counter.EventCount(ctx)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event count failed"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(healthResponse{OK: "true", EventCount: eventCount})
+	}
 }
 
 func listenAddr(getenv func(string) string) string {
