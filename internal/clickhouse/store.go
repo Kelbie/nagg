@@ -106,12 +106,18 @@ func closeUnsentBatch(batch chdriver.Batch) {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration, derivedMigration, notificationsMigration} {
+	for _, migration := range embeddedMigrations() {
 		for _, stmt := range splitSQLStatements(migration) {
 			if err := s.conn.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("migration failed: %w", err)
 			}
 		}
+	}
+	// The CREATEs above ensure declared tables/views exist; the reconciler then
+	// strips anything the embedded SQL no longer declares and evolves columns,
+	// making the SQL files the single declarative source of truth.
+	if err := s.reconcileSchema(ctx, schemaReconcileMode()); err != nil {
+		return fmt.Errorf("schema reconcile failed: %w", err)
 	}
 	return nil
 }
