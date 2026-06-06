@@ -56,9 +56,9 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 	New(store, WithNIP05Validation(false), WithRateLimit(1_000, time.Minute)).Register(mux)
 
 	var feed FeedResponse
-	requestJSON(t, mux, http.MethodGet, "/nostr/feed?kind=trending&limit=5", nil, &feed)
+	requestJSON(t, mux, http.MethodGet, "/nostr/feed?pubkeys="+integrationAlice+"&limit=5", nil, &feed)
 	if len(feed.Items) == 0 || feed.Items[0].Type != "note" || feed.Items[0].Event.ID != integrationRootID {
-		t.Fatalf("trending feed first item = %+v", feed.Items)
+		t.Fatalf("feed first item = %+v", feed.Items)
 	}
 	assertRootStats(t, feed.Metrics[integrationRootID])
 	if profile := feed.Profiles[integrationAlice]; profile.Name != "Alice" {

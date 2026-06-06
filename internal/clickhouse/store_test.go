@@ -48,19 +48,6 @@ func TestSatsFromBolt11HRP(t *testing.T) {
 	}
 }
 
-func TestTrendingCacheKeyBucketsSinceToMinute(t *testing.T) {
-	since := time.Date(2026, 5, 31, 12, 34, 56, 0, time.UTC)
-	roundedA, keyA := trendingCacheKey(since, 30)
-	roundedB, keyB := trendingCacheKey(since.Add(3*time.Second), 30)
-
-	if !roundedA.Equal(time.Date(2026, 5, 31, 12, 34, 0, 0, time.UTC)) {
-		t.Fatalf("rounded = %s", roundedA)
-	}
-	if !roundedA.Equal(roundedB) || keyA != keyB {
-		t.Fatalf("keys = %q/%q rounded = %s/%s", keyA, keyB, roundedA, roundedB)
-	}
-}
-
 func TestNotificationPolicyThresholds(t *testing.T) {
 	tests := map[string]struct {
 		actor  float64
@@ -198,20 +185,3 @@ func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
 	}
 }
 
-func TestDedupeTrendingClusterRowsKeepsFirstUniqueIDs(t *testing.T) {
-	rows := []TrendingClusterRow{
-		{ID: "cluster:a", Score: 10, EventCount: 10},
-		{ID: "cluster:b", Score: 9, EventCount: 9},
-		{ID: "cluster:a", Score: 8, EventCount: 8},
-		{ID: "cluster:c", Score: 7, EventCount: 7},
-	}
-
-	got := dedupeTrendingClusterRows(rows, 3)
-
-	if len(got) != 3 {
-		t.Fatalf("rows = %+v", got)
-	}
-	if got[0].ID != "cluster:a" || got[1].ID != "cluster:b" || got[2].ID != "cluster:c" {
-		t.Fatalf("rows = %+v", got)
-	}
-}

@@ -95,7 +95,7 @@ func (s *Store) WriteEnrichmentAnnotations(ctx context.Context, annotations []en
 	if len(annotations) == 0 {
 		return nil
 	}
-	tagRows, metricRows, embeddingRows, clusterRows := countAnnotationRows(annotations)
+	tagRows, metricRows, embeddingRows := countAnnotationRows(annotations)
 	if tagRows > 0 {
 		if err := s.writeDerivedTags(ctx, annotations); err != nil {
 			return err
@@ -108,11 +108,6 @@ func (s *Store) WriteEnrichmentAnnotations(ctx context.Context, annotations []en
 	}
 	if embeddingRows > 0 {
 		if err := s.writeEventEmbeddings(ctx, annotations); err != nil {
-			return err
-		}
-	}
-	if clusterRows > 0 {
-		if err := s.writeTrendingClusters(ctx, annotations); err != nil {
 			return err
 		}
 	}
@@ -142,11 +137,10 @@ func (s *Store) SaveEnrichmentState(ctx context.Context, state enrich.State) err
 	`, task, cursorCreatedAt, cursorEventID, state.Processed, state.Failed, updatedAt)
 }
 
-func countAnnotationRows(annotations []enrich.Annotation) (int, int, int, int) {
+func countAnnotationRows(annotations []enrich.Annotation) (int, int, int) {
 	var tagRows int
 	var metricRows int
 	var embeddingRows int
-	var clusterRows int
 	for _, annotation := range annotations {
 		for _, tag := range annotation.Tags {
 			if strings.TrimSpace(tag.Key) != "" {
@@ -161,13 +155,8 @@ func countAnnotationRows(annotations []enrich.Annotation) (int, int, int, int) {
 		if len(annotation.Embedding) > 0 {
 			embeddingRows++
 		}
-		for _, cluster := range annotation.Clusters {
-			if strings.TrimSpace(cluster.ID) != "" {
-				clusterRows++
-			}
-		}
 	}
-	return tagRows, metricRows, embeddingRows, clusterRows
+	return tagRows, metricRows, embeddingRows
 }
 
 func (s *Store) writeDerivedTags(ctx context.Context, annotations []enrich.Annotation) error {
@@ -262,43 +251,6 @@ func (s *Store) writeEventEmbeddings(ctx context.Context, annotations []enrich.A
 	return batch.Send()
 }
 
-func (s *Store) writeTrendingClusters(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO trending_clusters")
-	if err != nil {
-		return err
-	}
-	defer closeUnsentBatch(batch)
-	seen := map[string]struct{}{}
-	for _, annotation := range annotations {
-		for _, cluster := range annotation.Clusters {
-			id := strings.TrimSpace(cluster.ID)
-			if id == "" {
-				continue
-			}
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			seen[id] = struct{}{}
-			if err := batch.Append(
-				id,
-				cluster.Window,
-				cluster.StartedAt,
-				cluster.Category,
-				cluster.Subcategory,
-				cluster.Title,
-				cluster.Description,
-				cluster.Centroid,
-				cluster.EventCount,
-				cluster.Score,
-				clusterComputedAt(annotation, cluster),
-			); err != nil {
-				return err
-			}
-		}
-	}
-	return batch.Send()
-}
-
 func annotationComputedAt(annotation enrich.Annotation) time.Time {
 	if !annotation.ComputedAt.IsZero() {
 		return annotation.ComputedAt
@@ -312,11 +264,4 @@ func annotationModelVersion(annotation enrich.Annotation) string {
 		return "unknown"
 	}
 	return version
-}
-
-func clusterComputedAt(annotation enrich.Annotation, cluster enrich.TrendingCluster) time.Time {
-	if !cluster.ComputedAt.IsZero() {
-		return cluster.ComputedAt
-	}
-	return annotationComputedAt(annotation)
 }

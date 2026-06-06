@@ -54,14 +54,13 @@ type ViewerConfig struct {
 }
 
 type EnrichConfig struct {
-	Tasks                    []string
-	BatchSize                int
-	PollInterval             time.Duration
-	ModelDir                 string
-	ModelVersion             string
-	ModelBackend             string
-	OnnxLibraryPath          string
-	TrendingDedupeSimilarity float64
+	Tasks           []string
+	BatchSize       int
+	PollInterval    time.Duration
+	ModelDir        string
+	ModelVersion    string
+	ModelBackend    string
+	OnnxLibraryPath string
 }
 
 type OnDemandConfig struct {
@@ -136,14 +135,13 @@ func Load() (Config, error) {
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),
 		},
 		Enrich: EnrichConfig{
-			Tasks:                    splitCSV(env("NAGG_ENRICH_TASKS", "topics,embeddings,trending,stance,sentiment,quality,controversy,nsfw")),
-			BatchSize:                parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
-			PollInterval:             parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
-			ModelDir:                 strings.TrimSpace(os.Getenv("NAGG_ENRICH_MODEL_DIR")),
-			ModelVersion:             env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
-			ModelBackend:             strings.ToLower(env("NAGG_ENRICH_MODEL_BACKEND", "go")),
-			OnnxLibraryPath:          strings.TrimSpace(os.Getenv("NAGG_ENRICH_ONNX_LIBRARY_PATH")),
-			TrendingDedupeSimilarity: parseFloat(env("NAGG_TRENDING_DEDUPE_SIM", "0.82")),
+			Tasks:           splitCSV(env("NAGG_ENRICH_TASKS", "embeddings,stance,sentiment,quality,controversy,nsfw")),
+			BatchSize:       parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
+			PollInterval:    parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
+			ModelDir:        strings.TrimSpace(os.Getenv("NAGG_ENRICH_MODEL_DIR")),
+			ModelVersion:    env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
+			ModelBackend:    strings.ToLower(env("NAGG_ENRICH_MODEL_BACKEND", "go")),
+			OnnxLibraryPath: strings.TrimSpace(os.Getenv("NAGG_ENRICH_ONNX_LIBRARY_PATH")),
 		},
 		Cache: CacheConfig{
 			URL:        strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
@@ -213,9 +211,6 @@ func (c Config) validate() error {
 	}
 	if strings.TrimSpace(c.Enrich.ModelVersion) == "" {
 		return errors.New("NAGG_ENRICH_MODEL_VERSION must be non-empty")
-	}
-	if c.Enrich.TrendingDedupeSimilarity <= 0 || c.Enrich.TrendingDedupeSimilarity > 1 {
-		return errors.New("NAGG_TRENDING_DEDUPE_SIM must be greater than 0 and less than or equal to 1")
 	}
 	switch c.Enrich.ModelBackend {
 	case "", "go", "gomlx", "ort", "onnx", "onnxruntime":
@@ -308,14 +303,6 @@ func parseInt(value string) int {
 
 func parseInt64(value string) int64 {
 	n, err := strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
-func parseFloat(value string) float64 {
-	n, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return 0
 	}

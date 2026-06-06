@@ -29,10 +29,6 @@ func (s fakeStore) FollowsFeed(context.Context, []string, int64, uint64, uint64)
 	return nil, nil
 }
 
-func (s fakeStore) TrendingFeed(context.Context, time.Time, uint64) ([]chstore.EventView, error) {
-	return nil, nil
-}
-
 func (s fakeStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error) {
 	return nil, nil
 }
@@ -101,10 +97,9 @@ func (s *profilePolicySpyStore) SaveVertexProfile(_ context.Context, profile ver
 
 type sequencedFeedStore struct {
 	fakeStore
-	feeds         [][]chstore.EventView
-	calls         int
-	authors       [][]string
-	trendingCalls int
+	feeds   [][]chstore.EventView
+	calls   int
+	authors [][]string
 }
 
 func (s *sequencedFeedStore) FollowsFeed(_ context.Context, authors []string, _ int64, _ uint64, _ uint64) ([]chstore.EventView, error) {
@@ -119,11 +114,6 @@ func (s *sequencedFeedStore) FollowsFeed(_ context.Context, authors []string, _ 
 	}
 	s.calls++
 	return s.feeds[idx], nil
-}
-
-func (s *sequencedFeedStore) TrendingFeed(context.Context, time.Time, uint64) ([]chstore.EventView, error) {
-	s.trendingCalls++
-	return nil, nil
 }
 
 type sequencedEventStore struct {
@@ -364,21 +354,17 @@ func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if store.trendingCalls != 0 {
-		t.Fatalf("trending calls = %d", store.trendingCalls)
-	}
 	if len(store.authors) != 1 || len(store.authors[0]) != 1 || store.authors[0][0] != testPubkey {
 		t.Fatalf("authors = %+v", store.authors)
 	}
 }
 
-func TestConfiguredViewerPubkeyDoesNotOverrideTrendingFeedSpec(t *testing.T) {
+func TestFeedWithoutAuthorsReturnsEmpty(t *testing.T) {
 	store := &sequencedFeedStore{
 		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
 	}
 	handler := New(
 		store,
-		WithViewerPubkey(testPubkey),
 		WithNIP05Validation(false),
 	)
 
@@ -386,15 +372,12 @@ func TestConfiguredViewerPubkeyDoesNotOverrideTrendingFeedSpec(t *testing.T) {
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/nostr/feed",
-		strings.NewReader(`{"spec":"{\"id\":\"trending-cluster\"}","limit":5}`),
+		strings.NewReader(`{"spec":"{\"id\":\"some-feed\"}","limit":5}`),
 	)
 	handler.feed(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
-	}
-	if store.trendingCalls != 1 {
-		t.Fatalf("trending calls = %d", store.trendingCalls)
 	}
 	if len(store.authors) != 0 {
 		t.Fatalf("authors = %+v", store.authors)
@@ -548,7 +531,7 @@ func TestDMEnvelopesHydratesViewerInbox(t *testing.T) {
 	if backfiller.hydrated != 1 || backfiller.calls != 1 || backfiller.pubkey != testPubkey || backfiller.until != 1_710_000_000 || backfiller.limit != 25 {
 		t.Fatalf("dm hydration = %+v", backfiller)
 	}
-	if len(backfiller.kinds) != 1 || backfiller.kinds[0] != 1059 {
+	if len(backfiller.kinds) != 2 || backfiller.kinds[0] != 4 || backfiller.kinds[1] != 1059 {
 		t.Fatalf("dm kinds = %+v", backfiller.kinds)
 	}
 	if len(store.eventInputs) != 2 {
@@ -559,6 +542,47 @@ func TestDMEnvelopesHydratesViewerInbox(t *testing.T) {
 	}
 	if len(store.eventInputs[1].Tags) != 1 || store.eventInputs[1].Tags[0].Key != "p" || store.eventInputs[1].Tags[0].Value != testPubkey {
 		t.Fatalf("received input = %+v", store.eventInputs[1])
+	}
+}
+
+// TestDMEnvelopesReturnsEncryptedContentVerbatim asserts nagg is zero-knowledge
+// for DMs: the envelopes path returns the raw encrypted Content exactly as it
+// came from the store, without any decryption or rewriting. The client is the
+// only party that holds the key and decrypts.
+func TestDMEnvelopesReturnsEncryptedContentVerbatim(t *testing.T) {
+	const ciphertext = "AdseMQ8a8b1cKpQ9z3==?iv=Z3VhcmRfdGVzdF9pdg==" // opaque NIP-04 ciphertext
+	envelope := chstore.EventView{
+		ID:        strings.Repeat("c", 64),
+		PubKey:    testPubkey,
+		Kind:      4,
+		CreatedAt: time.Unix(1_710_000_000, 0),
+		Content:   ciphertext,
+		Tags:      [][]string{{"p", testPubkey}},
+		Sig:       strings.Repeat("c", 128),
+	}
+	store := &sequencedEventStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		// First call is the authored query, second is the received query.
+		events: [][]chstore.EventView{{envelope}, nil},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/dm/envelopes?viewer="+testPubkey+"&limit=25", nil)
+	handler.dmEnvelopes(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response DmEnvelopesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Envelopes) != 1 {
+		t.Fatalf("envelopes = %+v, want exactly one", response.Envelopes)
+	}
+	if got := response.Envelopes[0].Content; got != ciphertext {
+		t.Fatalf("envelope content = %q, want encrypted ciphertext verbatim %q", got, ciphertext)
 	}
 }
 

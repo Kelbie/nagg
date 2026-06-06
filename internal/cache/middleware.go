@@ -187,8 +187,6 @@ func graphqlTTL(query string, def time.Duration) time.Duration {
 		return 15 * time.Second
 	case strings.Contains(query, "ownProfiles"), strings.Contains(query, "profileSearch"):
 		return 120 * time.Second
-	case strings.Contains(query, "trending"):
-		return 60 * time.Second
 	case strings.Contains(query, "serviceInfo"):
 		return 600 * time.Second
 	case strings.Contains(query, "rankedEvents"), strings.Contains(query, "events"):

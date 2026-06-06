@@ -36,8 +36,6 @@ var Names = []string{
 	"graphql.rank.shuffle",
 	"graphql.tags.derivedDataset",
 	"graphql.tags.excludeValues",
-	"graphql.availableTopics",
-	"graphql.trending",
 	"graphql.notifications",
 	"graphql.profileSearch",
 	"graphql.dmEnvelopes",

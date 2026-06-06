@@ -42,10 +42,6 @@ type fakeStore struct {
 	vertexProfileRows           map[string]vertex.ProfileResult
 	derivedMetricRows           map[string]map[string]float64
 	derivedMetricInputs         []derivedMetricInput
-	topicRows                   []chstore.TopicRow
-	availableTopicInputs        []chstore.EventQueryInput
-	trendingRows                []chstore.TrendingClusterRow
-	trendingInputs              []chstore.TrendingInput
 	notificationRows            []chstore.NotificationRow
 	notificationInputs          []chstore.NotificationInput
 }
@@ -334,16 +330,6 @@ func (s *fakeStore) DerivedMetricValues(_ context.Context, metric string, eventI
 		}
 	}
 	return out, nil
-}
-
-func (s *fakeStore) AvailableTopics(_ context.Context, input chstore.EventQueryInput) ([]chstore.TopicRow, error) {
-	s.availableTopicInputs = append(s.availableTopicInputs, input)
-	return s.topicRows, nil
-}
-
-func (s *fakeStore) TrendingClusters(_ context.Context, input chstore.TrendingInput) ([]chstore.TrendingClusterRow, error) {
-	s.trendingInputs = append(s.trendingInputs, input)
-	return s.trendingRows, nil
 }
 
 func (s *fakeStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
@@ -2928,140 +2914,6 @@ func TestEventsAcceptsNegativeEventFilters(t *testing.T) {
 	}
 	if len(input.ExcludePubKeys) != 1 || input.ExcludePubKeys[0] != hiddenPubkey {
 		t.Fatalf("exclude pubkeys = %+v", input.ExcludePubKeys)
-	}
-}
-
-func TestAvailableTopicsReturnsDerivedTopicRows(t *testing.T) {
-	store := &fakeStore{
-		topicRows: []chstore.TopicRow{
-			{Value: "crypto.bitcoin", Parent: "crypto", Label: "Bitcoin", IsDefault: true, Count: 42},
-		},
-	}
-	schema, err := NewSchema(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result := graphql.Do(graphql.Params{
-		Schema: schema,
-		RequestString: `query {
-			availableTopics(input:{kinds:[1], limit:25}) {
-				value
-				parent
-				label
-				isDefault
-				count
-			}
-		}`,
-		Context: context.Background(),
-	})
-
-	if len(result.Errors) > 0 {
-		t.Fatalf("graphql errors = %+v", result.Errors)
-	}
-	data := result.Data.(map[string]any)
-	topics := data["availableTopics"].([]any)
-	if len(topics) != 1 {
-		t.Fatalf("topics = %+v", topics)
-	}
-	topic := topics[0].(map[string]any)
-	if topic["value"] != "crypto.bitcoin" || topic["label"] != "Bitcoin" || topic["count"] != 42 {
-		t.Fatalf("topic = %+v", topic)
-	}
-	if len(store.availableTopicInputs) != 1 {
-		t.Fatalf("available topic inputs = %+v", store.availableTopicInputs)
-	}
-	input := store.availableTopicInputs[0]
-	if len(input.Kinds) != 1 || input.Kinds[0] != 1 || input.Limit != 25 {
-		t.Fatalf("available topic input = %+v", input)
-	}
-}
-
-func TestTrendingReturnsClustersWithSampleEvents(t *testing.T) {
-	clusterID := "cluster-h24-crypto"
-	sampleID := testHex("9")
-	store := &fakeStore{
-		events: [][]chstore.EventView{{
-			{
-				ID:        sampleID,
-				PubKey:    testPubkey,
-				Kind:      1,
-				CreatedAt: time.Unix(1_710_000_000, 0),
-				Content:   "sample",
-				Tags:      [][]string{},
-				Sig:       strings.Repeat("9", 128),
-			},
-		}},
-		trendingRows: []chstore.TrendingClusterRow{
-			{
-				ID:          clusterID,
-				Window:      "H24",
-				StartedAt:   time.Unix(1_710_000_000, 0),
-				Category:    "crypto",
-				Subcategory: "bitcoin",
-				Title:       "Bitcoin relay chatter",
-				Description: "Clustered Bitcoin notes",
-				EventCount:  12,
-				Score:       4.5,
-				ComputedAt:  time.Unix(1_710_000_100, 0),
-			},
-		},
-	}
-	schema, err := NewSchema(store)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result := graphql.Do(graphql.Params{
-		Schema: schema,
-		RequestString: `query {
-			trending(input:{window:H24, category:"crypto", limit:2}) {
-				id
-				window
-				category
-				subcategory
-				title
-				eventCount
-				score
-				sampleEvents(limit:1) { nodes { id } }
-			}
-		}`,
-		Context: context.Background(),
-	})
-
-	if len(result.Errors) > 0 {
-		t.Fatalf("graphql errors = %+v", result.Errors)
-	}
-	data := result.Data.(map[string]any)
-	clusters := data["trending"].([]any)
-	if len(clusters) != 1 {
-		t.Fatalf("clusters = %+v", clusters)
-	}
-	cluster := clusters[0].(map[string]any)
-	if cluster["id"] != clusterID || cluster["title"] != "Bitcoin relay chatter" || cluster["eventCount"] != 12 {
-		t.Fatalf("cluster = %+v", cluster)
-	}
-	nodes := cluster["sampleEvents"].(map[string]any)["nodes"].([]any)
-	if len(nodes) != 1 || nodes[0].(map[string]any)["id"] != sampleID {
-		t.Fatalf("sample nodes = %+v", nodes)
-	}
-	if len(store.trendingInputs) != 1 {
-		t.Fatalf("trending inputs = %+v", store.trendingInputs)
-	}
-	input := store.trendingInputs[0]
-	if input.Window != "H24" || input.Category != "crypto" || input.Limit != 2 {
-		t.Fatalf("trending input = %+v", input)
-	}
-	if len(store.eventInputs) != 1 {
-		t.Fatalf("sample event inputs = %+v", store.eventInputs)
-	}
-	sampleInput := store.eventInputs[0]
-	if sampleInput.Limit != 1 || len(sampleInput.Tags) != 1 {
-		t.Fatalf("sample input = %+v", sampleInput)
-	}
-	tag := sampleInput.Tags[0]
-	if tag.Key != "cluster" || tag.Value != clusterID || tag.Dataset != "DERIVED_TAGS" {
-		t.Fatalf("sample tag = %+v", tag)
 	}
 }
 

@@ -24,7 +24,6 @@ import (
 
 type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
-	TrendingFeed(context.Context, time.Time, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
@@ -334,19 +333,17 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		req.Offset = uint64(intParam(r, "offset", 0))
 	}
 
-	authors, trending := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
-	var events []chstore.EventView
-	var err error
-	if trending || len(authors) == 0 {
-		events, err = h.store.TrendingFeed(r.Context(), time.Now().Add(-24*time.Hour), req.Limit)
-	} else {
-		events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+	authors := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
+	if len(authors) == 0 {
+		h.writeFeedResponse(w, r, nil)
+		return
 	}
+	events, err := h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if !trending && h.shouldBackfillAuthoredFeed(events, authors, req.Until, req.Limit, req.Offset) {
+	if h.shouldBackfillAuthoredFeed(events, authors, req.Until, req.Limit, req.Offset) {
 		if h.tryBackfillUserFeeds(r.Context(), takeStrings(authors, 10), req.Limit) {
 			events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
 			if err != nil {
@@ -358,47 +355,38 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	h.writeFeedResponse(w, r, events)
 }
 
-func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) ([]string, bool) {
+func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
 	if r.Method == http.MethodGet {
-		kind := r.URL.Query().Get("kind")
-		if kind == "trending" {
-			return nil, true
-		}
 		authors := normalizePubkeys(csv(r.URL.Query().Get("pubkeys")))
 		if len(authors) == 0 && h.viewerPubkey != "" {
 			authors = []string{h.viewerPubkey}
 		}
-		return authors, false
+		return authors
 	}
 	var parsed struct {
-		ID      string   `json:"id"`
 		PubKey  string   `json:"pubkey"`
 		PubKeys []string `json:"pubkeys"`
 	}
 	if err := json.Unmarshal([]byte(spec), &parsed); err != nil {
-		return nil, true
+		return nil
 	}
 	if len(parsed.PubKeys) > 0 {
-		return normalizePubkeys(parsed.PubKeys), false
+		return normalizePubkeys(parsed.PubKeys)
 	}
 	if parsed.PubKey != "" {
 		if pubkey, err := normalizePubkey(parsed.PubKey); err == nil {
-			return []string{pubkey}, false
+			return []string{pubkey}
 		}
 	}
 	if userPubkey != "" {
 		if pubkey, err := normalizePubkey(userPubkey); err == nil {
-			return []string{pubkey}, false
+			return []string{pubkey}
 		}
 	}
-	if h.viewerPubkey != "" && !isTrendingFeedID(parsed.ID) {
-		return []string{h.viewerPubkey}, false
+	if h.viewerPubkey != "" {
+		return []string{h.viewerPubkey}
 	}
-	return nil, true
-}
-
-func isTrendingFeedID(id string) bool {
-	return strings.Contains(strings.ToLower(strings.TrimSpace(id)), "trending")
+	return nil
 }
 
 func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {

@@ -38,8 +38,6 @@ type Store interface {
 	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
 	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
-	AvailableTopics(context.Context, chstore.EventQueryInput) ([]chstore.TopicRow, error)
-	TrendingClusters(context.Context, chstore.TrendingInput) ([]chstore.TrendingClusterRow, error)
 	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 }
@@ -171,11 +169,6 @@ type eventNode struct {
 	event          chstore.EventView
 	relations      *pubkeyRelationCache
 	eventRelations *eventRelationCache
-}
-
-type trendingClusterNode struct {
-	row   chstore.TrendingClusterRow
-	store Store
 }
 
 type notificationNode struct {
@@ -689,78 +682,6 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"appViews":             &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(appViewCapabilityType)))},
 		},
 	})
-	topicType := graphql.NewObject(graphql.ObjectConfig{
-		Name: "Topic",
-		Fields: graphql.Fields{
-			"value":     &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"parent":    &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"label":     &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
-			"isDefault": &graphql.Field{Type: graphql.NewNonNull(graphql.Boolean)},
-			"count":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
-		},
-	})
-	trendingWindowEnumType := graphql.NewEnum(graphql.EnumConfig{
-		Name: "TrendingWindow",
-		Values: graphql.EnumValueConfigMap{
-			"H8":  &graphql.EnumValueConfig{Value: "H8"},
-			"H24": &graphql.EnumValueConfig{Value: "H24"},
-			"D7":  &graphql.EnumValueConfig{Value: "D7"},
-		},
-	})
-	trendingInputType := graphql.NewInputObject(graphql.InputObjectConfig{
-		Name: "TrendingInput",
-		Fields: graphql.InputObjectConfigFieldMap{
-			"window":   &graphql.InputObjectFieldConfig{Type: trendingWindowEnumType, DefaultValue: "H24"},
-			"category": &graphql.InputObjectFieldConfig{Type: graphql.String},
-			"limit":    &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 20},
-		},
-	})
-	trendingClusterType := graphql.NewObject(graphql.ObjectConfig{
-		Name: "TrendingCluster",
-		Fields: graphql.FieldsThunk(func() graphql.Fields {
-			return graphql.Fields{
-				"id":          &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.ID })},
-				"window":      &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Window })},
-				"startedAt":   &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.StartedAt })},
-				"category":    &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Category })},
-				"subcategory": &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Subcategory })},
-				"title":       &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Title })},
-				"description": &graphql.Field{Type: graphql.NewNonNull(graphql.String), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Description })},
-				"eventCount":  &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.EventCount })},
-				"score":       &graphql.Field{Type: graphql.NewNonNull(graphql.Float), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.Score })},
-				"computedAt":  &graphql.Field{Type: graphql.NewNonNull(graphql.DateTime), Resolve: trendingClusterField(func(row chstore.TrendingClusterRow) any { return row.ComputedAt })},
-				"sampleEvents": &graphql.Field{
-					Type: graphql.NewNonNull(eventConnectionType),
-					Args: graphql.FieldConfigArgument{"limit": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 3}},
-					Resolve: func(p graphql.ResolveParams) (any, error) {
-						cluster, ok := p.Source.(trendingClusterNode)
-						if !ok {
-							return eventConnectionSource{}, nil
-						}
-						limit := intValue(p.Args["limit"], 3)
-						if limit <= 0 || limit > 20 {
-							limit = 3
-						}
-						events, err := cluster.store.QueryEvents(p.Context, chstore.EventQueryInput{
-							Kinds: []int{1, 1111},
-							Tags: []chstore.TagFilter{{
-								Key:     "cluster",
-								Value:   cluster.row.ID,
-								Dataset: "DERIVED_TAGS",
-							}},
-							Limit: uint64(limit),
-						})
-						if err != nil {
-							return nil, err
-						}
-						relations := newPubkeyRelationCache(cluster.store, events)
-						eventRelations := newEventRelationCache(cluster.store, events)
-						return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations, eventRelations)}, nil
-					},
-				},
-			}
-		}),
-	})
 	notificationTabEnumType := graphql.NewEnum(graphql.EnumConfig{
 		Name: "NotificationTab",
 		Values: graphql.EnumValueConfigMap{
@@ -998,36 +919,6 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					}
 					rows, err := r.store.AggregateEvents(p.Context, input)
 					return map[string]any{"rows": rows}, err
-				},
-			},
-			"availableTopics": &graphql.Field{
-				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(topicType))),
-				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: eventQueryInputType}},
-				Resolve: func(p graphql.ResolveParams) (any, error) {
-					raw, _ := p.Args["input"].(map[string]any)
-					input, err := r.parseEventQueryInput(p.Context, raw)
-					if err != nil {
-						return nil, err
-					}
-					r.hydrateRelayEventQuery(p.Context, input, "availableTopics")
-					return r.store.AvailableTopics(p.Context, input)
-				},
-			},
-			"trending": &graphql.Field{
-				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(trendingClusterType))),
-				Args: graphql.FieldConfigArgument{"input": &graphql.ArgumentConfig{Type: trendingInputType}},
-				Resolve: func(p graphql.ResolveParams) (any, error) {
-					raw, _ := p.Args["input"].(map[string]any)
-					input := parseTrendingInput(raw)
-					rows, err := r.store.TrendingClusters(p.Context, input)
-					if err != nil {
-						return nil, err
-					}
-					nodes := make([]trendingClusterNode, 0, len(rows))
-					for _, row := range rows {
-						nodes = append(nodes, trendingClusterNode{row: row, store: r.store})
-					}
-					return nodes, nil
 				},
 			},
 			"profileSearch": &graphql.Field{
@@ -1548,7 +1439,7 @@ func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput)
 
 func rankedTargetHasFilters(input chstore.EventQueryInput) bool {
 	// Kind-only targets are post-filtered during event hydration so global
-	// trending queries keep the cheaper aggregate path.
+	// kind-only queries keep the cheaper aggregate path.
 	return len(input.IDs) > 0 ||
 		len(input.PubKeys) > 0 ||
 		len(input.Tags) > 0 ||
@@ -3343,24 +3234,6 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 	)
 }
 
-func parseTrendingInput(raw map[string]any) chstore.TrendingInput {
-	input := chstore.TrendingInput{
-		Window: "H24",
-		Limit:  20,
-	}
-	if raw == nil {
-		return input
-	}
-	if window := strings.ToUpper(strings.TrimSpace(stringValue(raw["window"]))); window == "H8" || window == "H24" || window == "D7" {
-		input.Window = window
-	}
-	input.Category = strings.TrimSpace(stringValue(raw["category"]))
-	if limit := intValue(raw["limit"], 20); limit > 0 {
-		input.Limit = uint64(limit)
-	}
-	return input
-}
-
 func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, error) {
 	input := chstore.NotificationInput{
 		Tab:        "ALL",
@@ -3603,26 +3476,6 @@ func eventField(fn func(chstore.EventView) any) graphql.FieldResolveFn {
 			return nil, nil
 		}
 		return fn(event), nil
-	}
-}
-
-func trendingClusterField(fn func(chstore.TrendingClusterRow) any) graphql.FieldResolveFn {
-	return func(p graphql.ResolveParams) (any, error) {
-		switch cluster := p.Source.(type) {
-		case trendingClusterNode:
-			return fn(cluster.row), nil
-		case *trendingClusterNode:
-			if cluster != nil {
-				return fn(cluster.row), nil
-			}
-		case chstore.TrendingClusterRow:
-			return fn(cluster), nil
-		case *chstore.TrendingClusterRow:
-			if cluster != nil {
-				return fn(*cluster), nil
-			}
-		}
-		return nil, nil
 	}
 }
 
