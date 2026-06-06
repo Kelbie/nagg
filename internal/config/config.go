@@ -54,13 +54,10 @@ type ViewerConfig struct {
 }
 
 type EnrichConfig struct {
-	Tasks           []string
-	BatchSize       int
-	PollInterval    time.Duration
-	ModelDir        string
-	ModelVersion    string
-	ModelBackend    string
-	OnnxLibraryPath string
+	Tasks        []string
+	BatchSize    int
+	PollInterval time.Duration
+	ModelVersion string
 }
 
 type OnDemandConfig struct {
@@ -135,13 +132,10 @@ func Load() (Config, error) {
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),
 		},
 		Enrich: EnrichConfig{
-			Tasks:           splitCSV(env("NAGG_ENRICH_TASKS", "embeddings,stance,sentiment,quality,controversy,nsfw")),
-			BatchSize:       parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
-			PollInterval:    parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
-			ModelDir:        strings.TrimSpace(os.Getenv("NAGG_ENRICH_MODEL_DIR")),
-			ModelVersion:    env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
-			ModelBackend:    strings.ToLower(env("NAGG_ENRICH_MODEL_BACKEND", "go")),
-			OnnxLibraryPath: strings.TrimSpace(os.Getenv("NAGG_ENRICH_ONNX_LIBRARY_PATH")),
+			Tasks:        splitCSV(env("NAGG_ENRICH_TASKS", "quality")),
+			BatchSize:    parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
+			PollInterval: parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
+			ModelVersion: env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
 		},
 		Cache: CacheConfig{
 			URL:        strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
@@ -211,11 +205,6 @@ func (c Config) validate() error {
 	}
 	if strings.TrimSpace(c.Enrich.ModelVersion) == "" {
 		return errors.New("NAGG_ENRICH_MODEL_VERSION must be non-empty")
-	}
-	switch c.Enrich.ModelBackend {
-	case "", "go", "gomlx", "ort", "onnx", "onnxruntime":
-	default:
-		return errors.New("NAGG_ENRICH_MODEL_BACKEND must be go or ort")
 	}
 	for _, task := range c.Enrich.Tasks {
 		if !validEnrichTask(task) {

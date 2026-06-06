@@ -30,20 +30,6 @@ ENGINE = ReplacingMergeTree(computed_at)
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (metric, event_id);
 
-CREATE TABLE IF NOT EXISTS event_embeddings
-(
-    event_id FixedString(64),
-    pubkey FixedString(64),
-    kind UInt32,
-    created_at DateTime,
-    embedding Array(Float32),
-    model_version LowCardinality(String),
-    computed_at DateTime
-)
-ENGINE = ReplacingMergeTree(computed_at)
-PARTITION BY toYYYYMM(created_at)
-ORDER BY (model_version, event_id);
-
 CREATE TABLE IF NOT EXISTS enrichment_state
 (
     task LowCardinality(String),

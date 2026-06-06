@@ -95,7 +95,7 @@ func (s *Store) WriteEnrichmentAnnotations(ctx context.Context, annotations []en
 	if len(annotations) == 0 {
 		return nil
 	}
-	tagRows, metricRows, embeddingRows := countAnnotationRows(annotations)
+	tagRows, metricRows := countAnnotationRows(annotations)
 	if tagRows > 0 {
 		if err := s.writeDerivedTags(ctx, annotations); err != nil {
 			return err
@@ -103,11 +103,6 @@ func (s *Store) WriteEnrichmentAnnotations(ctx context.Context, annotations []en
 	}
 	if metricRows > 0 {
 		if err := s.writeDerivedMetrics(ctx, annotations); err != nil {
-			return err
-		}
-	}
-	if embeddingRows > 0 {
-		if err := s.writeEventEmbeddings(ctx, annotations); err != nil {
 			return err
 		}
 	}
@@ -137,10 +132,9 @@ func (s *Store) SaveEnrichmentState(ctx context.Context, state enrich.State) err
 	`, task, cursorCreatedAt, cursorEventID, state.Processed, state.Failed, updatedAt)
 }
 
-func countAnnotationRows(annotations []enrich.Annotation) (int, int, int) {
+func countAnnotationRows(annotations []enrich.Annotation) (int, int) {
 	var tagRows int
 	var metricRows int
-	var embeddingRows int
 	for _, annotation := range annotations {
 		for _, tag := range annotation.Tags {
 			if strings.TrimSpace(tag.Key) != "" {
@@ -152,11 +146,8 @@ func countAnnotationRows(annotations []enrich.Annotation) (int, int, int) {
 				metricRows++
 			}
 		}
-		if len(annotation.Embedding) > 0 {
-			embeddingRows++
-		}
 	}
-	return tagRows, metricRows, embeddingRows
+	return tagRows, metricRows
 }
 
 func (s *Store) writeDerivedTags(ctx context.Context, annotations []enrich.Annotation) error {
@@ -220,32 +211,6 @@ func (s *Store) writeDerivedMetrics(ctx context.Context, annotations []enrich.An
 			); err != nil {
 				return err
 			}
-		}
-	}
-	return batch.Send()
-}
-
-func (s *Store) writeEventEmbeddings(ctx context.Context, annotations []enrich.Annotation) error {
-	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO event_embeddings")
-	if err != nil {
-		return err
-	}
-	defer closeUnsentBatch(batch)
-	for _, annotation := range annotations {
-		if len(annotation.Embedding) == 0 {
-			continue
-		}
-		event := annotation.Event
-		if err := batch.Append(
-			event.ID,
-			event.PubKey,
-			uint32(event.Kind),
-			event.CreatedAt,
-			annotation.Embedding,
-			annotationModelVersion(annotation),
-			annotationComputedAt(annotation),
-		); err != nil {
-			return err
 		}
 	}
 	return batch.Send()

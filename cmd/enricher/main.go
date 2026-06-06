@@ -46,35 +46,18 @@ func main() {
 	}
 
 	processors, err := enrich.NewProcessors(cfg.Enrich.Tasks, enrich.ProcessorConfig{
-		ModelDir:        cfg.Enrich.ModelDir,
-		ModelVersion:    cfg.Enrich.ModelVersion,
-		ModelBackend:    cfg.Enrich.ModelBackend,
-		OnnxLibraryPath: cfg.Enrich.OnnxLibraryPath,
+		ModelVersion: cfg.Enrich.ModelVersion,
 	})
 	if err != nil {
 		slog.Error("enricher setup failed", "error", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := enrich.CloseProcessors(processors); err != nil {
-			slog.Warn("enricher model cleanup failed", "error", err)
-		}
-	}()
 
 	slog.Info("enricher starting",
 		"tasks", enrich.NormalizeTasks(cfg.Enrich.Tasks),
 		"batch_size", cfg.Enrich.BatchSize,
 		"poll_interval", cfg.Enrich.PollInterval,
-		"model_dir", cfg.Enrich.ModelDir,
 		"model_version", cfg.Enrich.ModelVersion,
-		"model_backend", cfg.Enrich.ModelBackend,
-	)
-	modelInventory := enrich.DiscoverHugotModelInventory(cfg.Enrich.ModelDir)
-	slog.Info("enricher model inventory",
-		"model_dir", modelInventory.Root,
-		"model_dir_exists", modelInventory.RootExists,
-		"available_models", modelInventory.Available,
-		"missing_models", modelInventory.Missing,
 	)
 	runner := enrich.NewRunner(store, processors, enrich.RunnerConfig{
 		BatchSize:    cfg.Enrich.BatchSize,
