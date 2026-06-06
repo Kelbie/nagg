@@ -724,7 +724,9 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, DmEnvelopesResponse{Envelopes: merged, HasNextPage: len(merged) >= limit})
 }
 
-// parseDmKinds reads a CSV `kinds` param, defaulting to NIP-17 gift wraps.
+// parseDmKinds reads a CSV `kinds` param, defaulting to NIP-04 legacy DMs
+// (kind 4) and NIP-17 gift wraps (kind 1059) — matching the GraphQL dmKinds
+// default so both transports surface the same conversations.
 func parseDmKinds(raw string) []int {
 	values := csv(raw)
 	kinds := make([]int, 0, len(values))
@@ -734,7 +736,7 @@ func parseDmKinds(raw string) []int {
 		}
 	}
 	if len(kinds) == 0 {
-		return []int{1059}
+		return []int{4, 1059}
 	}
 	return kinds
 }

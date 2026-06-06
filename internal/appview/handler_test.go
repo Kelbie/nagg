@@ -1403,3 +1403,30 @@ func TestRegisterAppliesRateLimit(t *testing.T) {
 		t.Fatalf("second status = %d body = %s", second.Code, second.Body.String())
 	}
 }
+
+func TestParseDmKindsDefaultsToNip04AndNip17(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []int
+	}{
+		{name: "empty defaults to kind 4 + 1059", raw: "", want: []int{4, 1059}},
+		{name: "whitespace defaults", raw: "  ", want: []int{4, 1059}},
+		{name: "explicit single kind honored", raw: "1059", want: []int{1059}},
+		{name: "explicit csv honored", raw: "4,1059", want: []int{4, 1059}},
+		{name: "non-numeric tokens skipped", raw: "4,foo,1059", want: []int{4, 1059}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseDmKinds(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseDmKinds(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("parseDmKinds(%q) = %v, want %v", tc.raw, got, tc.want)
+				}
+			}
+		})
+	}
+}
