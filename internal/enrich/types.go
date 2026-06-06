@@ -6,12 +6,7 @@ import (
 )
 
 const (
-	TaskEmbeddings  = "embeddings"
-	TaskStance      = "stance"
-	TaskSentiment   = "sentiment"
-	TaskQuality     = "quality"
-	TaskControversy = "controversy"
-	TaskNSFW        = "nsfw"
+	TaskQuality = "quality"
 )
 
 type Cursor struct {
@@ -36,20 +31,6 @@ type Event struct {
 	Tags      [][]string
 }
 
-type LabelScore struct {
-	Label string
-	Score float64
-}
-
-type ModelProvider interface {
-	Embed(ctx context.Context, inputs []string) ([][]float32, bool, error)
-	ClassifySentiment(ctx context.Context, inputs []string) ([][]LabelScore, bool, error)
-	ClassifyStance(ctx context.Context, inputs []string, labels []string) ([][]LabelScore, bool, error)
-	ClassifyNSFWText(ctx context.Context, inputs []string) ([][]LabelScore, bool, error)
-	ClassifyNSFWImages(ctx context.Context, paths []string) ([][]LabelScore, bool, error)
-	Close() error
-}
-
 type Tag struct {
 	Key   string
 	Value string
@@ -65,13 +46,12 @@ type Annotation struct {
 	Event        Event
 	Tags         []Tag
 	Metrics      []Metric
-	Embedding    []float32
 	ModelVersion string
 	ComputedAt   time.Time
 }
 
 func (a Annotation) Empty() bool {
-	return len(a.Tags) == 0 && len(a.Metrics) == 0 && len(a.Embedding) == 0
+	return len(a.Tags) == 0 && len(a.Metrics) == 0
 }
 
 type ProcessResult struct {
@@ -82,11 +62,6 @@ type ProcessResult struct {
 type Processor interface {
 	Task() string
 	ProcessBatch(ctx context.Context, events []Event) ([]ProcessResult, error)
-}
-
-type ClosableProcessor interface {
-	Processor
-	Close() error
 }
 
 type Store interface {

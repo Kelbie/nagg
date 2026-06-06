@@ -28,7 +28,7 @@ func TestRunnerRunOnceWritesAnnotationsAndAdvancesPastEventErrors(t *testing.T) 
 	}
 	store := &fakeStore{events: events}
 	processor := fakeProcessor{
-		task: TaskEmbeddings,
+		task: TaskQuality,
 		results: []ProcessResult{
 			{Annotation: Annotation{Tags: []Tag{{Key: "topic", Value: "crypto.bitcoin"}}, ModelVersion: "test-v1"}},
 			{Err: errors.New("model refused event")},
@@ -58,7 +58,7 @@ func TestRunnerRunOnceWritesAnnotationsAndAdvancesPastEventErrors(t *testing.T) 
 	if !written.ComputedAt.Equal(now) {
 		t.Fatalf("computed_at = %s, want %s", written.ComputedAt, now)
 	}
-	if store.saved.Task != TaskEmbeddings {
+	if store.saved.Task != TaskQuality {
 		t.Fatalf("saved task = %q", store.saved.Task)
 	}
 	if store.saved.Cursor.EventID != events[1].ID || !store.saved.Cursor.CreatedAt.Equal(events[1].CreatedAt) {
@@ -79,7 +79,7 @@ func TestRunnerRunOnceDoesNotSaveWatermarkWhenWriteFails(t *testing.T) {
 	}}
 	store := &fakeStore{events: events, writeErr: errors.New("clickhouse unavailable")}
 	processor := fakeProcessor{
-		task:    TaskEmbeddings,
+		task:    TaskQuality,
 		results: []ProcessResult{{Annotation: Annotation{Tags: []Tag{{Key: "topic", Value: "crypto.bitcoin"}}}}},
 	}
 	runner := NewRunner(store, []Processor{processor}, RunnerConfig{BatchSize: 1}, discardLogger())

@@ -55,8 +55,8 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.Vertex.SyncBatch != 200 {
 		t.Fatalf("vertex sync batch = %d, want 200", cfg.Vertex.SyncBatch)
 	}
-	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "embeddings,stance,sentiment,quality,controversy,nsfw" {
-		t.Fatalf("enrich tasks = %q, want default signal tasks", got)
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "quality" {
+		t.Fatalf("enrich tasks = %q, want default quality task", got)
 	}
 	for _, relay := range cfg.Firehose.Relays {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
@@ -154,20 +154,17 @@ func TestLoadRejectsInvalidVertexSyncBatch(t *testing.T) {
 
 func TestLoadEnrichConfigOverride(t *testing.T) {
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_TASKS", "embeddings,stance,embeddings")
+	t.Setenv("NAGG_ENRICH_TASKS", "quality,quality")
 	t.Setenv("NAGG_ENRICH_BATCH_SIZE", "32")
 	t.Setenv("NAGG_ENRICH_POLL_INTERVAL", "5s")
-	t.Setenv("NAGG_ENRICH_MODEL_DIR", "/models")
 	t.Setenv("NAGG_ENRICH_MODEL_VERSION", "test-model-v1")
-	t.Setenv("NAGG_ENRICH_MODEL_BACKEND", "ort")
-	t.Setenv("NAGG_ENRICH_ONNX_LIBRARY_PATH", "/opt/onnxruntime/libonnxruntime.so")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "embeddings,stance" {
-		t.Fatalf("enrich tasks = %q", got)
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "quality" {
+		t.Fatalf("enrich tasks = %q, want deduped quality", got)
 	}
 	if cfg.Enrich.BatchSize != 32 {
 		t.Fatalf("enrich batch size = %d, want 32", cfg.Enrich.BatchSize)
@@ -175,42 +172,20 @@ func TestLoadEnrichConfigOverride(t *testing.T) {
 	if cfg.Enrich.PollInterval.String() != "5s" {
 		t.Fatalf("enrich poll interval = %s, want 5s", cfg.Enrich.PollInterval)
 	}
-	if cfg.Enrich.ModelDir != "/models" {
-		t.Fatalf("enrich model dir = %q", cfg.Enrich.ModelDir)
-	}
 	if cfg.Enrich.ModelVersion != "test-model-v1" {
 		t.Fatalf("enrich model version = %q", cfg.Enrich.ModelVersion)
-	}
-	if cfg.Enrich.ModelBackend != "ort" {
-		t.Fatalf("enrich model backend = %q, want ort", cfg.Enrich.ModelBackend)
-	}
-	if cfg.Enrich.OnnxLibraryPath != "/opt/onnxruntime/libonnxruntime.so" {
-		t.Fatalf("enrich onnx library path = %q", cfg.Enrich.OnnxLibraryPath)
 	}
 }
 
 func TestLoadRejectsUnknownEnrichTask(t *testing.T) {
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_TASKS", "embeddings,unknown")
+	t.Setenv("NAGG_ENRICH_TASKS", "quality,unknown")
 
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "NAGG_ENRICH_TASKS") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestLoadRejectsUnknownEnrichBackend(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_MODEL_BACKEND", "cuda")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "NAGG_ENRICH_MODEL_BACKEND") {
 		t.Fatalf("error = %v", err)
 	}
 }

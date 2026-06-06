@@ -406,16 +406,6 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
-	eventContextType := graphql.NewObject(graphql.ObjectConfig{
-		Name: "EventContext",
-		Fields: graphql.Fields{
-			"root": &graphql.Field{Type: graphql.NewNonNull(eventType)},
-			"events": &graphql.Field{
-				Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(eventType))),
-			},
-		},
-	})
-
 	tagFilterType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "TagFilterInput",
 		Fields: graphql.InputObjectConfigFieldMap{
@@ -955,24 +945,6 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 					return r.rankedEvents(p.Context, p.Args["input"])
 				},
 			},
-			"eventContext": &graphql.Field{
-				Type: eventContextType,
-				Args: graphql.FieldConfigArgument{
-					"id":    &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)},
-					"limit": &graphql.ArgumentConfig{Type: graphql.Int, DefaultValue: 1000},
-				},
-				Resolve: func(p graphql.ResolveParams) (any, error) {
-					id := p.Args["id"].(string)
-					if err := validateHex64(id); err != nil {
-						return nil, err
-					}
-					limit := intValue(p.Args["limit"], 1000)
-					if limit <= 0 || limit > 2000 {
-						limit = 1000
-					}
-					return r.eventContext(p.Context, id, limit)
-				},
-			},
 		},
 	})
 
@@ -1137,22 +1109,6 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 		source:    args.Source,
 		fromCache: fromCache,
 		nodes:     nodes,
-	}, nil
-}
-
-func (r *resolver) eventContext(ctx context.Context, id string, limit int) (map[string]any, error) {
-	root, events, err := r.store.ThreadEvents(ctx, id, limit)
-	if err != nil {
-		return nil, err
-	}
-	all := make([]chstore.EventView, 0, len(events)+1)
-	all = append(all, *root)
-	all = append(all, events...)
-	relations := newPubkeyRelationCache(r.store, all)
-	eventRelations := newEventRelationCacheWithPubkeyScoreMinFollowers(r.store, all, r.pubkeyScoreMinFollowers)
-	return map[string]any{
-		"root":   wrapEvent(*root, relations, eventRelations),
-		"events": wrapEvents(events, relations, eventRelations),
 	}, nil
 }
 
