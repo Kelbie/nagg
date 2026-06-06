@@ -7,39 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
-func TestKeywordTopicProcessorUsesContentAndHashtags(t *testing.T) {
-	processor := NewKeywordTopicProcessor("test-v1")
-	results, err := processor.ProcessBatch(context.Background(), []Event{{
-		Content: "Building on Nostr with Cashu",
-		Tags: [][]string{
-			{"t", "bitcoin"},
-			{"t", "nostr"},
-		},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := topicValues(results[0].Annotation.Tags)
-	want := []string{"crypto.bitcoin", "payments.cashu", "protocol.nostr"}
-	if len(got) != len(want) {
-		t.Fatalf("topics = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("topics = %v, want %v", got, want)
-		}
-	}
-	if results[0].Annotation.ModelVersion != "test-v1" {
-		t.Fatalf("model version = %q", results[0].Annotation.ModelVersion)
-	}
-}
-
-func TestNewProcessorsSupportsTrendingTask(t *testing.T) {
+func TestNewProcessorsBuildsRequestedTasks(t *testing.T) {
 	processors, err := NewProcessors([]string{
-		TaskTrending,
+		TaskEmbeddings,
 		TaskStance,
 		TaskSentiment,
 		TaskQuality,
@@ -52,7 +24,7 @@ func TestNewProcessorsSupportsTrendingTask(t *testing.T) {
 	if len(processors) != 6 {
 		t.Fatalf("processors = %+v, want six processors", processors)
 	}
-	if processors[0].Task() != TaskTrending || processors[5].Task() != TaskNSFW {
+	if processors[0].Task() != TaskEmbeddings || processors[5].Task() != TaskNSFW {
 		t.Fatalf("processors = %+v, want requested task order", processors)
 	}
 }
@@ -81,71 +53,6 @@ func TestHashingEmbeddingProcessorReturnsNormalizedStableVector(t *testing.T) {
 	}
 	if math.Abs(norm-1) > 0.0001 {
 		t.Fatalf("embedding norm = %f, want 1", norm)
-	}
-}
-
-func TestTrendingProcessorBuildsClusterTagsAndRows(t *testing.T) {
-	processor := NewTrendingProcessorWithSimilarity("test-v1", 0.01)
-	events := []Event{
-		{
-			ID:        hexID("1"),
-			PubKey:    hexID("a"),
-			Kind:      1,
-			CreatedAt: time.Unix(100, 0).UTC(),
-			Content:   "bitcoin sats are moving",
-		},
-		{
-			ID:        hexID("2"),
-			PubKey:    hexID("b"),
-			Kind:      1,
-			CreatedAt: time.Unix(200, 0).UTC(),
-			Content:   "more bitcoin discussion",
-		},
-	}
-
-	results, err := processor.ProcessBatch(context.Background(), events)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 2 {
-		t.Fatalf("results len = %d, want 2", len(results))
-	}
-	firstClusterTags := clusterTagValues(results[0].Annotation.Tags)
-	secondClusterTags := clusterTagValues(results[1].Annotation.Tags)
-	if len(firstClusterTags) != 3 || len(secondClusterTags) != 3 {
-		t.Fatalf("cluster tags = %v/%v, want three window tags", firstClusterTags, secondClusterTags)
-	}
-	for i, tag := range firstClusterTags {
-		if tag == "" || tag != secondClusterTags[i] {
-			t.Fatalf("cluster tags = %v/%v, want matching ids by window", firstClusterTags, secondClusterTags)
-		}
-		if !strings.HasPrefix(tag, "cluster:") {
-			t.Fatalf("cluster id = %q, want cluster: prefix", tag)
-		}
-	}
-	if len(results[0].Annotation.Clusters) != 3 {
-		t.Fatalf("first clusters len = %d, want 3", len(results[0].Annotation.Clusters))
-	}
-	if len(results[1].Annotation.Clusters) != 0 {
-		t.Fatalf("second clusters len = %d, want 0", len(results[1].Annotation.Clusters))
-	}
-	windows := map[string]bool{}
-	for i, cluster := range results[0].Annotation.Clusters {
-		if cluster.ID != firstClusterTags[i] || cluster.Category != "crypto" || cluster.Subcategory != "bitcoin" {
-			t.Fatalf("cluster = %+v", cluster)
-		}
-		windows[cluster.Window] = true
-		if cluster.EventCount != 2 || cluster.Score != 2 {
-			t.Fatalf("cluster count/score = %d/%f, want 2/2", cluster.EventCount, cluster.Score)
-		}
-		if len(cluster.Centroid) != 384 {
-			t.Fatalf("centroid dimensions = %d, want 384", len(cluster.Centroid))
-		}
-	}
-	for _, window := range []string{"H8", "H24", "D7"} {
-		if !windows[window] {
-			t.Fatalf("windows = %v, want %s", windows, window)
-		}
 	}
 }
 
@@ -314,14 +221,6 @@ func TestDiscoverHugotModelInventoryReportsAvailableAliases(t *testing.T) {
 	}
 }
 
-func topicValues(tags []Tag) []string {
-	values := make([]string, 0, len(tags))
-	for _, tag := range tags {
-		values = append(values, tag.Value)
-	}
-	return values
-}
-
 type fakeModelProvider struct {
 	embeddings [][]float32
 	sentiment  [][]LabelScore
@@ -352,25 +251,6 @@ func (p *fakeModelProvider) ClassifyNSFWImages(context.Context, []string) ([][]L
 
 func (p *fakeModelProvider) Close() error {
 	return nil
-}
-
-func clusterTagValue(tags []Tag) string {
-	for _, tag := range tags {
-		if tag.Key == "cluster" {
-			return tag.Value
-		}
-	}
-	return ""
-}
-
-func clusterTagValues(tags []Tag) []string {
-	values := []string{}
-	for _, tag := range tags {
-		if tag.Key == "cluster" {
-			values = append(values, tag.Value)
-		}
-	}
-	return values
 }
 
 func metricValue(metrics []Metric, name string) float64 {

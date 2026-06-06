@@ -44,17 +44,6 @@ ENGINE = ReplacingMergeTree(computed_at)
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (model_version, event_id);
 
-CREATE TABLE IF NOT EXISTS topic_taxonomy
-(
-    value String,
-    parent String,
-    label String,
-    is_default UInt8,
-    updated_at DateTime
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY value;
-
 CREATE TABLE IF NOT EXISTS enrichment_state
 (
     task LowCardinality(String),

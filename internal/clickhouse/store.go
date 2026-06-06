@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
@@ -27,9 +26,6 @@ var rankingMigration string
 //go:embed migrations/004_derived.sql
 var derivedMigration string
 
-//go:embed migrations/005_trending.sql
-var trendingMigration string
-
 //go:embed migrations/006_notifications.sql
 var notificationsMigration string
 
@@ -43,14 +39,7 @@ type Config struct {
 }
 
 type Store struct {
-	conn            ch.Conn
-	trendingCacheMu sync.Mutex
-	trendingCache   map[string]trendingCacheEntry
-}
-
-type trendingCacheEntry struct {
-	expiresAt time.Time
-	events    []EventView
+	conn ch.Conn
 }
 
 type EventRecord struct {
@@ -84,7 +73,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := conn.Ping(ctx); err != nil {
 		return nil, err
 	}
-	return &Store{conn: conn, trendingCache: map[string]trendingCacheEntry{}}, nil
+	return &Store{conn: conn}, nil
 }
 
 func positiveOrDefault(value int, fallback int) int {
@@ -117,7 +106,7 @@ func closeUnsentBatch(batch chdriver.Batch) {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration, derivedMigration, trendingMigration, notificationsMigration} {
+	for _, migration := range []string{ingestionMigration, appviewMigration, rankingMigration, derivedMigration, notificationsMigration} {
 		for _, stmt := range splitSQLStatements(migration) {
 			if err := s.conn.Exec(ctx, stmt); err != nil {
 				return fmt.Errorf("migration failed: %w", err)
@@ -347,14 +336,7 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 			return err
 		}
 	}
-	s.clearTrendingCache()
 	return nil
-}
-
-func (s *Store) clearTrendingCache() {
-	s.trendingCacheMu.Lock()
-	defer s.trendingCacheMu.Unlock()
-	s.trendingCache = map[string]trendingCacheEntry{}
 }
 
 func flattenTag(tag nostr.Tag) (string, string, []string) {

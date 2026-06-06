@@ -55,11 +55,8 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.Vertex.SyncBatch != 200 {
 		t.Fatalf("vertex sync batch = %d, want 200", cfg.Vertex.SyncBatch)
 	}
-	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "topics,embeddings,trending,stance,sentiment,quality,controversy,nsfw" {
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "embeddings,stance,sentiment,quality,controversy,nsfw" {
 		t.Fatalf("enrich tasks = %q, want default signal tasks", got)
-	}
-	if cfg.Enrich.TrendingDedupeSimilarity != 0.82 {
-		t.Fatalf("trending dedupe similarity = %f, want 0.82", cfg.Enrich.TrendingDedupeSimilarity)
 	}
 	for _, relay := range cfg.Firehose.Relays {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
@@ -157,20 +154,19 @@ func TestLoadRejectsInvalidVertexSyncBatch(t *testing.T) {
 
 func TestLoadEnrichConfigOverride(t *testing.T) {
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_TASKS", "topics,embeddings,topics")
+	t.Setenv("NAGG_ENRICH_TASKS", "embeddings,stance,embeddings")
 	t.Setenv("NAGG_ENRICH_BATCH_SIZE", "32")
 	t.Setenv("NAGG_ENRICH_POLL_INTERVAL", "5s")
 	t.Setenv("NAGG_ENRICH_MODEL_DIR", "/models")
 	t.Setenv("NAGG_ENRICH_MODEL_VERSION", "test-model-v1")
 	t.Setenv("NAGG_ENRICH_MODEL_BACKEND", "ort")
 	t.Setenv("NAGG_ENRICH_ONNX_LIBRARY_PATH", "/opt/onnxruntime/libonnxruntime.so")
-	t.Setenv("NAGG_TRENDING_DEDUPE_SIM", "0.7")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "topics,embeddings" {
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "embeddings,stance" {
 		t.Fatalf("enrich tasks = %q", got)
 	}
 	if cfg.Enrich.BatchSize != 32 {
@@ -191,14 +187,11 @@ func TestLoadEnrichConfigOverride(t *testing.T) {
 	if cfg.Enrich.OnnxLibraryPath != "/opt/onnxruntime/libonnxruntime.so" {
 		t.Fatalf("enrich onnx library path = %q", cfg.Enrich.OnnxLibraryPath)
 	}
-	if cfg.Enrich.TrendingDedupeSimilarity != 0.7 {
-		t.Fatalf("trending dedupe similarity = %f, want 0.7", cfg.Enrich.TrendingDedupeSimilarity)
-	}
 }
 
 func TestLoadRejectsUnknownEnrichTask(t *testing.T) {
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_TASKS", "topics,unknown")
+	t.Setenv("NAGG_ENRICH_TASKS", "embeddings,unknown")
 
 	_, err := Load()
 	if err == nil {
@@ -218,19 +211,6 @@ func TestLoadRejectsUnknownEnrichBackend(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "NAGG_ENRICH_MODEL_BACKEND") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestLoadRejectsInvalidTrendingDedupeSimilarity(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_TRENDING_DEDUPE_SIM", "1.5")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "NAGG_TRENDING_DEDUPE_SIM") {
 		t.Fatalf("error = %v", err)
 	}
 }

@@ -6,9 +6,7 @@ import (
 )
 
 const (
-	TaskTopics      = "topics"
 	TaskEmbeddings  = "embeddings"
-	TaskTrending    = "trending"
 	TaskStance      = "stance"
 	TaskSentiment   = "sentiment"
 	TaskQuality     = "quality"
@@ -68,27 +66,12 @@ type Annotation struct {
 	Tags         []Tag
 	Metrics      []Metric
 	Embedding    []float32
-	Clusters     []TrendingCluster
 	ModelVersion string
 	ComputedAt   time.Time
 }
 
 func (a Annotation) Empty() bool {
-	return len(a.Tags) == 0 && len(a.Metrics) == 0 && len(a.Embedding) == 0 && len(a.Clusters) == 0
-}
-
-type TrendingCluster struct {
-	ID          string
-	Window      string
-	StartedAt   time.Time
-	Category    string
-	Subcategory string
-	Title       string
-	Description string
-	Centroid    []float32
-	EventCount  uint64
-	Score       float64
-	ComputedAt  time.Time
+	return len(a.Tags) == 0 && len(a.Metrics) == 0 && len(a.Embedding) == 0
 }
 
 type ProcessResult struct {

@@ -46,11 +46,10 @@ func main() {
 	}
 
 	processors, err := enrich.NewProcessors(cfg.Enrich.Tasks, enrich.ProcessorConfig{
-		ModelDir:                 cfg.Enrich.ModelDir,
-		ModelVersion:             cfg.Enrich.ModelVersion,
-		ModelBackend:             cfg.Enrich.ModelBackend,
-		OnnxLibraryPath:          cfg.Enrich.OnnxLibraryPath,
-		TrendingDedupeSimilarity: cfg.Enrich.TrendingDedupeSimilarity,
+		ModelDir:        cfg.Enrich.ModelDir,
+		ModelVersion:    cfg.Enrich.ModelVersion,
+		ModelBackend:    cfg.Enrich.ModelBackend,
+		OnnxLibraryPath: cfg.Enrich.OnnxLibraryPath,
 	})
 	if err != nil {
 		slog.Error("enricher setup failed", "error", err)
@@ -69,7 +68,6 @@ func main() {
 		"model_dir", cfg.Enrich.ModelDir,
 		"model_version", cfg.Enrich.ModelVersion,
 		"model_backend", cfg.Enrich.ModelBackend,
-		"trending_dedupe_similarity", cfg.Enrich.TrendingDedupeSimilarity,
 	)
 	modelInventory := enrich.DiscoverHugotModelInventory(cfg.Enrich.ModelDir)
 	slog.Info("enricher model inventory",
