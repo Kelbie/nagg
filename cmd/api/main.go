@@ -103,11 +103,16 @@ func main() {
 	mux.HandleFunc("/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
 	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
+	// Reuse the GraphQL schema options so the REST ranked-feed route runs the
+	// exact same ranking pipeline (scoring + on-demand hydration) as the
+	// GraphQL rankedEvents resolver.
+	ranker := graphqlapi.NewRanker(store, schemaOpts...)
 	appviewOpts := []appview.Option{
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL),
+		appview.WithRankedFeed(ranker),
 	}
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))

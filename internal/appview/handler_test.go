@@ -67,6 +67,10 @@ func (s fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventVie
 	return nil, nil, nil
 }
 
+func (s fakeStore) Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error) {
+	return nil, nil
+}
+
 type followCountSpyStore struct {
 	fakeStore
 	calls   int
@@ -1425,6 +1429,253 @@ func TestRegisterAppliesRateLimit(t *testing.T) {
 	mux.ServeHTTP(second, req)
 	if second.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status = %d body = %s", second.Code, second.Body.String())
+	}
+}
+
+type fakeRanker struct {
+	events []chstore.EventView
+	err    error
+	calls  int
+	last   any
+}
+
+func (f *fakeRanker) RankedEventViews(_ context.Context, input any) ([]chstore.EventView, error) {
+	f.calls++
+	f.last = input
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.events, nil
+}
+
+func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
+	const firstID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const secondID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const authorPubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+
+	// Ranked order is [first, second]; createdAt is intentionally inverted so a
+	// passthrough of ranking (not chronological order) is what we assert.
+	first := chstore.EventView{
+		ID:        firstID,
+		PubKey:    authorPubkey,
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_000, 0),
+		Content:   "ranked first",
+		Tags:      [][]string{},
+	}
+	second := chstore.EventView{
+		ID:        secondID,
+		PubKey:    authorPubkey,
+		Kind:      1,
+		CreatedAt: time.Unix(1_710_000_500, 0),
+		Content:   "ranked second",
+		Tags:      [][]string{},
+	}
+	store := &appViewHydrationStore{
+		fakeStore: fakeStore{
+			profiles: map[string]chstore.ProfileRow{
+				authorPubkey: {PubKey: authorPubkey, EventID: firstID, DisplayName: "Ranked Author"},
+			},
+		},
+		events: map[string]chstore.EventView{},
+		stats: map[string]chstore.NoteStats{
+			firstID:  {LikeCount: 1},
+			secondID: {LikeCount: 2},
+		},
+	}
+	ranker := &fakeRanker{events: []chstore.EventView{first, second}}
+	handler := New(store, WithRankedFeed(ranker), WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	body := `{"references":{"kinds":[7]},"via":{"key":"e"},"limit":10}`
+	req := httptest.NewRequest(http.MethodPost, "/nostr/feed/ranked", strings.NewReader(body))
+	handler.rankedFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if ranker.calls != 1 {
+		t.Fatalf("ranker calls = %d, want 1", ranker.calls)
+	}
+	if _, ok := ranker.last.(map[string]any); !ok {
+		t.Fatalf("ranker input = %T, want map[string]any (same shape as GraphQL input)", ranker.last)
+	}
+	var response FeedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 2 {
+		t.Fatalf("items = %+v, want 2", response.Items)
+	}
+	if response.Items[0].Event == nil || response.Items[0].Event.ID != firstID {
+		t.Fatalf("first item = %+v, want ranked-first id %s", response.Items[0].Event, firstID)
+	}
+	if response.Items[1].Event == nil || response.Items[1].Event.ID != secondID {
+		t.Fatalf("second item = %+v, want ranked-second id %s", response.Items[1].Event, secondID)
+	}
+	if response.Metrics[firstID].LikeCount != 1 || response.Metrics[secondID].LikeCount != 2 {
+		t.Fatalf("metrics = %+v", response.Metrics)
+	}
+	if response.Profiles[authorPubkey].Name != "Ranked Author" {
+		t.Fatalf("profiles = %+v", response.Profiles)
+	}
+}
+
+func TestRankedFeedWithoutProviderReturnsServiceUnavailable(t *testing.T) {
+	handler := New(fakeStore{profiles: map[string]chstore.ProfileRow{}}, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/nostr/feed/ranked", strings.NewReader(`{}`))
+	handler.rankedFeed(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRankedFeedRejectsNonPost(t *testing.T) {
+	ranker := &fakeRanker{}
+	handler := New(fakeStore{profiles: map[string]chstore.ProfileRow{}}, WithRankedFeed(ranker), WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/ranked", nil)
+	handler.rankedFeed(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if ranker.calls != 0 {
+		t.Fatalf("ranker should not be called for GET, calls = %d", ranker.calls)
+	}
+}
+
+type notificationStore struct {
+	appViewHydrationStore
+	rows      []chstore.NotificationRow
+	lastInput chstore.NotificationInput
+}
+
+func (s *notificationStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
+	s.lastInput = input
+	return s.rows, nil
+}
+
+func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
+	const eventID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const actorPubkey = "1111111111111111111111111111111111111111111111111111111111111111"
+
+	event := chstore.EventView{
+		ID:        eventID,
+		PubKey:    actorPubkey,
+		Kind:      7,
+		CreatedAt: time.Unix(1_710_000_000, 0),
+		Content:   "+",
+		Tags:      [][]string{{"p", testPubkey}},
+	}
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{
+				profiles: map[string]chstore.ProfileRow{
+					actorPubkey: {PubKey: actorPubkey, EventID: eventID, DisplayName: "Reactor"},
+				},
+			},
+			events: map[string]chstore.EventView{},
+			stats:  map[string]chstore.NoteStats{eventID: {LikeCount: 3}},
+		},
+		rows: []chstore.NotificationRow{{
+			Event:            event,
+			Reason:           "REACTION",
+			ActorVertexScore: 0.42,
+		}},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/nostr/notifications?viewer="+testPubkey+"&policy=relaxed&replyScope=direct&until=1710000000&limit=25",
+		nil,
+	)
+	handler.notifications(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.lastInput.Viewer != testPubkey {
+		t.Fatalf("viewer = %q, want %q", store.lastInput.Viewer, testPubkey)
+	}
+	if store.lastInput.Policy != "RELAXED" || store.lastInput.ReplyScope != "DIRECT" {
+		t.Fatalf("policy/replyScope = %q/%q", store.lastInput.Policy, store.lastInput.ReplyScope)
+	}
+	if store.lastInput.Until != 1_710_000_000 || store.lastInput.Limit != 25 {
+		t.Fatalf("until/limit = %d/%d", store.lastInput.Until, store.lastInput.Limit)
+	}
+	var response NotificationsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Notifications) != 1 {
+		t.Fatalf("notifications = %+v", response.Notifications)
+	}
+	got := response.Notifications[0]
+	if got.Event.ID != eventID || got.Reason != "REACTION" || got.ActorVertexScore != 0.42 {
+		t.Fatalf("notification row = %+v", got)
+	}
+	if response.Metrics[eventID].LikeCount != 3 {
+		t.Fatalf("metrics = %+v", response.Metrics)
+	}
+	if response.Profiles[actorPubkey].Name != "Reactor" {
+		t.Fatalf("profiles = %+v", response.Profiles)
+	}
+	if response.PaginationUntil != event.CreatedAt.Unix() {
+		t.Fatalf("paginationUntil = %d, want %d", response.PaginationUntil, event.CreatedAt.Unix())
+	}
+}
+
+func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]chstore.NoteStats{},
+		},
+	}
+	handler := New(store, WithViewerPubkey(testPubkey), WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications", nil)
+	handler.notifications(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.lastInput.Viewer != testPubkey {
+		t.Fatalf("viewer fallback = %q, want %q", store.lastInput.Viewer, testPubkey)
+	}
+	if store.lastInput.Tab != "ALL" || store.lastInput.Policy != "STRICT" || store.lastInput.ReplyScope != "THREAD" {
+		t.Fatalf("defaults = tab %q policy %q replyScope %q", store.lastInput.Tab, store.lastInput.Policy, store.lastInput.ReplyScope)
+	}
+	if store.lastInput.Limit != 50 {
+		t.Fatalf("default limit = %d, want 50", store.lastInput.Limit)
+	}
+}
+
+func TestNotificationsRequiresViewer(t *testing.T) {
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]chstore.NoteStats{},
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications", nil)
+	handler.notifications(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s, want 400", rec.Code, rec.Body.String())
 	}
 }
 

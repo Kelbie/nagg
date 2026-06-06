@@ -32,6 +32,17 @@ type Store interface {
 	CachedVertexProfile(context.Context, string) (vertex.ProfileResult, bool, error)
 	SaveVertexProfile(context.Context, vertex.ProfileResult) error
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
+	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
+}
+
+// RankedFeedProvider runs the shared ranked-feed ranking pipeline. It is
+// satisfied by *graphqlapi.Ranker, which reuses the exact same ranking core as
+// the GraphQL rankedEvents resolver. The REST handler decodes the request body
+// into the same map shape the GraphQL `rankedEvents(input: ...)` field accepts
+// and hands it to RankedEventViews, so both transports produce identical
+// ranking for identical input. When nil, the ranked-feed route returns 503.
+type RankedFeedProvider interface {
+	RankedEventViews(context.Context, any) ([]chstore.EventView, error)
 }
 
 type Handler struct {
@@ -50,6 +61,7 @@ type Handler struct {
 	viewerPubkey              string
 	cache                     cache.Cache
 	cacheTTL                  time.Duration
+	ranker                    RankedFeedProvider
 }
 
 type VertexClient interface {
@@ -104,6 +116,15 @@ func WithResponseCache(c cache.Cache, defaultTTL time.Duration) Option {
 func WithRateLimit(limit int, window time.Duration) Option {
 	return func(h *Handler) {
 		h.rateLimiter = newRateLimiter(limit, window)
+	}
+}
+
+// WithRankedFeed wires the shared ranked-feed ranking pipeline so the REST
+// /nostr/feed/ranked route can serve the same ranking the GraphQL rankedEvents
+// resolver produces. Without it, the route responds 503.
+func WithRankedFeed(provider RankedFeedProvider) Option {
+	return func(h *Handler) {
+		h.ranker = provider
 	}
 }
 
@@ -170,6 +191,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/capabilities", h.capabilities},
 		{"/nostr/feed", h.feed},
 		{"/nostr/feed/user", h.userFeed},
+		{"/nostr/feed/ranked", h.rankedFeed},
+		{"/nostr/notifications", h.notifications},
 		{"/nostr/notes/stats", h.noteStats},
 		{"/nostr/thread", h.thread},
 		{"/nostr/follows", h.follows},
@@ -542,6 +565,161 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		PaginationUntil:  paginationUntil,
 		PaginationOffset: len(items),
 	}, nil
+}
+
+// rankedFeed is the REST counterpart of the GraphQL rankedEvents resolver. It
+// decodes the request body into the same input map the GraphQL
+// `rankedEvents(input: ...)` field accepts (so Sovran feed recipes produce one
+// shape for both transports), runs the shared ranking pipeline via the injected
+// RankedFeedProvider, then enriches the ordered events into a FeedResponse using
+// the same helpers as /nostr/feed. The ranking order is preserved verbatim.
+func (h *Handler) rankedFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST /nostr/feed/ranked only", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.ranker == nil {
+		http.Error(w, "ranked feed not configured", http.StatusServiceUnavailable)
+		return
+	}
+	var input map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	events, err := h.ranker.RankedEventViews(r.Context(), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	h.writeFeedResponse(w, r, events)
+}
+
+// NotificationRowJSON is the REST shape for a single notification: the event
+// plus the ranking metadata the GraphQL notifications resolver exposes.
+type NotificationRowJSON struct {
+	Event            FeedEvent `json:"event"`
+	Reason           string    `json:"reason"`
+	ActorVertexScore float64   `json:"actorVertexScore"`
+}
+
+// NotificationsResponse mirrors the feed enrichment (Metrics, Profiles, Quoted)
+// so clients can render notification events with the same hydration as the feed.
+type NotificationsResponse struct {
+	Notifications   []NotificationRowJSON        `json:"notifications"`
+	Metrics         map[string]chstore.NoteStats `json:"metrics"`
+	Profiles        map[string]ProfileInfo       `json:"profiles"`
+	Quoted          map[string]FeedEvent         `json:"quoted"`
+	PaginationUntil int64                        `json:"paginationUntil"`
+}
+
+// notifications is the REST counterpart of the GraphQL notifications resolver.
+// It builds a chstore.NotificationInput from request params (mirroring the
+// GraphQL input: viewer, tab, policy, replyScope, since, until, limit), calls
+// store.Notifications, then enriches the notification events with the same
+// Metrics/Profiles/Quoted hydration the feed uses.
+func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "GET or POST /nostr/notifications only", http.StatusMethodNotAllowed)
+		return
+	}
+	input, err := h.parseNotificationRequest(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rows, err := h.store.Notifications(r.Context(), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	events := make([]chstore.EventView, 0, len(rows))
+	notifications := make([]NotificationRowJSON, 0, len(rows))
+	var paginationUntil int64
+	for _, row := range rows {
+		events = append(events, row.Event)
+		feedEvent := eventJSON(row.Event)
+		if paginationUntil == 0 || feedEvent.CreatedAt < paginationUntil {
+			paginationUntil = feedEvent.CreatedAt
+		}
+		notifications = append(notifications, NotificationRowJSON{
+			Event:            feedEvent,
+			Reason:           row.Reason,
+			ActorVertexScore: row.ActorVertexScore,
+		})
+	}
+
+	hydration, err := h.hydrateAppViewEvents(r.Context(), events)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, NotificationsResponse{
+		Notifications:   notifications,
+		Metrics:         hydration.Metrics,
+		Profiles:        hydration.Profiles,
+		Quoted:          hydration.Quoted,
+		PaginationUntil: paginationUntil,
+	})
+}
+
+// parseNotificationRequest builds a chstore.NotificationInput from the request,
+// accepting both query params (GET) and a JSON body (POST). Defaults match the
+// GraphQL parseNotificationInput: tab ALL, policy STRICT, replyScope THREAD,
+// limit 50. The viewer pubkey falls back to the configured viewer.
+func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.NotificationInput, error) {
+	input := chstore.NotificationInput{
+		Tab:        "ALL",
+		Policy:     "STRICT",
+		ReplyScope: "THREAD",
+		Limit:      50,
+	}
+
+	var raw struct {
+		Viewer     string `json:"viewer"`
+		Tab        string `json:"tab"`
+		Policy     string `json:"policy"`
+		ReplyScope string `json:"replyScope"`
+		Since      int64  `json:"since"`
+		Until      int64  `json:"until"`
+		Limit      int    `json:"limit"`
+	}
+	if r.Method == http.MethodPost {
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			return input, err
+		}
+	} else {
+		q := r.URL.Query()
+		raw.Viewer = q.Get("viewer")
+		raw.Tab = q.Get("tab")
+		raw.Policy = q.Get("policy")
+		raw.ReplyScope = q.Get("replyScope")
+		raw.Since = int64(intParam(r, "since", 0))
+		raw.Until = int64(intParam(r, "until", 0))
+		raw.Limit = intParam(r, "limit", 0)
+	}
+
+	viewer, err := h.viewerPubkeyOr(raw.Viewer)
+	if err != nil {
+		return input, fmt.Errorf("notification viewer: %w", err)
+	}
+	input.Viewer = strings.ToLower(viewer)
+	if tab := strings.ToUpper(strings.TrimSpace(raw.Tab)); tab == "ALL" || tab == "MENTIONS" {
+		input.Tab = tab
+	}
+	if policy := strings.ToUpper(strings.TrimSpace(raw.Policy)); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" {
+		input.Policy = policy
+	}
+	if replyScope := strings.ToUpper(strings.TrimSpace(raw.ReplyScope)); replyScope == "DIRECT" || replyScope == "THREAD" {
+		input.ReplyScope = replyScope
+	}
+	input.Since = raw.Since
+	input.Until = raw.Until
+	if raw.Limit > 0 {
+		input.Limit = uint64(raw.Limit)
+	}
+	return input, nil
 }
 
 func (h *Handler) noteStats(w http.ResponseWriter, r *http.Request) {

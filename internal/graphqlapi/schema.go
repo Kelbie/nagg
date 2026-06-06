@@ -1385,31 +1385,48 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
-	rows, err := r.rankedEventRows(ctx, input)
+	ordered, err := r.rankedEventViews(ctx, input)
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
+	if len(ordered) == 0 {
+		return eventConnectionSource{}, nil
+	}
+	return r.newEventConnection(ordered), nil
+}
+
+// rankedEventViews runs the ranking core for an already-parsed input and returns
+// the ordered events. It is the single source of truth for the ranking
+// pipeline (aggregate rows -> ranked target IDs -> queryEvents -> weighted or
+// simple ordering) shared by the GraphQL rankedEvents resolver and the REST
+// ranked-feed handler. Callers wrap the result however they like (GraphQL wraps
+// with newEventConnection; REST enriches into a FeedResponse).
+func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput) ([]chstore.EventView, error) {
+	rows, err := r.rankedEventRows(ctx, input)
+	if err != nil {
+		return nil, err
+	}
 	targetIDs := rankedTargetIDs(rows, 0, max(input.Limit+input.Offset, input.Limit))
 	if len(targetIDs) == 0 {
-		return eventConnectionSource{}, nil
+		return nil, nil
 	}
 	if len(input.Target.IDs) > 0 {
 		targetIDs = intersectRankedIDs(targetIDs, input.Target.IDs)
 	}
 	if len(targetIDs) == 0 {
-		return eventConnectionSource{}, nil
+		return nil, nil
 	}
 	input.Target.IDs = targetIDs
 	input.Target.Limit = uint64(len(targetIDs))
 
 	events, err := r.queryEvents(ctx, input.Target)
 	if err != nil {
-		return eventConnectionSource{}, err
+		return nil, err
 	}
 	if useWeightedRanking(input.WeightedTerms, input.CandidateBoosts, input.Shuffle) {
 		targetIDs, err = weightedRankCandidateIDs(ctx, r.store, events, input.WeightedTerms, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
 		if err != nil {
-			return eventConnectionSource{}, err
+			return nil, err
 		}
 	} else {
 		targetIDs = rankedCandidateIDs(rows, events, input.Offset, input.Limit)
@@ -1424,7 +1441,7 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 			ordered = append(ordered, event)
 		}
 	}
-	return r.newEventConnection(ordered), nil
+	return ordered, nil
 }
 
 func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput) ([]chstore.AggregateRow, error) {
