@@ -19,6 +19,9 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeed {
 		t.Fatal("on-demand user feed backfill should be opt-in by default")
 	}
+	if !cfg.RunIngester || !cfg.RunEnricher {
+		t.Fatalf("in-process workers should default on: ingester=%v enricher=%v", cfg.RunIngester, cfg.RunEnricher)
+	}
 	if cfg.OnDemand.GraphQLHydration {
 		t.Fatal("graphql relay hydration should follow the disabled user-feed default")
 	}
@@ -62,6 +65,20 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 		if strings.Contains(strings.ToLower(relay), "pri"+"mal") {
 			t.Fatalf("default relay set includes external cache host %q", relay)
 		}
+	}
+}
+
+func TestLoadInProcessWorkerFlags(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_RUN_INGESTER", "false")
+	t.Setenv("NAGG_RUN_ENRICHER", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RunIngester || cfg.RunEnricher {
+		t.Fatalf("workers should be disabled by env: ingester=%v enricher=%v", cfg.RunIngester, cfg.RunEnricher)
 	}
 }
 
@@ -177,16 +194,19 @@ func TestLoadEnrichConfigOverride(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnknownEnrichTask(t *testing.T) {
+func TestLoadDropsUnknownEnrichTasks(t *testing.T) {
+	// Unsupported tasks (e.g. a stale env from a prior version) are dropped, not
+	// rejected — the API hosts the enricher in-process and must not crash on a
+	// stale NAGG_ENRICH_TASKS value.
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_ENRICH_TASKS", "quality,unknown")
+	t.Setenv("NAGG_ENRICH_TASKS", "embeddings,stance,quality,unknown")
 
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("expected load to succeed with stale tasks dropped, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "NAGG_ENRICH_TASKS") {
-		t.Fatalf("error = %v", err)
+	if got := strings.Join(cfg.Enrich.Tasks, ","); got != "quality" {
+		t.Fatalf("enrich tasks = %q, want only the supported subset 'quality'", got)
 	}
 }
 

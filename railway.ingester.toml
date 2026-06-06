@@ -1,3 +1,7 @@
+# OPTIONAL split-out service. The firehose ingester runs IN the main `nagg`
+# service by default (NAGG_RUN_INGESTER=true). Only deploy this standalone
+# service if you set NAGG_RUN_INGESTER=false on the main service (e.g. to scale
+# the API to multiple replicas without each opening its own firehose consumer).
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"

@@ -27,6 +27,15 @@ type Config struct {
 	Viewer     ViewerConfig
 	Enrich     EnrichConfig
 	Cache      CacheConfig
+
+	// RunIngester / RunEnricher let the API process host the firehose ingester
+	// and the enrichment runner in-process (alongside the HTTP server + Vertex
+	// syncer), so a single `nagg` service can do everything against one
+	// ClickHouse + Redis. Default on. Set false to split those workers back out
+	// into the standalone cmd/ingester / cmd/enricher binaries (e.g. to scale the
+	// API horizontally without N duplicate firehose consumers).
+	RunIngester bool
+	RunEnricher bool
 }
 
 type APIConfig struct {
@@ -132,7 +141,7 @@ func Load() (Config, error) {
 			PubKey: strings.ToLower(strings.TrimSpace(os.Getenv("NAGG_VIEWER_PUBKEY"))),
 		},
 		Enrich: EnrichConfig{
-			Tasks:        splitCSV(env("NAGG_ENRICH_TASKS", "quality")),
+			Tasks:        supportedEnrichTasks(splitCSV(env("NAGG_ENRICH_TASKS", "quality"))),
 			BatchSize:    parseInt(env("NAGG_ENRICH_BATCH_SIZE", "256")),
 			PollInterval: parseDuration(env("NAGG_ENRICH_POLL_INTERVAL", "30s")),
 			ModelVersion: env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
@@ -141,6 +150,8 @@ func Load() (Config, error) {
 			URL:        strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
 			DefaultTTL: parseDuration(env("NAGG_CACHE_DEFAULT_TTL", "30s")),
 		},
+		RunIngester: parseBool(env("NAGG_RUN_INGESTER", "true")),
+		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -206,11 +217,10 @@ func (c Config) validate() error {
 	if strings.TrimSpace(c.Enrich.ModelVersion) == "" {
 		return errors.New("NAGG_ENRICH_MODEL_VERSION must be non-empty")
 	}
-	for _, task := range c.Enrich.Tasks {
-		if !validEnrichTask(task) {
-			return fmt.Errorf("NAGG_ENRICH_TASKS contains unsupported task %q", task)
-		}
-	}
+	// NAGG_ENRICH_TASKS is NOT rejected here: unsupported tasks are dropped at
+	// load (supportedEnrichTasks). Now that the API hosts the enricher in-process,
+	// a stale env value must not crash the whole service — it just runs the
+	// supported subset.
 	// NAGG_REDIS_URL is intentionally not validated here: the cache is
 	// best-effort, so an empty or malformed URL just disables it (see cache.New)
 	// rather than failing the process.
@@ -219,6 +229,21 @@ func (c Config) validate() error {
 
 func validEnrichTask(task string) bool {
 	return enrich.SupportedTask(task)
+}
+
+// supportedEnrichTasks drops any tasks this build no longer supports (e.g. a
+// stale NAGG_ENRICH_TASKS env left over from a previous version with trending /
+// topics / ML tasks). Dropping instead of erroring keeps the API — which now
+// hosts the enricher in-process — from crashing on a stale value; unsupported
+// tasks are simply ignored.
+func supportedEnrichTasks(tasks []string) []string {
+	out := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		if validEnrichTask(task) {
+			out = append(out, task)
+		}
+	}
+	return out
 }
 
 func env(key, fallback string) string {

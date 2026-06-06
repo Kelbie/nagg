@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,7 +16,10 @@ import (
 	"github.com/vertex-lab/nagg/internal/cache"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
+	"github.com/vertex-lab/nagg/internal/enrich"
+	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
+	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -54,6 +58,61 @@ func main() {
 			BatchSize:    cfg.Vertex.SyncBatch,
 		}, logger)
 		go vertexSyncer.Run(ctx)
+	}
+
+	// Optionally host the firehose ingester and the enrichment runner in-process
+	// so a single `nagg` service does everything (HTTP + Vertex sync + ingest +
+	// enrich) against one ClickHouse + Redis. Set NAGG_RUN_INGESTER=false /
+	// NAGG_RUN_ENRICHER=false to split them back into cmd/ingester / cmd/enricher.
+	// Worker setup failures are logged but NON-fatal: serving the API always
+	// takes priority over a background worker that can't start.
+	if cfg.RunIngester || cfg.RunEnricher {
+		// In-process workers need the schema present. Migrations are idempotent
+		// (CREATE ... IF NOT EXISTS), so this is safe alongside the deploy-time
+		// migrate step; if it fails the API still serves (reads surface errors).
+		if err := store.Migrate(ctx); err != nil {
+			slog.Error("in-process worker migration failed; serving continues", "error", err)
+		}
+	}
+
+	if cfg.RunEnricher {
+		processors, err := enrich.NewProcessors(cfg.Enrich.Tasks, enrich.ProcessorConfig{
+			ModelVersion: cfg.Enrich.ModelVersion,
+		})
+		if err != nil {
+			slog.Error("in-process enricher disabled: setup failed", "error", err)
+		} else {
+			runner := enrich.NewRunner(store, processors, enrich.RunnerConfig{
+				BatchSize:    cfg.Enrich.BatchSize,
+				PollInterval: cfg.Enrich.PollInterval,
+			}, logger)
+			slog.Info("in-process enricher starting", "tasks", enrich.NormalizeTasks(cfg.Enrich.Tasks))
+			go func() {
+				if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Error("enricher stopped with error", "error", err)
+				}
+			}()
+		}
+	}
+
+	if cfg.RunIngester {
+		firehoseClient, err := firehose.New(cfg.Firehose)
+		if err != nil {
+			slog.Error("in-process ingester disabled: firehose setup failed", "error", err)
+		} else {
+			pipeline := ingest.New(store, cfg.Ingest)
+			events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
+			slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays))
+			go func() {
+				firehoseClient.Run(ctx, events)
+				close(events)
+			}()
+			go func() {
+				if err := pipeline.Run(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
+					slog.Error("ingestion stopped with error", "error", err)
+				}
+			}()
+		}
 	}
 
 	var userFeedBackfiller *appview.RelayUserFeedBackfiller

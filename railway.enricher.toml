@@ -1,3 +1,6 @@
+# OPTIONAL split-out service. The enrichment runner runs IN the main `nagg`
+# service by default (NAGG_RUN_ENRICHER=true). Only deploy this standalone
+# service if you set NAGG_RUN_ENRICHER=false on the main service.
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
