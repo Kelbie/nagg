@@ -267,10 +267,42 @@ type FeedResponse struct {
 	PaginationOffset int                          `json:"paginationOffset"`
 }
 
+// ThreadResponse is the flat REST app-view thread shape: a server-ranked flat
+// list of descendant events under `root`, with the same enrichment side maps as
+// the feed. It matches the canonical NaggThread so one client parser serves both
+// transports.
+type ThreadResponse struct {
+	Root     FeedEvent                    `json:"root"`
+	Events   []FeedEvent                  `json:"events"`
+	Metrics  map[string]chstore.NoteStats `json:"metrics"`
+	Profiles map[string]ProfileInfo       `json:"profiles"`
+	Quoted   map[string]FeedEvent         `json:"quoted"`
+}
+
 type EnrichmentResponse struct {
 	Metrics  map[string]chstore.NoteStats `json:"metrics"`
 	Profiles map[string]ProfileInfo       `json:"profiles"`
 	Quoted   map[string]FeedEvent         `json:"quoted"`
+}
+
+// PageInfo is the connection cursor envelope shared by the list app-view shapes
+// (DM envelopes, notifications). It matches the GraphQL `pageInfo` shape so the
+// nagg-ts client parses both transports with one schema. EndCursor is the
+// `<RFC3339Nano>|<id>` cursor of the last (oldest) row, or null when empty.
+type PageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   *string `json:"endCursor"`
+}
+
+// eventEndCursor mirrors the GraphQL resolver's cursor format so the REST and
+// GraphQL `pageInfo.endCursor` shapes are identical.
+func eventEndCursor(events []chstore.EventView) *string {
+	if len(events) == 0 {
+		return nil
+	}
+	last := events[len(events)-1]
+	cursor := last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID
+	return &cursor
 }
 
 type appViewHydration struct {
@@ -603,14 +635,21 @@ type NotificationRowJSON struct {
 	ActorVertexScore float64   `json:"actorVertexScore"`
 }
 
+// NotificationConnection is the notification rows + cursor, matching the GraphQL
+// notifications connection shape ({ nodes, pageInfo }) so one client schema
+// parses both transports (the pageInfo synthesis moves server-side here).
+type NotificationConnection struct {
+	Nodes    []NotificationRowJSON `json:"nodes"`
+	PageInfo PageInfo              `json:"pageInfo"`
+}
+
 // NotificationsResponse mirrors the feed enrichment (Metrics, Profiles, Quoted)
 // so clients can render notification events with the same hydration as the feed.
 type NotificationsResponse struct {
-	Notifications   []NotificationRowJSON        `json:"notifications"`
-	Metrics         map[string]chstore.NoteStats `json:"metrics"`
-	Profiles        map[string]ProfileInfo       `json:"profiles"`
-	Quoted          map[string]FeedEvent         `json:"quoted"`
-	PaginationUntil int64                        `json:"paginationUntil"`
+	Notifications NotificationConnection       `json:"notifications"`
+	Metrics       map[string]chstore.NoteStats `json:"metrics"`
+	Profiles      map[string]ProfileInfo       `json:"profiles"`
+	Quoted        map[string]FeedEvent         `json:"quoted"`
 }
 
 // notifications is the REST counterpart of the GraphQL notifications resolver.
@@ -636,15 +675,10 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 
 	events := make([]chstore.EventView, 0, len(rows))
 	notifications := make([]NotificationRowJSON, 0, len(rows))
-	var paginationUntil int64
 	for _, row := range rows {
 		events = append(events, row.Event)
-		feedEvent := eventJSON(row.Event)
-		if paginationUntil == 0 || feedEvent.CreatedAt < paginationUntil {
-			paginationUntil = feedEvent.CreatedAt
-		}
 		notifications = append(notifications, NotificationRowJSON{
-			Event:            feedEvent,
+			Event:            eventJSON(row.Event),
 			Reason:           row.Reason,
 			ActorVertexScore: row.ActorVertexScore,
 		})
@@ -656,11 +690,13 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, NotificationsResponse{
-		Notifications:   notifications,
-		Metrics:         hydration.Metrics,
-		Profiles:        hydration.Profiles,
-		Quoted:          hydration.Quoted,
-		PaginationUntil: paginationUntil,
+		Notifications: NotificationConnection{
+			Nodes:    notifications,
+			PageInfo: PageInfo{HasNextPage: len(rows) >= int(input.Limit), EndCursor: eventEndCursor(events)},
+		},
+		Metrics:  hydration.Metrics,
+		Profiles: hydration.Profiles,
+		Quoted:   hydration.Quoted,
 	})
 }
 
@@ -779,20 +815,13 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	out := struct {
-		Root     FeedEvent                    `json:"root"`
-		Events   []FeedEvent                  `json:"events"`
-		Metrics  map[string]chstore.NoteStats `json:"metrics"`
-		Profiles map[string]ProfileInfo       `json:"profiles"`
-		Quoted   map[string]FeedEvent         `json:"quoted"`
-	}{
+	writeJSON(w, ThreadResponse{
 		Root:     eventJSON(*root),
 		Events:   eventsJSON(events),
 		Metrics:  hydration.Metrics,
 		Profiles: hydration.Profiles,
 		Quoted:   hydration.Quoted,
-	}
-	writeJSON(w, out)
+	})
 }
 
 func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
@@ -845,10 +874,18 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, EnrichmentResponse{Metrics: hydration.Metrics, Profiles: hydration.Profiles, Quoted: quoted})
 }
 
-// DmEnvelopesResponse is the REST app-view shape for the DM/contacts page.
+// DmConnection is the REST app-view DM list. It matches the GraphQL dmEnvelopes
+// connection shape ({ nodes, pageInfo }) so the nagg-ts client parses both
+// transports with one schema and no per-transport normalize.
+type DmConnection struct {
+	Nodes    []chstore.EventView `json:"nodes"`
+	PageInfo PageInfo            `json:"pageInfo"`
+}
+
+// DmEnvelopesResponse wraps the connection under `dmEnvelopes` to byte-match the
+// GraphQL `data.dmEnvelopes` shape for the DM/contacts page.
 type DmEnvelopesResponse struct {
-	Envelopes   []chstore.EventView `json:"envelopes"`
-	HasNextPage bool                `json:"hasNextPage"`
+	DmEnvelopes DmConnection `json:"dmEnvelopes"`
 }
 
 // dmEnvelopes is the REST app-view counterpart of the GraphQL dmEnvelopes
@@ -887,7 +924,10 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	merged := mergeDmEnvelopes(limit, authored, received)
-	writeJSON(w, DmEnvelopesResponse{Envelopes: merged, HasNextPage: len(merged) >= limit})
+	writeJSON(w, DmEnvelopesResponse{DmEnvelopes: DmConnection{
+		Nodes:    merged,
+		PageInfo: PageInfo{HasNextPage: len(merged) >= limit, EndCursor: eventEndCursor(merged)},
+	}})
 }
 
 // parseDmKinds reads a CSV `kinds` param, defaulting to NIP-04 legacy DMs

@@ -582,11 +582,14 @@ func TestDMEnvelopesReturnsEncryptedContentVerbatim(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(response.Envelopes) != 1 {
-		t.Fatalf("envelopes = %+v, want exactly one", response.Envelopes)
+	if len(response.DmEnvelopes.Nodes) != 1 {
+		t.Fatalf("envelopes = %+v, want exactly one", response.DmEnvelopes.Nodes)
 	}
-	if got := response.Envelopes[0].Content; got != ciphertext {
+	if got := response.DmEnvelopes.Nodes[0].Content; got != ciphertext {
 		t.Fatalf("envelope content = %q, want encrypted ciphertext verbatim %q", got, ciphertext)
+	}
+	if response.DmEnvelopes.PageInfo.EndCursor == nil {
+		t.Fatalf("pageInfo.endCursor = nil, want a cursor for a non-empty page")
 	}
 }
 
@@ -1614,10 +1617,10 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Notifications) != 1 {
+	if len(response.Notifications.Nodes) != 1 {
 		t.Fatalf("notifications = %+v", response.Notifications)
 	}
-	got := response.Notifications[0]
+	got := response.Notifications.Nodes[0]
 	if got.Event.ID != eventID || got.Reason != "REACTION" || got.ActorVertexScore != 0.42 {
 		t.Fatalf("notification row = %+v", got)
 	}
@@ -1627,8 +1630,8 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 	if response.Profiles[actorPubkey].Name != "Reactor" {
 		t.Fatalf("profiles = %+v", response.Profiles)
 	}
-	if response.PaginationUntil != event.CreatedAt.Unix() {
-		t.Fatalf("paginationUntil = %d, want %d", response.PaginationUntil, event.CreatedAt.Unix())
+	if response.Notifications.PageInfo.EndCursor == nil {
+		t.Fatalf("pageInfo.endCursor = nil, want a cursor for a non-empty page")
 	}
 }
 
