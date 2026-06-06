@@ -1,3 +1,13 @@
+# The single `nagg` service. cmd/api hosts everything by default — HTTP
+# (GraphQL + REST), the Vertex score syncer, the firehose INGESTER, and the
+# ENRICHMENT runner — against one ClickHouse + one Redis. So this one service +
+# ClickHouse + Redis is the whole backend; the separate nagg-ingester /
+# nagg-enricher Railway services are no longer needed and can be deleted.
+#
+# To split the workers back out (e.g. to scale the API horizontally without N
+# duplicate firehose consumers): set NAGG_RUN_INGESTER=false and/or
+# NAGG_RUN_ENRICHER=false here, and run cmd/ingester / cmd/enricher as their own
+# services (railway.ingester.toml / railway.enricher.toml).
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
