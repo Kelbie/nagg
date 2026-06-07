@@ -629,12 +629,33 @@ func (h *Handler) rankedFeed(w http.ResponseWriter, r *http.Request) {
 	h.writeFeedResponse(w, r, events)
 }
 
-// NotificationRowJSON is the REST shape for a single notification: the event
-// plus the ranking metadata the GraphQL notifications resolver exposes.
+// NotificationActor is one participant in a grouped notification (a follower /
+// reposter / reactor / zapper), carried as a sample so the UI can render an
+// avatar cluster without the full member list.
+type NotificationActor struct {
+	PubKey           string  `json:"pubkey"`
+	EventID          string  `json:"eventId"`
+	CreatedAt        int64   `json:"createdAt"`
+	ActorVertexScore float64 `json:"actorVertexScore,omitempty"`
+}
+
+// NotificationRowJSON is the REST shape for one notification item. It mirrors the
+// feed's FeedItem convention: a `type` discriminator plus flat omitempty fields
+// and an inline related-event pointer (TargetEvent, like FeedItem.OriginalEvent).
+// A "group" collapses many same-target same-reason notifications (follow /
+// repost / reaction / zap) into one item with a representative Event (the most
+// recent member), a Total count, and up to three sample actors. reply / quote /
+// mention are always "single" so their text stays readable.
 type NotificationRowJSON struct {
-	Event            FeedEvent `json:"event"`
-	Reason           string    `json:"reason"`
-	ActorVertexScore float64   `json:"actorVertexScore"`
+	Type             string              `json:"type"` // "single" | "group"
+	Event            FeedEvent           `json:"event"`
+	Reason           string              `json:"reason"`
+	ActorVertexScore float64             `json:"actorVertexScore"`
+	TargetEventID    string              `json:"targetEventId,omitempty"`
+	TargetEvent      *FeedEvent          `json:"targetEvent,omitempty"`
+	Total            int                 `json:"total,omitempty"`
+	TotalCapped      bool                `json:"totalCapped,omitempty"`
+	SampleActors     []NotificationActor `json:"sampleActors,omitempty"`
 }
 
 // NotificationConnection is the notification rows + cursor, matching the GraphQL
@@ -664,7 +685,7 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET or POST /nostr/notifications only", http.StatusMethodNotAllowed)
 		return
 	}
-	input, err := h.parseNotificationRequest(r)
+	input, grouped, err := h.parseNotificationRequest(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -675,26 +696,52 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	events := make([]chstore.EventView, 0, len(rows))
-	notifications := make([]NotificationRowJSON, 0, len(rows))
-	for _, row := range rows {
-		events = append(events, row.Event)
-		notifications = append(notifications, NotificationRowJSON{
-			Event:            eventJSON(row.Event),
-			Reason:           row.Reason,
-			ActorVertexScore: row.ActorVertexScore,
-		})
+	var (
+		nodes        []NotificationRowJSON
+		hydrationIDs []chstore.EventView
+		actorPubkeys []string
+		hasNext      bool
+	)
+	if grouped {
+		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, rows)
+	} else {
+		nodes = make([]NotificationRowJSON, 0, len(rows))
+		hydrationIDs = make([]chstore.EventView, 0, len(rows))
+		for _, row := range rows {
+			hydrationIDs = append(hydrationIDs, row.Event)
+			nodes = append(nodes, NotificationRowJSON{
+				Type:             "single",
+				Event:            eventJSON(row.Event),
+				Reason:           row.Reason,
+				ActorVertexScore: row.ActorVertexScore,
+			})
+		}
+		hasNext = len(rows) >= int(input.Limit)
 	}
 
-	hydration, err := h.hydrateAppViewEvents(r.Context(), events)
+	hydration, err := h.hydrateAppViewEvents(r.Context(), hydrationIDs)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	// Sample actors beyond the representative are not event authors, so hydrate
+	// their profiles explicitly for the avatar cluster.
+	if len(actorPubkeys) > 0 {
+		if profiles, perr := h.profileInfos(r.Context(), actorPubkeys); perr == nil {
+			if hydration.Profiles == nil {
+				hydration.Profiles = make(map[string]ProfileInfo, len(profiles))
+			}
+			for pubkey, profile := range profiles {
+				if _, exists := hydration.Profiles[pubkey]; !exists {
+					hydration.Profiles[pubkey] = profile
+				}
+			}
+		}
+	}
 	writeJSON(w, NotificationsResponse{
 		Notifications: NotificationConnection{
-			Nodes:    notifications,
-			PageInfo: PageInfo{HasNextPage: len(rows) >= int(input.Limit), EndCursor: eventEndCursor(events)},
+			Nodes:    nodes,
+			PageInfo: PageInfo{HasNextPage: hasNext, EndCursor: notificationEndCursor(nodes)},
 		},
 		Metrics:  hydration.Metrics,
 		Profiles: hydration.Profiles,
@@ -702,11 +749,176 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// notificationGroupReasons collapse into a single item. reply / quote / mention
+// carry text and always render individually.
+func notificationGroupable(reason string) bool {
+	switch reason {
+	case "follow", "repost", "reaction", "zap":
+		return true
+	}
+	return false
+}
+
+// notificationGroupKey is what same-reason notifications collapse on. All
+// follows share one group; repost/reaction/zap collapse per target post (or a
+// per-reason "profile" bucket when there's no target event, e.g. a profile zap).
+func notificationGroupKey(reason, targetID string) string {
+	if reason == "follow" {
+		return "follow"
+	}
+	if targetID == "" {
+		return reason + ":profile"
+	}
+	return reason + ":" + targetID
+}
+
+type notificationGroupAcc struct {
+	rep       chstore.NotificationRow // representative = most-recent member
+	targetID  string
+	total     int
+	actors    []NotificationActor
+	actorSeen map[string]struct{}
+}
+
+// groupNotifications collapses the (newest-first) candidate rows into grouped
+// items, mirroring how feedResponse collapses reposts. It returns the response
+// nodes, the events to hydrate (representatives + target posts), and whether
+// more items exist past the page. All product semantics live here; the store
+// query stays generic.
+func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow) ([]NotificationRowJSON, []chstore.EventView, []string, bool) {
+	overfetch := int(input.Limit) * 8
+	if overfetch < 400 {
+		overfetch = 400
+	}
+	if overfetch > 4000 {
+		overfetch = 4000
+	}
+	windowSaturated := len(rows) >= overfetch
+
+	order := make([]string, 0, len(rows))
+	groups := make(map[string]*notificationGroupAcc, len(rows))
+	for _, row := range rows {
+		targetID := ""
+		if row.Reason == "repost" || row.Reason == "reaction" || row.Reason == "zap" {
+			targetID = firstEventTag(row.Event)
+		}
+		var key string
+		if notificationGroupable(row.Reason) {
+			key = notificationGroupKey(row.Reason, targetID)
+		} else {
+			// reply/quote/mention: each is its own single item.
+			key = "single:" + row.Event.ID
+		}
+		acc, ok := groups[key]
+		if !ok {
+			acc = &notificationGroupAcc{rep: row, targetID: targetID, actorSeen: map[string]struct{}{}}
+			groups[key] = acc
+			order = append(order, key)
+		}
+		acc.total++
+		if _, seen := acc.actorSeen[row.ActorPubKey]; !seen && len(acc.actors) < 3 && row.ActorPubKey != "" {
+			acc.actorSeen[row.ActorPubKey] = struct{}{}
+			acc.actors = append(acc.actors, NotificationActor{
+				PubKey:           row.ActorPubKey,
+				EventID:          row.Event.ID,
+				CreatedAt:        row.NotificationCreatedAt.Unix(),
+				ActorVertexScore: row.ActorVertexScore,
+			})
+		}
+	}
+
+	// order is already most-recent-first (first-seen = newest member). Trim to
+	// the page; anything beyond means there is a next page.
+	hasNext := len(order) > int(input.Limit) || windowSaturated && len(order) >= int(input.Limit)
+	if len(order) > int(input.Limit) {
+		order = order[:input.Limit]
+	}
+
+	// Exact follower count for the follow group (cheap, reused from /nostr/follows).
+	followTotal := -1
+	for _, key := range order {
+		if key == "follow" {
+			if counts, err := h.store.FollowCounts(ctx, input.Viewer); err == nil {
+				followTotal = int(counts.Followers)
+			}
+			break
+		}
+	}
+
+	nodes := make([]NotificationRowJSON, 0, len(order))
+	hydrationEvents := make([]chstore.EventView, 0, len(order)*2)
+	for _, key := range order {
+		acc := groups[key]
+		node := NotificationRowJSON{
+			Type:             "single",
+			Event:            eventJSON(acc.rep.Event),
+			Reason:           acc.rep.Reason,
+			ActorVertexScore: acc.rep.ActorVertexScore,
+		}
+		hydrationEvents = append(hydrationEvents, acc.rep.Event)
+		if acc.targetID != "" {
+			node.TargetEventID = acc.targetID
+		}
+		if notificationGroupable(acc.rep.Reason) && acc.total >= 2 {
+			node.Type = "group"
+			node.Total = acc.total
+			node.SampleActors = acc.actors
+			if acc.rep.Reason == "follow" && followTotal >= 0 {
+				node.Total = followTotal
+			} else {
+				node.TotalCapped = windowSaturated
+			}
+		}
+		nodes = append(nodes, node)
+	}
+
+	// Hydrate target posts inline (like feedResponse does for OriginalEvent) and
+	// merge sample-actor profiles so avatars resolve.
+	targetIDs := make([]string, 0, len(nodes))
+	actorPubkeys := make([]string, 0, len(nodes)*3)
+	for _, node := range nodes {
+		if node.TargetEventID != "" {
+			targetIDs = append(targetIDs, node.TargetEventID)
+		}
+		for _, actor := range node.SampleActors {
+			actorPubkeys = append(actorPubkeys, actor.PubKey)
+		}
+	}
+	if len(targetIDs) > 0 {
+		if targets, err := h.eventsByID(ctx, targetIDs); err == nil {
+			for i := range nodes {
+				if nodes[i].TargetEventID == "" {
+					continue
+				}
+				if target, ok := targets[nodes[i].TargetEventID]; ok {
+					tj := eventJSON(target)
+					nodes[i].TargetEvent = &tj
+					hydrationEvents = append(hydrationEvents, target)
+				}
+			}
+		}
+	}
+	return nodes, hydrationEvents, actorPubkeys, hasNext
+}
+
+// notificationEndCursor mirrors eventEndCursor over the last node's
+// representative event, keeping the REST and GraphQL cursor formats identical.
+func notificationEndCursor(nodes []NotificationRowJSON) *string {
+	if len(nodes) == 0 {
+		return nil
+	}
+	last := nodes[len(nodes)-1].Event
+	cursor := time.Unix(last.CreatedAt, 0).UTC().Format(time.RFC3339Nano) + "|" + last.ID
+	return &cursor
+}
+
 // parseNotificationRequest builds a chstore.NotificationInput from the request,
 // accepting both query params (GET) and a JSON body (POST). Defaults match the
 // GraphQL parseNotificationInput: tab ALL, policy STRICT, replyScope THREAD,
-// limit 50. The viewer pubkey falls back to the configured viewer.
-func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.NotificationInput, error) {
+// limit 50. The viewer pubkey falls back to the configured viewer. It also
+// returns whether the response should be grouped (default true) — the
+// followers-detail screen passes grouped=false to read the raw follow list.
+func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.NotificationInput, bool, error) {
 	input := chstore.NotificationInput{
 		Tab:        "ALL",
 		Policy:     "STRICT",
@@ -722,10 +934,15 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		Since      int64  `json:"since"`
 		Until      int64  `json:"until"`
 		Limit      int    `json:"limit"`
+		Grouped    *bool  `json:"grouped"`
 	}
+	grouped := true
 	if r.Method == http.MethodPost {
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-			return input, err
+			return input, grouped, err
+		}
+		if raw.Grouped != nil {
+			grouped = *raw.Grouped
 		}
 	} else {
 		q := r.URL.Query()
@@ -736,11 +953,12 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		raw.Since = int64(intParam(r, "since", 0))
 		raw.Until = int64(intParam(r, "until", 0))
 		raw.Limit = intParam(r, "limit", 0)
+		grouped = q.Get("grouped") != "false"
 	}
 
 	viewer, err := h.viewerPubkeyOr(raw.PubKey)
 	if err != nil {
-		return input, fmt.Errorf("notification pubkey: %w", err)
+		return input, grouped, fmt.Errorf("notification pubkey: %w", err)
 	}
 	input.Viewer = strings.ToLower(viewer)
 	if tab := strings.ToUpper(strings.TrimSpace(raw.Tab)); tab == "ALL" || tab == "MENTIONS" {
@@ -757,7 +975,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 	if raw.Limit > 0 {
 		input.Limit = uint64(raw.Limit)
 	}
-	return input, nil
+	return input, grouped, nil
 }
 
 func (h *Handler) noteStats(w http.ResponseWriter, r *http.Request) {

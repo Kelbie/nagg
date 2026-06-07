@@ -146,6 +146,12 @@ type NotificationRow struct {
 	Event            EventView `json:"event"`
 	Reason           string    `json:"reason"`
 	ActorVertexScore float64   `json:"actorVertexScore"`
+	// ActorPubKey is the follower/reposter/reactor/zapper. NotificationCreatedAt
+	// is the candidate's recency (not the event's created_at, which can differ
+	// for re-broadcast follows). Both feed the app-view grouping layer; the
+	// generic GraphQL path ignores them.
+	ActorPubKey           string    `json:"actorPubkey"`
+	NotificationCreatedAt time.Time `json:"notificationCreatedAt"`
 }
 
 type ProfileRow struct {
@@ -928,7 +934,9 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			sig,
 			last_seen_at,
 			reason,
-			actor_vertex_score
+			actor_vertex_score,
+			actor_pubkey,
+			notification_created_at
 		FROM (
 			SELECT
 				e.id AS id,
@@ -941,6 +949,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				e.last_seen_at AS last_seen_at,
 				n.reason AS reason,
 				ifNull(actor_score.score, 0) AS actor_vertex_score,
+				n.actor_pubkey AS actor_pubkey,
 				n.created_at AS notification_created_at,
 				n.event_id AS notification_event_id
 			FROM (
@@ -1001,6 +1010,8 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			&row.Event.UpdatedAt,
 			&row.Reason,
 			&row.ActorVertexScore,
+			&row.ActorPubKey,
+			&row.NotificationCreatedAt,
 		); err != nil {
 			return nil, err
 		}

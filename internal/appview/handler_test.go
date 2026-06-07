@@ -1682,6 +1682,116 @@ func TestNotificationsRequiresViewer(t *testing.T) {
 	}
 }
 
+func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) {
+	hex := func(c byte) string { return strings.Repeat(string(c), 64) }
+	target := hex('f')
+	mk := func(id, actor string, kind int, reason string, at int64, tags [][]string) chstore.NotificationRow {
+		return chstore.NotificationRow{
+			Event:                 chstore.EventView{ID: id, PubKey: actor, Kind: kind, CreatedAt: time.Unix(at, 0), Tags: tags},
+			Reason:                reason,
+			ActorPubKey:           actor,
+			NotificationCreatedAt: time.Unix(at, 0),
+		}
+	}
+	reactionTags := [][]string{{"e", target}, {"p", testPubkey}}
+	// Newest-first, as the store returns them.
+	rows := []chstore.NotificationRow{
+		mk(hex('a'), hex('1'), 7, "reaction", 300, reactionTags),
+		mk(hex('b'), hex('2'), 7, "reaction", 290, reactionTags),
+		mk(hex('c'), hex('3'), 3, "follow", 280, nil),
+		mk(hex('d'), hex('4'), 3, "follow", 270, nil),
+		mk(hex('e'), hex('5'), 3, "follow", 260, nil),
+		mk(hex('9'), hex('6'), 1, "reply", 250, [][]string{{"e", target, "", "reply"}}),
+	}
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{
+				profiles: map[string]chstore.ProfileRow{
+					hex('1'): {PubKey: hex('1'), DisplayName: "A1"},
+					hex('2'): {PubKey: hex('2'), DisplayName: "A2"},
+				},
+				counts: chstore.FollowCounts{Followers: 100},
+			},
+			events: map[string]chstore.EventView{target: {ID: target, PubKey: testPubkey, Kind: 1, Content: "my post"}},
+			stats:  map[string]chstore.NoteStats{},
+		},
+		rows: rows,
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications?pubkey="+testPubkey+"&limit=30", nil)
+	handler.notifications(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var resp NotificationsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	nodes := resp.Notifications.Nodes
+	if len(nodes) != 3 {
+		t.Fatalf("items = %d, want 3 (reaction group, follow group, reply single): %+v", len(nodes), nodes)
+	}
+	// node[0]: reaction group on the shared target.
+	if nodes[0].Type != "group" || nodes[0].Reason != "reaction" || nodes[0].Total != 2 {
+		t.Fatalf("reaction group = %+v", nodes[0])
+	}
+	if len(nodes[0].SampleActors) != 2 || nodes[0].TargetEventID != target || nodes[0].TargetEvent == nil {
+		t.Fatalf("reaction group actors/target = %+v", nodes[0])
+	}
+	// node[1]: follow group with the exact follower count from FollowCounts.
+	if nodes[1].Type != "group" || nodes[1].Reason != "follow" || nodes[1].Total != 100 || nodes[1].TotalCapped {
+		t.Fatalf("follow group = %+v", nodes[1])
+	}
+	if len(nodes[1].SampleActors) != 3 {
+		t.Fatalf("follow sample actors = %d, want 3", len(nodes[1].SampleActors))
+	}
+	// node[2]: reply stays single (text must be readable).
+	if nodes[2].Type != "single" || nodes[2].Reason != "reply" {
+		t.Fatalf("reply single = %+v", nodes[2])
+	}
+	// Sample-actor profiles are hydrated even though their member events collapsed.
+	if resp.Profiles[hex('2')].Name != "A2" {
+		t.Fatalf("sample actor profile missing: %+v", resp.Profiles)
+	}
+}
+
+func TestNotificationsGroupedFalseReturnsRawSingles(t *testing.T) {
+	hex := func(c byte) string { return strings.Repeat(string(c), 64) }
+	rows := []chstore.NotificationRow{
+		{Event: chstore.EventView{ID: hex('a'), PubKey: hex('1'), Kind: 3, CreatedAt: time.Unix(300, 0)}, Reason: "follow", ActorPubKey: hex('1'), NotificationCreatedAt: time.Unix(300, 0)},
+		{Event: chstore.EventView{ID: hex('b'), PubKey: hex('2'), Kind: 3, CreatedAt: time.Unix(290, 0)}, Reason: "follow", ActorPubKey: hex('2'), NotificationCreatedAt: time.Unix(290, 0)},
+	}
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]chstore.NoteStats{},
+		},
+		rows: rows,
+	}
+	handler := New(store, WithNIP05Validation(false))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications?pubkey="+testPubkey+"&grouped=false", nil)
+	handler.notifications(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var resp NotificationsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Notifications.Nodes) != 2 {
+		t.Fatalf("grouped=false should return raw rows, got %d", len(resp.Notifications.Nodes))
+	}
+	for _, n := range resp.Notifications.Nodes {
+		if n.Type != "single" || n.Total != 0 || len(n.SampleActors) != 0 {
+			t.Fatalf("grouped=false node must be a raw single: %+v", n)
+		}
+	}
+}
+
 func TestParseDmKindsDefaultsToNip04AndNip17(t *testing.T) {
 	cases := []struct {
 		name string
