@@ -140,6 +140,12 @@ type NotificationInput struct {
 	Since      int64
 	Until      int64
 	Limit      uint64
+	// Reasons / ExcludeReasons filter the candidate window by reason (follow,
+	// reply, quote, mention, repost, reaction, zap). The app-view grouping layer
+	// uses them to fetch follows and non-follows on separate windows so a flood
+	// of follow candidates can't crowd everything else out of the page.
+	Reasons        []string
+	ExcludeReasons []string
 }
 
 type NotificationRow struct {
@@ -826,6 +832,14 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	if input.Until > 0 {
 		recentFilters += " AND created_at < ?"
 		recentArgs = append(recentArgs, time.Unix(input.Until, 0).UTC())
+	}
+	if len(input.Reasons) > 0 {
+		recentFilters += " AND reason IN (?)"
+		recentArgs = append(recentArgs, input.Reasons)
+	}
+	if len(input.ExcludeReasons) > 0 {
+		recentFilters += " AND reason NOT IN (?)"
+		recentArgs = append(recentArgs, input.ExcludeReasons)
 	}
 
 	where := "WHERE 1 = 1"

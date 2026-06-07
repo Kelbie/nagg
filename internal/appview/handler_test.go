@@ -1559,8 +1559,32 @@ type notificationStore struct {
 }
 
 func (s *notificationStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
-	s.lastInput = input
-	return s.rows, nil
+	// Record the primary (non-follow) call; the grouped handler also makes a
+	// small follow-only sub-call we don't want to clobber the mirrored input.
+	if len(input.Reasons) == 0 {
+		s.lastInput = input
+	}
+	// Honor the reason include/exclude filters the way ClickHouse does, so the
+	// grouped handler's separate follow / non-follow windows behave realistically.
+	include := map[string]bool{}
+	for _, reason := range input.Reasons {
+		include[reason] = true
+	}
+	exclude := map[string]bool{}
+	for _, reason := range input.ExcludeReasons {
+		exclude[reason] = true
+	}
+	out := make([]chstore.NotificationRow, 0, len(s.rows))
+	for _, row := range s.rows {
+		if len(include) > 0 && !include[row.Reason] {
+			continue
+		}
+		if exclude[row.Reason] {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {

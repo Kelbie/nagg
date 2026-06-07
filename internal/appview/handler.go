@@ -690,11 +690,6 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rows, err := h.store.Notifications(r.Context(), input)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
 
 	var (
 		nodes        []NotificationRowJSON
@@ -703,8 +698,48 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		hasNext      bool
 	)
 	if grouped {
-		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, rows)
+		// Follows are pulled onto their own small window: a flood of follow
+		// candidates (kind-3 republishes from every follower) would otherwise fill
+		// the recency window and starve likes/reposts/replies. Follows collapse to
+		// one item with an exact count anyway, so a handful of recent followers is
+		// all we need; everything else gets the full window.
+		bodyInput := input
+		bodyInput.ExcludeReasons = append([]string{"follow"}, input.ExcludeReasons...)
+		bodyRows, err := h.store.Notifications(r.Context(), bodyInput)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		overfetch := int(input.Limit) * 8
+		if overfetch < 400 {
+			overfetch = 400
+		}
+		if overfetch > 4000 {
+			overfetch = 4000
+		}
+		windowSaturated := len(bodyRows) >= overfetch
+
+		var followRows []chstore.NotificationRow
+		if input.Tab != "MENTIONS" {
+			followInput := input
+			followInput.Reasons = []string{"follow"}
+			followInput.ExcludeReasons = nil
+			followInput.Limit = 12
+			if fr, ferr := h.store.Notifications(r.Context(), followInput); ferr == nil {
+				followRows = fr
+			}
+		}
+
+		allRows := make([]chstore.NotificationRow, 0, len(followRows)+len(bodyRows))
+		allRows = append(allRows, followRows...)
+		allRows = append(allRows, bodyRows...)
+		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
 	} else {
+		rows, err := h.store.Notifications(r.Context(), input)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
 		nodes = make([]NotificationRowJSON, 0, len(rows))
 		hydrationIDs = make([]chstore.EventView, 0, len(rows))
 		for _, row := range rows {
@@ -785,16 +820,7 @@ type notificationGroupAcc struct {
 // nodes, the events to hydrate (representatives + target posts), and whether
 // more items exist past the page. All product semantics live here; the store
 // query stays generic.
-func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow) ([]NotificationRowJSON, []chstore.EventView, []string, bool) {
-	overfetch := int(input.Limit) * 8
-	if overfetch < 400 {
-		overfetch = 400
-	}
-	if overfetch > 4000 {
-		overfetch = 4000
-	}
-	windowSaturated := len(rows) >= overfetch
-
+func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow, windowSaturated bool) ([]NotificationRowJSON, []chstore.EventView, []string, bool) {
 	order := make([]string, 0, len(rows))
 	groups := make(map[string]*notificationGroupAcc, len(rows))
 	for _, row := range rows {
@@ -827,8 +853,12 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 		}
 	}
 
-	// order is already most-recent-first (first-seen = newest member). Trim to
-	// the page; anything beyond means there is a next page.
+	// Order items by their representative recency. Rows may arrive as several
+	// concatenated windows (e.g. follows fetched separately from everything
+	// else), so we can't rely on first-seen order being globally sorted.
+	sort.SliceStable(order, func(i, j int) bool {
+		return groups[order[i]].rep.NotificationCreatedAt.After(groups[order[j]].rep.NotificationCreatedAt)
+	})
 	hasNext := len(order) > int(input.Limit) || windowSaturated && len(order) >= int(input.Limit)
 	if len(order) > int(input.Limit) {
 		order = order[:input.Limit]
