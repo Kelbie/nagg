@@ -703,21 +703,26 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		// the recency window and starve likes/reposts/replies. Follows collapse to
 		// one item with an exact count anyway, so a handful of recent followers is
 		// all we need; everything else gets the full window.
+		// Grouping needs a wide candidate window — many rows collapse into a few
+		// items — so fetch well past the page size, then trim to `limit` items in
+		// groupNotifications. Saturating this window is what tells us more pages
+		// exist (the per-page item count can't, since grouping shrinks it).
+		bodyWindow := int(input.Limit) * 6
+		if bodyWindow < 120 {
+			bodyWindow = 120
+		}
+		if bodyWindow > 600 {
+			bodyWindow = 600
+		}
 		bodyInput := input
+		bodyInput.Limit = uint64(bodyWindow)
 		bodyInput.ExcludeReasons = append([]string{"follow"}, input.ExcludeReasons...)
 		bodyRows, err := h.store.Notifications(r.Context(), bodyInput)
 		if err != nil {
 			writeError(w, err)
 			return
 		}
-		overfetch := int(input.Limit) * 8
-		if overfetch < 400 {
-			overfetch = 400
-		}
-		if overfetch > 4000 {
-			overfetch = 4000
-		}
-		windowSaturated := len(bodyRows) >= overfetch
+		windowSaturated := len(bodyRows) >= bodyWindow
 
 		// The follow group is a single collapsed entry pinned to the top of the
 		// first page; don't re-fetch/re-emit it while paginating (until > 0) or it
