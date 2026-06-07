@@ -365,12 +365,47 @@ curl -s -X POST https://nagg.up.railway.app/graphql -H 'content-type: applicatio
 
 ---
 
+## 10b. Notification grouping (shipped)
+
+The All tab was still dominated by follows: every follower's kind-3 republish
+becomes a follow candidate, so the recency-ordered window was *entirely*
+follows and the page collapsed to one follow entry with nothing else.
+
+Fix (app-view only; generic GraphQL stays per-event, mirroring how `feedResponse`
+collapses reposts):
+
+- `GET /nostr/notifications` now returns **grouped items**. follow / repost /
+  reaction / zap collapse (follow → one group; the rest per target post); reply
+  / quote / mention stay `type:"single"` so their text is readable. Each group
+  node carries a representative event, a `total`, `totalCapped`, ≤3
+  `sampleActors`, and (for repost/reaction/zap) an inline `targetEvent`.
+- **Follows are fetched on a separate capped window** so the flood can't crowd
+  out everything else; the body window excludes follows. The follow `total` is
+  the exact `FollowCounts().Followers`; other totals are window-bounded with
+  `totalCapped` → "N+". `limit` now means items, so a page is a genuine mixture.
+- `grouped=false` returns the raw ungrouped rows (the followers-detail screen).
+
+Verified live (e.g. jack): **17 items** — 1 follow group (`total` 15,046, 3
+sample actors), plus reactions/mentions/reposts/replies/quotes, profiles
+hydrated. Latency ~6–7 s cold (the extra follow sub-query adds ~2–3 s; a
+follow-window that skips the reply-scope joins is an easy follow-up), warm
+sub-second.
+
+Clients: `@sovranbitcoin/nagg-ts` schema gains the optional group fields +
+`grouped` param; `sovran-app` renders server groups (avatar cluster from
+`sampleActors`, "A, B and N more …", reaction/zap titles, target preview) and
+falls back to client-side consecutive grouping for the GraphQL path.
+
 ## 11. Commits
 
 - `nagg` (pushed to `Kelbie/nagg` main → deployed):
   - `perf(notifications): bound candidate window before FINAL joins and reply scans`
   - `feat(api)!: notifications pubkey input + viewer pubkey on ranked feed`
+  - `feat(notifications): group follows/reposts/reactions/zaps in the app-view`
+  - `fix(notifications): pull follows onto their own window so the page is a mixture`
 - `nagg-ts` (committed, `0.4.0`, needs publish):
   - `feat(api)!: notifications take pubkey; ranked input carries viewer pubkey`
+  - `feat(notifications): grouped node schema + grouped app-view param`
 - `sovran-app` (committed, needs nagg-ts `0.4.0`):
   - `feat(feed)!: pass pubkey to nagg notifications (API rename)`
+  - `feat(notifications): render server-grouped notifications with a mixture`
