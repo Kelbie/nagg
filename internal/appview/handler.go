@@ -715,7 +715,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 	}
 
 	var raw struct {
-		Viewer     string `json:"viewer"`
+		PubKey     string `json:"pubkey"`
 		Tab        string `json:"tab"`
 		Policy     string `json:"policy"`
 		ReplyScope string `json:"replyScope"`
@@ -729,7 +729,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		}
 	} else {
 		q := r.URL.Query()
-		raw.Viewer = q.Get("viewer")
+		raw.PubKey = q.Get("pubkey")
 		raw.Tab = q.Get("tab")
 		raw.Policy = q.Get("policy")
 		raw.ReplyScope = q.Get("replyScope")
@@ -738,9 +738,9 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		raw.Limit = intParam(r, "limit", 0)
 	}
 
-	viewer, err := h.viewerPubkeyOr(raw.Viewer)
+	viewer, err := h.viewerPubkeyOr(raw.PubKey)
 	if err != nil {
-		return input, fmt.Errorf("notification viewer: %w", err)
+		return input, fmt.Errorf("notification pubkey: %w", err)
 	}
 	input.Viewer = strings.ToLower(viewer)
 	if tab := strings.ToUpper(strings.TrimSpace(raw.Tab)); tab == "ALL" || tab == "MENTIONS" {

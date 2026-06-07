@@ -644,9 +644,12 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		Fields: graphql.InputObjectConfigFieldMap{
 			"references": &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(eventQueryInputType)},
 			"via":        &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(tagFilterType)},
-			"target":     &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
-			"metric":     &graphql.InputObjectFieldConfig{Type: metricInputType},
-			"terms":      &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(weightedRankTermInputType))},
+			// Optional requesting account, carried for forward-compatible
+			// personalization (future viewer-specific ranking/mutes).
+			"pubkey": &graphql.InputObjectFieldConfig{Type: graphql.String},
+			"target": &graphql.InputObjectFieldConfig{Type: eventQueryInputType},
+			"metric": &graphql.InputObjectFieldConfig{Type: metricInputType},
+			"terms":  &graphql.InputObjectFieldConfig{Type: graphql.NewList(graphql.NewNonNull(weightedRankTermInputType))},
 			"candidatePubkeyBoosts": &graphql.InputObjectFieldConfig{
 				Type: graphql.NewList(graphql.NewNonNull(candidatePubkeyBoostInputType)),
 			},
@@ -697,7 +700,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	notificationInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "NotificationInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"viewer":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
+			"pubkey":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
 			"tab":        &graphql.InputObjectFieldConfig{Type: notificationTabEnumType, DefaultValue: "ALL"},
 			"policy":     &graphql.InputObjectFieldConfig{Type: notificationPolicyEnumType, DefaultValue: "STRICT"},
 			"replyScope": &graphql.InputObjectFieldConfig{Type: notificationReplyScopeEnumType, DefaultValue: "THREAD"},
@@ -1434,8 +1437,12 @@ type rankedEventsInput struct {
 	WeightedTerms   []weightedRankTerm
 	CandidateBoosts []candidatePubkeyBoost
 	Shuffle         shuffleSpec
-	Limit           int
-	Offset          int
+	// ViewerPubkey is the requesting account, carried on every ranked request so
+	// future personalization (viewer-specific boosts, mutes, vertex weighting)
+	// can read it without a client/schema change. Optional and currently advisory.
+	ViewerPubkey string
+	Limit        int
+	Offset       int
 }
 
 type rankedReverseReferenceInput struct {
@@ -1940,6 +1947,11 @@ func (r *resolver) parseRankedEventsInput(ctx context.Context, raw any) (rankedE
 	out.CandidateBoosts, err = r.candidatePubkeyBoosts(ctx, m["candidatePubkeyBoosts"])
 	if err != nil {
 		return out, err
+	}
+	// Optional viewer pubkey, carried for forward-compatible personalization. We
+	// accept and normalize it but never fail the request on it.
+	if pubkey := strings.ToLower(strings.TrimSpace(stringValue(m["pubkey"]))); pubkey != "" && validateHex64(pubkey) == nil {
+		out.ViewerPubkey = pubkey
 	}
 	return out, nil
 }
@@ -3215,11 +3227,11 @@ func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, erro
 		Limit:      50,
 	}
 	if raw == nil {
-		return input, fmt.Errorf("notification viewer is required")
+		return input, fmt.Errorf("notification pubkey is required")
 	}
-	input.Viewer = strings.ToLower(strings.TrimSpace(stringValue(raw["viewer"])))
+	input.Viewer = strings.ToLower(strings.TrimSpace(stringValue(raw["pubkey"])))
 	if err := validateHex64(input.Viewer); err != nil {
-		return input, fmt.Errorf("notification viewer: %w", err)
+		return input, fmt.Errorf("notification pubkey: %w", err)
 	}
 	if tab := strings.ToUpper(strings.TrimSpace(stringValue(raw["tab"]))); tab == "ALL" || tab == "MENTIONS" {
 		input.Tab = tab

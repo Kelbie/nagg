@@ -2947,7 +2947,7 @@ func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
 		Schema: schema,
 		RequestString: `query {
 			notifications(input:{
-				viewer:"` + testPubkey + `"
+				pubkey:"` + testPubkey + `"
 				tab:MENTIONS
 				policy:STRICT
 				replyScope:DIRECT
@@ -3004,7 +3004,7 @@ func TestNotificationsDefaultsToAllStrict(t *testing.T) {
 
 	result := graphql.Do(graphql.Params{
 		Schema:        schema,
-		RequestString: `query { notifications(input:{viewer:"` + testPubkey + `"}) { nodes { reason } } }`,
+		RequestString: `query { notifications(input:{pubkey:"` + testPubkey + `"}) { nodes { reason } } }`,
 		Context:       context.Background(),
 	})
 

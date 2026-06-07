@@ -1596,7 +1596,7 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(
 		http.MethodGet,
-		"/nostr/notifications?viewer="+testPubkey+"&policy=relaxed&replyScope=direct&until=1710000000&limit=25",
+		"/nostr/notifications?pubkey="+testPubkey+"&policy=relaxed&replyScope=direct&until=1710000000&limit=25",
 		nil,
 	)
 	handler.notifications(rec, req)
