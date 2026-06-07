@@ -1670,7 +1670,10 @@ func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 	handler := New(store, WithViewerPubkey(testPubkey), WithNIP05Validation(false))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications", nil)
+	// grouped=false exercises the pass-through path so we can assert the parsed
+	// defaults reach the store verbatim (the grouped path intentionally fans the
+	// limit into a wide grouping window + a small follow window).
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications?grouped=false", nil)
 	handler.notifications(rec, req)
 
 	if rec.Code != http.StatusOK {
