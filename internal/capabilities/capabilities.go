@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	GraphQLSchemaVersion = "2026-06-07"
+	GraphQLSchemaVersion = "2026-06-08"
 	AppViewVersion       = "v1"
 )
 

@@ -876,13 +876,17 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 	}
 
 	// Exact follower count for the follow group (cheap, reused from /nostr/follows).
+	// Under the FOLLOWS policy the follow group is filtered to mutuals, so the
+	// all-followers count would be wrong — fall back to the window count there.
 	followTotal := -1
-	for _, key := range order {
-		if key == "follow" {
-			if counts, err := h.store.FollowCounts(ctx, input.Viewer); err == nil {
-				followTotal = int(counts.Followers)
+	if input.Policy != "FOLLOWS" {
+		for _, key := range order {
+			if key == "follow" {
+				if counts, err := h.store.FollowCounts(ctx, input.Viewer); err == nil {
+					followTotal = int(counts.Followers)
+				}
+				break
 			}
-			break
 		}
 	}
 
@@ -1005,7 +1009,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 	if tab := strings.ToUpper(strings.TrimSpace(raw.Tab)); tab == "ALL" || tab == "MENTIONS" {
 		input.Tab = tab
 	}
-	if policy := strings.ToUpper(strings.TrimSpace(raw.Policy)); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" {
+	if policy := strings.ToUpper(strings.TrimSpace(raw.Policy)); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" || policy == "FOLLOWS" {
 		input.Policy = policy
 	}
 	if replyScope := strings.ToUpper(strings.TrimSpace(raw.ReplyScope)); replyScope == "DIRECT" || replyScope == "THREAD" {

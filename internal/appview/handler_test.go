@@ -1690,6 +1690,26 @@ func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 	}
 }
 
+func TestNotificationsAcceptsFollowsPolicy(t *testing.T) {
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]chstore.NoteStats{},
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications?pubkey="+testPubkey+"&policy=follows&grouped=false", nil)
+	handler.notifications(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.lastInput.Policy != "FOLLOWS" {
+		t.Fatalf("policy = %q, want FOLLOWS", store.lastInput.Policy)
+	}
+}
+
 func TestNotificationsRequiresViewer(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{

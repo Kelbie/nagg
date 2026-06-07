@@ -841,6 +841,19 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		recentFilters += " AND reason NOT IN (?)"
 		recentArgs = append(recentArgs, input.ExcludeReasons)
 	}
+	if policy == "FOLLOWS" {
+		// Only notifications whose actor is in the viewer's follow set (the
+		// p-tags of the viewer's latest kind-3 contact list).
+		recentFilters += ` AND actor_pubkey IN (
+			SELECT tag_value FROM event_tags
+			WHERE tag_key = 'p' AND length(tag_value) = 64 AND event_id IN (
+				SELECT id FROM nostr_events FINAL
+				WHERE pubkey = ? AND kind = 3
+				ORDER BY created_at DESC LIMIT 1
+			)
+		)`
+		recentArgs = append(recentArgs, input.Viewer)
+	}
 
 	where := "WHERE 1 = 1"
 	actorThreshold, viewerThreshold := notificationPolicyThresholds(policy)
@@ -1092,7 +1105,9 @@ func notificationHasQuoteReference(tags [][]string) bool {
 
 func notificationPolicyThresholds(policy string) (float64, float64) {
 	switch strings.ToUpper(strings.TrimSpace(policy)) {
-	case "RELAXED":
+	case "RELAXED", "FOLLOWS":
+		// FOLLOWS gates on the follow graph, not vertex scores, so no score
+		// threshold applies (the actor-in-follows filter does the gating).
 		return 0, 0
 	case "MODERATE":
 		return 20, 60

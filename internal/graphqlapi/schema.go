@@ -688,6 +688,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"RELAXED":  &graphql.EnumValueConfig{Value: "RELAXED"},
 			"MODERATE": &graphql.EnumValueConfig{Value: "MODERATE"},
 			"STRICT":   &graphql.EnumValueConfig{Value: "STRICT"},
+			"FOLLOWS":  &graphql.EnumValueConfig{Value: "FOLLOWS"},
 		},
 	})
 	notificationReplyScopeEnumType := graphql.NewEnum(graphql.EnumConfig{
@@ -3236,7 +3237,7 @@ func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, erro
 	if tab := strings.ToUpper(strings.TrimSpace(stringValue(raw["tab"]))); tab == "ALL" || tab == "MENTIONS" {
 		input.Tab = tab
 	}
-	if policy := strings.ToUpper(strings.TrimSpace(stringValue(raw["policy"]))); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" {
+	if policy := strings.ToUpper(strings.TrimSpace(stringValue(raw["policy"]))); policy == "RELAXED" || policy == "MODERATE" || policy == "STRICT" || policy == "FOLLOWS" {
 		input.Policy = policy
 	}
 	if replyScope := strings.ToUpper(strings.TrimSpace(stringValue(raw["replyScope"]))); replyScope == "DIRECT" || replyScope == "THREAD" {
