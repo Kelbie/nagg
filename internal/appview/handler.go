@@ -719,8 +719,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		}
 		windowSaturated := len(bodyRows) >= overfetch
 
+		// The follow group is a single collapsed entry pinned to the top of the
+		// first page; don't re-fetch/re-emit it while paginating (until > 0) or it
+		// would repeat on every scroll page.
 		var followRows []chstore.NotificationRow
-		if input.Tab != "MENTIONS" {
+		if input.Tab != "MENTIONS" && input.Until == 0 {
 			followInput := input
 			followInput.Reasons = []string{"follow"}
 			followInput.ExcludeReasons = nil
@@ -859,7 +862,10 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 	sort.SliceStable(order, func(i, j int) bool {
 		return groups[order[i]].rep.NotificationCreatedAt.After(groups[order[j]].rep.NotificationCreatedAt)
 	})
-	hasNext := len(order) > int(input.Limit) || windowSaturated && len(order) >= int(input.Limit)
+	// More items exist if we collapsed past the page, or if the candidate window
+	// was saturated (older candidates remain beyond it — they may collapse into
+	// the same groups, but the client needs the chance to page for new ones).
+	hasNext := len(order) > int(input.Limit) || windowSaturated
 	if len(order) > int(input.Limit) {
 		order = order[:input.Limit]
 	}
