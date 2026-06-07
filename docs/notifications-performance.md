@@ -1,5 +1,11 @@
 # Nagg app-view load-time audit — notifications, feed, profile (June 2026)
 
+> For how the notification flow is *meant* to work (grouping, policies,
+> pagination, the layer responsibilities), see
+> [`notifications-flow.md`](./notifications-flow.md). This doc is the perf
+> history + benchmarks.
+
+
 Status: **shipped** (query restructure + API changes deployed to the Railway
 `nagg` service, schema `2026-06-07`). Materialized read-model is designed below
 as the next step.
