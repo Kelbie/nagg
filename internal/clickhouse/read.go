@@ -791,26 +791,52 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		replyScope = "THREAD"
 	}
 
-	where := "WHERE 1 = 1"
-	args := []any{input.Viewer}
-	whereArgs := []any{}
+	// Bound how many recent candidates we hydrate before the heavy FINAL joins
+	// and reply-reference scans. The candidate table is ORDER BY (viewer,
+	// created_at, ...), so taking the most-recent window for a viewer is a cheap
+	// range scan; every downstream join then probes only this small set instead
+	// of the viewer's entire notification history. We over-fetch so that the
+	// follow dedupe, policy threshold, and reply-scope filters still leave at
+	// least `limit` rows for high-volume viewers.
+	overfetch := input.Limit * 8
+	if overfetch < 400 {
+		overfetch = 400
+	}
+	if overfetch > 4000 {
+		overfetch = 4000
+	}
+
+	// recentFilters / recentArgs scope the candidate window itself (cheap, runs
+	// before any join). tab/since/until belong here, not in the outer WHERE.
+	recentFilters := ""
+	recentArgs := []any{}
 	if tab == "MENTIONS" {
-		where += " AND n.reason = 'mention'"
+		recentFilters += " AND reason = 'mention'"
 	}
 	if input.Since > 0 {
-		where += " AND n.created_at >= ?"
-		whereArgs = append(whereArgs, time.Unix(input.Since, 0).UTC())
+		recentFilters += " AND created_at >= ?"
+		recentArgs = append(recentArgs, time.Unix(input.Since, 0).UTC())
 	}
 	if input.Until > 0 {
-		where += " AND n.created_at < ?"
-		whereArgs = append(whereArgs, time.Unix(input.Until, 0).UTC())
+		recentFilters += " AND created_at < ?"
+		recentArgs = append(recentArgs, time.Unix(input.Until, 0).UTC())
 	}
+
+	where := "WHERE 1 = 1"
 	actorThreshold, viewerThreshold := notificationPolicyThresholds(policy)
+	policyArgs := []any{}
+	policyWhere := ""
 	if actorThreshold > 0 || viewerThreshold > 0 {
-		where += " AND (ifNull(actor_score.score, 0) >= ? OR ifNull(viewer_score.score, 0) >= ?)"
-		whereArgs = append(whereArgs, actorThreshold, viewerThreshold)
+		policyWhere = " AND (ifNull(actor_score.score, 0) >= ? OR ifNull(viewer_score.score, 0) >= ?)"
+		policyArgs = append(policyArgs, actorThreshold, viewerThreshold)
 	}
+
+	// The reply-reference subqueries are the most expensive part of the legacy
+	// query because they scan all of event_tags. We bound every one of them to
+	// the candidate event ids in `recent` so the work scales with the page size,
+	// not the global tag table.
 	replyReferenceJoin := ""
+	replyArgs := []any{}
 	if replyScope == "DIRECT" || replyScope == "THREAD" {
 		replyReferenceJoin = `
 			LEFT JOIN (
@@ -830,21 +856,38 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 						lower(if(length(tag_extra) >= 2, tag_extra[2], '')) AS marker
 					FROM event_tags
 					WHERE tag_key = 'e' AND length(tag_value) = 64
+					  AND event_id IN (SELECT event_id FROM recent)
 				)
 				GROUP BY event_id
 			) AS reply_meta ON reply_meta.event_id = e.id
-			LEFT JOIN nostr_events AS reply_parent FINAL ON reply_parent.id = reply_meta.direct_parent_id
+			LEFT JOIN (
+				SELECT id, pubkey
+				FROM nostr_events FINAL
+				WHERE id IN (
+					SELECT tag_value FROM event_tags
+					WHERE tag_key = 'e' AND length(tag_value) = 64
+					  AND event_id IN (SELECT event_id FROM recent)
+				)
+			) AS reply_parent ON reply_parent.id = reply_meta.direct_parent_id
 			LEFT JOIN (
 				SELECT rt.event_id, count() > 0 AS has_viewer_reply_reference
 				FROM event_tags AS rt
-				INNER JOIN nostr_events AS referenced FINAL ON referenced.id = rt.tag_value
+				INNER JOIN (
+					SELECT id, pubkey FROM nostr_events FINAL
+					WHERE id IN (
+						SELECT tag_value FROM event_tags
+						WHERE tag_key = 'e' AND length(tag_value) = 64
+						  AND event_id IN (SELECT event_id FROM recent)
+					)
+				) AS referenced ON referenced.id = rt.tag_value
 				WHERE rt.tag_key = 'e'
 				  AND length(rt.tag_value) = 64
 				  AND lower(if(length(rt.tag_extra) >= 2, rt.tag_extra[2], '')) IN ('', 'root', 'reply')
 				  AND referenced.pubkey = ?
+				  AND rt.event_id IN (SELECT event_id FROM recent)
 				GROUP BY rt.event_id
 			) AS viewer_reply_refs ON viewer_reply_refs.event_id = e.id`
-		args = append(args, input.Viewer)
+		replyArgs = append(replyArgs, input.Viewer)
 	}
 	switch replyScope {
 	case "DIRECT":
@@ -852,10 +895,29 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	case "THREAD":
 		where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR ifNull(viewer_reply_refs.has_viewer_reply_reference, 0) = 1)"
 	}
-	args = append(args, whereArgs...)
+
+	// Positional args in textual order:
+	//   recent CTE: viewer, [since], [until], overfetch
+	//   viewer_score subquery: viewer
+	//   reply join (optional): viewer
+	//   policy (optional): actorThreshold, viewerThreshold
+	//   final LIMIT
+	args := []any{input.Viewer}
+	args = append(args, recentArgs...)
+	args = append(args, overfetch)
+	args = append(args, input.Viewer)
+	args = append(args, replyArgs...)
+	args = append(args, policyArgs...)
 	args = append(args, input.Limit)
 
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+		WITH recent AS (
+			SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+			FROM notification_candidates FINAL
+			WHERE viewer = ?%s
+			ORDER BY created_at DESC, event_id DESC
+			LIMIT ?
+		)
 		SELECT
 			id,
 			pubkey,
@@ -892,25 +954,32 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 						created_at,
 						reason,
 						row_number() OVER (
-							PARTITION BY viewer, reason, actor_pubkey
+							PARTITION BY reason, actor_pubkey
 							ORDER BY created_at ASC, event_id ASC
 						) AS actor_reason_rank
-					FROM notification_candidates FINAL
-					WHERE viewer = ?
+					FROM recent
 				)
 				WHERE reason != 'follow' OR actor_reason_rank = 1
 			) AS n
-			INNER JOIN nostr_events AS e FINAL ON e.id = n.event_id
-			LEFT JOIN vertex_scores AS actor_score FINAL
-				ON actor_score.source = 'vertex' AND actor_score.pubkey = n.actor_pubkey
-			LEFT JOIN vertex_scores AS viewer_score FINAL
-				ON viewer_score.source = 'vertex' AND viewer_score.pubkey = n.viewer
+			INNER JOIN (
+				SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+				FROM nostr_events FINAL
+				WHERE id IN (SELECT event_id FROM recent)
+			) AS e ON e.id = n.event_id
+			LEFT JOIN (
+				SELECT pubkey, score FROM vertex_scores FINAL
+				WHERE source = 'vertex' AND pubkey IN (SELECT actor_pubkey FROM recent)
+			) AS actor_score ON actor_score.pubkey = n.actor_pubkey
+			LEFT JOIN (
+				SELECT pubkey, score FROM vertex_scores FINAL
+				WHERE source = 'vertex' AND pubkey = ?
+			) AS viewer_score ON viewer_score.pubkey = n.viewer
 			%s
-			%s
+			%s%s
 		)
 		ORDER BY notification_created_at DESC, notification_event_id DESC
 		LIMIT ?
-	`, replyReferenceJoin, where), args...)
+	`, recentFilters, replyReferenceJoin, where, policyWhere), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2321,4 +2390,3 @@ func takeUnvisited(visited map[string]struct{}, ids []string, max int) []string 
 	}
 	return out
 }
-
