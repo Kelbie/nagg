@@ -1254,11 +1254,21 @@ func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, 
 		until = time.Now().Add(time.Second).Unix()
 	}
 
+	// Dedup with LIMIT 1 BY id instead of FINAL: for a ReplacingMergeTree keyed by
+	// (kind, created_at, pubkey, id), two rows sharing an id necessarily share the
+	// whole sort key (the id is a hash of those fields), so "latest row per id"
+	// (max last_seen_at) is identical to FINAL's result — without forcing a
+	// read-and-merge of every part. Bounded by the follow set + created_at window.
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events AS e FINAL
-		WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?
-		ORDER BY e.created_at DESC, e.id DESC
+		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM (
+			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+			FROM nostr_events AS e
+			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?
+			ORDER BY e.id ASC, e.last_seen_at DESC
+			LIMIT 1 BY e.id
+		)
+		ORDER BY created_at DESC, id DESC
 		LIMIT %d OFFSET %d
 	`, limit, offset), pubkeys, time.Unix(until, 0).UTC())
 	if err != nil {

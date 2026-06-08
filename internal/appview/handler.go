@@ -473,13 +473,11 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := uint64(limitParam)
 	offset := uint64(offsetParam)
-	events, err := h.store.FollowsFeed(
-		r.Context(),
-		[]string{pubkey},
-		until,
-		limit,
-		offset,
-	)
+	var events []chstore.EventView
+	err = recordPhase(r.Context(), "db", func() (e error) {
+		events, e = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -747,6 +745,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 			followInput.Reasons = []string{"follow"}
 			followInput.ExcludeReasons = nil
 			followInput.Limit = 12
+			// Follows are kind-3, never replies, so the reply-reference scans (the
+			// most expensive part of the notifications query) are pure waste here.
+			// "NONE" falls through the store's DIRECT/THREAD switch, skipping the
+			// reply joins entirely without changing which follow rows return.
+			followInput.ReplyScope = "NONE"
 			if fr, ferr := h.store.Notifications(r.Context(), followInput); ferr == nil {
 				followRows = fr
 			}
