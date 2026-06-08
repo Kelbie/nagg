@@ -1358,16 +1358,43 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 		where += " AND e.created_at < ?"
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
-	orderBy, orderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
-	args = append(args, orderArgs...)
-	args = append(args, input.Limit)
-	query := `
-		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events AS e FINAL
-		` + where + `
-		` + orderBy + `
-		LIMIT ?
-	`
+
+	// When the query is bounded by an author set or a tag subquery (e.g. the DM
+	// envelopes authored/received reads), dedup with LIMIT 1 BY id instead of
+	// FINAL: rows sharing an id share the whole ReplacingMergeTree sort key, so
+	// latest-per-id equals FINAL without read-merging every part. Keep FINAL for
+	// unbounded kind/search-only scans, where the dedup subquery would have to
+	// materialize the whole filtered set before the outer ORDER BY/LIMIT.
+	bounded := len(input.PubKeys) > 0 || len(input.Tags) > 0
+	var query string
+	if bounded {
+		orderBy, orderArgs := eventOrderBy("created_at", "id", input.Shuffle)
+		args = append(args, orderArgs...)
+		args = append(args, input.Limit)
+		query = `
+			SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+			FROM (
+				SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+				FROM nostr_events AS e
+				` + where + `
+				ORDER BY e.id ASC, e.last_seen_at DESC
+				LIMIT 1 BY e.id
+			)
+			` + orderBy + `
+			LIMIT ?
+		`
+	} else {
+		orderBy, orderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
+		args = append(args, orderArgs...)
+		args = append(args, input.Limit)
+		query = `
+			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+			FROM nostr_events AS e FINAL
+			` + where + `
+			` + orderBy + `
+			LIMIT ?
+		`
+	}
 	if input.Offset > 0 {
 		query += " OFFSET ?"
 		args = append(args, input.Offset)
