@@ -130,21 +130,44 @@ fans out to ~8 ClickHouse queries, so ~4 concurrent requests ≈ 4×8×0.85 GB �
 near the 28.8 GB ceiling → cgroup OOM → `connection reset by peer`**. That matches the
 observed conc=2 OK / conc=4 fail.
 
-### Recommendation (priority order)
+### What was applied (and the result)
 
-1. **Cut per-query memory (app-side, our control):** remove the remaining `FINAL` in the
-   notifications query (`notification_candidates FINAL`, `vertex_scores FINAL` in
-   `internal/clickhouse/read.go`) — same `LIMIT 1 BY`/`argMax` technique. Lower memory/query
-   raises safe concurrency on the *same* instance. Validate with `--load`.
-2. **Set a per-query memory guardrail (CH config, affects prod — recommend, don't apply blind):**
-   `max_memory_usage` ≈ 4 GB. Over-budget queries then fail with a clean "memory limit
-   exceeded" instead of OOM-resetting the whole server (which takes prod down too).
-3. **Backpressure limiter** (`NAGG_MAX_CONCURRENT_REQUESTS`, shipped) sized to the memory
-   budget: with ~0.85 GB/query × ~8/request, ≈3 concurrent requests fit under 28.8 GB →
-   keep devnagg at 2–3. Set it on prod too.
-4. **Redis** (prod) collapses repeat reads — the main lever for many *returning* users, but
-   not for many *distinct* cold viewers (so 1–3 still matter).
-5. **More RAM** only if 1–4 don't reach the target concurrency — likely unnecessary first.
+1. **Cut per-query memory (done):** removed `notification_candidates FINAL` (→ windowed
+   `LIMIT 1 BY (event_id, reason)`) and both `vertex_scores FINAL` joins (→
+   `argMax(score, fetched_at) GROUP BY pubkey`) in `internal/clickhouse/read.go`. Modest:
+   notifications `db` p50 ≈ 550ms. Same data (ungrouped id sets match prod 100%).
+2. **Bounded read-only ClickHouse user (done, server-side):** `admin` is config-defined and
+   can't be `ALTER`ed, so created a SQL-managed `nagg_ro` (SELECT-only + memory/time limits);
+   devnagg now connects as it. Overload now degrades **gracefully** (a per-user memory-limit
+   rejection) instead of a cgroup-OOM `connection reset` that destabilises the whole server.
+   ```sql
+   CREATE USER nagg_ro IDENTIFIED BY '<pw>'
+     SETTINGS max_memory_usage = 4000000000,        -- 4 GB per query (runaway guard)
+              max_memory_usage_for_user = 22000000000, -- 22 GB total (headroom under 29.8 GB cgroup)
+              max_execution_time = 28;               -- under nagg's 30s request ctx
+   GRANT SELECT ON default.* TO nagg_ro;
+   ```
+3. **Backpressure limiter (done):** `NAGG_MAX_CONCURRENT_REQUESTS=2` on devnagg.
 
-Note: `--load` exercises the **shared** prod ClickHouse, so keep runs bounded; a dedicated
-dev ClickHouse is worth it if sustained load testing becomes routine.
+### Measured ceiling (the honest result)
+
+Even after 1–3, the shared CH caps at **~2 concurrent heavy requests**: limiter=2 → 100% across
+the whole sweep (~0.96 req/s, latency grows with queueing); limiter=4 → failures return when the
+CH is busy (conc=3 dropped to 50% in one run, 100% when idle). The ceiling is **variable**
+because devnagg shares the CH with prod + ingestion + merges, so available memory headroom
+fluctuates. A fixed limiter can't adapt — **2 is the safe floor on the shared instance**.
+
+### To actually serve hundreds of users (remaining levers)
+
+- **Redis** (prod has it) — the primary lever: collapses repeat reads so most requests never
+  touch CH. Distinct cold viewers still cost, so the limiter + headroom still matter.
+- **More RAM on ClickHouse** — the only way to raise the ~2-concurrent ceiling materially;
+  ~0.85 GB/query × ~8 queries/request means 30 GB only fits ~2–3 requests. Doubling RAM ≈
+  doubles safe concurrency.
+- **Apply to prod:** point prod `nagg` at `nagg_ro` (read-only + graceful limits) and set
+  `NAGG_MAX_CONCURRENT_REQUESTS` (+ merge PR #9 so prod gets the faster queries — prod currently
+  times out at conc=3).
+- **Dedicated dev ClickHouse** — removes the prod-shared variance; needed for clean, repeatable
+  load testing and so load tests stop taxing prod.
+
+Note: `--load` exercises the **shared** prod ClickHouse, so keep runs bounded.
