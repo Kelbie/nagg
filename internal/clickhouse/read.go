@@ -895,23 +895,27 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			) AS reply_meta ON reply_meta.event_id = e.id
 			LEFT JOIN (
 				SELECT id, pubkey
-				FROM nostr_events FINAL
+				FROM nostr_events
 				WHERE id IN (
 					SELECT tag_value FROM event_tags
 					WHERE tag_key = 'e' AND length(tag_value) = 64
 					  AND event_id IN (SELECT event_id FROM recent)
 				)
+				ORDER BY id ASC, last_seen_at DESC
+				LIMIT 1 BY id
 			) AS reply_parent ON reply_parent.id = reply_meta.direct_parent_id
 			LEFT JOIN (
 				SELECT rt.event_id, count() > 0 AS has_viewer_reply_reference
 				FROM event_tags AS rt
 				INNER JOIN (
-					SELECT id, pubkey FROM nostr_events FINAL
+					SELECT id, pubkey FROM nostr_events
 					WHERE id IN (
 						SELECT tag_value FROM event_tags
 						WHERE tag_key = 'e' AND length(tag_value) = 64
 						  AND event_id IN (SELECT event_id FROM recent)
 					)
+					ORDER BY id ASC, last_seen_at DESC
+					LIMIT 1 BY id
 				) AS referenced ON referenced.id = rt.tag_value
 				WHERE rt.tag_key = 'e'
 				  AND length(rt.tag_value) = 64
@@ -999,8 +1003,10 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			) AS n
 			INNER JOIN (
 				SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
-				FROM nostr_events FINAL
+				FROM nostr_events
 				WHERE id IN (SELECT event_id FROM recent)
+				ORDER BY id ASC, last_seen_at DESC
+				LIMIT 1 BY id
 			) AS e ON e.id = n.event_id
 			LEFT JOIN (
 				SELECT pubkey, score FROM vertex_scores FINAL
