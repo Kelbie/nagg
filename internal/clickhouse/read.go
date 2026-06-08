@@ -850,16 +850,22 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		// full-scanned the entire global p-tag range (~10s). Reading the one kind-3
 		// row off nostr_events' (kind, created_at, pubkey, id) prefix and extracting
 		// its p-tags is a bounded point lookup.
+		// Select the single latest kind-3 event FIRST (inner LIMIT 1), then
+		// arrayJoin its p-tags in the outer query — otherwise LIMIT 1 would apply
+		// after arrayJoin and return only the first follow.
 		recentFilters += ` AND actor_pubkey IN (
 			SELECT arrayJoin(
 				arrayMap(t -> t[2],
 					arrayFilter(t -> length(t) >= 2 AND t[1] = 'p' AND length(t[2]) = 64,
 						JSONExtract(tags_json, 'Array(Array(String))')))
 			)
-			FROM nostr_events
-			WHERE pubkey = ? AND kind = 3
-			ORDER BY created_at DESC, last_seen_at DESC
-			LIMIT 1
+			FROM (
+				SELECT tags_json
+				FROM nostr_events
+				WHERE pubkey = ? AND kind = 3
+				ORDER BY created_at DESC, last_seen_at DESC
+				LIMIT 1
+			)
 		)`
 		recentArgs = append(recentArgs, input.Viewer)
 	}
