@@ -172,6 +172,7 @@ func main() {
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor),
 		appview.WithRankedFeed(ranker),
+		appview.WithMaxConcurrentRequests(cfg.API.MaxConcurrentRequests),
 	}
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))

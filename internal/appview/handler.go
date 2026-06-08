@@ -63,6 +63,11 @@ type Handler struct {
 	cacheTTL                  time.Duration
 	cacheStaleFor             time.Duration
 	ranker                    RankedFeedProvider
+	// querySlots bounds how many CH-heavy requests execute concurrently (cache
+	// misses only). The shared ClickHouse degrades sharply past a handful of
+	// concurrent heavy queries, so excess requests wait here and succeed a little
+	// slower instead of stampeding CH and failing. nil = unlimited.
+	querySlots chan struct{}
 }
 
 type VertexClient interface {
@@ -124,6 +129,16 @@ func WithRateLimit(limit int, window time.Duration) Option {
 // WithRankedFeed wires the shared ranked-feed ranking pipeline so the REST
 // /nostr/feed/ranked route can serve the same ranking the GraphQL rankedEvents
 // resolver produces. Without it, the route responds 503.
+// WithMaxConcurrentRequests bounds concurrent CH-heavy requests (cache misses).
+// n <= 0 leaves it unlimited.
+func WithMaxConcurrentRequests(n int) Option {
+	return func(h *Handler) {
+		if n > 0 {
+			h.querySlots = make(chan struct{}, n)
+		}
+	}
+}
+
 func WithRankedFeed(provider RankedFeedProvider) Option {
 	return func(h *Handler) {
 		h.ranker = provider
@@ -189,27 +204,54 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	routes := []struct {
 		path    string
 		handler http.HandlerFunc
+		// heavy routes run multi-query ClickHouse aggregations; only these go
+		// through the concurrency limiter so a burst can't overwhelm CH.
+		heavy bool
 	}{
-		{"/nostr/capabilities", h.capabilities},
-		{"/nostr/feed", h.feed},
-		{"/nostr/feed/user", h.userFeed},
-		{"/nostr/feed/ranked", h.rankedFeed},
-		{"/nostr/notifications", h.notifications},
-		{"/nostr/notes/stats", h.noteStats},
-		{"/nostr/thread", h.thread},
-		{"/nostr/follows", h.follows},
-		{"/nostr/events", h.events},
-		{"/nostr/dm/envelopes", h.dmEnvelopes},
-		{"/nostr/profiles", h.profiles},
-		{"/nostr/profile", h.profile},
-		{"/nostr/search", h.search},
-		{"/nostr/recommended", h.recommended},
+		{"/nostr/capabilities", h.capabilities, false},
+		{"/nostr/feed", h.feed, true},
+		{"/nostr/feed/user", h.userFeed, true},
+		{"/nostr/feed/ranked", h.rankedFeed, true},
+		{"/nostr/notifications", h.notifications, true},
+		{"/nostr/notes/stats", h.noteStats, false},
+		{"/nostr/thread", h.thread, true},
+		{"/nostr/follows", h.follows, false},
+		{"/nostr/events", h.events, false},
+		{"/nostr/dm/envelopes", h.dmEnvelopes, true},
+		{"/nostr/profiles", h.profiles, false},
+		{"/nostr/profile", h.profile, false},
+		{"/nostr/search", h.search, false},
+		{"/nostr/recommended", h.recommended, false},
 	}
 	for _, route := range routes {
-		wrapped := h.withMiddleware(route.handler)
+		next := route.handler
+		if route.heavy {
+			next = h.limitConcurrency(next)
+		}
+		wrapped := h.withMiddleware(next)
 		mux.HandleFunc(route.path, wrapped)
 		// Forward-looking versioned alias; both share the same cache + middleware.
 		mux.HandleFunc("/v1"+route.path, wrapped)
+	}
+}
+
+// limitConcurrency gates a handler on the querySlots semaphore so only N CH-heavy
+// requests run at once; the rest wait (bounded by the request context) rather
+// than piling onto an already-saturated ClickHouse. It wraps the raw handler
+// INSIDE the response cache, so cache hits never wait. Returns 503 (retryable)
+// if the client's context expires while queued.
+func (h *Handler) limitConcurrency(next http.HandlerFunc) http.HandlerFunc {
+	if h.querySlots == nil {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case h.querySlots <- struct{}{}:
+			defer func() { <-h.querySlots }()
+			next(w, r)
+		case <-r.Context().Done():
+			http.Error(w, "server busy, retry shortly", http.StatusServiceUnavailable)
+		}
 	}
 }
 
