@@ -420,7 +420,13 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
 	if r.Method == http.MethodGet {
-		authors := normalizePubkeys(csv(r.URL.Query().Get("pubkeys")))
+		// Accept the plural `pubkeys` and, for parity with the single-viewer
+		// routes, fall back to a single `pubkey`/`viewer` author.
+		raw := r.URL.Query().Get("pubkeys")
+		if strings.TrimSpace(raw) == "" {
+			raw = queryViewerParam(r)
+		}
+		authors := normalizePubkeys(csv(raw))
 		if len(authors) == 0 && h.viewerPubkey != "" {
 			authors = []string{h.viewerPubkey}
 		}
@@ -428,6 +434,7 @@ func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Reques
 	}
 	var parsed struct {
 		PubKey  string   `json:"pubkey"`
+		Viewer  string   `json:"viewer"`
 		PubKeys []string `json:"pubkeys"`
 	}
 	if err := json.Unmarshal([]byte(spec), &parsed); err != nil {
@@ -436,8 +443,8 @@ func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Reques
 	if len(parsed.PubKeys) > 0 {
 		return normalizePubkeys(parsed.PubKeys)
 	}
-	if parsed.PubKey != "" {
-		if pubkey, err := normalizePubkey(parsed.PubKey); err == nil {
+	if single := firstNonEmpty(parsed.PubKey, parsed.Viewer); single != "" {
+		if pubkey, err := normalizePubkey(single); err == nil {
 			return []string{pubkey}
 		}
 	}
@@ -457,7 +464,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/feed/user only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -998,6 +1005,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 
 	var raw struct {
 		PubKey     string `json:"pubkey"`
+		Viewer     string `json:"viewer"`
 		Tab        string `json:"tab"`
 		Policy     string `json:"policy"`
 		ReplyScope string `json:"replyScope"`
@@ -1014,9 +1022,12 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		if raw.Grouped != nil {
 			grouped = *raw.Grouped
 		}
+		if strings.TrimSpace(raw.PubKey) == "" {
+			raw.PubKey = raw.Viewer
+		}
 	} else {
 		q := r.URL.Query()
-		raw.PubKey = q.Get("pubkey")
+		raw.PubKey = queryViewerParam(r)
 		raw.Tab = q.Get("tab")
 		raw.Policy = q.Get("policy")
 		raw.ReplyScope = q.Get("replyScope")
@@ -1119,7 +1130,7 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/follows only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1189,7 +1200,7 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET or POST /nostr/dm/envelopes only", http.StatusMethodNotAllowed)
 		return
 	}
-	viewer, err := h.viewerPubkeyOr(r.URL.Query().Get("viewer"))
+	viewer, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1281,7 +1292,11 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profiles only", http.StatusMethodNotAllowed)
 		return
 	}
-	profiles, err := h.profileInfos(r.Context(), normalizePubkeys(csv(r.URL.Query().Get("pubkeys"))))
+	raw := r.URL.Query().Get("pubkeys")
+	if strings.TrimSpace(raw) == "" {
+		raw = queryViewerParam(r)
+	}
+	profiles, err := h.profileInfos(r.Context(), normalizePubkeys(csv(raw)))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1298,7 +1313,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profile only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -2088,6 +2103,33 @@ func (h *Handler) viewerPubkeyOr(input string) (string, error) {
 		return h.viewerPubkey, nil
 	}
 	return normalizePubkey(input)
+}
+
+// queryViewerParam reads the viewer/subject pubkey from the query string,
+// accepting every spelling shipped clients use. sovran-app (already in prod)
+// sends `pubkey` on some routes and `viewer` on others, so every single-viewer
+// route accepts both — plus the first value of the plural `pubkeys` — without the
+// client having to change.
+func queryViewerParam(r *http.Request) string {
+	q := r.URL.Query()
+	for _, name := range []string{"pubkey", "viewer"} {
+		if v := strings.TrimSpace(q.Get(name)); v != "" {
+			return v
+		}
+	}
+	if list := csv(q.Get("pubkeys")); len(list) > 0 {
+		return list[0]
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func normalizeEventID(input string) (string, error) {
