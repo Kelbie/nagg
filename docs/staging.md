@@ -1,5 +1,21 @@
 # devnagg — read-only staging app-view
 
+> **Production rollout (done).** PR #9 (FINAL removals, FOLLOWS fix, Server-Timing,
+> backpressure limiter, conn-retry) merged to `main` and deployed to prod `nagg`.
+> Prod is now on `admin` (it writes via on-demand hydration + Vertex syncer, so the
+> read-only `nagg_ro` user is **not** usable there) with `NAGG_MAX_CONCURRENT_REQUESTS=3`
+> and `NAGG_CLICKHOUSE_MAX_OPEN_CONNS=15`. Result: notifications **db ~430ms / FOLLOWS
+> ~760ms** (was 8–13s, timing out at conc=3); a **10-simultaneous-distinct burst = 10/10
+> success** (cold ~3–8s queued behind the limiter, warm ~130ms via Redis).
+>
+> **Deploy gotcha (prod too):** a normal `main`→Railway prod deploy hits the same
+> ClickHouse connection-overlap deadlock devnagg does — the new container can't open its
+> pool while the old one + ingester hold theirs (`connection reset by peer`), so the
+> zero-downtime deploy fails and rolls back. Recovery: `railway down --service nagg -y`
+> then redeploy (set vars to trigger it) so the new container boots with **no overlap**.
+> Brief prod downtime; lowering the pool to 15 reduces (not eliminates) the risk.
+> Migrate/reconcile on prod was a verified no-op (no schema changes).
+
 `devnagg` is a Railway service for benchmarking ClickHouse query rewrites against
 **real production data** before they ship to `main`. It runs the `staging` branch
 and points at the **same** ClickHouse as prod, as a strict reader.
