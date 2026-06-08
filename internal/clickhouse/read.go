@@ -965,10 +965,14 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		WITH recent AS (
 			SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
-			FROM notification_candidates FINAL
-			WHERE viewer = ?%s
-			ORDER BY created_at DESC, event_id DESC
-			LIMIT ?
+			FROM (
+				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+				FROM notification_candidates
+				WHERE viewer = ?%s
+				ORDER BY created_at DESC, event_id DESC
+				LIMIT ?
+			)
+			LIMIT 1 BY event_id, reason
 		)
 		SELECT
 			id,
@@ -1024,12 +1028,16 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				LIMIT 1 BY id
 			) AS e ON e.id = n.event_id
 			LEFT JOIN (
-				SELECT pubkey, score FROM vertex_scores FINAL
+				SELECT pubkey, argMax(score, fetched_at) AS score
+				FROM vertex_scores
 				WHERE source = 'vertex' AND pubkey IN (SELECT actor_pubkey FROM recent)
+				GROUP BY pubkey
 			) AS actor_score ON actor_score.pubkey = n.actor_pubkey
 			LEFT JOIN (
-				SELECT pubkey, score FROM vertex_scores FINAL
+				SELECT pubkey, argMax(score, fetched_at) AS score
+				FROM vertex_scores
 				WHERE source = 'vertex' AND pubkey = ?
+				GROUP BY pubkey
 			) AS viewer_score ON viewer_score.pubkey = n.viewer
 			%s
 			%s%s
