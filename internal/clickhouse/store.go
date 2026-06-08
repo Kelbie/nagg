@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -42,6 +43,56 @@ type Store struct {
 	conn ch.Conn
 }
 
+// retryConn wraps the driver connection so a single transient connection-level
+// failure (a pooled connection the server closed out from under us — "connection
+// reset by peer", broken pipe, EOF) retries once instead of surfacing as a 5xx.
+// Under back-to-back/concurrent load these blips are the dominant non-fatal
+// error; one retry on a fresh pooled connection makes reads resilient. It only
+// retries reads (Query/QueryRow) and never on context cancel/deadline (the
+// caller gave up or the query is genuinely too slow — retrying would pile on) or
+// on Exec/inserts (not idempotent). All other driver methods promote unchanged.
+type retryConn struct {
+	chdriver.Conn
+}
+
+func isTransientConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	msg := err.Error()
+	for _, marker := range []string{
+		"connection reset by peer",
+		"broken pipe",
+		"use of closed network connection",
+		"unexpected EOF",
+		"EOF",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c retryConn) Query(ctx context.Context, query string, args ...any) (chdriver.Rows, error) {
+	rows, err := c.Conn.Query(ctx, query, args...)
+	if isTransientConnErr(err) {
+		return c.Conn.Query(ctx, query, args...)
+	}
+	return rows, err
+}
+
+func (c retryConn) QueryRow(ctx context.Context, query string, args ...any) chdriver.Row {
+	row := c.Conn.QueryRow(ctx, query, args...)
+	if isTransientConnErr(row.Err()) {
+		return c.Conn.QueryRow(ctx, query, args...)
+	}
+	return row
+}
+
 type EventRecord struct {
 	Event *nostr.Event
 	Relay string
@@ -65,7 +116,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		ConnOpenStrategy: ch.ConnOpenInOrder,
 		MaxOpenConns:     maxOpenConns,
 		MaxIdleConns:     maxIdleConns,
-		ConnMaxLifetime:  time.Hour,
+		// Recycle pooled connections well before Railway's private network / the
+		// ClickHouse server drops idle ones, so we hand out fewer dead connections
+		// (the retryConn wrapper recovers the rest).
+		ConnMaxLifetime: 10 * time.Minute,
 	})
 	if err != nil {
 		return nil, err
@@ -73,7 +127,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := conn.Ping(ctx); err != nil {
 		return nil, err
 	}
-	return &Store{conn: conn}, nil
+	return &Store{conn: retryConn{Conn: conn}}, nil
 }
 
 func positiveOrDefault(value int, fallback int) int {

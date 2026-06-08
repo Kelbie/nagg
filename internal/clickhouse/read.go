@@ -842,14 +842,29 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		recentArgs = append(recentArgs, input.ExcludeReasons)
 	}
 	if policy == "FOLLOWS" {
-		// Only notifications whose actor is in the viewer's follow set (the
-		// p-tags of the viewer's latest kind-3 contact list).
+		// Only notifications whose actor is in the viewer's follow set: the p-tags
+		// of the viewer's single latest kind-3 contact list, parsed straight from
+		// tags_json. The previous form expanded the kind-3 id against event_tags
+		// WHERE tag_key='p', but event_id is LAST in event_tags' sort key
+		// (tag_key, tag_value, kind, created_at, event_id), so that probe
+		// full-scanned the entire global p-tag range (~10s). Reading the one kind-3
+		// row off nostr_events' (kind, created_at, pubkey, id) prefix and extracting
+		// its p-tags is a bounded point lookup.
+		// Select the single latest kind-3 event FIRST (inner LIMIT 1), then
+		// arrayJoin its p-tags in the outer query — otherwise LIMIT 1 would apply
+		// after arrayJoin and return only the first follow.
 		recentFilters += ` AND actor_pubkey IN (
-			SELECT tag_value FROM event_tags
-			WHERE tag_key = 'p' AND length(tag_value) = 64 AND event_id IN (
-				SELECT id FROM nostr_events FINAL
+			SELECT arrayJoin(
+				arrayMap(t -> t[2],
+					arrayFilter(t -> length(t) >= 2 AND t[1] = 'p' AND length(t[2]) = 64,
+						JSONExtract(tags_json, 'Array(Array(String))')))
+			)
+			FROM (
+				SELECT tags_json
+				FROM nostr_events
 				WHERE pubkey = ? AND kind = 3
-				ORDER BY created_at DESC LIMIT 1
+				ORDER BY created_at DESC, last_seen_at DESC
+				LIMIT 1
 			)
 		)`
 		recentArgs = append(recentArgs, input.Viewer)
@@ -895,23 +910,27 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			) AS reply_meta ON reply_meta.event_id = e.id
 			LEFT JOIN (
 				SELECT id, pubkey
-				FROM nostr_events FINAL
+				FROM nostr_events
 				WHERE id IN (
 					SELECT tag_value FROM event_tags
 					WHERE tag_key = 'e' AND length(tag_value) = 64
 					  AND event_id IN (SELECT event_id FROM recent)
 				)
+				ORDER BY id ASC, last_seen_at DESC
+				LIMIT 1 BY id
 			) AS reply_parent ON reply_parent.id = reply_meta.direct_parent_id
 			LEFT JOIN (
 				SELECT rt.event_id, count() > 0 AS has_viewer_reply_reference
 				FROM event_tags AS rt
 				INNER JOIN (
-					SELECT id, pubkey FROM nostr_events FINAL
+					SELECT id, pubkey FROM nostr_events
 					WHERE id IN (
 						SELECT tag_value FROM event_tags
 						WHERE tag_key = 'e' AND length(tag_value) = 64
 						  AND event_id IN (SELECT event_id FROM recent)
 					)
+					ORDER BY id ASC, last_seen_at DESC
+					LIMIT 1 BY id
 				) AS referenced ON referenced.id = rt.tag_value
 				WHERE rt.tag_key = 'e'
 				  AND length(rt.tag_value) = 64
@@ -946,10 +965,14 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		WITH recent AS (
 			SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
-			FROM notification_candidates FINAL
-			WHERE viewer = ?%s
-			ORDER BY created_at DESC, event_id DESC
-			LIMIT ?
+			FROM (
+				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+				FROM notification_candidates
+				WHERE viewer = ?%s
+				ORDER BY created_at DESC, event_id DESC
+				LIMIT ?
+			)
+			LIMIT 1 BY event_id, reason
 		)
 		SELECT
 			id,
@@ -999,16 +1022,22 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			) AS n
 			INNER JOIN (
 				SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
-				FROM nostr_events FINAL
+				FROM nostr_events
 				WHERE id IN (SELECT event_id FROM recent)
+				ORDER BY id ASC, last_seen_at DESC
+				LIMIT 1 BY id
 			) AS e ON e.id = n.event_id
 			LEFT JOIN (
-				SELECT pubkey, score FROM vertex_scores FINAL
+				SELECT pubkey, argMax(score, fetched_at) AS score
+				FROM vertex_scores
 				WHERE source = 'vertex' AND pubkey IN (SELECT actor_pubkey FROM recent)
+				GROUP BY pubkey
 			) AS actor_score ON actor_score.pubkey = n.actor_pubkey
 			LEFT JOIN (
-				SELECT pubkey, score FROM vertex_scores FINAL
+				SELECT pubkey, argMax(score, fetched_at) AS score
+				FROM vertex_scores
 				WHERE source = 'vertex' AND pubkey = ?
+				GROUP BY pubkey
 			) AS viewer_score ON viewer_score.pubkey = n.viewer
 			%s
 			%s%s
@@ -1254,11 +1283,21 @@ func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, 
 		until = time.Now().Add(time.Second).Unix()
 	}
 
+	// Dedup with LIMIT 1 BY id instead of FINAL: for a ReplacingMergeTree keyed by
+	// (kind, created_at, pubkey, id), two rows sharing an id necessarily share the
+	// whole sort key (the id is a hash of those fields), so "latest row per id"
+	// (max last_seen_at) is identical to FINAL's result — without forcing a
+	// read-and-merge of every part. Bounded by the follow set + created_at window.
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events AS e FINAL
-		WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?
-		ORDER BY e.created_at DESC, e.id DESC
+		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM (
+			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+			FROM nostr_events AS e
+			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?
+			ORDER BY e.id ASC, e.last_seen_at DESC
+			LIMIT 1 BY e.id
+		)
+		ORDER BY created_at DESC, id DESC
 		LIMIT %d OFFSET %d
 	`, limit, offset), pubkeys, time.Unix(until, 0).UTC())
 	if err != nil {
@@ -1348,16 +1387,43 @@ func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]Event
 		where += " AND e.created_at < ?"
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
-	orderBy, orderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
-	args = append(args, orderArgs...)
-	args = append(args, input.Limit)
-	query := `
-		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events AS e FINAL
-		` + where + `
-		` + orderBy + `
-		LIMIT ?
-	`
+
+	// When the query is bounded by an author set or a tag subquery (e.g. the DM
+	// envelopes authored/received reads), dedup with LIMIT 1 BY id instead of
+	// FINAL: rows sharing an id share the whole ReplacingMergeTree sort key, so
+	// latest-per-id equals FINAL without read-merging every part. Keep FINAL for
+	// unbounded kind/search-only scans, where the dedup subquery would have to
+	// materialize the whole filtered set before the outer ORDER BY/LIMIT.
+	bounded := len(input.PubKeys) > 0 || len(input.Tags) > 0
+	var query string
+	if bounded {
+		orderBy, orderArgs := eventOrderBy("created_at", "id", input.Shuffle)
+		args = append(args, orderArgs...)
+		args = append(args, input.Limit)
+		query = `
+			SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+			FROM (
+				SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+				FROM nostr_events AS e
+				` + where + `
+				ORDER BY e.id ASC, e.last_seen_at DESC
+				LIMIT 1 BY e.id
+			)
+			` + orderBy + `
+			LIMIT ?
+		`
+	} else {
+		orderBy, orderArgs := eventOrderBy("e.created_at", "e.id", input.Shuffle)
+		args = append(args, orderArgs...)
+		args = append(args, input.Limit)
+		query = `
+			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+			FROM nostr_events AS e FINAL
+			` + where + `
+			` + orderBy + `
+			LIMIT ?
+		`
+	}
 	if input.Offset > 0 {
 		query += " OFFSET ?"
 		args = append(args, input.Offset)

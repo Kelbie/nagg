@@ -63,6 +63,11 @@ type Handler struct {
 	cacheTTL                  time.Duration
 	cacheStaleFor             time.Duration
 	ranker                    RankedFeedProvider
+	// querySlots bounds how many CH-heavy requests execute concurrently (cache
+	// misses only). The shared ClickHouse degrades sharply past a handful of
+	// concurrent heavy queries, so excess requests wait here and succeed a little
+	// slower instead of stampeding CH and failing. nil = unlimited.
+	querySlots chan struct{}
 }
 
 type VertexClient interface {
@@ -124,6 +129,16 @@ func WithRateLimit(limit int, window time.Duration) Option {
 // WithRankedFeed wires the shared ranked-feed ranking pipeline so the REST
 // /nostr/feed/ranked route can serve the same ranking the GraphQL rankedEvents
 // resolver produces. Without it, the route responds 503.
+// WithMaxConcurrentRequests bounds concurrent CH-heavy requests (cache misses).
+// n <= 0 leaves it unlimited.
+func WithMaxConcurrentRequests(n int) Option {
+	return func(h *Handler) {
+		if n > 0 {
+			h.querySlots = make(chan struct{}, n)
+		}
+	}
+}
+
 func WithRankedFeed(provider RankedFeedProvider) Option {
 	return func(h *Handler) {
 		h.ranker = provider
@@ -189,27 +204,54 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	routes := []struct {
 		path    string
 		handler http.HandlerFunc
+		// heavy routes run multi-query ClickHouse aggregations; only these go
+		// through the concurrency limiter so a burst can't overwhelm CH.
+		heavy bool
 	}{
-		{"/nostr/capabilities", h.capabilities},
-		{"/nostr/feed", h.feed},
-		{"/nostr/feed/user", h.userFeed},
-		{"/nostr/feed/ranked", h.rankedFeed},
-		{"/nostr/notifications", h.notifications},
-		{"/nostr/notes/stats", h.noteStats},
-		{"/nostr/thread", h.thread},
-		{"/nostr/follows", h.follows},
-		{"/nostr/events", h.events},
-		{"/nostr/dm/envelopes", h.dmEnvelopes},
-		{"/nostr/profiles", h.profiles},
-		{"/nostr/profile", h.profile},
-		{"/nostr/search", h.search},
-		{"/nostr/recommended", h.recommended},
+		{"/nostr/capabilities", h.capabilities, false},
+		{"/nostr/feed", h.feed, true},
+		{"/nostr/feed/user", h.userFeed, true},
+		{"/nostr/feed/ranked", h.rankedFeed, true},
+		{"/nostr/notifications", h.notifications, true},
+		{"/nostr/notes/stats", h.noteStats, false},
+		{"/nostr/thread", h.thread, true},
+		{"/nostr/follows", h.follows, false},
+		{"/nostr/events", h.events, false},
+		{"/nostr/dm/envelopes", h.dmEnvelopes, true},
+		{"/nostr/profiles", h.profiles, false},
+		{"/nostr/profile", h.profile, false},
+		{"/nostr/search", h.search, false},
+		{"/nostr/recommended", h.recommended, false},
 	}
 	for _, route := range routes {
-		wrapped := h.withMiddleware(route.handler)
+		next := route.handler
+		if route.heavy {
+			next = h.limitConcurrency(next)
+		}
+		wrapped := h.withMiddleware(next)
 		mux.HandleFunc(route.path, wrapped)
 		// Forward-looking versioned alias; both share the same cache + middleware.
 		mux.HandleFunc("/v1"+route.path, wrapped)
+	}
+}
+
+// limitConcurrency gates a handler on the querySlots semaphore so only N CH-heavy
+// requests run at once; the rest wait (bounded by the request context) rather
+// than piling onto an already-saturated ClickHouse. It wraps the raw handler
+// INSIDE the response cache, so cache hits never wait. Returns 503 (retryable)
+// if the client's context expires while queued.
+func (h *Handler) limitConcurrency(next http.HandlerFunc) http.HandlerFunc {
+	if h.querySlots == nil {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case h.querySlots <- struct{}{}:
+			defer func() { <-h.querySlots }()
+			next(w, r)
+		case <-r.Context().Done():
+			http.Error(w, "server busy, retry shortly", http.StatusServiceUnavailable)
+		}
 	}
 }
 
@@ -232,7 +274,9 @@ func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		handler(w, r.WithContext(ctx))
+		ctx, timer := withTimer(ctx)
+		tw := &timingWriter{ResponseWriter: w, timer: timer, start: time.Now()}
+		handler(tw, r.WithContext(ctx))
 	}
 }
 
@@ -395,7 +439,11 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.writeFeedResponse(w, r, nil)
 		return
 	}
-	events, err := h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+	var events []chstore.EventView
+	err := recordPhase(r.Context(), "db", func() (e error) {
+		events, e = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -414,7 +462,13 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
 	if r.Method == http.MethodGet {
-		authors := normalizePubkeys(csv(r.URL.Query().Get("pubkeys")))
+		// Accept the plural `pubkeys` and, for parity with the single-viewer
+		// routes, fall back to a single `pubkey`/`viewer` author.
+		raw := r.URL.Query().Get("pubkeys")
+		if strings.TrimSpace(raw) == "" {
+			raw = queryViewerParam(r)
+		}
+		authors := normalizePubkeys(csv(raw))
 		if len(authors) == 0 && h.viewerPubkey != "" {
 			authors = []string{h.viewerPubkey}
 		}
@@ -422,6 +476,7 @@ func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Reques
 	}
 	var parsed struct {
 		PubKey  string   `json:"pubkey"`
+		Viewer  string   `json:"viewer"`
 		PubKeys []string `json:"pubkeys"`
 	}
 	if err := json.Unmarshal([]byte(spec), &parsed); err != nil {
@@ -430,8 +485,8 @@ func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Reques
 	if len(parsed.PubKeys) > 0 {
 		return normalizePubkeys(parsed.PubKeys)
 	}
-	if parsed.PubKey != "" {
-		if pubkey, err := normalizePubkey(parsed.PubKey); err == nil {
+	if single := firstNonEmpty(parsed.PubKey, parsed.Viewer); single != "" {
+		if pubkey, err := normalizePubkey(single); err == nil {
 			return []string{pubkey}
 		}
 	}
@@ -451,7 +506,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/feed/user only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -467,13 +522,11 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := uint64(limitParam)
 	offset := uint64(offsetParam)
-	events, err := h.store.FollowsFeed(
-		r.Context(),
-		[]string{pubkey},
-		until,
-		limit,
-		offset,
-	)
+	var events []chstore.EventView
+	err = recordPhase(r.Context(), "db", func() (e error) {
+		events, e = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -586,7 +639,11 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		items = append(items, item)
 	}
 
-	hydration, err := h.hydrateAppViewEvents(ctx, hydrationEvents)
+	var hydration appViewHydration
+	err = recordPhase(ctx, "hydrate", func() (e error) {
+		hydration, e = h.hydrateAppViewEvents(ctx, hydrationEvents)
+		return
+	})
 	if err != nil {
 		return FeedResponse{}, err
 	}
@@ -717,7 +774,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		bodyInput := input
 		bodyInput.Limit = uint64(bodyWindow)
 		bodyInput.ExcludeReasons = append([]string{"follow"}, input.ExcludeReasons...)
-		bodyRows, err := h.store.Notifications(r.Context(), bodyInput)
+		var bodyRows []chstore.NotificationRow
+		err = recordPhase(r.Context(), "db", func() (e error) {
+			bodyRows, e = h.store.Notifications(r.Context(), bodyInput)
+			return
+		})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -733,6 +794,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 			followInput.Reasons = []string{"follow"}
 			followInput.ExcludeReasons = nil
 			followInput.Limit = 12
+			// Follows are kind-3, never replies, so the reply-reference scans (the
+			// most expensive part of the notifications query) are pure waste here.
+			// "NONE" falls through the store's DIRECT/THREAD switch, skipping the
+			// reply joins entirely without changing which follow rows return.
+			followInput.ReplyScope = "NONE"
 			if fr, ferr := h.store.Notifications(r.Context(), followInput); ferr == nil {
 				followRows = fr
 			}
@@ -743,7 +809,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		allRows = append(allRows, bodyRows...)
 		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
 	} else {
-		rows, err := h.store.Notifications(r.Context(), input)
+		var rows []chstore.NotificationRow
+		err = recordPhase(r.Context(), "db", func() (e error) {
+			rows, e = h.store.Notifications(r.Context(), input)
+			return
+		})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -762,7 +832,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		hasNext = len(rows) >= int(input.Limit)
 	}
 
-	hydration, err := h.hydrateAppViewEvents(r.Context(), hydrationIDs)
+	var hydration appViewHydration
+	err = recordPhase(r.Context(), "hydrate", func() (e error) {
+		hydration, e = h.hydrateAppViewEvents(r.Context(), hydrationIDs)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -973,6 +1047,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 
 	var raw struct {
 		PubKey     string `json:"pubkey"`
+		Viewer     string `json:"viewer"`
 		Tab        string `json:"tab"`
 		Policy     string `json:"policy"`
 		ReplyScope string `json:"replyScope"`
@@ -989,9 +1064,12 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		if raw.Grouped != nil {
 			grouped = *raw.Grouped
 		}
+		if strings.TrimSpace(raw.PubKey) == "" {
+			raw.PubKey = raw.Viewer
+		}
 	} else {
 		q := r.URL.Query()
-		raw.PubKey = q.Get("pubkey")
+		raw.PubKey = queryViewerParam(r)
 		raw.Tab = q.Get("tab")
 		raw.Policy = q.Get("policy")
 		raw.ReplyScope = q.Get("replyScope")
@@ -1094,7 +1172,7 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/follows only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1164,7 +1242,7 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET or POST /nostr/dm/envelopes only", http.StatusMethodNotAllowed)
 		return
 	}
-	viewer, err := h.viewerPubkeyOr(r.URL.Query().Get("viewer"))
+	viewer, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1174,15 +1252,18 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 	until := int64(intParam(r, "until", 0))
 
 	h.tryBackfillDMEnvelopes(r.Context(), viewer, kinds, until, uint64(limit))
-	authored, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
-		PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
-	})
-	if err != nil {
-		writeError(w, err)
+	var authored, received []chstore.EventView
+	err = recordPhase(r.Context(), "db", func() (e error) {
+		authored, e = h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+			PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
+		})
+		if e != nil {
+			return
+		}
+		received, e = h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+			Tags: []chstore.TagFilter{{Key: "p", Value: viewer}}, Kinds: kinds, Until: until, Limit: uint64(limit),
+		})
 		return
-	}
-	received, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
-		Tags: []chstore.TagFilter{{Key: "p", Value: viewer}}, Kinds: kinds, Until: until, Limit: uint64(limit),
 	})
 	if err != nil {
 		writeError(w, err)
@@ -1253,7 +1334,11 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profiles only", http.StatusMethodNotAllowed)
 		return
 	}
-	profiles, err := h.profileInfos(r.Context(), normalizePubkeys(csv(r.URL.Query().Get("pubkeys"))))
+	raw := r.URL.Query().Get("pubkeys")
+	if strings.TrimSpace(raw) == "" {
+		raw = queryViewerParam(r)
+	}
+	profiles, err := h.profileInfos(r.Context(), normalizePubkeys(csv(raw)))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1270,7 +1355,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/profile only", http.StatusMethodNotAllowed)
 		return
 	}
-	pubkey, err := h.viewerPubkeyOr(r.URL.Query().Get("pubkey"))
+	pubkey, err := h.viewerPubkeyOr(queryViewerParam(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -2060,6 +2145,33 @@ func (h *Handler) viewerPubkeyOr(input string) (string, error) {
 		return h.viewerPubkey, nil
 	}
 	return normalizePubkey(input)
+}
+
+// queryViewerParam reads the viewer/subject pubkey from the query string,
+// accepting every spelling shipped clients use. sovran-app (already in prod)
+// sends `pubkey` on some routes and `viewer` on others, so every single-viewer
+// route accepts both — plus the first value of the plural `pubkeys` — without the
+// client having to change.
+func queryViewerParam(r *http.Request) string {
+	q := r.URL.Query()
+	for _, name := range []string{"pubkey", "viewer"} {
+		if v := strings.TrimSpace(q.Get(name)); v != "" {
+			return v
+		}
+	}
+	if list := csv(q.Get("pubkeys")); len(list) > 0 {
+		return list[0]
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func normalizeEventID(input string) (string, error) {

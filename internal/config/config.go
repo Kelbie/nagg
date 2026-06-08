@@ -40,6 +40,10 @@ type Config struct {
 
 type APIConfig struct {
 	GraphQLTimeout time.Duration
+	// MaxConcurrentRequests bounds concurrent CH-heavy app-view requests (cache
+	// misses). 0 = unlimited. Protects a capacity-limited ClickHouse from being
+	// overwhelmed by a burst of concurrent heavy queries.
+	MaxConcurrentRequests int
 }
 
 // CacheConfig configures the optional shared Redis response cache. When URL is
@@ -102,7 +106,8 @@ func Load() (Config, error) {
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
 		},
 		API: APIConfig{
-			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
+			GraphQLTimeout:        parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
+			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "0")),
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),

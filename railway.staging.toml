@@ -1,0 +1,27 @@
+# devnagg — read-only staging app-view (project "Sovran").
+#
+# This service exists ONLY to benchmark ClickHouse query rewrites against real
+# production data before they ship via main. It points at the SAME ClickHouse as
+# prod (clickhouse.railway.internal), so it is deliberately a pure reader:
+#
+#   * NO preDeployCommand — must never run ./nagg-migrate. migrate +
+#     schema-reconcile STRIP undeclared tables, which would mutate the prod
+#     ClickHouse. devnagg never touches schema.
+#   * NAGG_RUN_INGESTER=false / NAGG_RUN_ENRICHER=false (the only writers).
+#   * NAGG_REDIS_URL empty so every request computes — clean A/B measurement via
+#     the Server-Timing header.
+#
+# Schema changes (projections, materialized views) ship through main/railway.toml
+# (which DOES run migrate), reviewed — never through this service.
+#
+# Set this file as the service's config path and target the `staging` git branch
+# so pushes to staging auto-redeploy.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
