@@ -47,6 +47,8 @@ const arg = (name: string, def: number) => {
 };
 const N_BIG = arg("big", 3);
 const N_SMALL = arg("small", 3);
+const LOAD = process.argv.includes("--load");
+const REPS = arg("reps", 2);
 
 // Seeds: verification npub + well-known accounts. Discovery expands this.
 const VERIFY = "c673ff0b5f228feb0abb1001882178d4c588bc4e50f857173544b5543b454f81";
@@ -94,6 +96,80 @@ async function call(base: string, path: string, req: Req = {}): Promise<Resp> {
     }
   }
   return last;
+}
+
+// ---- load test (concurrency scaling) ---------------------------------------
+// Simulate "N people checking notifications at once": one request per DISTINCT
+// pubkey (distinct viewers => no shared cache => worst case), fired with a bounded
+// number in flight. Single attempt (NO retry) so we measure true success rate and
+// latency, and sweep concurrency to expose the scaling curve.
+
+async function fireOnce(base: string, path: string) {
+  const t0 = performance.now();
+  try {
+    const res = await fetch(base + path, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(60000),
+    });
+    let db: number | undefined;
+    const h = res.headers.get("server-timing");
+    if (h) { const m = h.match(/db;dur=([0-9.]+)/i); if (m) db = parseFloat(m[1]); }
+    await res.text(); // drain body so the connection is fully released
+    return { ms: performance.now() - t0, status: res.status, db };
+  } catch {
+    return { ms: performance.now() - t0, status: 0, db: undefined as number | undefined };
+  }
+}
+
+async function runLevel(base: string, pubkeys: string[], conc: number) {
+  // One notifications request per pubkey, at most `conc` in flight.
+  const tasks = pubkeys.map((pk) => () => fireOnce(base, `/nostr/notifications?pubkey=${pk}&limit=50`));
+  const results: { ms: number; status: number; db?: number }[] = [];
+  let i = 0;
+  const wall0 = performance.now();
+  const worker = async () => { while (i < tasks.length) { const t = tasks[i++]; results.push(await t()); } };
+  await Promise.all(Array.from({ length: Math.min(conc, tasks.length) }, worker));
+  return { results, wallMs: performance.now() - wall0 };
+}
+
+function pctile(sorted: number[], p: number) {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] | 0;
+}
+
+async function loadTest() {
+  const pubkeys = SEEDS;
+  const levels = [...new Set([1, 3, 5, 10, pubkeys.length])].filter((c) => c <= pubkeys.length).sort((a, b) => a - b);
+  console.log(`Load test: notifications, ${pubkeys.length} distinct pubkeys, ${REPS} reps/level`);
+  console.log(`dev=${DEV} (Redis off, limiter applies)\n`);
+  console.log(`${"conc".padStart(5)} ${"ok%".padStart(5)} ${"p50".padStart(6)} ${"p95".padStart(6)} ${"max".padStart(6)} ${"thru/s".padStart(7)} ${"dbp50".padStart(6)}`);
+  const summary: { conc: number; okPct: number; p50: number; thru: number }[] = [];
+  for (const c of levels) {
+    const lat: number[] = []; const dbs: number[] = []; let ok = 0, n = 0; let wall = 0;
+    for (let r = 0; r < REPS; r++) {
+      const { results, wallMs } = await runLevel(DEV, pubkeys, c);
+      wall += wallMs;
+      for (const x of results) { n++; lat.push(x.ms); if (x.status >= 200 && x.status < 300) ok++; if (x.db !== undefined) dbs.push(x.db); }
+    }
+    lat.sort((a, b) => a - b); dbs.sort((a, b) => a - b);
+    const okPct = Math.round((ok / n) * 100);
+    const thru = (pubkeys.length * REPS) / (wall / 1000);
+    summary.push({ conc: c, okPct, p50: pctile(lat, 0.5), thru });
+    console.log(`${String(c).padStart(5)} ${(okPct + "%").padStart(5)} ${(pctile(lat, 0.5) + "").padStart(6)} ${(pctile(lat, 0.95) + "").padStart(6)} ${(pctile(lat, 1) + "").padStart(6)} ${thru.toFixed(2).padStart(7)} ${(pctile(dbs, 0.5) + "").padStart(6)}`);
+  }
+  // Light prod comparison (Redis on) at low concurrency only — do NOT hammer prod.
+  console.log(`\nprod=${PROD} (Redis on) — light reference, conc=3:`);
+  const { results, wallMs } = await runLevel(PROD, pubkeys.slice(0, 5), 3);
+  const plat = results.map((r) => r.ms).sort((a, b) => a - b);
+  const pok = results.filter((r) => r.status >= 200 && r.status < 300).length;
+  console.log(`  conc=3 n=${results.length} ok=${pok}/${results.length} p50=${pctile(plat, 0.5)}ms p95=${pctile(plat, 0.95)}ms thru=${(results.length / (wallMs / 1000)).toFixed(2)}/s`);
+  // Verdict
+  const maxThru = Math.max(...summary.map((s) => s.thru));
+  const plateau = summary.find((s) => s.thru >= maxThru * 0.9);
+  const firstFail = summary.find((s) => s.okPct < 100);
+  console.log(`\n━━ verdict ━━`);
+  console.log(`throughput peaks ~${maxThru.toFixed(2)} req/s (plateaus by conc=${plateau?.conc}); p50 latency grows ${summary[0].p50}ms→${summary[summary.length - 1].p50}ms as concurrency rises = queueing behind the limiter.`);
+  console.log(firstFail ? `⚠️  failures begin at conc=${firstFail.conc} (${firstFail.okPct}% ok) — capacity exceeded.` : `✅ no failures across the sweep (limiter held; cost is latency, not errors).`);
 }
 
 // ---- id / value extraction per endpoint ------------------------------------
@@ -203,6 +279,11 @@ function printRows(title: string, rows: Row[], labels: Map<string, string>) {
 }
 
 // ---- main ------------------------------------------------------------------
+
+if (LOAD) {
+  await loadTest();
+  process.exit(0);
+}
 
 console.log(`prod=${PROD}\ndev =${DEV}\nDiscovering + bucketing pubkeys…`);
 const sizes = await discoverPubkeys();

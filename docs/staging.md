@@ -103,3 +103,48 @@ bun scripts/parity-check.ts                  # full audit
 bun scripts/parity-check.ts --big 3 --small 3
 bun scripts/parity-check.ts --big 1 --small 1   # quick
 ```
+
+## Load testing & ClickHouse capacity
+
+`--load` sweeps notification-request concurrency (1/3/5/10/all pubkeys), one request
+per distinct viewer (worst case — distinct viewers don't share cache), single attempt
+(no retry) so failures and latency are real:
+
+```bash
+bun scripts/parity-check.ts --load             # concurrency sweep on devnagg
+bun scripts/parity-check.ts --load --reps 3
+```
+
+**Measured scaling (devnagg, Redis off, limiter=2):** 0 failures across the sweep, but
+throughput plateaus at ~0.9 req/s and p50 latency grows with concurrency (2.1s @1 →
+9–10s @10–13) — the limiter converts overload into queueing, not errors. **Prod
+reference (old queries, no limiter): conc=3 → 0/5 succeeded, all hit the 30s timeout** —
+prod currently falls over at ~3 concurrent uncached notifications (fixed by PR #9).
+
+### Why it caps (`railway connect ClickHouse` / HTTP `system` tables)
+
+The instance is **not** small: **32 cores, ~29.8 GiB RAM**, `max_concurrent_queries=1000`,
+`max_server_memory_usage≈28.8 GB`. The problem is **memory**: `max_memory_usage=0` (no
+per-query cap) and each notification query peaks **~0.8–1 GB**. A notification *request*
+fans out to ~8 ClickHouse queries, so ~4 concurrent requests ≈ 4×8×0.85 GB ≈ **26 GB →
+near the 28.8 GB ceiling → cgroup OOM → `connection reset by peer`**. That matches the
+observed conc=2 OK / conc=4 fail.
+
+### Recommendation (priority order)
+
+1. **Cut per-query memory (app-side, our control):** remove the remaining `FINAL` in the
+   notifications query (`notification_candidates FINAL`, `vertex_scores FINAL` in
+   `internal/clickhouse/read.go`) — same `LIMIT 1 BY`/`argMax` technique. Lower memory/query
+   raises safe concurrency on the *same* instance. Validate with `--load`.
+2. **Set a per-query memory guardrail (CH config, affects prod — recommend, don't apply blind):**
+   `max_memory_usage` ≈ 4 GB. Over-budget queries then fail with a clean "memory limit
+   exceeded" instead of OOM-resetting the whole server (which takes prod down too).
+3. **Backpressure limiter** (`NAGG_MAX_CONCURRENT_REQUESTS`, shipped) sized to the memory
+   budget: with ~0.85 GB/query × ~8/request, ≈3 concurrent requests fit under 28.8 GB →
+   keep devnagg at 2–3. Set it on prod too.
+4. **Redis** (prod) collapses repeat reads — the main lever for many *returning* users, but
+   not for many *distinct* cold viewers (so 1–3 still matter).
+5. **More RAM** only if 1–4 don't reach the target concurrency — likely unnecessary first.
+
+Note: `--load` exercises the **shared** prod ClickHouse, so keep runs bounded; a dedicated
+dev ClickHouse is worth it if sustained load testing becomes routine.
