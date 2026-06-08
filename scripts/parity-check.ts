@@ -66,15 +66,22 @@ async function fetchJSON(
   base: string,
   path: string,
 ): Promise<{ ms: number; status: number; timing: string | null; body: any }> {
-  const t0 = performance.now();
-  const res = await fetch(base + path, { headers: { accept: "application/json" } });
-  const body = await res.json().catch(() => null);
-  return {
-    ms: performance.now() - t0,
-    status: res.status,
-    timing: res.headers.get("server-timing"),
-    body,
-  };
+  // Retry transient failures: the shared prod ClickHouse occasionally resets a
+  // connection or times out under burst load, which would otherwise show as a
+  // false contract failure. A real schema break is deterministic and survives.
+  let last: { ms: number; status: number; timing: string | null; body: any } | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const t0 = performance.now();
+    try {
+      const res = await fetch(base + path, { headers: { accept: "application/json" } });
+      const body = await res.json().catch(() => null);
+      last = { ms: performance.now() - t0, status: res.status, timing: res.headers.get("server-timing"), body };
+      if (res.status >= 200 && res.status < 300 && body) return last;
+    } catch (e) {
+      last = { ms: performance.now() - t0, status: 0, timing: null, body: null };
+    }
+  }
+  return last!;
 }
 
 function parseTiming(h: string | null): Record<string, number> {
