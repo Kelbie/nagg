@@ -58,6 +58,13 @@ const SEEDS = [
   "32e1827635450ebb3c5a7d12c1f8e7b2b514439ac10a67eef3d9fd9c5c68e245", // jb55
   "04c915daefee38317fa734444acee390a8269fe5810b2241e5e6dd343dfbecc9", // odell
   "97c70a44366a6535c145b333f973ea86dfdc2d7a99da618c40c64705ad98e322", // hodlbod
+  // User-supplied accounts (mix of follower sizes) for broader coverage.
+  "1e53e900c3bbc5ead295215efe27b2c8d5fbd15fb3dd810da3063674cb7213b2",
+  "ddf03aca85ade039e6742d5bef3df352df199d0d31e22b9858e7eda85cb3bbbe",
+  "1021c8921548fa89abb4cc7e8668a3a8dcebae0a4c323ffeaf570438832d6993",
+  "805b34f708837dfb3e7f05815ac5760564628b58d5a0ce839ccbb6ef3620fac3",
+  "1afe0c74e3d7784eba93a5e3fa554a6eeb01928d12739ae8ba4832786808e36d",
+  "c48e29f04b482cc01ca1f9ef8c86ef8318c059e0e9353235162f080f26e14c11",
 ];
 
 type Req = { method?: "GET" | "POST"; body?: unknown };
