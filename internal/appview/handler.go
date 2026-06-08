@@ -232,7 +232,9 @@ func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		handler(w, r.WithContext(ctx))
+		ctx, timer := withTimer(ctx)
+		tw := &timingWriter{ResponseWriter: w, timer: timer, start: time.Now()}
+		handler(tw, r.WithContext(ctx))
 	}
 }
 
@@ -395,7 +397,11 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		h.writeFeedResponse(w, r, nil)
 		return
 	}
-	events, err := h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+	var events []chstore.EventView
+	err := recordPhase(r.Context(), "db", func() (e error) {
+		events, e = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -586,7 +592,11 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 		items = append(items, item)
 	}
 
-	hydration, err := h.hydrateAppViewEvents(ctx, hydrationEvents)
+	var hydration appViewHydration
+	err = recordPhase(ctx, "hydrate", func() (e error) {
+		hydration, e = h.hydrateAppViewEvents(ctx, hydrationEvents)
+		return
+	})
 	if err != nil {
 		return FeedResponse{}, err
 	}
@@ -717,7 +727,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		bodyInput := input
 		bodyInput.Limit = uint64(bodyWindow)
 		bodyInput.ExcludeReasons = append([]string{"follow"}, input.ExcludeReasons...)
-		bodyRows, err := h.store.Notifications(r.Context(), bodyInput)
+		var bodyRows []chstore.NotificationRow
+		err = recordPhase(r.Context(), "db", func() (e error) {
+			bodyRows, e = h.store.Notifications(r.Context(), bodyInput)
+			return
+		})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -743,7 +757,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		allRows = append(allRows, bodyRows...)
 		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
 	} else {
-		rows, err := h.store.Notifications(r.Context(), input)
+		var rows []chstore.NotificationRow
+		err = recordPhase(r.Context(), "db", func() (e error) {
+			rows, e = h.store.Notifications(r.Context(), input)
+			return
+		})
 		if err != nil {
 			writeError(w, err)
 			return
@@ -762,7 +780,11 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		hasNext = len(rows) >= int(input.Limit)
 	}
 
-	hydration, err := h.hydrateAppViewEvents(r.Context(), hydrationIDs)
+	var hydration appViewHydration
+	err = recordPhase(r.Context(), "hydrate", func() (e error) {
+		hydration, e = h.hydrateAppViewEvents(r.Context(), hydrationIDs)
+		return
+	})
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1174,15 +1196,18 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 	until := int64(intParam(r, "until", 0))
 
 	h.tryBackfillDMEnvelopes(r.Context(), viewer, kinds, until, uint64(limit))
-	authored, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
-		PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
-	})
-	if err != nil {
-		writeError(w, err)
+	var authored, received []chstore.EventView
+	err = recordPhase(r.Context(), "db", func() (e error) {
+		authored, e = h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+			PubKeys: []string{viewer}, Kinds: kinds, Until: until, Limit: uint64(limit),
+		})
+		if e != nil {
+			return
+		}
+		received, e = h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
+			Tags: []chstore.TagFilter{{Key: "p", Value: viewer}}, Kinds: kinds, Until: until, Limit: uint64(limit),
+		})
 		return
-	}
-	received, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
-		Tags: []chstore.TagFilter{{Key: "p", Value: viewer}}, Kinds: kinds, Until: until, Limit: uint64(limit),
 	})
 	if err != nil {
 		writeError(w, err)
