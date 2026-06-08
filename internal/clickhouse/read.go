@@ -842,15 +842,24 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		recentArgs = append(recentArgs, input.ExcludeReasons)
 	}
 	if policy == "FOLLOWS" {
-		// Only notifications whose actor is in the viewer's follow set (the
-		// p-tags of the viewer's latest kind-3 contact list).
+		// Only notifications whose actor is in the viewer's follow set: the p-tags
+		// of the viewer's single latest kind-3 contact list, parsed straight from
+		// tags_json. The previous form expanded the kind-3 id against event_tags
+		// WHERE tag_key='p', but event_id is LAST in event_tags' sort key
+		// (tag_key, tag_value, kind, created_at, event_id), so that probe
+		// full-scanned the entire global p-tag range (~10s). Reading the one kind-3
+		// row off nostr_events' (kind, created_at, pubkey, id) prefix and extracting
+		// its p-tags is a bounded point lookup.
 		recentFilters += ` AND actor_pubkey IN (
-			SELECT tag_value FROM event_tags
-			WHERE tag_key = 'p' AND length(tag_value) = 64 AND event_id IN (
-				SELECT id FROM nostr_events FINAL
-				WHERE pubkey = ? AND kind = 3
-				ORDER BY created_at DESC LIMIT 1
+			SELECT arrayJoin(
+				arrayMap(t -> t[2],
+					arrayFilter(t -> length(t) >= 2 AND t[1] = 'p' AND length(t[2]) = 64,
+						JSONExtract(tags_json, 'Array(Array(String))')))
 			)
+			FROM nostr_events
+			WHERE pubkey = ? AND kind = 3
+			ORDER BY created_at DESC, last_seen_at DESC
+			LIMIT 1
 		)`
 		recentArgs = append(recentArgs, input.Viewer)
 	}
