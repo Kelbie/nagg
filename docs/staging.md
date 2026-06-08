@@ -78,18 +78,28 @@ devnagg → Settings → connect repo `Kelbie/nagg`, set the deploy branch to
 (which omits the migrate pre-deploy). After that, `git push origin staging`
 redeploys automatically. Until then, deploy with the `down`/`up` flow above.
 
-## Benchmark + parity harness
+## Audit harness — `scripts/parity-check.ts`
 
-`scripts/parity-check.ts` validates devnagg responses against the nagg-ts client
-Zod contract (the real "won't break clients" gate, immune to data volatility) and
-benchmarks server compute via the `Server-Timing` header (devnagg has Redis off,
-so `app`/`db`/`hydrate` are clean per-request compute). prod is hit only for the
-contract baseline + wall-clock sanity (prod has no Server-Timing and Redis on, so
-the harness rotates popular pubkeys to defeat its cache).
+Full prod-vs-staging audit of every REST app-view sovran-app uses (feed,
+feed/user, notifications, dm/envelopes, profile, notes/stats, thread). For each
+it checks three things:
+
+1. **Data parity** — compares the set of event ids (or stat keys) prod vs devnagg
+   return and reports overlap. Both read the same ClickHouse, so overlap is ~100%;
+   the only legitimate gap is prod's on-demand relay hydration (off on devnagg),
+   which shows as a few `prod-only` events.
+2. **Contract** — validates each devnagg response against the nagg-ts client Zod
+   schema (the real "won't break clients" gate; non-zero exit on failure).
+3. **Speed** — devnagg `Server-Timing` (`app`/`db`, clean compute, Redis off) vs
+   prod wall (cache-warmed, context only).
+
+Pubkeys are discovered from the live feed and bucketed by follower count (via
+`/nostr/follows`) so big accounts are compared against small ones. Also runs the
+notification tab/policy/replyScope matrix and thread lookups (root ids derived
+from each account's most-replied note).
 
 ```bash
-bun scripts/parity-check.ts              # parity + benchmark
-bun scripts/parity-check.ts --bench-only # devnagg compute only
+bun scripts/parity-check.ts                  # full audit
+bun scripts/parity-check.ts --big 3 --small 3
+bun scripts/parity-check.ts --big 1 --small 1   # quick
 ```
-
-Exit code is non-zero if any devnagg response fails the client contract.
