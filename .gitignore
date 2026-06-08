@@ -1,3 +1,11 @@
 .gocache/
 .gomodcache/
 bin/
+
+# Go build artifacts (binaries named after cmd/ dirs)
+/migrate
+/nagg-api
+/nagg-migrate
+/nagg-ingester
+/nagg-enricher
+/nagg-backfill
