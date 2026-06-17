@@ -198,6 +198,20 @@ func main() {
 }
 
 func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config) {
+	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
+		slog.Error("in-process ingester disabled: event kind retention failed", "error", err)
+		return
+	} else if result.Skipped {
+		slog.Warn("in-process ingester event kind retention skipped: no configured NAGG_KINDS")
+	} else if result.RemovedEvents > 0 {
+		slog.Info(
+			"clickhouse pruned removed event kinds",
+			"events", result.RemovedEvents,
+			"kinds", result.RemovedCounts,
+			"rebuilt_appview", result.RebuiltAppView,
+		)
+	}
+
 	firehoseClient, err := firehose.New(cfg.Firehose)
 	if err != nil {
 		slog.Error("in-process ingester disabled: firehose setup failed", "error", err)
@@ -259,7 +273,6 @@ var healthEventKinds = []eventKindInfo{
 	{Kind: 1059, Description: "Gift Wrap", Source: "NIP-59"},
 	{Kind: 1063, Description: "File Metadata", Source: "NIP-94"},
 	{Kind: 9735, Description: "Zap", Source: "NIP-57"},
-	{Kind: 10050, Description: "Relay list to receive DMs", Source: "NIP-51/NIP-17"},
 	{Kind: 10051, Description: "KeyPackage Relays List", Source: "Marmot"},
 	{Kind: 30078, Description: "Application-specific Data", Source: "NIP-78"},
 	{Kind: 38000, Description: "Ecash Mint Recommendation", Source: "NIP-87"},

@@ -41,24 +41,6 @@ func TestEventKindRetentionMutationsSkipEmptyAllowlist(t *testing.T) {
 	}
 }
 
-func TestActiveMutationCountQueryUsesCurrentDatabaseAndPendingMutations(t *testing.T) {
-	query := activeMutationCountQuery()
-	for _, want := range []string{"system.mutations", "database = currentDatabase()", "is_done = 0"} {
-		if !strings.Contains(query, want) {
-			t.Fatalf("active mutation query missing %q: %s", want, query)
-		}
-	}
-}
-
-func TestDiskFreeRatioQueryUsesClickHouseDisks(t *testing.T) {
-	query := diskFreeRatioQuery()
-	for _, want := range []string{"system.disks", "free_space", "total_space"} {
-		if !strings.Contains(query, want) {
-			t.Fatalf("disk free ratio query missing %q: %s", want, query)
-		}
-	}
-}
-
 func TestShouldRebuildAppViewAfterKindPrune(t *testing.T) {
 	if shouldRebuildAppViewAfterKindPrune(map[int]uint64{30078: 10}) {
 		t.Fatal("app-view rebuild should not run for generic app-data events")

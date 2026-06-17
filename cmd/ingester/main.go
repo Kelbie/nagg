@@ -39,6 +39,18 @@ func main() {
 		slog.Error("clickhouse migration failed", "error", err)
 		os.Exit(1)
 	}
+	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
+		slog.Warn("clickhouse event kind retention failed; continuing", "error", err)
+	} else if result.Skipped {
+		slog.Warn("clickhouse event kind retention skipped: no configured NAGG_KINDS")
+	} else if result.RemovedEvents > 0 {
+		slog.Info(
+			"clickhouse pruned removed event kinds",
+			"events", result.RemovedEvents,
+			"kinds", result.RemovedCounts,
+			"rebuilt_appview", result.RebuiltAppView,
+		)
+	}
 
 	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
 	client, err := firehose.New(cfg.Firehose)

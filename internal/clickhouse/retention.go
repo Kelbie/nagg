@@ -8,18 +8,12 @@ import (
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 )
 
-const eventKindRetentionMinDiskFreeRatio = 0.10
-
 type EventKindPruneResult struct {
-	ConfiguredKinds  []int
-	RemovedCounts    map[int]uint64
-	RemovedEvents    uint64
-	ActiveMutations  uint64
-	DiskFreeRatio    float64
-	MinDiskFreeRatio float64
-	RebuiltAppView   bool
-	Skipped          bool
-	SkipReason       string
+	ConfiguredKinds []int
+	RemovedCounts   map[int]uint64
+	RemovedEvents   uint64
+	RebuiltAppView  bool
+	Skipped         bool
 }
 
 func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []int) (EventKindPruneResult, error) {
@@ -30,18 +24,6 @@ func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []in
 	}
 	if len(kinds) == 0 {
 		result.Skipped = true
-		result.SkipReason = "no_configured_kinds"
-		return result, nil
-	}
-
-	activeMutations, err := s.activeMutationCount(ctx)
-	if err != nil {
-		return result, fmt.Errorf("count active mutations before event kind prune: %w", err)
-	}
-	result.ActiveMutations = activeMutations
-	if activeMutations > 0 {
-		result.Skipped = true
-		result.SkipReason = "active_mutations"
 		return result, nil
 	}
 
@@ -53,18 +35,6 @@ func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []in
 	result.RemovedCounts = removed
 	result.RemovedEvents = total
 	if total == 0 {
-		return result, nil
-	}
-
-	diskFreeRatio, err := s.diskFreeRatio(ctx)
-	if err != nil {
-		return result, fmt.Errorf("check clickhouse disk free space before event kind prune: %w", err)
-	}
-	result.DiskFreeRatio = diskFreeRatio
-	result.MinDiskFreeRatio = eventKindRetentionMinDiskFreeRatio
-	if diskFreeRatio < eventKindRetentionMinDiskFreeRatio {
-		result.Skipped = true
-		result.SkipReason = "low_disk_headroom"
 		return result, nil
 	}
 
@@ -83,38 +53,6 @@ func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []in
 	}
 
 	return result, nil
-}
-
-func (s *Store) activeMutationCount(ctx context.Context) (uint64, error) {
-	var count uint64
-	if err := s.conn.QueryRow(ctx, activeMutationCountQuery()).Scan(&count); err != nil {
-		return 0, err
-	}
-	return count, nil
-}
-
-func activeMutationCountQuery() string {
-	return `
-		SELECT count()
-		FROM system.mutations
-		WHERE database = currentDatabase()
-			AND is_done = 0
-	`
-}
-
-func (s *Store) diskFreeRatio(ctx context.Context) (float64, error) {
-	var ratio float64
-	if err := s.conn.QueryRow(ctx, diskFreeRatioQuery()).Scan(&ratio); err != nil {
-		return 0, err
-	}
-	return ratio, nil
-}
-
-func diskFreeRatioQuery() string {
-	return `
-		SELECT ifNull(min(toFloat64(free_space) / nullIf(toFloat64(total_space), 0)), 1)
-		FROM system.disks
-	`
 }
 
 func (s *Store) eventKindCountsMatching(ctx context.Context, predicate string) (map[int]uint64, uint64, error) {
