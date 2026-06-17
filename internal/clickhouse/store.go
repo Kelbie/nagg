@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -128,6 +129,81 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		return nil, err
 	}
 	return &Store{conn: retryConn{Conn: conn}}, nil
+}
+
+type openRetryConfig struct {
+	Attempts     int
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
+}
+
+// OpenWithRetry absorbs short ClickHouse availability blips during Railway
+// deploys. Heavy background mutations can briefly reset TCP connections; a
+// single failed Ping should not fail the whole pre-deploy or app startup.
+func OpenWithRetry(ctx context.Context, cfg Config, logger *slog.Logger) (*Store, error) {
+	return openWithRetry(ctx, cfg, openRetryConfig{
+		Attempts:     8,
+		InitialDelay: 2 * time.Second,
+		MaxDelay:     15 * time.Second,
+	}, logger, Open)
+}
+
+func openWithRetry(
+	ctx context.Context,
+	cfg Config,
+	retry openRetryConfig,
+	logger *slog.Logger,
+	open func(context.Context, Config) (*Store, error),
+) (*Store, error) {
+	attempts := positiveOrDefault(retry.Attempts, 1)
+	delay := retry.InitialDelay
+	if delay <= 0 {
+		delay = time.Second
+	}
+	maxDelay := retry.MaxDelay
+	if maxDelay <= 0 {
+		maxDelay = delay
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		store, err := open(ctx, cfg)
+		if err == nil {
+			if attempt > 1 && logger != nil {
+				logger.Info("clickhouse connection recovered", "attempt", attempt)
+			}
+			return store, nil
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if logger != nil {
+			logger.Warn(
+				"clickhouse connection failed; retrying",
+				"attempt", attempt,
+				"max_attempts", attempts,
+				"next_delay", delay,
+				"error", err,
+			)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+	return nil, lastErr
 }
 
 func positiveOrDefault(value int, fallback int) int {

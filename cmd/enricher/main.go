@@ -29,7 +29,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := chstore.Open(ctx, cfg.ClickHouse)
+	store, err := chstore.OpenWithRetry(ctx, cfg.ClickHouse, logger)
 	if err != nil {
 		slog.Error("clickhouse connection failed", "error", err)
 		os.Exit(1)
