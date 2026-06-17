@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -233,7 +234,7 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 
 type healthStore interface {
 	EventCount(context.Context) (uint64, error)
-	EventKindCounts(context.Context, []int) (map[int]uint64, error)
+	EventKindStats(context.Context, []int) (map[int]chstore.EventKindStats, error)
 }
 
 type healthResponse struct {
@@ -250,10 +251,12 @@ type eventKindInfo struct {
 }
 
 type eventKindBreakdown struct {
-	Kind        int    `json:"kind"`
-	Description string `json:"description"`
-	Source      string `json:"source"`
-	Count       uint64 `json:"count"`
+	Kind        int     `json:"kind"`
+	Description string  `json:"description"`
+	Source      string  `json:"source"`
+	Count       uint64  `json:"count"`
+	StoredBytes uint64  `json:"storedBytes"`
+	StoredGB    float64 `json:"storedGB"`
 }
 
 var healthEventKinds = []eventKindInfo{
@@ -304,18 +307,25 @@ func healthEventKindInfo(kind int) eventKindInfo {
 	}
 }
 
-func healthEventKindBreakdown(kinds []int, counts map[int]uint64) []eventKindBreakdown {
+func healthEventKindBreakdown(kinds []int, stats map[int]chstore.EventKindStats) []eventKindBreakdown {
 	breakdown := make([]eventKindBreakdown, 0, len(kinds))
 	for _, kind := range kinds {
 		info := healthEventKindInfo(kind)
+		stat := stats[info.Kind]
 		breakdown = append(breakdown, eventKindBreakdown{
 			Kind:        info.Kind,
 			Description: info.Description,
 			Source:      info.Source,
-			Count:       counts[info.Kind],
+			Count:       stat.Count,
+			StoredBytes: stat.StoredBytesRaw,
+			StoredGB:    bytesToDecimalGB(stat.StoredBytesRaw),
 		})
 	}
 	return breakdown
+}
+
+func bytesToDecimalGB(bytes uint64) float64 {
+	return math.Round(float64(bytes)/1_000_000_000*1_000_000) / 1_000_000
 }
 
 func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
@@ -332,17 +342,17 @@ func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
 			return
 		}
 
-		eventKindCounts, err := store.EventKindCounts(ctx, kindNumbers)
+		eventKindStats, err := store.EventKindStats(ctx, kindNumbers)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind count failed"})
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind stats failed"})
 			return
 		}
 
 		_ = json.NewEncoder(w).Encode(healthResponse{
 			OK:         "true",
 			EventCount: eventCount,
-			EventKinds: healthEventKindBreakdown(kindNumbers, eventKindCounts),
+			EventKinds: healthEventKindBreakdown(kindNumbers, eventKindStats),
 		})
 	}
 }

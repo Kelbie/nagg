@@ -227,22 +227,27 @@ func (s *Store) EventCount(ctx context.Context) (uint64, error) {
 	return count, nil
 }
 
-func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
+type EventKindStats struct {
+	Count          uint64
+	StoredBytesRaw uint64
+}
+
+func (s *Store) EventKindStats(ctx context.Context, kinds []int) (map[int]EventKindStats, error) {
 	kinds = uniqueEventKinds(kinds)
-	out := make(map[int]uint64, len(kinds))
+	out := make(map[int]EventKindStats, len(kinds))
 	for _, kind := range kinds {
-		out[kind] = 0
+		out[kind] = EventKindStats{}
 	}
 	if len(kinds) == 0 {
 		return out, nil
 	}
 
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT kind, count()
+		SELECT kind, count(), sum(%s)
 		FROM nostr_events
 		WHERE kind IN (%s)
 		GROUP BY kind
-	`, ints(kinds)))
+	`, rawEventStoredBytesExpression(), ints(kinds)))
 	if err != nil {
 		return nil, err
 	}
@@ -250,13 +255,31 @@ func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint6
 
 	for rows.Next() {
 		var kind uint32
-		var count uint64
-		if err := rows.Scan(&kind, &count); err != nil {
+		var stats EventKindStats
+		if err := rows.Scan(&kind, &stats.Count, &stats.StoredBytesRaw); err != nil {
 			return nil, err
 		}
-		out[int(kind)] = count
+		out[int(kind)] = stats
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
+	stats, err := s.EventKindStats(ctx, kinds)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[int]uint64, len(stats))
+	for kind, stat := range stats {
+		out[kind] = stat.Count
+	}
+	return out, nil
+}
+
+func rawEventStoredBytesExpression() string {
+	// id, pubkey, sig, kind, and DateTime fields are fixed-size columns; content
+	// and tags_json carry the event-specific variable payload.
+	return "length(id) + length(pubkey) + length(sig) + length(content) + length(tags_json) + 16"
 }
 
 func uniqueEventKinds(values []int) []int {
