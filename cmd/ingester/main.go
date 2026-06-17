@@ -40,8 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
-		slog.Error("clickhouse event kind retention failed", "error", err)
-		os.Exit(1)
+		slog.Warn("clickhouse event kind retention failed; continuing", "error", err)
 	} else if result.Skipped {
 		slog.Warn("clickhouse event kind retention skipped: no configured NAGG_KINDS")
 	} else if result.RemovedEvents > 0 {
