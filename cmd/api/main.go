@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -37,12 +38,31 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	ref := &storeRef{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", earlyHealthHandler(ref, cfg.Firehose.Kinds))
+
+	addr := listenAddr(os.Getenv)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		slog.Info("graphql api listening", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("graphql api failed", "error", err)
+			stop()
+		}
+	}()
+
 	store, err := chstore.OpenWithRetry(ctx, cfg.ClickHouse, logger)
 	if err != nil {
 		slog.Error("clickhouse connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer store.Close()
+	ref.Set(store)
 
 	var vertexClient *vertex.Client
 	if cfg.Vertex.PrivateKey != "" {
@@ -146,7 +166,6 @@ func main() {
 		slog.Info("response cache enabled", "default_ttl", cfg.Cache.DefaultTTL, "stale_for", cfg.Cache.StaleFor)
 	}
 
-	mux := http.NewServeMux()
 	gqlHandler := graphqlapi.Handler(
 		schema,
 		graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout),
@@ -174,22 +193,6 @@ func main() {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
-	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds))
-
-	addr := listenAddr(os.Getenv)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		slog.Info("graphql api listening", "addr", addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("graphql api failed", "error", err)
-			stop()
-		}
-	}()
 
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -326,6 +329,45 @@ func healthEventKindBreakdown(kinds []int, stats map[int]chstore.EventKindStats)
 
 func bytesToDecimalGB(bytes uint64) float64 {
 	return math.Round(float64(bytes)/1_000_000_000*1_000_000) / 1_000_000
+}
+
+type storeRef struct {
+	ptr atomic.Pointer[chstore.Store]
+}
+
+func (r *storeRef) Get() *chstore.Store { return r.ptr.Load() }
+func (r *storeRef) Set(s *chstore.Store) { r.ptr.Store(s) }
+
+func earlyHealthHandler(ref *storeRef, configuredKinds []int) http.HandlerFunc {
+	kindNumbers := healthEventKindNumbers(configuredKinds)
+	return func(w http.ResponseWriter, r *http.Request) {
+		store := ref.Get()
+		w.Header().Set("Content-Type", "application/json")
+		if store == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "starting up"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		eventCount, err := store.EventCount(ctx)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event count failed"})
+			return
+		}
+		eventKindStats, err := store.EventKindStats(ctx, kindNumbers)
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind stats failed"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(healthResponse{
+			OK:         "true",
+			EventCount: eventCount,
+			EventKinds: healthEventKindBreakdown(kindNumbers, eventKindStats),
+		})
+	}
 }
 
 func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
