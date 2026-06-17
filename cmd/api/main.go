@@ -66,16 +66,18 @@ func main() {
 	// NAGG_RUN_ENRICHER=false to split them back into cmd/ingester / cmd/enricher.
 	// Worker setup failures are logged but NON-fatal: serving the API always
 	// takes priority over a background worker that can't start.
+	workerSchemaReady := true
 	if cfg.RunIngester || cfg.RunEnricher {
 		// In-process workers need the schema present. Migrations are idempotent
 		// (CREATE ... IF NOT EXISTS), so this is safe alongside the deploy-time
 		// migrate step; if it fails the API still serves (reads surface errors).
 		if err := store.Migrate(ctx); err != nil {
 			slog.Error("in-process worker migration failed; serving continues", "error", err)
+			workerSchemaReady = false
 		}
 	}
 
-	if cfg.RunEnricher {
+	if cfg.RunEnricher && workerSchemaReady {
 		processors, err := enrich.NewProcessors(cfg.Enrich.Tasks, enrich.ProcessorConfig{
 			ModelVersion: cfg.Enrich.ModelVersion,
 		})
@@ -95,24 +97,14 @@ func main() {
 		}
 	}
 
-	if cfg.RunIngester {
-		firehoseClient, err := firehose.New(cfg.Firehose)
-		if err != nil {
-			slog.Error("in-process ingester disabled: firehose setup failed", "error", err)
-		} else {
-			pipeline := ingest.New(store, cfg.Ingest)
-			events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
-			slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays))
-			go func() {
-				firehoseClient.Run(ctx, events)
-				close(events)
-			}()
-			go func() {
-				if err := pipeline.Run(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
-					slog.Error("ingestion stopped with error", "error", err)
-				}
-			}()
-		}
+	if cfg.RunIngester && !workerSchemaReady {
+		slog.Error("in-process ingester disabled: schema setup failed")
+	}
+	if cfg.RunEnricher && !workerSchemaReady {
+		slog.Error("in-process enricher disabled: schema setup failed")
+	}
+	if cfg.RunIngester && workerSchemaReady {
+		startInProcessIngester(ctx, store, cfg)
 	}
 
 	var userFeedBackfiller *appview.RelayUserFeedBackfiller
@@ -181,7 +173,7 @@ func main() {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
-	mux.HandleFunc("/healthz", healthHandler(store))
+	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds))
 
 	addr := listenAddr(os.Getenv)
 	server := &http.Server{
@@ -202,6 +194,41 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownCtx)
+}
+
+func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config) {
+	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
+		slog.Error("in-process ingester disabled: event kind retention failed", "error", err)
+		return
+	} else if result.Skipped {
+		slog.Warn("in-process ingester event kind retention skipped: no configured NAGG_KINDS")
+	} else if result.RemovedEvents > 0 {
+		slog.Info(
+			"clickhouse pruned removed event kinds",
+			"events", result.RemovedEvents,
+			"kinds", result.RemovedCounts,
+			"rebuilt_appview", result.RebuiltAppView,
+		)
+	}
+
+	firehoseClient, err := firehose.New(cfg.Firehose)
+	if err != nil {
+		slog.Error("in-process ingester disabled: firehose setup failed", "error", err)
+		return
+	}
+
+	pipeline := ingest.New(store, cfg.Ingest)
+	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
+	slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays), "kinds", cfg.Firehose.Kinds)
+	go func() {
+		firehoseClient.Run(ctx, events)
+		close(events)
+	}()
+	go func() {
+		if err := pipeline.Run(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
+			slog.Error("ingestion stopped with error", "error", err)
+		}
+	}()
 }
 
 type healthStore interface {
@@ -248,17 +275,39 @@ var healthEventKinds = []eventKindInfo{
 	{Kind: 38000, Description: "Ecash Mint Recommendation", Source: "NIP-87"},
 }
 
-func healthEventKindNumbers() []int {
-	kinds := make([]int, 0, len(healthEventKinds))
-	for _, info := range healthEventKinds {
-		kinds = append(kinds, info.Kind)
+func healthEventKindNumbers(configuredKinds []int) []int {
+	kinds := make([]int, 0, len(configuredKinds))
+	seen := make(map[int]struct{}, len(configuredKinds))
+	for _, kind := range configuredKinds {
+		if kind < 0 {
+			continue
+		}
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		kinds = append(kinds, kind)
 	}
 	return kinds
 }
 
-func healthEventKindBreakdown(counts map[int]uint64) []eventKindBreakdown {
-	breakdown := make([]eventKindBreakdown, 0, len(healthEventKinds))
+func healthEventKindInfo(kind int) eventKindInfo {
 	for _, info := range healthEventKinds {
+		if info.Kind == kind {
+			return info
+		}
+	}
+	return eventKindInfo{
+		Kind:        kind,
+		Description: "Unknown Nostr event kind",
+		Source:      "",
+	}
+}
+
+func healthEventKindBreakdown(kinds []int, counts map[int]uint64) []eventKindBreakdown {
+	breakdown := make([]eventKindBreakdown, 0, len(kinds))
+	for _, kind := range kinds {
+		info := healthEventKindInfo(kind)
 		breakdown = append(breakdown, eventKindBreakdown{
 			Kind:        info.Kind,
 			Description: info.Description,
@@ -269,7 +318,8 @@ func healthEventKindBreakdown(counts map[int]uint64) []eventKindBreakdown {
 	return breakdown
 }
 
-func healthHandler(store healthStore) http.HandlerFunc {
+func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
+	kindNumbers := healthEventKindNumbers(configuredKinds)
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -282,7 +332,7 @@ func healthHandler(store healthStore) http.HandlerFunc {
 			return
 		}
 
-		eventKindCounts, err := store.EventKindCounts(ctx, healthEventKindNumbers())
+		eventKindCounts, err := store.EventKindCounts(ctx, kindNumbers)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind count failed"})
@@ -292,7 +342,7 @@ func healthHandler(store healthStore) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(healthResponse{
 			OK:         "true",
 			EventCount: eventCount,
-			EventKinds: healthEventKindBreakdown(eventKindCounts),
+			EventKinds: healthEventKindBreakdown(kindNumbers, eventKindCounts),
 		})
 	}
 }

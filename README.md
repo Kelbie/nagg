@@ -42,7 +42,7 @@ NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_WAIT=0s
 ```
 
-The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`, which covers profiles, notes, contact lists, legacy encrypted DMs, reposts, reactions, generic reposts, NIP-17 gift wraps, zaps, DM inbox relay lists, app data, and Cashu mint review events for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Set `NAGG_SINCE=0` to omit the `since` filter.
+The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`, which covers profiles, notes, contact lists, legacy encrypted DMs, reposts, reactions, generic reposts, NIP-17 gift wraps, zaps, DM inbox relay lists, app data, and Cashu mint review events for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. The ingester treats this list as the retained kind allowlist: when it starts, any raw, tag, relay-provenance, derived, or notification rows for kinds outside the configured list are pruned before new relay subscriptions open. Set `NAGG_SINCE=0` to omit the `since` filter.
 
 ## Backfill The App-View Tables
 

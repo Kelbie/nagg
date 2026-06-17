@@ -38,7 +38,9 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 		},
 	}
 
-	healthHandler(counter)(rec, req)
+	configuredKinds := []int{0, 1, 9735, 38000}
+
+	healthHandler(counter, configuredKinds)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -50,11 +52,11 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	if body.OK != "true" || body.EventCount != 12345 || body.Error != "" {
 		t.Fatalf("body = %+v", body)
 	}
-	if !reflect.DeepEqual(counter.requestedKinds, healthEventKindNumbers()) {
-		t.Fatalf("requested kinds = %v, want %v", counter.requestedKinds, healthEventKindNumbers())
+	if !reflect.DeepEqual(counter.requestedKinds, configuredKinds) {
+		t.Fatalf("requested kinds = %v, want %v", counter.requestedKinds, configuredKinds)
 	}
-	if len(body.EventKinds) != len(healthEventKinds) {
-		t.Fatalf("eventKinds len = %d, want %d", len(body.EventKinds), len(healthEventKinds))
+	if len(body.EventKinds) != len(configuredKinds) {
+		t.Fatalf("eventKinds len = %d, want %d", len(body.EventKinds), len(configuredKinds))
 	}
 	if body.EventKinds[0] != (eventKindBreakdown{Kind: 0, Description: "User Metadata", Source: "NIP-01", Count: 0}) {
 		t.Fatalf("first event kind = %+v", body.EventKinds[0])
@@ -74,7 +76,7 @@ func TestHealthHandlerReturnsUnavailableOnEventCountError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
-	healthHandler(&fakeEventCounter{eventCountErr: errors.New("clickhouse unavailable")})(rec, req)
+	healthHandler(&fakeEventCounter{eventCountErr: errors.New("clickhouse unavailable")}, []int{1})(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -95,7 +97,7 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	healthHandler(&fakeEventCounter{
 		count:         12345,
 		kindCountsErr: errors.New("clickhouse unavailable"),
-	})(rec, req)
+	}, []int{1})(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -106,6 +108,41 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	}
 	if body.OK != "false" || body.Error != "clickhouse event kind count failed" || body.EventCount != 0 || body.EventKinds != nil {
 		t.Fatalf("body = %+v", body)
+	}
+}
+
+func TestHealthHandlerReportsOnlyConfiguredKinds(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	counter := &fakeEventCounter{
+		count: 9,
+		kindCounts: map[int]uint64{
+			1:     3,
+			30078: 6,
+		},
+	}
+
+	healthHandler(counter, []int{1, 1, 30079})(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(counter.requestedKinds, []int{1, 30079}) {
+		t.Fatalf("requested kinds = %v", counter.requestedKinds)
+	}
+	if len(body.EventKinds) != 2 {
+		t.Fatalf("eventKinds len = %d, want 2", len(body.EventKinds))
+	}
+	if kind := eventKindByNumber(body.EventKinds, 30078); kind != nil {
+		t.Fatalf("removed kind 30078 should not be reported: %+v", kind)
+	}
+	unknown := eventKindByNumber(body.EventKinds, 30079)
+	if unknown == nil || unknown.Description != "Unknown Nostr event kind" || unknown.Source != "" {
+		t.Fatalf("unknown kind = %+v", unknown)
 	}
 }
 
