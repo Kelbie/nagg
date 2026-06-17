@@ -8,13 +8,15 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+
+	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 )
 
 type fakeEventCounter struct {
 	count          uint64
-	kindCounts     map[int]uint64
+	kindStats      map[int]chstore.EventKindStats
 	eventCountErr  error
-	kindCountsErr  error
+	kindStatsErr   error
 	requestedKinds []int
 }
 
@@ -22,9 +24,9 @@ func (f *fakeEventCounter) EventCount(context.Context) (uint64, error) {
 	return f.count, f.eventCountErr
 }
 
-func (f *fakeEventCounter) EventKindCounts(_ context.Context, kinds []int) (map[int]uint64, error) {
+func (f *fakeEventCounter) EventKindStats(_ context.Context, kinds []int) (map[int]chstore.EventKindStats, error) {
 	f.requestedKinds = append([]int(nil), kinds...)
-	return f.kindCounts, f.kindCountsErr
+	return f.kindStats, f.kindStatsErr
 }
 
 func TestHealthHandlerReturnsEventCount(t *testing.T) {
@@ -32,9 +34,9 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	counter := &fakeEventCounter{
 		count: 12345,
-		kindCounts: map[int]uint64{
-			1:    42,
-			9735: 7,
+		kindStats: map[int]chstore.EventKindStats{
+			1:    {Count: 42, StoredBytesRaw: 1_500_000_000},
+			9735: {Count: 7, StoredBytesRaw: 250_000_000},
 		},
 	}
 
@@ -58,13 +60,13 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	if len(body.EventKinds) != len(configuredKinds) {
 		t.Fatalf("eventKinds len = %d, want %d", len(body.EventKinds), len(configuredKinds))
 	}
-	if body.EventKinds[0] != (eventKindBreakdown{Kind: 0, Description: "User Metadata", Source: "NIP-01", Count: 0}) {
+	if body.EventKinds[0] != (eventKindBreakdown{Kind: 0, Description: "User Metadata", Source: "NIP-01", Count: 0, StoredBytes: 0, StoredGB: 0}) {
 		t.Fatalf("first event kind = %+v", body.EventKinds[0])
 	}
-	if kind := eventKindByNumber(body.EventKinds, 1); kind == nil || kind.Description != "Short Text Note" || kind.Source != "NIP-10" || kind.Count != 42 {
+	if kind := eventKindByNumber(body.EventKinds, 1); kind == nil || kind.Description != "Short Text Note" || kind.Source != "NIP-10" || kind.Count != 42 || kind.StoredBytes != 1_500_000_000 || kind.StoredGB != 1.5 {
 		t.Fatalf("kind 1 breakdown = %+v", kind)
 	}
-	if kind := eventKindByNumber(body.EventKinds, 9735); kind == nil || kind.Description != "Zap" || kind.Source != "NIP-57" || kind.Count != 7 {
+	if kind := eventKindByNumber(body.EventKinds, 9735); kind == nil || kind.Description != "Zap" || kind.Source != "NIP-57" || kind.Count != 7 || kind.StoredBytes != 250_000_000 || kind.StoredGB != 0.25 {
 		t.Fatalf("kind 9735 breakdown = %+v", kind)
 	}
 	if kind := eventKindByNumber(body.EventKinds, 38000); kind == nil || kind.Description != "Ecash Mint Recommendation" || kind.Source != "NIP-87" {
@@ -95,8 +97,8 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
 	healthHandler(&fakeEventCounter{
-		count:         12345,
-		kindCountsErr: errors.New("clickhouse unavailable"),
+		count:        12345,
+		kindStatsErr: errors.New("clickhouse unavailable"),
 	}, []int{1})(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
@@ -106,7 +108,7 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.OK != "false" || body.Error != "clickhouse event kind count failed" || body.EventCount != 0 || body.EventKinds != nil {
+	if body.OK != "false" || body.Error != "clickhouse event kind stats failed" || body.EventCount != 0 || body.EventKinds != nil {
 		t.Fatalf("body = %+v", body)
 	}
 }
@@ -116,9 +118,9 @@ func TestHealthHandlerReportsOnlyConfiguredKinds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	counter := &fakeEventCounter{
 		count: 9,
-		kindCounts: map[int]uint64{
-			1:     3,
-			30078: 6,
+		kindStats: map[int]chstore.EventKindStats{
+			1:     {Count: 3, StoredBytesRaw: 100},
+			30078: {Count: 6, StoredBytesRaw: 200},
 		},
 	}
 

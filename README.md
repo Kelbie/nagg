@@ -107,6 +107,8 @@ curl -X POST http://127.0.0.1:8080/nostr/notes/stats \
   -d '{"ids":[]}'
 ```
 
+`/healthz` returns the total raw event count plus a per-configured-kind breakdown with the event count, estimated raw `nostr_events` bytes, and decimal GB. The GB value is useful for comparing kind pressure; it is not exact compressed ClickHouse part size.
+
 ## Deploy On Railway
 
 This repo includes a `Dockerfile` and `railway.toml` for the API service. Railway builds the Dockerfile, runs `./nagg-migrate` as the pre-deploy command, starts `./nagg-api`, and checks `GET /healthz` before making the deployment active.
