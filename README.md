@@ -42,7 +42,7 @@ NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_WAIT=0s
 ```
 
-The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`, which covers profiles, notes, contact lists, legacy encrypted DMs, reposts, reactions, generic reposts, NIP-17 gift wraps, zaps, DM inbox relay lists, app data, and Cashu mint review events for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. The ingester treats this list as the retained kind allowlist: when it starts, any raw, tag, relay-provenance, derived, or notification rows for kinds outside the configured list are pruned before new relay subscriptions open. Set `NAGG_SINCE=0` to omit the `since` filter.
+The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`, which covers profiles, notes, contact lists, legacy encrypted DMs, reposts, reactions, generic reposts, NIP-17 gift wraps, file metadata, zaps, DM relay lists, Marmot key-package relay lists, app data, and ecash mint recommendations for the app-view API. Set `NAGG_KINDS` explicitly when you need a different relay subscription. Removed kinds stop being requested the next time the ingester or API-hosted ingester starts. Stored ClickHouse rows are not pruned during startup; run the retention command deliberately when you are ready to delete stale content. Set `NAGG_SINCE=0` to omit the `since` filter.
 
 ## Backfill The App-View Tables
 
@@ -56,6 +56,19 @@ go run ./cmd/backfill
 ```
 
 The command is idempotent: it truncates and rebuilds app-view counter/profile tables from `nostr_events` and `event_tags`.
+
+## Prune Removed Event Kinds
+
+After removing a kind from `NAGG_KINDS`, run retention once to delete stored rows whose kind is outside the current allowlist:
+
+```sh
+NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
+NAGG_CLICKHOUSE_USERNAME=nagg \
+NAGG_CLICKHOUSE_PASSWORD=nagg_secret \
+go run ./cmd/retention
+```
+
+The command deletes matching relay-provenance, derived, notification, tag, and raw event rows, then rebuilds app-view tables if an app-view source kind was pruned. It skips when `NAGG_KINDS` is empty and refuses to run while ClickHouse already has active mutations or less than 10% disk headroom. Run it as an explicit maintenance action, not as deploy startup, because DELETE mutations rewrite table parts.
 
 ## Run The API
 
@@ -154,6 +167,14 @@ The pre-deploy command only migrates schemas. After first deploy, or after chang
 ```sh
 ./nagg-backfill
 ```
+
+After changing `NAGG_KINDS`, deploy normally first so removed kinds are no longer requested from relays, then run retention from the Railway shell or a one-off command when ClickHouse is not already processing mutations:
+
+```sh
+./nagg-retention
+```
+
+Do not run `./nagg-retention` from `preDeployCommand` or normal API/ingester startup.
 
 If you want the ingester as a separate Railway service, deploy the same image and override the start command to:
 
