@@ -149,6 +149,54 @@ func (s *Store) EventCount(ctx context.Context) (uint64, error) {
 	return count, nil
 }
 
+func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
+	kinds = uniqueEventKinds(kinds)
+	out := make(map[int]uint64, len(kinds))
+	for _, kind := range kinds {
+		out[kind] = 0
+	}
+	if len(kinds) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+		SELECT kind, count()
+		FROM nostr_events
+		WHERE kind IN (%s)
+		GROUP BY kind
+	`, ints(kinds)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var kind uint32
+		var count uint64
+		if err := rows.Scan(&kind, &count); err != nil {
+			return nil, err
+		}
+		out[int(kind)] = count
+	}
+	return out, rows.Err()
+}
+
+func uniqueEventKinds(values []int) []int {
+	seen := make(map[int]struct{}, len(values))
+	out := make([]int, 0, len(values))
+	for _, value := range values {
+		if value < 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (s *Store) prepareInsertBatch(ctx context.Context, query string) (chdriver.Batch, error) {
 	return s.conn.PrepareBatch(ctx, query, chdriver.WithReleaseConnection())
 }

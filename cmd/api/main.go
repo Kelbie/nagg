@@ -204,29 +204,96 @@ func main() {
 	_ = server.Shutdown(shutdownCtx)
 }
 
-type eventCounter interface {
+type healthStore interface {
 	EventCount(context.Context) (uint64, error)
+	EventKindCounts(context.Context, []int) (map[int]uint64, error)
 }
 
 type healthResponse struct {
-	OK         string `json:"ok"`
-	EventCount uint64 `json:"eventCount,omitempty"`
-	Error      string `json:"error,omitempty"`
+	OK         string               `json:"ok"`
+	EventCount uint64               `json:"eventCount,omitempty"`
+	EventKinds []eventKindBreakdown `json:"eventKinds,omitempty"`
+	Error      string               `json:"error,omitempty"`
 }
 
-func healthHandler(counter eventCounter) http.HandlerFunc {
+type eventKindInfo struct {
+	Kind        int
+	Description string
+	Source      string
+}
+
+type eventKindBreakdown struct {
+	Kind        int    `json:"kind"`
+	Description string `json:"description"`
+	Source      string `json:"source"`
+	Count       uint64 `json:"count"`
+}
+
+var healthEventKinds = []eventKindInfo{
+	{Kind: 0, Description: "User Metadata", Source: "NIP-01"},
+	{Kind: 1, Description: "Short Text Note", Source: "NIP-10"},
+	{Kind: 3, Description: "Follows", Source: "NIP-02"},
+	{Kind: 4, Description: "Encrypted Direct Messages", Source: "NIP-04"},
+	{Kind: 6, Description: "Repost", Source: "NIP-18"},
+	{Kind: 7, Description: "Reaction", Source: "NIP-25"},
+	{Kind: 16, Description: "Generic Repost", Source: "NIP-18"},
+	{Kind: 443, Description: "KeyPackage", Source: "Marmot"},
+	{Kind: 444, Description: "Welcome Message", Source: "Marmot"},
+	{Kind: 445, Description: "Group Event", Source: "Marmot"},
+	{Kind: 1059, Description: "Gift Wrap", Source: "NIP-59"},
+	{Kind: 1063, Description: "File Metadata", Source: "NIP-94"},
+	{Kind: 9735, Description: "Zap", Source: "NIP-57"},
+	{Kind: 10051, Description: "KeyPackage Relays List", Source: "Marmot"},
+	{Kind: 30078, Description: "Application-specific Data", Source: "NIP-78"},
+	{Kind: 38000, Description: "Ecash Mint Recommendation", Source: "NIP-87"},
+}
+
+func healthEventKindNumbers() []int {
+	kinds := make([]int, 0, len(healthEventKinds))
+	for _, info := range healthEventKinds {
+		kinds = append(kinds, info.Kind)
+	}
+	return kinds
+}
+
+func healthEventKindBreakdown(counts map[int]uint64) []eventKindBreakdown {
+	breakdown := make([]eventKindBreakdown, 0, len(healthEventKinds))
+	for _, info := range healthEventKinds {
+		breakdown = append(breakdown, eventKindBreakdown{
+			Kind:        info.Kind,
+			Description: info.Description,
+			Source:      info.Source,
+			Count:       counts[info.Kind],
+		})
+	}
+	return breakdown
+}
+
+func healthHandler(store healthStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		eventCount, err := counter.EventCount(ctx)
+		eventCount, err := store.EventCount(ctx)
 		w.Header().Set("Content-Type", "application/json")
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event count failed"})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(healthResponse{OK: "true", EventCount: eventCount})
+
+		eventKindCounts, err := store.EventKindCounts(ctx, healthEventKindNumbers())
+		if err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind count failed"})
+			return
+		}
+
+		_ = json.NewEncoder(w).Encode(healthResponse{
+			OK:         "true",
+			EventCount: eventCount,
+			EventKinds: healthEventKindBreakdown(eventKindCounts),
+		})
 	}
 }
 
