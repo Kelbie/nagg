@@ -142,7 +142,9 @@ type openRetryConfig struct {
 // single failed Ping should not fail the whole pre-deploy or app startup.
 func OpenWithRetry(ctx context.Context, cfg Config, logger *slog.Logger) (*Store, error) {
 	return openWithRetry(ctx, cfg, openRetryConfig{
-		Attempts:     8,
+		// With the 15s cap, 18 attempts waits about 4 minutes before the final
+		// failure, staying inside Railway's 300s production healthcheck window.
+		Attempts:     18,
 		InitialDelay: 2 * time.Second,
 		MaxDelay:     15 * time.Second,
 	}, logger, Open)
