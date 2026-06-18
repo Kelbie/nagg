@@ -120,11 +120,29 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		go vertexSyncer.Run(ctx)
 	}
 
+	// Optionally host the firehose ingester and the enrichment runner in-process
+	// so a single `nagg` service does everything (HTTP + Vertex sync + ingest +
+	// enrich) against one ClickHouse + Redis. Set NAGG_RUN_INGESTER=false /
+	// NAGG_RUN_ENRICHER=false to split them back into cmd/ingester / cmd/enricher.
+	// Worker setup failures are logged but NON-fatal: serving the API always
+	// takes priority over a background worker that can't start.
+	workerSchemaReady := true
+	if cfg.RunIngester || cfg.RunEnricher || cfg.RunRollup {
+		// In-process workers need the schema present. Migrations are idempotent
+		// (CREATE ... IF NOT EXISTS), so this is safe alongside the deploy-time
+		// migrate step; if it fails the API still serves (reads surface errors).
+		if err := store.Migrate(ctx); err != nil {
+			slog.Error("in-process worker migration failed; serving continues", "error", err)
+			workerSchemaReady = false
+		}
+	}
+
 	// Database-first aggregation: the rollup job maintains the direct-reply edges,
 	// vertex-real engagement counts, per-user stats, and the per-event rank-feature
-	// table the For-You / trending hot path reads. Hosted in-process next to the
-	// Vertex syncer; set NAGG_RUN_ROLLUP=false to split it out.
-	if cfg.RunRollup {
+	// table the For-You / trending hot path reads. Started AFTER the in-process
+	// migrate (and gated on it) so its first tick can't race table creation on a
+	// fresh database. Set NAGG_RUN_ROLLUP=false to split it out.
+	if cfg.RunRollup && workerSchemaReady {
 		rollupRunner := rollup.NewRunner(store, rollup.Config{
 			Interval:     cfg.Rollup.Interval,
 			RecentWindow: cfg.Rollup.RecentWindow,
@@ -135,23 +153,6 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			},
 		}, logger)
 		go rollupRunner.Run(ctx)
-	}
-
-	// Optionally host the firehose ingester and the enrichment runner in-process
-	// so a single `nagg` service does everything (HTTP + Vertex sync + ingest +
-	// enrich) against one ClickHouse + Redis. Set NAGG_RUN_INGESTER=false /
-	// NAGG_RUN_ENRICHER=false to split them back into cmd/ingester / cmd/enricher.
-	// Worker setup failures are logged but NON-fatal: serving the API always
-	// takes priority over a background worker that can't start.
-	workerSchemaReady := true
-	if cfg.RunIngester || cfg.RunEnricher {
-		// In-process workers need the schema present. Migrations are idempotent
-		// (CREATE ... IF NOT EXISTS), so this is safe alongside the deploy-time
-		// migrate step; if it fails the API still serves (reads surface errors).
-		if err := store.Migrate(ctx); err != nil {
-			slog.Error("in-process worker migration failed; serving continues", "error", err)
-			workerSchemaReady = false
-		}
 	}
 
 	if cfg.RunEnricher && workerSchemaReady {

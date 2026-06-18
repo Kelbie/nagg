@@ -300,10 +300,19 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 // (keyed by event_id, so this is an indexed lookup). FINAL collapses the
 // ReplacingMergeTree to the latest computed row per event.
 func (s *Store) mergeRealStats(ctx context.Context, ids []string, set func(string, NoteStats)) error {
+	// argMax over computed_at collapses ReplacingMergeTree rows AND any extra
+	// threshold_version rows to one value per event (FINAL alone would keep one
+	// row per (event_id, threshold_version) and emit duplicate event_id rows once
+	// a second threshold version exists).
 	rows, err := s.conn.Query(ctx, `
-		SELECT event_id, real_likes, real_reposts, real_replies, real_zap_sats
-		FROM note_engagement_real FINAL
+		SELECT event_id,
+			argMax(real_likes, computed_at),
+			argMax(real_reposts, computed_at),
+			argMax(real_replies, computed_at),
+			argMax(real_zap_sats, computed_at)
+		FROM note_engagement_real
 		WHERE event_id IN (?)
+		GROUP BY event_id
 	`, ids)
 	if err != nil {
 		return err

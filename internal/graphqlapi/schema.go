@@ -1398,7 +1398,7 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	// aggregation. The per-viewer follow-boost + shuffle are then applied cheaply by
 	// finalizeRankedIDs. Falls through to the base-pool/direct path when the feature
 	// table is cold (before the first rollup tick) or the terms are not recognized.
-	if len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
+	if len(input.WeightedTerms) > 0 && featureRankTargetIsGlobal(input.Target) {
 		if weights, halfLife, minFollowers, ok := featureWeightsFromTerms(input.WeightedTerms); ok {
 			views, served, err := r.rankedEventViewsFromFeatures(ctx, input, weights, halfLife, minFollowers)
 			if err != nil {
@@ -1430,12 +1430,30 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 // generous read bound, not a hard product filter.
 const featureRankWindow = 7 * 24 * time.Hour
 
+// featureRankTargetIsGlobal reports whether a ranked request targets a global
+// (kind-only) candidate pool — the only shape note_rank_features can serve. The
+// feature scan honors only kinds (+ exclusions, forwarded separately); a request
+// that scopes candidates by pubkey, tag, search, or a time window must fall
+// through to the live aggregation path, which applies those filters. Without this
+// gate an author-scoped "popular posts by X" would silently return global trending.
+func featureRankTargetIsGlobal(t chstore.EventQueryInput) bool {
+	return len(t.IDs) == 0 &&
+		len(t.PubKeys) == 0 &&
+		len(t.Tags) == 0 &&
+		t.Since == 0 &&
+		t.Until == 0 &&
+		t.Search == ""
+}
+
 // featureWeightsFromTerms maps the weighted rank terms onto the precomputed
 // feature columns. It returns ok=false (so the caller falls back to the live
-// aggregation path) unless EVERY term is recognized, keeping ranking correct for
-// any custom term shape the feature table doesn't cover. Engagement weights apply
-// to the vertex-real counts; the LOG1P transform is baked into the feature SQL, so
-// engagement terms must use it.
+// aggregation path) unless EVERY term maps cleanly, keeping ranking correct for
+// any term shape the feature table doesn't represent. Weights ACCUMULATE so
+// duplicate terms behave like the live path (which sums every term). Engagement
+// weights apply to the vertex-real columns, so an engagement term must (a) use the
+// LOG1P transform baked into the feature SQL and (b) gate its engagers by a vertex
+// pubkey score — an ungated term (counts ALL engagers, e.g. trending) has no
+// matching feature column and falls back.
 func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, float64, uint64, bool) {
 	var w chstore.FeatureWeights
 	var halfLife float64
@@ -1443,43 +1461,55 @@ func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, 
 	if len(terms) == 0 {
 		return w, 0, 0, false
 	}
+	bail := func() (chstore.FeatureWeights, float64, uint64, bool) {
+		return chstore.FeatureWeights{}, 0, 0, false
+	}
 	for _, t := range terms {
 		switch t.Kind {
 		case weightedRankTermPubkeyScore:
-			if t.PubkeyScore.Source != "vertex" {
-				return chstore.FeatureWeights{}, 0, 0, false
+			// Only the vertex AUTHOR score with a zero fallback is represented by
+			// author_vertex_score; a non-vertex source, non-AUTHOR target, or
+			// non-zero fallback would score differently here than on the live path.
+			if t.PubkeyScore.Source != "vertex" ||
+				t.PubkeyScore.Fallback != 0 ||
+				(t.PubkeyScore.Target != "" && t.PubkeyScore.Target != "AUTHOR") {
+				return bail()
 			}
-			w.AuthorVertexScore = t.Weight
-			minFollowers = t.PubkeyScore.MinFollowers
+			w.AuthorVertexScore += t.Weight
+			if t.PubkeyScore.MinFollowers > minFollowers {
+				minFollowers = t.PubkeyScore.MinFollowers
+			}
 		case weightedRankTermCandidateField:
 			if t.CandidateField != "CREATED_AT" || t.Transform != "RECENCY_HALFLIFE" {
-				return chstore.FeatureWeights{}, 0, 0, false
+				return bail()
 			}
-			w.Recency = t.Weight
+			w.Recency += t.Weight
 			halfLife = t.HalfLifeSeconds
 		case weightedRankTermDerivedMetric:
 			if t.DerivedMetric != "contribution_quality" {
-				return chstore.FeatureWeights{}, 0, 0, false
+				return bail()
 			}
-			w.ContributionQuality = t.Weight
+			w.ContributionQuality += t.Weight
 		case weightedRankTermReferences:
-			if t.Transform != "LOG1P" {
-				return chstore.FeatureWeights{}, 0, 0, false
+			if t.Transform != "LOG1P" || t.References.PubkeyScore.Source == "" {
+				return bail()
 			}
 			switch t.Metric.Name {
 			case "likes":
-				w.Likes = t.Weight
+				w.Likes += t.Weight
 			case "replies":
-				w.Replies = t.Weight
+				w.Replies += t.Weight
 			case "reposts":
-				w.Reposts = t.Weight
+				w.Reposts += t.Weight
+			case "quotes":
+				w.Quotes += t.Weight
 			case "zapSats":
-				w.ZapSats = t.Weight
+				w.ZapSats += t.Weight
 			default:
-				return chstore.FeatureWeights{}, 0, 0, false
+				return bail()
 			}
 		default:
-			return chstore.FeatureWeights{}, 0, 0, false
+			return bail()
 		}
 	}
 	return w, halfLife, minFollowers, true

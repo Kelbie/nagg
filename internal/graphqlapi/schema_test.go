@@ -358,12 +358,15 @@ func (s *fakeStore) DirectReplyIDs(_ context.Context, parentID string) ([]string
 // forYouTerms mirrors the nagg-ts For-You recipe terms (rank.ts engagementRankTerms
 // + vertexAuthorScoreTerm + recencyTerm + contributionQualityTerm).
 func forYouTerms() []weightedRankTerm {
+	// Engagement terms carry the vertex pubkeyScore gate the For-You recipe sets,
+	// so they map to the vertex-real feature columns.
+	gated := chstore.EventQueryInput{PubkeyScore: chstore.PubkeyScoreFilter{Source: "vertex"}}
 	return []weightedRankTerm{
-		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Weight: 3, Transform: "LOG1P"},
-		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "replies"}, Weight: 2.5, Transform: "LOG1P"},
-		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "reposts"}, Weight: 2, Transform: "LOG1P"},
-		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "zapSats"}, Weight: 1.5, Transform: "LOG1P"},
-		{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", MinFollowers: 500}, Weight: 0.25},
+		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "likes"}, Weight: 3, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "replies"}, Weight: 2.5, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "reposts"}, Weight: 2, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "zapSats"}, Weight: 1.5, Transform: "LOG1P"},
+		{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", Target: "AUTHOR", MinFollowers: 500}, Weight: 0.25},
 		{Kind: weightedRankTermCandidateField, CandidateField: "CREATED_AT", Transform: "RECENCY_HALFLIFE", HalfLifeSeconds: 86400, Weight: 1.2},
 		{Kind: weightedRankTermDerivedMetric, DerivedMetric: "contribution_quality", Weight: 3},
 	}
@@ -389,12 +392,16 @@ func TestFeatureWeightsFromTerms_RecognizesForYou(t *testing.T) {
 }
 
 func TestFeatureWeightsFromTerms_BailsOnUnrecognized(t *testing.T) {
+	gated := chstore.EventQueryInput{PubkeyScore: chstore.PubkeyScoreFilter{Source: "vertex"}}
 	cases := map[string][]weightedRankTerm{
-		"empty":              nil,
-		"unknown engagement": {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "bookmarks"}, Transform: "LOG1P"}},
-		"non-log1p engagement": {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Transform: "IDENTITY"}},
-		"non-vertex pubkey":  {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "other"}}},
-		"non-quality derived": {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
+		"empty":                nil,
+		"unknown engagement":   {{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "bookmarks"}, Transform: "LOG1P"}},
+		"non-log1p engagement": {{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "likes"}, Transform: "IDENTITY"}},
+		// Ungated engagement (counts ALL engagers, e.g. trending) has no real_* column.
+		"ungated engagement":   {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Transform: "LOG1P"}},
+		"non-vertex pubkey":    {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "other"}}},
+		"non-zero fallback":    {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", Fallback: 0.1}}},
+		"non-quality derived":  {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
 	}
 	for name, terms := range cases {
 		if _, _, _, ok := featureWeightsFromTerms(terms); ok {
@@ -472,6 +479,28 @@ func TestRankedEvents_RoutesThroughFeatureScan(t *testing.T) {
 	}
 	if len(views) != 2 || views[0].ID != "a" {
 		t.Errorf("expected feature-ranked [a,b], got %+v", views)
+	}
+}
+
+// TestRankedEvents_ScopedTargetSkipsFeatureScan guards the CRITICAL fix: a
+// request that scopes candidates by pubkey (e.g. "popular posts by these authors")
+// must NOT use the global feature scan — which ignores the author filter — and must
+// fall through to the live path that honors it.
+func TestRankedEvents_ScopedTargetSkipsFeatureScan(t *testing.T) {
+	store := &fakeStore{
+		featureRankRows: []chstore.RankedFeatureRow{{EventID: "x", PubKey: "px", Score: 9}},
+	}
+	r := &resolver{store: store, basePool: newBasePoolCache(basePoolTTL, time.Now)}
+	_, err := r.rankedEventViews(context.Background(), rankedEventsInput{
+		WeightedTerms: forYouTerms(),
+		Target:        chstore.EventQueryInput{Kinds: []int{1, 1111}, PubKeys: []string{"author1"}},
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("rankedEventViews error: %v", err)
+	}
+	if len(store.featureRankInputs) != 0 {
+		t.Errorf("pubkey-scoped target must not hit the global feature scan; got %d calls", len(store.featureRankInputs))
 	}
 }
 
