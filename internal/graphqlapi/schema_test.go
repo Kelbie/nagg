@@ -44,6 +44,8 @@ type fakeStore struct {
 	derivedMetricInputs         []derivedMetricInput
 	notificationRows            []chstore.NotificationRow
 	notificationInputs          []chstore.NotificationInput
+	featureRankRows             []chstore.RankedFeatureRow
+	featureRankInputs           []chstore.FeatureRankInput
 }
 
 type latestEventsInput struct {
@@ -339,6 +341,90 @@ func (s *fakeStore) Notifications(_ context.Context, input chstore.NotificationI
 
 func (s *fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return nil, nil, nil
+}
+
+func (s *fakeStore) RankedEventsByFeatures(_ context.Context, input chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error) {
+	s.featureRankInputs = append(s.featureRankInputs, input)
+	return s.featureRankRows, nil
+}
+
+// forYouTerms mirrors the nagg-ts For-You recipe terms (rank.ts engagementRankTerms
+// + vertexAuthorScoreTerm + recencyTerm + contributionQualityTerm).
+func forYouTerms() []weightedRankTerm {
+	return []weightedRankTerm{
+		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Weight: 3, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "replies"}, Weight: 2.5, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "reposts"}, Weight: 2, Transform: "LOG1P"},
+		{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "zapSats"}, Weight: 1.5, Transform: "LOG1P"},
+		{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", MinFollowers: 500}, Weight: 0.25},
+		{Kind: weightedRankTermCandidateField, CandidateField: "CREATED_AT", Transform: "RECENCY_HALFLIFE", HalfLifeSeconds: 86400, Weight: 1.2},
+		{Kind: weightedRankTermDerivedMetric, DerivedMetric: "contribution_quality", Weight: 3},
+	}
+}
+
+func TestFeatureWeightsFromTerms_RecognizesForYou(t *testing.T) {
+	w, halfLife, minFollowers, ok := featureWeightsFromTerms(forYouTerms())
+	if !ok {
+		t.Fatal("For-You terms must be recognized by the feature mapper")
+	}
+	if w.Likes != 3 || w.Replies != 2.5 || w.Reposts != 2 || w.ZapSats != 1.5 {
+		t.Errorf("engagement weights mismapped: %+v", w)
+	}
+	if w.AuthorVertexScore != 0.25 || w.Recency != 1.2 || w.ContributionQuality != 3 {
+		t.Errorf("scalar weights mismapped: %+v", w)
+	}
+	if halfLife != 86400 {
+		t.Errorf("halfLife = %v, want 86400", halfLife)
+	}
+	if minFollowers != 500 {
+		t.Errorf("minFollowers = %d, want 500", minFollowers)
+	}
+}
+
+func TestFeatureWeightsFromTerms_BailsOnUnrecognized(t *testing.T) {
+	cases := map[string][]weightedRankTerm{
+		"empty":              nil,
+		"unknown engagement": {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "bookmarks"}, Transform: "LOG1P"}},
+		"non-log1p engagement": {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Transform: "IDENTITY"}},
+		"non-vertex pubkey":  {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "other"}}},
+		"non-quality derived": {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
+	}
+	for name, terms := range cases {
+		if _, _, _, ok := featureWeightsFromTerms(terms); ok {
+			t.Errorf("%s: expected ok=false (fall back to live aggregation)", name)
+		}
+	}
+}
+
+func TestRankedEvents_RoutesThroughFeatureScan(t *testing.T) {
+	store := &fakeStore{
+		featureRankRows: []chstore.RankedFeatureRow{
+			{EventID: "a", PubKey: "p1", Score: 10},
+			{EventID: "b", PubKey: "p2", Score: 5},
+		},
+		events: [][]chstore.EventView{{
+			{ID: "a", PubKey: "p1", Kind: 1},
+			{ID: "b", PubKey: "p2", Kind: 1},
+		}},
+	}
+	r := &resolver{store: store, basePool: newBasePoolCache(basePoolTTL, time.Now)}
+	views, err := r.rankedEventViews(context.Background(), rankedEventsInput{
+		WeightedTerms: forYouTerms(),
+		Target:        chstore.EventQueryInput{Kinds: []int{1, 1111}},
+		Limit:         10,
+	})
+	if err != nil {
+		t.Fatalf("rankedEventViews error: %v", err)
+	}
+	if len(store.featureRankInputs) != 1 {
+		t.Fatalf("expected the feature scan to be used once, got %d calls", len(store.featureRankInputs))
+	}
+	if got := store.featureRankInputs[0]; got.Weights.Likes != 3 || got.Limit != basePoolDepth {
+		t.Errorf("feature scan input not threaded: %+v", got)
+	}
+	if len(views) != 2 || views[0].ID != "a" {
+		t.Errorf("expected feature-ranked [a,b], got %+v", views)
+	}
 }
 
 type fakeUserBackfiller struct {

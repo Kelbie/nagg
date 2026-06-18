@@ -40,6 +40,7 @@ type Store interface {
 	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
 	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
+	RankedEventsByFeatures(context.Context, chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error)
 }
 
 var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
@@ -1381,6 +1382,24 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	// finalized per request with the viewer follow-boost and shuffle. This keeps
 	// the expensive aggregation off the hot path for every viewer in the TTL
 	// window. Everything else uses the direct path.
+	// Database-first path: when the weighted terms map cleanly to the precomputed
+	// note_rank_features columns (the For-You / trending recipe terms do), the whole
+	// weighted top-N is one indexed ClickHouse scan — no per-request live
+	// aggregation. The per-viewer follow-boost + shuffle are then applied cheaply by
+	// finalizeRankedIDs. Falls through to the base-pool/direct path when the feature
+	// table is cold (before the first rollup tick) or the terms are not recognized.
+	if len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
+		if weights, halfLife, minFollowers, ok := featureWeightsFromTerms(input.WeightedTerms); ok {
+			views, served, err := r.rankedEventViewsFromFeatures(ctx, input, weights, halfLife, minFollowers)
+			if err != nil {
+				return nil, err
+			}
+			if served {
+				return views, nil
+			}
+		}
+	}
+
 	if r.basePool != nil && len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
 		pool, baseScores, err := r.basePool.getOrCompute(ctx, r, input)
 		if err != nil {
@@ -1393,6 +1412,109 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 		return orderEventViewsByID(pool, ids), nil
 	}
 	return r.rankedEventViewsDirect(ctx, input)
+}
+
+// featureRankWindow bounds the recent-events window the feature scan reads. The
+// recency half-life makes content older than a few days contribute negligibly,
+// and the rollup only maintains features for its own recent window, so this is a
+// generous read bound, not a hard product filter.
+const featureRankWindow = 7 * 24 * time.Hour
+
+// featureWeightsFromTerms maps the weighted rank terms onto the precomputed
+// feature columns. It returns ok=false (so the caller falls back to the live
+// aggregation path) unless EVERY term is recognized, keeping ranking correct for
+// any custom term shape the feature table doesn't cover. Engagement weights apply
+// to the vertex-real counts; the LOG1P transform is baked into the feature SQL, so
+// engagement terms must use it.
+func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, float64, uint64, bool) {
+	var w chstore.FeatureWeights
+	var halfLife float64
+	var minFollowers uint64
+	if len(terms) == 0 {
+		return w, 0, 0, false
+	}
+	for _, t := range terms {
+		switch t.Kind {
+		case weightedRankTermPubkeyScore:
+			if t.PubkeyScore.Source != "vertex" {
+				return chstore.FeatureWeights{}, 0, 0, false
+			}
+			w.AuthorVertexScore = t.Weight
+			minFollowers = t.PubkeyScore.MinFollowers
+		case weightedRankTermCandidateField:
+			if t.CandidateField != "CREATED_AT" || t.Transform != "RECENCY_HALFLIFE" {
+				return chstore.FeatureWeights{}, 0, 0, false
+			}
+			w.Recency = t.Weight
+			halfLife = t.HalfLifeSeconds
+		case weightedRankTermDerivedMetric:
+			if t.DerivedMetric != "contribution_quality" {
+				return chstore.FeatureWeights{}, 0, 0, false
+			}
+			w.ContributionQuality = t.Weight
+		case weightedRankTermReferences:
+			if t.Transform != "LOG1P" {
+				return chstore.FeatureWeights{}, 0, 0, false
+			}
+			switch t.Metric.Name {
+			case "likes":
+				w.Likes = t.Weight
+			case "replies":
+				w.Replies = t.Weight
+			case "reposts":
+				w.Reposts = t.Weight
+			case "zapSats":
+				w.ZapSats = t.Weight
+			default:
+				return chstore.FeatureWeights{}, 0, 0, false
+			}
+		default:
+			return chstore.FeatureWeights{}, 0, 0, false
+		}
+	}
+	return w, halfLife, minFollowers, true
+}
+
+// rankedEventViewsFromFeatures runs the DB-side weighted top-N over
+// note_rank_features, hydrates the pool, and applies the per-viewer follow-boost +
+// shuffle. served=false signals a cold feature table so the caller can fall back.
+func (r *resolver) rankedEventViewsFromFeatures(ctx context.Context, input rankedEventsInput, weights chstore.FeatureWeights, halfLife float64, minFollowers uint64) ([]chstore.EventView, bool, error) {
+	rows, err := r.store.RankedEventsByFeatures(ctx, chstore.FeatureRankInput{
+		Kinds:              input.Target.Kinds,
+		Since:              time.Now().Add(-featureRankWindow).Unix(),
+		HalfLifeSeconds:    halfLife,
+		Weights:            weights,
+		MinAuthorFollowers: minFollowers,
+		Limit:              basePoolDepth,
+		ExcludeIDs:         input.Target.ExcludeIDs,
+		ExcludePubKeys:     input.Target.ExcludePubKeys,
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
+		return nil, false, nil
+	}
+
+	ids := make([]string, 0, len(rows))
+	scores := make(map[string]float64, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.EventID)
+		scores[row.EventID] = row.Score
+	}
+
+	target := input.Target
+	target.IDs = ids
+	target.Limit = uint64(len(ids))
+	events, err := r.queryEvents(ctx, target)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(events) == 0 {
+		return nil, false, nil
+	}
+	finalIDs := finalizeRankedIDs(events, scores, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
+	return orderEventViewsByID(events, finalIDs), true, nil
 }
 
 // rankedEventViewsDirect is the non-cached ranking path: it sizes the candidate
