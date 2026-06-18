@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -174,7 +175,9 @@ func main() {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
-	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds))
+	healthStorageStats := newHealthStorageStatsCache(store, cfg.Firehose.Kinds, logger)
+	go healthStorageStats.Run(ctx)
+	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds, healthStorageStats.Snapshot))
 
 	addr := listenAddr(os.Getenv)
 	server := &http.Server{
@@ -234,14 +237,15 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 
 type healthStore interface {
 	EventCount(context.Context) (uint64, error)
-	EventKindStats(context.Context, []int) (map[int]chstore.EventKindStats, error)
+	EventKindCounts(context.Context, []int) (map[int]uint64, error)
 }
 
 type healthResponse struct {
-	OK         string               `json:"ok"`
-	EventCount uint64               `json:"eventCount,omitempty"`
-	EventKinds []eventKindBreakdown `json:"eventKinds,omitempty"`
-	Error      string               `json:"error,omitempty"`
+	OK                string               `json:"ok"`
+	EventCount        uint64               `json:"eventCount,omitempty"`
+	StorageStatsReady bool                 `json:"storageStatsReady"`
+	EventKinds        []eventKindBreakdown `json:"eventKinds,omitempty"`
+	Error             string               `json:"error,omitempty"`
 }
 
 type eventKindInfo struct {
@@ -273,6 +277,7 @@ var healthEventKinds = []eventKindInfo{
 	{Kind: 1059, Description: "Gift Wrap", Source: "NIP-59"},
 	{Kind: 1063, Description: "File Metadata", Source: "NIP-94"},
 	{Kind: 9735, Description: "Zap", Source: "NIP-57"},
+	{Kind: 10050, Description: "Relay list to receive DMs", Source: "NIP-51/NIP-17"},
 	{Kind: 10051, Description: "KeyPackage Relays List", Source: "Marmot"},
 	{Kind: 30078, Description: "Application-specific Data", Source: "NIP-78"},
 	{Kind: 38000, Description: "Ecash Mint Recommendation", Source: "NIP-87"},
@@ -307,18 +312,18 @@ func healthEventKindInfo(kind int) eventKindInfo {
 	}
 }
 
-func healthEventKindBreakdown(kinds []int, stats map[int]chstore.EventKindStats) []eventKindBreakdown {
+func healthEventKindBreakdown(kinds []int, counts map[int]uint64, storage healthStorageSnapshot) []eventKindBreakdown {
 	breakdown := make([]eventKindBreakdown, 0, len(kinds))
 	for _, kind := range kinds {
 		info := healthEventKindInfo(kind)
-		stat := stats[info.Kind]
+		storedBytes := storage.StoredBytes[info.Kind]
 		breakdown = append(breakdown, eventKindBreakdown{
 			Kind:        info.Kind,
 			Description: info.Description,
 			Source:      info.Source,
-			Count:       stat.Count,
-			StoredBytes: stat.StoredBytesRaw,
-			StoredGB:    bytesToDecimalGB(stat.StoredBytesRaw),
+			Count:       counts[info.Kind],
+			StoredBytes: storedBytes,
+			StoredGB:    bytesToDecimalGB(storedBytes),
 		})
 	}
 	return breakdown
@@ -328,7 +333,96 @@ func bytesToDecimalGB(bytes uint64) float64 {
 	return math.Round(float64(bytes)/1_000_000_000*1_000_000) / 1_000_000
 }
 
-func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
+type healthStorageSnapshot struct {
+	Ready       bool
+	StoredBytes map[int]uint64
+}
+
+type healthStorageStatsCache struct {
+	store  *chstore.Store
+	kinds  []int
+	logger *slog.Logger
+
+	mu       sync.RWMutex
+	snapshot healthStorageSnapshot
+}
+
+const (
+	healthStorageStatsInitialDelay    = 30 * time.Second
+	healthStorageStatsRefreshInterval = 10 * time.Minute
+	healthStorageStatsRefreshTimeout  = 45 * time.Second
+)
+
+func newHealthStorageStatsCache(store *chstore.Store, configuredKinds []int, logger *slog.Logger) *healthStorageStatsCache {
+	return &healthStorageStatsCache{
+		store:  store,
+		kinds:  healthEventKindNumbers(configuredKinds),
+		logger: logger,
+	}
+}
+
+func (c *healthStorageStatsCache) Run(ctx context.Context) {
+	timer := time.NewTimer(healthStorageStatsInitialDelay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return
+	case <-timer.C:
+	}
+
+	c.refresh(ctx)
+	ticker := time.NewTicker(healthStorageStatsRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.refresh(ctx)
+		}
+	}
+}
+
+func (c *healthStorageStatsCache) refresh(ctx context.Context) {
+	refreshCtx, cancel := context.WithTimeout(ctx, healthStorageStatsRefreshTimeout)
+	defer cancel()
+
+	stats, err := c.store.EventKindStats(refreshCtx, c.kinds)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Warn("health storage stats refresh failed", "error", err)
+		}
+		return
+	}
+
+	storedBytes := make(map[int]uint64, len(stats))
+	for kind, stat := range stats {
+		storedBytes[kind] = stat.StoredBytesRaw
+	}
+
+	c.mu.Lock()
+	c.snapshot = healthStorageSnapshot{
+		Ready:       true,
+		StoredBytes: storedBytes,
+	}
+	c.mu.Unlock()
+}
+
+func (c *healthStorageStatsCache) Snapshot() healthStorageSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	storedBytes := make(map[int]uint64, len(c.snapshot.StoredBytes))
+	for kind, bytes := range c.snapshot.StoredBytes {
+		storedBytes[kind] = bytes
+	}
+	return healthStorageSnapshot{
+		Ready:       c.snapshot.Ready,
+		StoredBytes: storedBytes,
+	}
+}
+
+func healthHandler(store healthStore, configuredKinds []int, storageSnapshot func() healthStorageSnapshot) http.HandlerFunc {
 	kindNumbers := healthEventKindNumbers(configuredKinds)
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -342,17 +436,22 @@ func healthHandler(store healthStore, configuredKinds []int) http.HandlerFunc {
 			return
 		}
 
-		eventKindStats, err := store.EventKindStats(ctx, kindNumbers)
+		eventKindCounts, err := store.EventKindCounts(ctx, kindNumbers)
 		if err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind stats failed"})
+			_ = json.NewEncoder(w).Encode(healthResponse{OK: "false", Error: "clickhouse event kind count failed"})
 			return
+		}
+		storage := healthStorageSnapshot{}
+		if storageSnapshot != nil {
+			storage = storageSnapshot()
 		}
 
 		_ = json.NewEncoder(w).Encode(healthResponse{
-			OK:         "true",
-			EventCount: eventCount,
-			EventKinds: healthEventKindBreakdown(kindNumbers, eventKindStats),
+			OK:                "true",
+			EventCount:        eventCount,
+			StorageStatsReady: storage.Ready,
+			EventKinds:        healthEventKindBreakdown(kindNumbers, eventKindCounts, storage),
 		})
 	}
 }

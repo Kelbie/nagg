@@ -94,7 +94,7 @@ curl -X POST http://127.0.0.1:8080/nostr/notes/stats \
   -d '{"ids":[]}'
 ```
 
-`/healthz` returns the total raw event count plus a per-configured-kind breakdown with the event count, estimated raw `nostr_events` bytes, and decimal GB. The GB value is useful for comparing kind pressure; it is not exact compressed ClickHouse part size.
+`/healthz` returns the total raw event count plus a per-configured-kind breakdown with the event count, estimated raw `nostr_events` bytes, and decimal GB. The GB value is refreshed asynchronously so Railway healthchecks do not run the heavier byte scan; use `storageStatsReady` to tell whether the latest response includes a refreshed estimate. The GB value is useful for comparing kind pressure; it is not exact compressed ClickHouse part size.
 
 ## Deploy On Railway
 
