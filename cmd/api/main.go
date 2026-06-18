@@ -484,7 +484,7 @@ func (c *healthStorageStatsCache) refresh(ctx context.Context) {
 
 	storedBytes := make(map[int]uint64, len(stats))
 	for kind, stat := range stats {
-		storedBytes[kind] = stat.StoredBytesRaw
+		storedBytes[kind] = stat.StoredBytesEstimated
 	}
 
 	c.mu.Lock()

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -237,8 +238,8 @@ func (s *Store) EventCount(ctx context.Context) (uint64, error) {
 }
 
 type EventKindStats struct {
-	Count          uint64
-	StoredBytesRaw uint64
+	Count                uint64
+	StoredBytesEstimated uint64
 }
 
 func (s *Store) EventKindStats(ctx context.Context, kinds []int) (map[int]EventKindStats, error) {
@@ -251,26 +252,35 @@ func (s *Store) EventKindStats(ctx context.Context, kinds []int) (map[int]EventK
 		return out, nil
 	}
 
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT kind, count(), sum(%s)
-		FROM nostr_events
-		WHERE kind IN (%s)
-		GROUP BY kind
-	`, rawEventStoredBytesExpression(), ints(kinds)))
+	counts, err := s.EventKindCounts(ctx, kinds)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var kind uint32
-		var stats EventKindStats
-		if err := rows.Scan(&kind, &stats.Count, &stats.StoredBytesRaw); err != nil {
-			return nil, err
-		}
-		out[int(kind)] = stats
+	totalBytes, totalRows, err := s.nostrEventsStorageFootprint(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return out, rows.Err()
+
+	for kind, count := range counts {
+		out[kind] = EventKindStats{
+			Count:                count,
+			StoredBytesEstimated: estimateStoredBytes(count, totalBytes, totalRows),
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) nostrEventsStorageFootprint(ctx context.Context) (uint64, uint64, error) {
+	var bytes uint64
+	var rows uint64
+	if err := s.conn.QueryRow(ctx, `
+		SELECT sum(data_compressed_bytes), sum(rows)
+		FROM system.parts
+		WHERE active AND database = currentDatabase() AND table = 'nostr_events'
+	`).Scan(&bytes, &rows); err != nil {
+		return 0, 0, err
+	}
+	return bytes, rows, nil
 }
 
 func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
@@ -305,10 +315,11 @@ func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint6
 	return out, rows.Err()
 }
 
-func rawEventStoredBytesExpression() string {
-	// id, pubkey, sig, kind, and DateTime fields are fixed-size columns; content
-	// and tags_json carry the event-specific variable payload.
-	return "length(id) + length(pubkey) + length(sig) + length(content) + length(tags_json) + 16"
+func estimateStoredBytes(count uint64, totalBytes uint64, totalRows uint64) uint64 {
+	if count == 0 || totalBytes == 0 || totalRows == 0 {
+		return 0
+	}
+	return uint64(math.Round(float64(count) * float64(totalBytes) / float64(totalRows)))
 }
 
 func uniqueEventKinds(values []int) []int {
