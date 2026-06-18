@@ -8,6 +8,25 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 )
 
+func TestEstimateStoredBytes(t *testing.T) {
+	tests := map[string]struct {
+		count      uint64
+		totalBytes uint64
+		totalRows  uint64
+		want       uint64
+	}{
+		"empty count":  {count: 0, totalBytes: 100, totalRows: 10, want: 0},
+		"empty table":  {count: 10, totalBytes: 0, totalRows: 0, want: 0},
+		"proportional": {count: 25, totalBytes: 1_000, totalRows: 100, want: 250},
+		"rounded":      {count: 2, totalBytes: 10, totalRows: 3, want: 7},
+	}
+	for name, tc := range tests {
+		if got := estimateStoredBytes(tc.count, tc.totalBytes, tc.totalRows); got != tc.want {
+			t.Fatalf("%s estimate = %d, want %d", name, got, tc.want)
+		}
+	}
+}
+
 func TestExtractNoteZapUsesZapRequestAmount(t *testing.T) {
 	targetID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	event := &nostr.Event{
@@ -184,4 +203,3 @@ func TestAggregateOrderByAddsShuffleTieBreaker(t *testing.T) {
 		t.Fatalf("args = %+v", args)
 	}
 }
-
