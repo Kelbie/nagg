@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
@@ -25,6 +26,8 @@ import (
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
+const apiInitializationRetryDelay = 10 * time.Second
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -38,23 +41,76 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := chstore.OpenWithRetry(ctx, cfg.ClickHouse, logger)
-	if err != nil {
-		slog.Error("clickhouse connection failed", "error", err)
-		os.Exit(1)
-	}
-	defer store.Close()
+	runtime := &apiRuntime{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/livez", liveHandler)
+	mux.Handle("/", runtime)
 
+	addr := listenAddr(os.Getenv)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		slog.Info("graphql api listening", "addr", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("graphql api failed", "error", err)
+			stop()
+		}
+	}()
+
+	go initializeAPI(ctx, cfg, logger, runtime, stop)
+
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdownCtx)
+	runtime.Close()
+}
+
+func initializeAPI(ctx context.Context, cfg config.Config, logger *slog.Logger, runtime *apiRuntime, stop context.CancelFunc) {
+	for {
+		store, err := chstore.OpenWithRetry(ctx, cfg.ClickHouse, logger)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("clickhouse connection failed; retrying api initialization", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(apiInitializationRetryDelay):
+				continue
+			}
+		}
+
+		handler, err := buildReadyAPI(ctx, store, cfg, logger)
+		if err != nil {
+			store.Close()
+			slog.Error("api initialization failed", "error", err)
+			stop()
+			return
+		}
+
+		runtime.SetReady(store, handler)
+		slog.Info("api ready")
+		return
+	}
+}
+
+func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
 	var vertexClient *vertex.Client
 	if cfg.Vertex.PrivateKey != "" {
-		vertexClient, err = vertex.New(vertex.Config{
+		client, err := vertex.New(vertex.Config{
 			PrivateKey: cfg.Vertex.PrivateKey,
 			Relay:      cfg.Vertex.Relay,
 		})
 		if err != nil {
-			slog.Error("vertex client failed", "error", err)
-			os.Exit(1)
+			return nil, fmt.Errorf("vertex client failed: %w", err)
 		}
+		vertexClient = client
 		vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
 			MinFollowers: uint64(cfg.Vertex.RankMinFollowers),
 			BatchSize:    cfg.Vertex.SyncBatch,
@@ -138,8 +194,7 @@ func main() {
 	}
 	schema, err := graphqlapi.NewSchema(store, schemaOpts...)
 	if err != nil {
-		slog.Error("graphql schema failed", "error", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("graphql schema failed: %w", err)
 	}
 
 	responseCache := cache.New(cfg.Cache.URL, logger)
@@ -179,25 +234,57 @@ func main() {
 	go healthStorageStats.Run(ctx)
 	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds, healthStorageStats.Snapshot))
 
-	addr := listenAddr(os.Getenv)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
+	return mux, nil
+}
+
+type apiRuntime struct {
+	mu      sync.RWMutex
+	handler http.Handler
+	store   *chstore.Store
+}
+
+func (r *apiRuntime) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	r.mu.RLock()
+	handler := r.handler
+	r.mu.RUnlock()
+	if handler == nil {
+		apiUnavailable(w)
+		return
 	}
+	handler.ServeHTTP(w, req)
+}
 
-	go func() {
-		slog.Info("graphql api listening", "addr", addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("graphql api failed", "error", err)
-			stop()
-		}
-	}()
+func (r *apiRuntime) SetReady(store *chstore.Store, handler http.Handler) {
+	r.mu.Lock()
+	r.store = store
+	r.handler = handler
+	r.mu.Unlock()
+}
 
-	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
+func (r *apiRuntime) Close() {
+	r.mu.Lock()
+	store := r.store
+	r.store = nil
+	r.handler = nil
+	r.mu.Unlock()
+	if store != nil {
+		store.Close()
+	}
+}
+
+func liveHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
+}
+
+func apiUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "5")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"ok":    "false",
+		"error": "api initializing",
+	})
 }
 
 func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config) {
