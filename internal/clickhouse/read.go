@@ -380,11 +380,15 @@ func (s *Store) mergeCount(ctx context.Context, table, column string, ids []stri
 // values are owned by the caller (nagg-ts rank recipes) and arrive as SQL bind
 // params, never hardcoded in the query.
 type FeatureWeights struct {
-	Likes               float64
-	Reposts             float64
-	Replies             float64
-	Quotes              float64
-	ZapSats             float64
+	Likes   float64
+	Reposts float64
+	Replies float64
+	Quotes  float64
+	ZapSats float64
+	// Actors is the weight on the distinct-engager ("actors") count — For-You's
+	// primary engagement signal. It is applied WITHOUT LOG1P (identity), unlike
+	// the per-type counts.
+	Actors              float64
 	AuthorVertexScore   float64
 	ContributionQuality float64
 	Recency             float64
@@ -432,6 +436,7 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 	// SELECT bind params, in column order.
 	args := []any{
 		w.Likes, w.Replies, w.Reposts, w.Quotes, w.ZapSats,
+		w.Actors,
 		w.AuthorVertexScore, in.MinAuthorFollowers,
 		w.ContributionQuality,
 		w.Recency, halfLife,
@@ -442,6 +447,7 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		+ ? * log(1 + real_reposts)
 		+ ? * log(1 + real_quotes)
 		+ ? * log(1 + real_zap_sats)
+		+ ? * real_actors
 		+ ? * if(author_followers >= ?, author_vertex_score, 0)
 		+ ? * contribution_quality
 		+ ? * pow(0.5, greatest(toUnixTimestamp(now()) - toUnixTimestamp(created_at), 0) / ?)`

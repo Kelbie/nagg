@@ -64,6 +64,8 @@ func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing
 		"toDateTime(1700009999) AS computed_at",
 		"note_reply_edges",                    // real replies via edge authors
 		"note_zaps",                           // real zaps
+		"AS real_actors",                      // combined distinct-engager count
+		"uniqExact(actor)",                    // actors = distinct engagers across types
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("engagement-real SQL missing %q", want)

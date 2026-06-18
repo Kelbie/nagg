@@ -1491,19 +1491,46 @@ func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, 
 			}
 			w.ContributionQuality += t.Weight
 		case weightedRankTermReferences:
-			if t.Transform != "LOG1P" || t.References.PubkeyScore.Source == "" {
+			// Engagement terms must gate engagers by a vertex pubkey score (the
+			// real_* columns are vertex-gated); an ungated term has no feature column.
+			if t.References.PubkeyScore.Source == "" {
 				return bail()
 			}
+			// The "actors" candidate metric is an un-logged distinct-engager count;
+			// the per-type counts use LOG1P. Match the transform per metric so the
+			// feature SQL (which bakes the transform into each column) stays exact.
+			isLog1p := t.Transform == "LOG1P"
+			isIdentity := t.Transform == "" || t.Transform == "IDENTITY"
 			switch t.Metric.Name {
+			case "actors":
+				if !isIdentity {
+					return bail()
+				}
+				w.Actors += t.Weight
 			case "likes":
+				if !isLog1p {
+					return bail()
+				}
 				w.Likes += t.Weight
 			case "replies":
+				if !isLog1p {
+					return bail()
+				}
 				w.Replies += t.Weight
 			case "reposts":
+				if !isLog1p {
+					return bail()
+				}
 				w.Reposts += t.Weight
 			case "quotes":
+				if !isLog1p {
+					return bail()
+				}
 				w.Quotes += t.Weight
 			case "zapSats":
+				if !isLog1p {
+					return bail()
+				}
 				w.ZapSats += t.Weight
 			default:
 				return bail()

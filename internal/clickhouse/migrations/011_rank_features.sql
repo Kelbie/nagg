@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS note_rank_features
     real_quotes          UInt64,
     real_zaps            UInt64,
     real_zap_sats        UInt64,
+    real_actors          UInt64,
     author_vertex_score  Float64,
     author_followers     UInt64,
     contribution_quality Float64,

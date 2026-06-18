@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS note_engagement_real
     real_quotes       UInt64,
     real_zaps         UInt64,
     real_zap_sats     UInt64,
+    -- Distinct vertex-scored engagers across ALL reaction types (likes/reposts/
+    -- quotes/replies/zaps), the "actors" signal the For-You rank uses as its
+    -- primary engagement term.
+    real_actors       UInt64,
     threshold_version LowCardinality(String),
     computed_at       DateTime
 )

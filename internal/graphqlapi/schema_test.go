@@ -362,6 +362,8 @@ func forYouTerms() []weightedRankTerm {
 	// so they map to the vertex-real feature columns.
 	gated := chstore.EventQueryInput{PubkeyScore: chstore.PubkeyScoreFilter{Source: "vertex"}}
 	return []weightedRankTerm{
+		// The top-level candidate metric: distinct engagers, identity transform.
+		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "actors"}, Weight: 1},
 		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "likes"}, Weight: 3, Transform: "LOG1P"},
 		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "replies"}, Weight: 2.5, Transform: "LOG1P"},
 		{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "reposts"}, Weight: 2, Transform: "LOG1P"},
@@ -379,6 +381,9 @@ func TestFeatureWeightsFromTerms_RecognizesForYou(t *testing.T) {
 	}
 	if w.Likes != 3 || w.Replies != 2.5 || w.Reposts != 2 || w.ZapSats != 1.5 {
 		t.Errorf("engagement weights mismapped: %+v", w)
+	}
+	if w.Actors != 1 {
+		t.Errorf("actors weight = %v, want 1 (the identity candidate metric must map, not bail)", w.Actors)
 	}
 	if w.AuthorVertexScore != 0.25 || w.Recency != 1.2 || w.ContributionQuality != 3 {
 		t.Errorf("scalar weights mismapped: %+v", w)

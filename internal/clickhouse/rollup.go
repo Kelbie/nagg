@@ -210,6 +210,7 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 			ifNull(q.c, 0)  AS real_quotes,
 			ifNull(z.cnt, 0)  AS real_zaps,
 			ifNull(z.sats, 0) AS real_zap_sats,
+			ifNull(act.c, 0)  AS real_actors,
 			'%s' AS threshold_version,
 			toDateTime(%d) AS computed_at
 		FROM authors a
@@ -248,7 +249,32 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 			FROM note_zaps z
 			WHERE z.target_event_id IN (target_ids) AND z.pubkey IN (scored)
 			GROUP BY event_id
-		) z ON z.event_id = a.event_id`,
+		) z ON z.event_id = a.event_id
+		LEFT JOIN (
+			-- Distinct scored, non-self engagers across every reaction type — the
+			-- "actors" signal For-You ranks on.
+			SELECT event_id, uniqExact(actor) AS c
+			FROM (
+				SELECT et.tag_value AS event_id, et.pubkey AS actor
+				FROM event_tags et INNER JOIN authors a2 ON a2.event_id = et.tag_value
+				WHERE et.kind IN (6, 7, 16) AND et.tag_key = 'e' AND length(et.tag_value) = 64
+				  AND et.pubkey IN (scored) AND et.pubkey != a2.author
+				UNION ALL
+				SELECT et.tag_value AS event_id, et.pubkey AS actor
+				FROM event_tags et INNER JOIN authors a2 ON a2.event_id = et.tag_value
+				WHERE et.kind = 1 AND et.tag_key = 'q' AND length(et.tag_value) = 64
+				  AND et.pubkey IN (scored) AND et.pubkey != a2.author
+				UNION ALL
+				SELECT e.parent_id AS event_id, e.child_pubkey AS actor
+				FROM note_reply_edges e INNER JOIN authors a2 ON a2.event_id = e.parent_id
+				WHERE e.child_pubkey IN (scored) AND e.child_pubkey != a2.author
+				UNION ALL
+				SELECT zz.target_event_id AS event_id, zz.pubkey AS actor
+				FROM note_zaps zz INNER JOIN authors a2 ON a2.event_id = zz.target_event_id
+				WHERE zz.pubkey IN (scored) AND zz.pubkey != a2.author
+			)
+			GROUP BY event_id
+		) act ON act.event_id = a.event_id`,
 		targets, scored, version, computedAt.Unix())
 }
 
@@ -339,6 +365,7 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 			ifNull(er.real_quotes, 0) AS real_quotes,
 			ifNull(er.real_zaps, 0) AS real_zaps,
 			ifNull(er.real_zap_sats, 0) AS real_zap_sats,
+			ifNull(er.real_actors, 0) AS real_actors,
 			ifNull(vs.score, 0) AS author_vertex_score,
 			ifNull(vs.followers, 0) AS author_followers,
 			ifNull(dm.value, 0) AS contribution_quality,
@@ -350,7 +377,7 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(replies) AS v FROM note_direct_reply_counts WHERE target_event_id IN (target_ids) GROUP BY id) re ON re.id = n.id
 		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(quotes) AS v FROM note_quote_counts WHERE target_event_id IN (target_ids) GROUP BY id) qt ON qt.id = n.id
 		LEFT JOIN (SELECT target_event_id AS id, sumMerge(sats) AS sats, uniqMerge(zaps) AS zaps FROM note_zap_totals WHERE target_event_id IN (target_ids) GROUP BY id) zt ON zt.id = n.id
-		LEFT JOIN (SELECT event_id AS id, argMax(real_likes, computed_at) AS real_likes, argMax(real_reposts, computed_at) AS real_reposts, argMax(real_replies, computed_at) AS real_replies, argMax(real_quotes, computed_at) AS real_quotes, argMax(real_zaps, computed_at) AS real_zaps, argMax(real_zap_sats, computed_at) AS real_zap_sats FROM note_engagement_real WHERE event_id IN (target_ids) GROUP BY id) er ON er.id = n.id
+		LEFT JOIN (SELECT event_id AS id, argMax(real_likes, computed_at) AS real_likes, argMax(real_reposts, computed_at) AS real_reposts, argMax(real_replies, computed_at) AS real_replies, argMax(real_quotes, computed_at) AS real_quotes, argMax(real_zaps, computed_at) AS real_zaps, argMax(real_zap_sats, computed_at) AS real_zap_sats, argMax(real_actors, computed_at) AS real_actors FROM note_engagement_real WHERE event_id IN (target_ids) GROUP BY id) er ON er.id = n.id
 		LEFT JOIN (SELECT pubkey, argMax(score, fetched_at) AS score, argMax(followers, fetched_at) AS followers FROM vertex_scores WHERE source = 'vertex' GROUP BY pubkey) vs ON vs.pubkey = n.pubkey
 		LEFT JOIN (SELECT event_id AS id, argMax(value, computed_at) AS value FROM derived_metrics WHERE metric = 'contribution_quality' AND event_id IN (target_ids) GROUP BY id) dm ON dm.id = n.id`,
 		targets, version, computedAt.Unix())
