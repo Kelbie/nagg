@@ -5,7 +5,22 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	ch "github.com/ClickHouse/clickhouse-go/v2"
 )
+
+// rollupExecCtx caps the thread budget for the rollup's heavy INSERT…SELECTs.
+// Managed ClickHouse defaults max_threads to auto(N) (e.g. 32); these multi-join
+// recomputes would otherwise try to spawn that many worker threads and fail on a
+// small, thread-constrained server with error 439 ("failed to start the thread").
+// max_execution_time bounds a runaway tick.
+func rollupExecCtx(ctx context.Context) context.Context {
+	return ch.Context(ctx, ch.WithSettings(ch.Settings{
+		"max_threads":        2,
+		"max_insert_threads": 1,
+		"max_execution_time": 600,
+	}))
+}
 
 // Thresholds parameterize the vertex-real engagement rollup. An engagement actor
 // (liker / reposter / replier / quoter / zapper) counts toward a "real" count iff
@@ -166,10 +181,10 @@ func buildDirectReplyCountsSQL(since time.Time, limit int) string {
 // RecomputeReplyEdges rebuilds the direct-reply edges and counts for recent reply
 // candidates. uniqState makes the count rebuild idempotent (set union).
 func (s *Store) RecomputeReplyEdges(ctx context.Context, since time.Time, limit int) error {
-	if err := s.conn.Exec(ctx, buildReplyEdgesSQL(since, limit)); err != nil {
+	if err := s.conn.Exec(rollupExecCtx(ctx), buildReplyEdgesSQL(since, limit)); err != nil {
 		return fmt.Errorf("recompute reply edges: %w", err)
 	}
-	if err := s.conn.Exec(ctx, buildDirectReplyCountsSQL(since, limit)); err != nil {
+	if err := s.conn.Exec(rollupExecCtx(ctx), buildDirectReplyCountsSQL(since, limit)); err != nil {
 		return fmt.Errorf("recompute direct reply counts: %w", err)
 	}
 	return nil
@@ -240,7 +255,7 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 // RecomputeEngagementReal recomputes vertex-real engagement counts for the bounded
 // target set. ReplacingMergeTree(computed_at) overwrites, so this is idempotent.
 func (s *Store) RecomputeEngagementReal(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
-	if err := s.conn.Exec(ctx, buildEngagementRealSQL(since, limit, th, computedAt)); err != nil {
+	if err := s.conn.Exec(rollupExecCtx(ctx), buildEngagementRealSQL(since, limit, th, computedAt)); err != nil {
 		return fmt.Errorf("recompute engagement real: %w", err)
 	}
 	return nil
@@ -295,7 +310,7 @@ func buildUserStatsSQL(since time.Time, limit int, computedAt time.Time) string 
 // touched since `since`. Fixes the legacy follower-count bug (which counted all
 // kind-3 history instead of only the latest contact list per follower).
 func (s *Store) RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error {
-	if err := s.conn.Exec(ctx, buildUserStatsSQL(since, limit, computedAt)); err != nil {
+	if err := s.conn.Exec(rollupExecCtx(ctx), buildUserStatsSQL(since, limit, computedAt)); err != nil {
 		return fmt.Errorf("recompute user stats: %w", err)
 	}
 	return nil
@@ -344,7 +359,7 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 // RecomputeRankFeatures assembles the per-event hot-path feature row (raw + real
 // counts, author score, contribution quality) for the bounded target set.
 func (s *Store) RecomputeRankFeatures(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
-	if err := s.conn.Exec(ctx, buildRankFeaturesSQL(since, limit, th, computedAt)); err != nil {
+	if err := s.conn.Exec(rollupExecCtx(ctx), buildRankFeaturesSQL(since, limit, th, computedAt)); err != nil {
 		return fmt.Errorf("recompute rank features: %w", err)
 	}
 	return nil

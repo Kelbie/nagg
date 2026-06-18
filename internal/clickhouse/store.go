@@ -389,9 +389,19 @@ func closeUnsentBatch(batch chdriver.Batch) {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	// Run migrations — and especially the historical backfill INSERT…SELECTs — with
+	// a low thread budget. Managed ClickHouse defaults max_threads to auto(N) (e.g.
+	// 32); a backfill that tries to spawn that many worker threads fails on a small,
+	// thread-constrained server with "Cannot schedule a task: failed to start the
+	// thread" (error 439). Migrations run sequentially, so single-threaded is fine
+	// and still fast at our data volume.
+	migCtx := ch.Context(ctx, ch.WithSettings(ch.Settings{
+		"max_threads":        1,
+		"max_insert_threads": 1,
+	}))
 	for _, migration := range embeddedMigrations() {
 		for _, stmt := range splitSQLStatements(migration) {
-			if err := s.conn.Exec(ctx, stmt); err != nil {
+			if err := s.conn.Exec(migCtx, stmt); err != nil {
 				return fmt.Errorf("migration failed: %w", err)
 			}
 		}
