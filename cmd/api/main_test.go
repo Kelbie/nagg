@@ -8,15 +8,13 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
-
-	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 )
 
 type fakeEventCounter struct {
 	count          uint64
-	kindStats      map[int]chstore.EventKindStats
+	kindCounts     map[int]uint64
 	eventCountErr  error
-	kindStatsErr   error
+	kindCountsErr  error
 	requestedKinds []int
 }
 
@@ -24,9 +22,9 @@ func (f *fakeEventCounter) EventCount(context.Context) (uint64, error) {
 	return f.count, f.eventCountErr
 }
 
-func (f *fakeEventCounter) EventKindStats(_ context.Context, kinds []int) (map[int]chstore.EventKindStats, error) {
+func (f *fakeEventCounter) EventKindCounts(_ context.Context, kinds []int) (map[int]uint64, error) {
 	f.requestedKinds = append([]int(nil), kinds...)
-	return f.kindStats, f.kindStatsErr
+	return f.kindCounts, f.kindCountsErr
 }
 
 func TestHealthHandlerReturnsEventCount(t *testing.T) {
@@ -34,15 +32,23 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	counter := &fakeEventCounter{
 		count: 12345,
-		kindStats: map[int]chstore.EventKindStats{
-			1:    {Count: 42, StoredBytesRaw: 1_500_000_000},
-			9735: {Count: 7, StoredBytesRaw: 250_000_000},
+		kindCounts: map[int]uint64{
+			1:    42,
+			9735: 7,
 		},
 	}
 
 	configuredKinds := []int{0, 1, 9735, 38000}
 
-	healthHandler(counter, configuredKinds)(rec, req)
+	healthHandler(counter, configuredKinds, func() healthStorageSnapshot {
+		return healthStorageSnapshot{
+			Ready: true,
+			StoredBytes: map[int]uint64{
+				1:    1_500_000_000,
+				9735: 250_000_000,
+			},
+		}
+	})(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -51,7 +57,7 @@ func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.OK != "true" || body.EventCount != 12345 || body.Error != "" {
+	if body.OK != "true" || body.EventCount != 12345 || !body.StorageStatsReady || body.Error != "" {
 		t.Fatalf("body = %+v", body)
 	}
 	if !reflect.DeepEqual(counter.requestedKinds, configuredKinds) {
@@ -78,7 +84,7 @@ func TestHealthHandlerReturnsUnavailableOnEventCountError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
-	healthHandler(&fakeEventCounter{eventCountErr: errors.New("clickhouse unavailable")}, []int{1})(rec, req)
+	healthHandler(&fakeEventCounter{eventCountErr: errors.New("clickhouse unavailable")}, []int{1}, nil)(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -97,9 +103,9 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 
 	healthHandler(&fakeEventCounter{
-		count:        12345,
-		kindStatsErr: errors.New("clickhouse unavailable"),
-	}, []int{1})(rec, req)
+		count:         12345,
+		kindCountsErr: errors.New("clickhouse unavailable"),
+	}, []int{1}, nil)(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -108,7 +114,7 @@ func TestHealthHandlerReturnsUnavailableOnEventKindCountError(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.OK != "false" || body.Error != "clickhouse event kind stats failed" || body.EventCount != 0 || body.EventKinds != nil {
+	if body.OK != "false" || body.Error != "clickhouse event kind count failed" || body.EventCount != 0 || body.EventKinds != nil {
 		t.Fatalf("body = %+v", body)
 	}
 }
@@ -118,13 +124,18 @@ func TestHealthHandlerReportsOnlyConfiguredKinds(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	counter := &fakeEventCounter{
 		count: 9,
-		kindStats: map[int]chstore.EventKindStats{
-			1:     {Count: 3, StoredBytesRaw: 100},
-			30078: {Count: 6, StoredBytesRaw: 200},
+		kindCounts: map[int]uint64{
+			1:     3,
+			30078: 6,
 		},
 	}
 
-	healthHandler(counter, []int{1, 1, 30079})(rec, req)
+	healthHandler(counter, []int{1, 1, 30079}, func() healthStorageSnapshot {
+		return healthStorageSnapshot{
+			Ready:       true,
+			StoredBytes: map[int]uint64{1: 100, 30078: 200},
+		}
+	})(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -145,6 +156,32 @@ func TestHealthHandlerReportsOnlyConfiguredKinds(t *testing.T) {
 	unknown := eventKindByNumber(body.EventKinds, 30079)
 	if unknown == nil || unknown.Description != "Unknown Nostr event kind" || unknown.Source != "" {
 		t.Fatalf("unknown kind = %+v", unknown)
+	}
+}
+
+func TestHealthHandlerSucceedsWhenStorageStatsAreNotReady(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	counter := &fakeEventCounter{
+		count:      9,
+		kindCounts: map[int]uint64{1: 3},
+	}
+
+	healthHandler(counter, []int{1}, nil)(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.StorageStatsReady {
+		t.Fatalf("storage stats should not be ready: %+v", body)
+	}
+	kind := eventKindByNumber(body.EventKinds, 1)
+	if kind == nil || kind.Count != 3 || kind.StoredBytes != 0 || kind.StoredGB != 0 {
+		t.Fatalf("kind 1 breakdown = %+v", kind)
 	}
 }
 

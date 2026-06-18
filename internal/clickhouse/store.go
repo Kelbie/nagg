@@ -274,15 +274,35 @@ func (s *Store) EventKindStats(ctx context.Context, kinds []int) (map[int]EventK
 }
 
 func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
-	stats, err := s.EventKindStats(ctx, kinds)
+	kinds = uniqueEventKinds(kinds)
+	out := make(map[int]uint64, len(kinds))
+	for _, kind := range kinds {
+		out[kind] = 0
+	}
+	if len(kinds) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+		SELECT kind, count()
+		FROM nostr_events
+		WHERE kind IN (%s)
+		GROUP BY kind
+	`, ints(kinds)))
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[int]uint64, len(stats))
-	for kind, stat := range stats {
-		out[kind] = stat.Count
+	defer rows.Close()
+
+	for rows.Next() {
+		var kind uint32
+		var count uint64
+		if err := rows.Scan(&kind, &count); err != nil {
+			return nil, err
+		}
+		out[int(kind)] = count
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func rawEventStoredBytesExpression() string {
