@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	GraphQLSchemaVersion = "2026-06-08"
+	GraphQLSchemaVersion = "2026-06-18"
 	AppViewVersion       = "v1"
 )
 
@@ -31,6 +31,7 @@ var Names = []string{
 	"graphql.rank.weightedTerms",
 	"graphql.rank.candidatePubkeyBoosts",
 	"graphql.rank.pubkeyScoreTerms",
+	"graphql.rank.pubkeyScoreFilters",
 	"graphql.rank.candidateFieldTerms",
 	"graphql.rank.derivedMetricTerms",
 	"graphql.rank.shuffle",

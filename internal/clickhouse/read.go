@@ -47,6 +47,7 @@ type EventQueryInput struct {
 	Limit          uint64
 	Offset         uint64
 	Shuffle        ShuffleInput
+	PubkeyScore    PubkeyScoreFilter
 	Empty          bool
 }
 
@@ -57,18 +58,19 @@ type ShuffleInput struct {
 }
 
 type AggregateInput struct {
-	Dataset string
-	GroupBy []string
-	Metrics []string
-	IDs     []string
-	PubKeys []string
-	Kinds   []int
-	Tags    []TagFilter
-	Since   int64
-	Until   int64
-	Limit   uint64
-	Shuffle ShuffleInput
-	Empty   bool
+	Dataset     string
+	GroupBy     []string
+	Metrics     []string
+	IDs         []string
+	PubKeys     []string
+	Kinds       []int
+	Tags        []TagFilter
+	Since       int64
+	Until       int64
+	Limit       uint64
+	Shuffle     ShuffleInput
+	PubkeyScore PubkeyScoreFilter
+	Empty       bool
 }
 
 type AggregateRow struct {
@@ -85,6 +87,11 @@ type ReferenceAggregateInput struct {
 	Metrics        []ReferenceAggregateMetric
 	First          uint64
 	OrderBy        string
+}
+
+type PubkeyScoreFilter struct {
+	Source       string
+	MinFollowers uint64
 }
 
 type ReferenceAggregateDimension struct {
@@ -1657,6 +1664,10 @@ func (s *Store) queryEventsByTagTargetsFromTags(ctx context.Context, out map[str
 		clauses = append(clauses, "rt.created_at < ?")
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
+	if clause, scoreArgs := pubkeyScoreWhere("rt", input.PubkeyScore); clause != "" {
+		clauses = append(clauses, clause)
+		args = append(args, scoreArgs...)
+	}
 
 	innerOrderBy, innerOrderArgs := eventOrderBy("rt.created_at", "rt.event_id", input.Shuffle)
 	outerOrderBy, outerOrderArgs := eventOrderBy("created_at", "event_id", input.Shuffle)
@@ -2043,9 +2054,17 @@ func aggregateSpec(input AggregateInput) (aggSpec, []any, error) {
 	case "EVENTS":
 		spec.from = "nostr_events AS e FINAL"
 		spec.where, args = eventWhere("e", input.IDs, input.PubKeys, input.Kinds, input.Tags)
+		if clause, scoreArgs := pubkeyScoreWhere("e", input.PubkeyScore); clause != "" {
+			spec.where += " AND " + clause
+			args = append(args, scoreArgs...)
+		}
 	case "TAGS", "DERIVED_TAGS":
 		spec.from = tagDatasetTable(dataset) + " t INNER JOIN nostr_events AS e FINAL ON e.id = t.event_id"
 		spec.where, args = tagWhere(dataset, input.IDs, input.PubKeys, input.Kinds, input.Tags)
+		if clause, scoreArgs := pubkeyScoreWhere("t", input.PubkeyScore); clause != "" {
+			spec.where += " AND " + clause
+			args = append(args, scoreArgs...)
+		}
 	case "RELAYS":
 		spec.from = "event_seen_relays r"
 		spec.where = "WHERE 1 = 1"
@@ -2257,7 +2276,27 @@ func eventWhereInput(alias string, input EventQueryInput) (string, []any) {
 		where += fmt.Sprintf(" AND positionCaseInsensitiveUTF8(%s.content, ?) > 0", alias)
 		args = append(args, search)
 	}
+	if clause, scoreArgs := pubkeyScoreWhere(alias, input.PubkeyScore); clause != "" {
+		where += " AND " + clause
+		args = append(args, scoreArgs...)
+	}
 	return where, args
+}
+
+func pubkeyScoreWhere(alias string, filter PubkeyScoreFilter) (string, []any) {
+	source := strings.ToLower(strings.TrimSpace(filter.Source))
+	if source == "" {
+		return "", nil
+	}
+	minFollowers := filter.MinFollowers
+	clause := fmt.Sprintf(`%s.pubkey IN (
+		SELECT pubkey
+		FROM vertex_scores
+		WHERE source = ?
+		GROUP BY pubkey
+		HAVING max(followers) >= ?
+	)`, alias)
+	return clause, []any{source, minFollowers}
 }
 
 func eventWhereWithExclusions(alias string, ids, pubkeys, excludeIDs, excludePubkeys []string, kinds []int, tags []TagFilter) (string, []any) {

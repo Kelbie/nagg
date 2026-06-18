@@ -2000,6 +2000,97 @@ func TestRankedEventsUsesRecentReferencesAndPreservesRank(t *testing.T) {
 	}
 }
 
+func TestRankedEventsPropagatesPubkeyScoreFilterToEngagementReferences(t *testing.T) {
+	topID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	secondID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := &fakeStore{
+		aggregateRows: [][]chstore.AggregateRow{{
+			{
+				Dimensions: map[string]string{"tag_value": topID},
+				Metrics:    map[string]uint64{"unique_pubkeys": 3},
+			},
+			{
+				Dimensions: map[string]string{"tag_value": secondID},
+				Metrics:    map[string]uint64{"unique_pubkeys": 2},
+			},
+		}},
+		events: [][]chstore.EventView{{
+			{
+				ID:        topID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_001, 0),
+				Content:   "top",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("c", 128),
+			},
+			{
+				ID:        secondID,
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "second",
+				Tags:      [][]string{},
+				Sig:       strings.Repeat("d", 128),
+			},
+		}},
+		referenceAggregateSupported: true,
+		referenceAggregateRows: map[string][]chstore.AggregateRow{
+			topID: {{
+				Metrics: map[string]uint64{"value": 2},
+			}},
+			secondID: {{
+				Metrics: map[string]uint64{"value": 1},
+			}},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			rankedEvents(input:{
+				references:{kinds:[7,9735,6,16,1,1111], pubkeyScore:{source:"vertex"}}
+				via:{key:"e"}
+				target:{kinds:[1,1111]}
+				metric:{name:"actors", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+				terms:[{
+					references:{kinds:[7], limit:500, pubkeyScore:{source:"vertex"}}
+					via:{key:"e"}
+					metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+					weight:3.0
+					transform:"LOG1P"
+				}]
+				limit:2
+			}) {
+				nodes { id content }
+			}
+		}`,
+		Context: context.Background(),
+	})
+
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+	if len(store.aggregateInputs) != 1 {
+		t.Fatalf("aggregate inputs len = %d", len(store.aggregateInputs))
+	}
+	if got := store.aggregateInputs[0].PubkeyScore; got.Source != "vertex" || got.MinFollowers != 0 {
+		t.Fatalf("aggregate pubkey score filter = %+v", got)
+	}
+	if len(store.referenceAggregateInputs) != 2 {
+		t.Fatalf("reference aggregate inputs = %+v", store.referenceAggregateInputs)
+	}
+	for _, input := range store.referenceAggregateInputs {
+		if got := input.Events.PubkeyScore; got.Source != "vertex" || got.MinFollowers != 0 {
+			t.Fatalf("reference pubkey score filter = %+v", got)
+		}
+	}
+}
+
 func TestRankedEventsAggregatesInsideDerivedTargetFilters(t *testing.T) {
 	topID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	followedAuthor := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

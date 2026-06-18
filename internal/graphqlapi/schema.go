@@ -454,6 +454,14 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 
+	pubkeyScoreFilterInputType := graphql.NewInputObject(graphql.InputObjectConfig{
+		Name: "PubkeyScoreFilterInput",
+		Fields: graphql.InputObjectConfigFieldMap{
+			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "vertex"},
+			"minFollowers": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
+		},
+	})
+
 	eventQueryInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "EventQueryInput",
 		Fields: graphql.InputObjectConfigFieldMap{
@@ -472,6 +480,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			"limit":   &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 50},
 			"offset":  &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"shuffle": &graphql.InputObjectFieldConfig{Type: shuffleInputType},
+			"pubkeyScore": &graphql.InputObjectFieldConfig{
+				Type:        pubkeyScoreFilterInputType,
+				Description: "When set, only events authored by pubkeys with a matching cached score row are included.",
+			},
 		},
 	})
 
@@ -1654,17 +1666,18 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 	}
 	out.RankVia = rankVia
 	out.RankReferences = chstore.AggregateInput{
-		Dataset: "TAGS",
-		GroupBy: []string{"TAG_VALUE"},
-		Metrics: []string{rankMetricName(rankRaw["metric"])},
-		IDs:     references.IDs,
-		PubKeys: references.PubKeys,
-		Kinds:   references.Kinds,
-		Tags:    references.Tags,
-		Since:   references.Since,
-		Until:   references.Until,
-		Limit:   references.Limit,
-		Empty:   references.Empty,
+		Dataset:     "TAGS",
+		GroupBy:     []string{"TAG_VALUE"},
+		Metrics:     []string{rankMetricName(rankRaw["metric"])},
+		IDs:         references.IDs,
+		PubKeys:     references.PubKeys,
+		Kinds:       references.Kinds,
+		Tags:        references.Tags,
+		Since:       references.Since,
+		Until:       references.Until,
+		Limit:       references.Limit,
+		PubkeyScore: references.PubkeyScore,
+		Empty:       references.Empty,
 	}
 	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, r.parseEventQueryInput, r.pubkeyScoreMinFollowers)
 	if err != nil {
@@ -1726,17 +1739,18 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 	}
 	out.RankVia = rankVia
 	out.RankReferences = chstore.AggregateInput{
-		Dataset: "TAGS",
-		GroupBy: []string{"TAG_VALUE"},
-		Metrics: []string{rankMetricName(rankRaw["metric"])},
-		IDs:     references.IDs,
-		PubKeys: references.PubKeys,
-		Kinds:   references.Kinds,
-		Tags:    references.Tags,
-		Since:   references.Since,
-		Until:   references.Until,
-		Limit:   references.Limit,
-		Empty:   references.Empty,
+		Dataset:     "TAGS",
+		GroupBy:     []string{"TAG_VALUE"},
+		Metrics:     []string{rankMetricName(rankRaw["metric"])},
+		IDs:         references.IDs,
+		PubKeys:     references.PubKeys,
+		Kinds:       references.Kinds,
+		Tags:        references.Tags,
+		Since:       references.Since,
+		Until:       references.Until,
+		Limit:       references.Limit,
+		PubkeyScore: references.PubkeyScore,
+		Empty:       references.Empty,
 	}
 	out.WeightedTerms, err = weightedRankTerms(ctx, rankRaw, c.parseEventQueryInput, c.pubkeyScoreMinFollowers)
 	if err != nil {
@@ -1918,10 +1932,11 @@ func (r *resolver) parseRankedEventsInput(ctx context.Context, raw any) (rankedE
 			Tags: append(references.Tags, chstore.TagFilter{
 				Key: via.Key, Value: via.Value, Values: via.Values,
 			}),
-			Since: references.Since,
-			Until: references.Until,
-			Limit: uint64(aggregateLimit),
-			Empty: references.Empty,
+			Since:       references.Since,
+			Until:       references.Until,
+			Limit:       uint64(aggregateLimit),
+			PubkeyScore: references.PubkeyScore,
+			Empty:       references.Empty,
 		},
 		Candidates: chstore.EventQueryInput{
 			Kinds: references.Kinds,
@@ -2106,6 +2121,25 @@ func pubkeyScoreRankTermFrom(raw map[string]any, defaultMinFollowers uint64) pub
 		Target:       target,
 		MinFollowers: uint64(minFollowers),
 		Fallback:     floatValue(raw["fallback"], 0),
+	}
+}
+
+func pubkeyScoreFilterFromRaw(raw any) chstore.PubkeyScoreFilter {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return chstore.PubkeyScoreFilter{}
+	}
+	source := strings.ToLower(strings.TrimSpace(stringValue(m["source"])))
+	if source == "" {
+		source = "vertex"
+	}
+	minFollowers := intValue(m["minFollowers"], 0)
+	if minFollowers < 0 {
+		minFollowers = 0
+	}
+	return chstore.PubkeyScoreFilter{
+		Source:       source,
+		MinFollowers: uint64(minFollowers),
 	}
 }
 
@@ -2904,15 +2938,16 @@ func (r *resolver) queryEvents(ctx context.Context, input chstore.EventQueryInpu
 
 func (r *resolver) hydrateAggregateInput(ctx context.Context, input chstore.AggregateInput, label string) bool {
 	eventInput := chstore.EventQueryInput{
-		IDs:     input.IDs,
-		PubKeys: input.PubKeys,
-		Kinds:   input.Kinds,
-		Tags:    input.Tags,
-		Since:   input.Since,
-		Until:   input.Until,
-		Limit:   input.Limit,
-		Shuffle: input.Shuffle,
-		Empty:   input.Empty,
+		IDs:         input.IDs,
+		PubKeys:     input.PubKeys,
+		Kinds:       input.Kinds,
+		Tags:        input.Tags,
+		Since:       input.Since,
+		Until:       input.Until,
+		Limit:       input.Limit,
+		Shuffle:     input.Shuffle,
+		PubkeyScore: input.PubkeyScore,
+		Empty:       input.Empty,
 	}
 	return r.hydrateRelayEventQuery(ctx, eventInput, label)
 }
@@ -3210,6 +3245,7 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 		Limit:          uint64(intValue(raw["limit"], 50)),
 		Offset:         uint64(intValue(raw["offset"], 0)),
 		Shuffle:        chstoreShuffleInput(raw["shuffle"]),
+		PubkeyScore:    pubkeyScoreFilterFromRaw(raw["pubkeyScore"]),
 	}
 	if input.Search != "" && len(input.Search) < 3 {
 		return input, fmt.Errorf("events search must be at least 3 characters")
@@ -3266,17 +3302,18 @@ func parseProfileSearchInput(raw map[string]any) (vertex.SearchArgs, error) {
 
 func parseAggregateInput(raw map[string]any) (chstore.AggregateInput, error) {
 	input := chstore.AggregateInput{
-		Dataset: fmt.Sprint(raw["dataset"]),
-		GroupBy: stringList(raw["groupBy"]),
-		Metrics: stringList(raw["metrics"]),
-		IDs:     stringList(raw["ids"]),
-		PubKeys: stringList(raw["pubkeys"]),
-		Kinds:   intList(raw["kinds"]),
-		Tags:    tagFilters(raw["tags"]),
-		Since:   int64(intValue(raw["since"], 0)),
-		Until:   int64(intValue(raw["until"], 0)),
-		Limit:   uint64(intValue(raw["limit"], 100)),
-		Shuffle: chstoreShuffleInput(raw["shuffle"]),
+		Dataset:     fmt.Sprint(raw["dataset"]),
+		GroupBy:     stringList(raw["groupBy"]),
+		Metrics:     stringList(raw["metrics"]),
+		IDs:         stringList(raw["ids"]),
+		PubKeys:     stringList(raw["pubkeys"]),
+		Kinds:       intList(raw["kinds"]),
+		Tags:        tagFilters(raw["tags"]),
+		Since:       int64(intValue(raw["since"], 0)),
+		Until:       int64(intValue(raw["until"], 0)),
+		Limit:       uint64(intValue(raw["limit"], 100)),
+		Shuffle:     chstoreShuffleInput(raw["shuffle"]),
+		PubkeyScore: pubkeyScoreFilterFromRaw(raw["pubkeyScore"]),
 	}
 	return input, validateHexFilters(input.IDs, input.PubKeys)
 }
