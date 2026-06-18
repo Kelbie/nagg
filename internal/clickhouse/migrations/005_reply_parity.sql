@@ -1,7 +1,7 @@
 -- Reply-count parity: include NIP-22 comments (kind 1111) alongside kind 1 in
 -- the reply aggregate so display reply counts match the For You reply rank term
 -- (which counts kinds [1, 1111]). 002_appview.sql created mv_note_reply_counts
--- with kind = 1 only; CREATE ... IF NOT EXISTS there is a no-op on existing
+-- with kind = 1 only — CREATE ... IF NOT EXISTS there is a no-op on existing
 -- deployments, so the SELECT body is updated here via DROP + CREATE.
 --
 -- The reconciler parses CREATE MATERIALIZED VIEW names only (DROP VIEW / INSERT
