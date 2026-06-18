@@ -490,9 +490,11 @@ func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, 
 		return nil, nil
 	}
 	rows, err := s.conn.Query(ctx, `
-		SELECT DISTINCT child_id
+		SELECT child_id
 		FROM note_reply_edges
 		WHERE parent_id = ?
+		GROUP BY child_id
+		ORDER BY max(created_at) DESC, child_id DESC
 		LIMIT 5000
 	`, parentID)
 	if err != nil {
