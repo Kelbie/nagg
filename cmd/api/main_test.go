@@ -27,6 +27,60 @@ func (f *fakeEventCounter) EventKindCounts(_ context.Context, kinds []int) (map[
 	return f.kindCounts, f.kindCountsErr
 }
 
+func TestLiveHandlerReturnsOK(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/livez", nil)
+
+	liveHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["ok"] != "true" {
+		t.Fatalf("body = %+v", body)
+	}
+}
+
+func TestAPIRuntimeReturnsUnavailableUntilReady(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+
+	(&apiRuntime{}).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("Retry-After = %q, want 5", rec.Header().Get("Retry-After"))
+	}
+	var body map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["ok"] != "false" || body["error"] != "api initializing" {
+		t.Fatalf("body = %+v", body)
+	}
+}
+
+func TestAPIRuntimeDelegatesWhenReady(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	runtime := &apiRuntime{}
+	runtime.SetReady(nil, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	runtime.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", rec.Code)
+	}
+}
+
 func TestHealthHandlerReturnsEventCount(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
