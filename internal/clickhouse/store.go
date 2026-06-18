@@ -36,6 +36,21 @@ var replyParityMigration string
 //go:embed migrations/006_notifications.sql
 var notificationsMigration string
 
+//go:embed migrations/007_direct_replies.sql
+var directRepliesMigration string
+
+//go:embed migrations/008_raw_counts.sql
+var rawCountsMigration string
+
+//go:embed migrations/009_engagement_real.sql
+var engagementRealMigration string
+
+//go:embed migrations/010_user_aggregates.sql
+var userAggregatesMigration string
+
+//go:embed migrations/011_rank_features.sql
+var rankFeaturesMigration string
+
 type Config struct {
 	Addr         string
 	Database     string

@@ -19,6 +19,15 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"note_like_counts",
 		"note_repost_counts",
 		"note_reply_counts",
+		"note_reply_edges",
+		"note_direct_reply_counts",
+		"note_quote_counts",
+		"note_engagement_real",
+		"rollup_state",
+		"user_contacts_latest",
+		"user_post_counts",
+		"user_stats",
+		"note_rank_features",
 		"note_zaps",
 		"note_zap_totals",
 		"profiles_latest",
@@ -43,9 +52,12 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"mv_note_like_counts",
 		"mv_note_repost_counts",
 		"mv_note_reply_counts",
+		"mv_note_quote_counts",
 		"mv_note_zap_totals",
 		"mv_profiles_latest",
 		"mv_notification_candidates",
+		"mv_user_contacts_latest",
+		"mv_user_post_counts",
 	}
 	if len(desired.views) != len(wantViews) {
 		t.Fatalf("parsed %d views, want %d: %v", len(desired.views), len(wantViews), viewNames(desired))
@@ -300,6 +312,49 @@ func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
 	}
 	if !found {
 		t.Error("reply-parity migration is not wired into embeddedMigrations()")
+	}
+}
+
+// TestDirectRepliesMigration_DeclaresEdgeAndCountTables guards the NIP-10/22
+// direct-reply rebuild: migration 007 must declare the edge and direct-count
+// tables, derive the parent with the reply > unmarked-last > root coalesce, and
+// exclude quotes. It must also be wired into the apply order.
+func TestDirectRepliesMigration_DeclaresEdgeAndCountTables(t *testing.T) {
+	sql := directRepliesMigration
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS note_reply_edges",
+		"CREATE TABLE IF NOT EXISTS note_direct_reply_counts",
+		"uniqState(child_id)",
+		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply')",
+		"argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = '')",
+		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root')",
+		"has(quote_targets, parent_id)",
+		"kind IN (1, 1111)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("007 direct-replies migration missing %q", want)
+		}
+	}
+
+	desired, err := parseDesiredSchema(embeddedMigrations())
+	if err != nil {
+		t.Fatalf("parseDesiredSchema returned error: %v", err)
+	}
+	for _, tbl := range []string{"note_reply_edges", "note_direct_reply_counts"} {
+		if _, ok := desired.tables[tbl]; !ok {
+			t.Errorf("expected table %q declared by 007", tbl)
+		}
+	}
+
+	found := false
+	for _, m := range embeddedMigrations() {
+		if m == directRepliesMigration {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("007 direct-replies migration is not wired into embeddedMigrations()")
 	}
 }
 

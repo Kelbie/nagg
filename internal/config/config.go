@@ -36,6 +36,25 @@ type Config struct {
 	// API horizontally without N duplicate firehose consumers).
 	RunIngester bool
 	RunEnricher bool
+
+	// Rollup configures the database-first aggregation job (direct-reply edges,
+	// vertex-real engagement counts, per-user stats, per-event rank features).
+	Rollup RollupConfig
+	// RunRollup hosts the rollup job in the API process (alongside the Vertex
+	// syncer + enricher). Default on.
+	RunRollup bool
+}
+
+// RollupConfig parameterizes the periodic rollup job. MinActorScore is the Vertex
+// score an engagement actor must clear to count toward a "real" (bot-resistant)
+// count; Version is stamped into the threshold_version column so a threshold change
+// is a new logical row.
+type RollupConfig struct {
+	Interval      time.Duration
+	RecentWindow  time.Duration
+	MaxTargets    int
+	MinActorScore float64
+	Version       string
 }
 
 type APIConfig struct {
@@ -163,6 +182,14 @@ func Load() (Config, error) {
 		},
 		RunIngester: parseBool(env("NAGG_RUN_INGESTER", "true")),
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
+		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", "true")),
+		Rollup: RollupConfig{
+			Interval:      parseDuration(env("NAGG_ROLLUP_INTERVAL", "15m")),
+			RecentWindow:  parseDuration(env("NAGG_ROLLUP_RECENT_WINDOW", "48h")),
+			MaxTargets:    parseInt(env("NAGG_ROLLUP_MAX_TARGETS", "50000")),
+			MinActorScore: parseFloat(env("NAGG_ROLLUP_MIN_ACTOR_SCORE", "0")),
+			Version:       env("NAGG_ROLLUP_THRESHOLD_VERSION", "v1"),
+		},
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -337,4 +364,12 @@ func parseInt64(value string) int64 {
 func parseBool(value string) bool {
 	v, err := strconv.ParseBool(value)
 	return err == nil && v
+}
+
+func parseFloat(value string) float64 {
+	v, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }

@@ -63,7 +63,19 @@ func schemaReconcileMode() string {
 
 // embeddedMigrations returns the declarative migration SQL in apply order.
 func embeddedMigrations() []string {
-	return []string{ingestionMigration, appviewMigration, rankingMigration, derivedMigration, replyParityMigration, notificationsMigration}
+	return []string{
+		ingestionMigration,
+		appviewMigration,
+		rankingMigration,
+		derivedMigration,
+		replyParityMigration,
+		notificationsMigration,
+		directRepliesMigration,
+		rawCountsMigration,
+		engagementRealMigration,
+		userAggregatesMigration,
+		rankFeaturesMigration,
+	}
 }
 
 // parseDesiredSchema parses the embedded migration SQL into a DesiredSchema.

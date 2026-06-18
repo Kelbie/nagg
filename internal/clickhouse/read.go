@@ -261,7 +261,10 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 		})
 	})
 	g.Go(func() error {
-		return s.mergeCount(ctx, "note_reply_counts", "replies", ids, func(id string, value uint64) {
+		// Direct (NIP-10/22) replies only — note_direct_reply_counts excludes
+		// grandchildren and quotes that the legacy any-e-tag note_reply_counts
+		// (retired in migration 007) over-counted.
+		return s.mergeCount(ctx, "note_direct_reply_counts", "replies", ids, func(id string, value uint64) {
 			set(id, func(stats *NoteStats) { stats.ReplyCount = value })
 		})
 	})
@@ -319,6 +322,121 @@ func (s *Store) mergeCount(ctx context.Context, table, column string, ids []stri
 		set(id, value)
 	}
 	return rows.Err()
+}
+
+// FeatureWeights are the rank weights applied to the precomputed per-event
+// feature columns. Engagement weights apply to the VERTEX-REAL counts (the
+// bot-resistant signal); the raw counts are surfaced for display only. The
+// values are owned by the caller (nagg-ts rank recipes) and arrive as SQL bind
+// params, never hardcoded in the query.
+type FeatureWeights struct {
+	Likes               float64
+	Reposts             float64
+	Replies             float64
+	Quotes              float64
+	ZapSats             float64
+	AuthorVertexScore   float64
+	ContributionQuality float64
+	Recency             float64
+}
+
+// FeatureRankInput parameterizes the DB-side weighted top-N scan over
+// note_rank_features. Since bounds the scan to a recent window so the trending
+// query is a partition-pruned range scan, not a full-table read.
+type FeatureRankInput struct {
+	Kinds              []int
+	Since              int64 // unix seconds; lower bound on created_at (required)
+	Until              int64 // unix seconds; optional upper bound (0 = none)
+	HalfLifeSeconds    float64
+	Weights            FeatureWeights
+	MinAuthorFollowers uint64 // gate the author-score contribution (0 = no gate)
+	Limit              uint64
+	ExcludeIDs         []string
+	ExcludePubKeys     []string
+}
+
+// RankedFeatureRow is one scored candidate from the feature scan, already ordered
+// by descending score.
+type RankedFeatureRow struct {
+	EventID string
+	PubKey  string
+	Score   float64
+}
+
+// RankedEventsByFeatures runs the whole weighted top-N ranking as one ClickHouse
+// scan over the precomputed note_rank_features table. It replaces the per-request,
+// per-term live aggregation (weightedRankBaseScores): recency decay + weighted sum
+// over feature columns, ORDER BY score DESC LIMIT N. The recency and LOG1P
+// transforms mirror candidateFieldValue / transformedFloatRankValue exactly
+// (pow(0.5, age/halflife); log(1+x)) so the DB scores match the Go path.
+func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput) ([]RankedFeatureRow, error) {
+	if in.Limit == 0 {
+		return nil, nil
+	}
+	halfLife := in.HalfLifeSeconds
+	if halfLife <= 0 {
+		halfLife = 86400
+	}
+
+	w := in.Weights
+	// SELECT bind params, in column order.
+	args := []any{
+		w.Likes, w.Replies, w.Reposts, w.Quotes, w.ZapSats,
+		w.AuthorVertexScore, in.MinAuthorFollowers,
+		w.ContributionQuality,
+		w.Recency, halfLife,
+	}
+	score := `
+		  ? * log(1 + real_likes)
+		+ ? * log(1 + real_replies)
+		+ ? * log(1 + real_reposts)
+		+ ? * log(1 + real_quotes)
+		+ ? * log(1 + real_zap_sats)
+		+ ? * if(author_followers >= ?, author_vertex_score, 0)
+		+ ? * contribution_quality
+		+ ? * pow(0.5, greatest(toUnixTimestamp(now()) - toUnixTimestamp(created_at), 0) / ?)`
+
+	where := "WHERE created_at >= toDateTime(?)"
+	args = append(args, in.Since)
+	if in.Until > 0 {
+		where += " AND created_at <= toDateTime(?)"
+		args = append(args, in.Until)
+	}
+	if len(in.Kinds) > 0 {
+		where += fmt.Sprintf(" AND kind IN (%s)", ints(in.Kinds))
+	}
+	if len(in.ExcludeIDs) > 0 {
+		where += " AND event_id NOT IN (?)"
+		args = append(args, in.ExcludeIDs)
+	}
+	if len(in.ExcludePubKeys) > 0 {
+		where += " AND pubkey NOT IN (?)"
+		args = append(args, in.ExcludePubKeys)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT event_id, pubkey, (%s) AS score
+		FROM note_rank_features FINAL
+		%s
+		ORDER BY score DESC, created_at DESC, event_id DESC
+		LIMIT %d
+	`, score, where, in.Limit)
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]RankedFeatureRow, 0, in.Limit)
+	for rows.Next() {
+		var row RankedFeatureRow
+		if err := rows.Scan(&row.EventID, &row.PubKey, &row.Score); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, error) {

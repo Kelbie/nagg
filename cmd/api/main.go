@@ -23,6 +23,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/rollup"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -116,6 +117,23 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			BatchSize:    cfg.Vertex.SyncBatch,
 		}, logger)
 		go vertexSyncer.Run(ctx)
+	}
+
+	// Database-first aggregation: the rollup job maintains the direct-reply edges,
+	// vertex-real engagement counts, per-user stats, and the per-event rank-feature
+	// table the For-You / trending hot path reads. Hosted in-process next to the
+	// Vertex syncer; set NAGG_RUN_ROLLUP=false to split it out.
+	if cfg.RunRollup {
+		rollupRunner := rollup.NewRunner(store, rollup.Config{
+			Interval:     cfg.Rollup.Interval,
+			RecentWindow: cfg.Rollup.RecentWindow,
+			MaxTargets:   cfg.Rollup.MaxTargets,
+			Thresholds: chstore.Thresholds{
+				MinActorScore: cfg.Rollup.MinActorScore,
+				Version:       cfg.Rollup.Version,
+			},
+		}, logger)
+		go rollupRunner.Run(ctx)
 	}
 
 	// Optionally host the firehose ingester and the enrichment runner in-process
