@@ -46,6 +46,8 @@ type fakeStore struct {
 	notificationInputs          []chstore.NotificationInput
 	featureRankRows             []chstore.RankedFeatureRow
 	featureRankInputs           []chstore.FeatureRankInput
+	directReplyIDs              map[string][]string
+	directReplyParents          []string
 }
 
 type latestEventsInput struct {
@@ -348,6 +350,11 @@ func (s *fakeStore) RankedEventsByFeatures(_ context.Context, input chstore.Feat
 	return s.featureRankRows, nil
 }
 
+func (s *fakeStore) DirectReplyIDs(_ context.Context, parentID string) ([]string, error) {
+	s.directReplyParents = append(s.directReplyParents, parentID)
+	return s.directReplyIDs[parentID], nil
+}
+
 // forYouTerms mirrors the nagg-ts For-You recipe terms (rank.ts engagementRankTerms
 // + vertexAuthorScoreTerm + recencyTerm + contributionQualityTerm).
 func forYouTerms() []weightedRankTerm {
@@ -393,6 +400,47 @@ func TestFeatureWeightsFromTerms_BailsOnUnrecognized(t *testing.T) {
 		if _, _, _, ok := featureWeightsFromTerms(terms); ok {
 			t.Errorf("%s: expected ok=false (fall back to live aggregation)", name)
 		}
+	}
+}
+
+func TestReverseReferenceQuery_DirectRepliesUsesEdgeTable(t *testing.T) {
+	parent := chstore.EventView{ID: "parent000000000000000000000000000000000000000000000000000000000a"}
+	store := &fakeStore{
+		directReplyIDs: map[string][]string{
+			parent.ID: {"childA", "childB"},
+		},
+	}
+	r := &resolver{store: store}
+	input, err := r.reverseReferenceQuery(context.Background(), parent, map[string]any{
+		"via":   map[string]any{"key": "e", "directReplies": true},
+		"limit": 50,
+	})
+	if err != nil {
+		t.Fatalf("reverseReferenceQuery error: %v", err)
+	}
+	if len(store.directReplyParents) != 1 || store.directReplyParents[0] != parent.ID {
+		t.Fatalf("DirectReplyIDs not queried for the parent; got %v", store.directReplyParents)
+	}
+	if len(input.Tags) != 0 {
+		t.Errorf("direct-reply query must not use the broad e-tag filter; got tags %+v", input.Tags)
+	}
+	if len(input.IDs) != 2 || input.IDs[0] != "childA" {
+		t.Errorf("expected direct child ids [childA childB], got %v", input.IDs)
+	}
+}
+
+func TestReverseReferenceQuery_DirectRepliesEmptyShortCircuits(t *testing.T) {
+	parent := chstore.EventView{ID: "parent000000000000000000000000000000000000000000000000000000000b"}
+	store := &fakeStore{directReplyIDs: map[string][]string{}}
+	r := &resolver{store: store}
+	input, err := r.reverseReferenceQuery(context.Background(), parent, map[string]any{
+		"via": map[string]any{"key": "e", "directReplies": true},
+	})
+	if err != nil {
+		t.Fatalf("reverseReferenceQuery error: %v", err)
+	}
+	if !input.Empty {
+		t.Error("a post with no direct replies must short-circuit to an empty result, not a broad e-tag scan")
 	}
 }
 

@@ -41,6 +41,7 @@ type Store interface {
 	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	RankedEventsByFeatures(context.Context, chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error)
+	DirectReplyIDs(context.Context, string) ([]string, error)
 }
 
 var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
@@ -427,6 +428,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 				Type: graphql.NewList(graphql.NewNonNull(graphql.String)),
 			},
 			"index": &graphql.InputObjectFieldConfig{Type: graphql.Int},
+			// directReplies restricts an 'e'-tag reverse reference to NIP-10/22
+			// direct replies (via note_reply_edges), excluding grandchildren and
+			// quotes. Used by the thread view.
+			"directReplies": &graphql.InputObjectFieldConfig{Type: graphql.Boolean},
 		},
 	})
 
@@ -1139,6 +1144,11 @@ type graphTagPredicate struct {
 	Markers        []string
 	ExcludeMarkers []string
 	Index          int
+	// DirectReplies restricts an 'e'-tag reverse reference to NIP-10/22 DIRECT
+	// replies (via the note_reply_edges table) instead of every event that
+	// e-tags the target. Used by the thread view so grandchildren and quotes do
+	// not leak in.
+	DirectReplies bool
 }
 
 type selectedReferenceInput struct {
@@ -1917,12 +1927,25 @@ func (r *resolver) reverseReferenceQuery(ctx context.Context, event chstore.Even
 	if via.Key == "" {
 		via.Key = "e"
 	}
-	input.Tags = append(input.Tags, chstore.TagFilter{Key: via.Key, Value: target})
 	input.Limit = uint64(intValue(m["limit"], int(input.Limit)))
 	if input.Limit == 0 || input.Limit > 500 {
 		input.Limit = 50
 	}
 	input.Offset = uint64(intValue(m["offset"], int(input.Offset)))
+	if via.DirectReplies {
+		childIDs, err := r.store.DirectReplyIDs(ctx, target)
+		if err != nil {
+			return input, err
+		}
+		if len(childIDs) == 0 {
+			input.Empty = true
+			input.Limit = 0
+			return input, nil
+		}
+		input.IDs = childIDs
+		return input, nil
+	}
+	input.Tags = append(input.Tags, chstore.TagFilter{Key: via.Key, Value: target})
 	return input, nil
 }
 
@@ -1948,9 +1971,21 @@ func (r *resolver) rankedReverseReferenceQuery(ctx context.Context, event chstor
 	if via.Key == "" {
 		via.Key = "e"
 	}
-	out.Events.Tags = append(out.Events.Tags, chstore.TagFilter{Key: via.Key, Value: target})
 	if out.Events.Limit == 0 || out.Events.Limit > 500 {
 		out.Events.Limit = 50
+	}
+	if via.DirectReplies {
+		childIDs, err := r.store.DirectReplyIDs(ctx, target)
+		if err != nil {
+			return out, err
+		}
+		if len(childIDs) == 0 {
+			out.Events.Empty = true
+		} else {
+			out.Events.IDs = childIDs
+		}
+	} else {
+		out.Events.Tags = append(out.Events.Tags, chstore.TagFilter{Key: via.Key, Value: target})
 	}
 
 	rankRaw, ok := m["rank"].(map[string]any)
@@ -2927,6 +2962,7 @@ func graphTagPredicateFrom(v any) graphTagPredicate {
 		Markers:        stringList(raw["markers"]),
 		ExcludeMarkers: stringList(raw["excludeMarkers"]),
 		Index:          intValue(raw["index"], -1),
+		DirectReplies:  boolValue(raw["directReplies"], false),
 	}
 }
 

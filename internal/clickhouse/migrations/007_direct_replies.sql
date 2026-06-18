@@ -21,6 +21,10 @@
 
 -- One authoritative direct-reply edge per child reply event. ReplacingMergeTree
 -- keyed by child_id: re-seeing a child overwrites its (identical) edge row.
+-- ORDER BY (parent_id, child_id): a child's direct parent is fixed (event ids are
+-- content-addressed, so tags never change), so (parent_id, child_id) is one row
+-- per child and ReplacingMergeTree still dedups re-seen children. Leading with
+-- parent_id makes "direct replies to X" an indexed range scan for the thread view.
 CREATE TABLE IF NOT EXISTS note_reply_edges
 (
     child_id     FixedString(64),
@@ -31,7 +35,7 @@ CREATE TABLE IF NOT EXISTS note_reply_edges
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(created_at)
-ORDER BY (child_id);
+ORDER BY (parent_id, child_id);
 
 -- Direct-reply COUNT per parent. uniqState over distinct child ids makes repeated
 -- backfills / rollup recomputes idempotent (set union), matching the existing

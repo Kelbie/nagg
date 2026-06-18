@@ -480,6 +480,36 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 	return out, rows.Err()
 }
 
+// DirectReplyIDs returns the ids of the DIRECT (NIP-10/22) replies to parentID,
+// from the authoritative note_reply_edges table. This excludes grandchildren and
+// quotes that the any-e-tag reverse-reference query would otherwise include. The
+// caller (thread view) applies its own ordering / ranking / pagination over the
+// returned set; the cap bounds a pathological reply storm.
+func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, error) {
+	if len(parentID) != 64 {
+		return nil, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT DISTINCT child_id
+		FROM note_reply_edges
+		WHERE parent_id = ?
+		LIMIT 5000
+	`, parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, error) {
 	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
 	if err != nil {
