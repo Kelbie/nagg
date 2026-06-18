@@ -274,6 +274,35 @@ func TestSchemaReconcileMode_Default(t *testing.T) {
 	}
 }
 
+// TestReplyParityMigration_IncludesKind1111 guards the reply-count parity fix:
+// the reply MV must aggregate NIP-22 comments (kind 1111) alongside kind 1, and
+// the migration must DROP the old view first so the change applies on existing
+// deployments (CREATE ... IF NOT EXISTS alone is a no-op there). It must also
+// backfill historical replies.
+func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
+	sql := replyParityMigration
+	if !strings.Contains(sql, "DROP VIEW IF EXISTS mv_note_reply_counts") {
+		t.Error("reply-parity migration must DROP the old reply MV before recreating it")
+	}
+	if !strings.Contains(sql, "kind IN (1, 1111)") {
+		t.Error("reply-parity migration must aggregate kinds (1, 1111)")
+	}
+	if !strings.Contains(sql, "INSERT INTO note_reply_counts") {
+		t.Error("reply-parity migration must backfill historical replies")
+	}
+	// The migration must be wired into the apply order, or it never runs.
+	found := false
+	for _, m := range embeddedMigrations() {
+		if m == replyParityMigration {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("reply-parity migration is not wired into embeddedMigrations()")
+	}
+}
+
 // --- helpers ---
 
 func tableNames(d DesiredSchema) []string {

@@ -29,6 +29,9 @@ var rankingMigration string
 //go:embed migrations/004_derived.sql
 var derivedMigration string
 
+//go:embed migrations/005_reply_parity.sql
+var replyParityMigration string
+
 //go:embed migrations/006_notifications.sql
 var notificationsMigration string
 

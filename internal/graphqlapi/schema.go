@@ -59,6 +59,7 @@ type resolver struct {
 	relayEventBackfiller    RelayEventBackfiller
 	profileSearcher         ProfileSearcher
 	pubkeyScoreMinFollowers uint64
+	basePool                *basePoolCache
 }
 
 type ProfileSearcher interface {
@@ -239,6 +240,7 @@ type pubkeyRelationCache struct {
 
 func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	r := &resolver{store: store, pubkeyScoreMinFollowers: defaultPubkeyScoreMinFollowers}
+	r.basePool = newBasePoolCache(basePoolTTL, time.Now)
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -1374,6 +1376,28 @@ func (r *resolver) rankedEvents(ctx context.Context, raw any) (eventConnectionSo
 // ranked-feed handler. Callers wrap the result however they like (GraphQL wraps
 // with newEventConnection; REST enriches into a FeedResponse).
 func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput) ([]chstore.EventView, error) {
+	// For You-style requests (weighted terms, no explicit candidate id set) share
+	// a viewer-independent base pool that is computed once and cached, then
+	// finalized per request with the viewer follow-boost and shuffle. This keeps
+	// the expensive aggregation off the hot path for every viewer in the TTL
+	// window. Everything else uses the direct path.
+	if r.basePool != nil && len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
+		pool, baseScores, err := r.basePool.getOrCompute(ctx, r, input)
+		if err != nil {
+			return nil, err
+		}
+		if len(pool) == 0 {
+			return nil, nil
+		}
+		ids := finalizeRankedIDs(pool, baseScores, input.CandidateBoosts, input.Shuffle, input.Offset, input.Limit)
+		return orderEventViewsByID(pool, ids), nil
+	}
+	return r.rankedEventViewsDirect(ctx, input)
+}
+
+// rankedEventViewsDirect is the non-cached ranking path: it sizes the candidate
+// set to the requested page, hydrates those events and ranks them in-line.
+func (r *resolver) rankedEventViewsDirect(ctx context.Context, input rankedEventsInput) ([]chstore.EventView, error) {
 	rows, err := r.rankedEventRows(ctx, input)
 	if err != nil {
 		return nil, err
@@ -1403,17 +1427,176 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	} else {
 		targetIDs = rankedCandidateIDs(rows, events, input.Offset, input.Limit)
 	}
+	return orderEventViewsByID(events, targetIDs), nil
+}
+
+// orderEventViewsByID returns events in the order of ids, skipping ids absent
+// from events.
+func orderEventViewsByID(events []chstore.EventView, ids []string) []chstore.EventView {
 	eventsByID := make(map[string]chstore.EventView, len(events))
 	for _, event := range events {
 		eventsByID[event.ID] = event
 	}
-	ordered := make([]chstore.EventView, 0, len(events))
-	for _, id := range targetIDs {
+	ordered := make([]chstore.EventView, 0, len(ids))
+	for _, id := range ids {
 		if event, ok := eventsByID[id]; ok {
 			ordered = append(ordered, event)
 		}
 	}
-	return ordered, nil
+	return ordered
+}
+
+// basePoolDepth is how many top candidates (by reference aggregate) are scored
+// and cached as the shared base pool. It must be deep enough that a followed
+// author with real engagement can be lifted into the visible page by the
+// per-viewer follow-boost — the visible page is at most a few dozen rows, so a
+// few hundred candidates leaves ample headroom. Validate against real
+// followed-author rank positions before tuning.
+const basePoolDepth = 250
+
+// basePoolTTL is how long a computed base pool stays fresh. Engagement freshness
+// comes from the continuously-updated aggregate MVs, not from recomputing the
+// ranking, so a short window amortizes the expensive aggregation across every
+// viewer without staleness that a reader would notice. The HTTP response cache
+// adds stale-while-revalidate on top of this.
+const basePoolTTL = 90 * time.Second
+
+// basePoolCacheMaxEntries bounds the number of distinct viewer-free pools held
+// at once. For You has very few viewer-free key variants, so this is a safety
+// cap, not a working-set limit.
+const basePoolCacheMaxEntries = 64
+
+type basePoolEntry struct {
+	pool      []chstore.EventView
+	scores    map[string]float64
+	expiresAt time.Time
+}
+
+// basePoolCache holds viewer-independent ranked base pools keyed by the
+// viewer-free request signature. It is created per schema (NewSchema), never a
+// package global, so it can never serve one store's pool to another.
+type basePoolCache struct {
+	mu      sync.Mutex
+	entries map[string]*basePoolEntry
+	group   singleflight.Group
+	ttl     time.Duration
+	now     func() time.Time
+}
+
+func newBasePoolCache(ttl time.Duration, now func() time.Time) *basePoolCache {
+	return &basePoolCache{
+		entries: map[string]*basePoolEntry{},
+		ttl:     ttl,
+		now:     now,
+	}
+}
+
+// getOrCompute returns the cached base pool for input's viewer-free signature,
+// computing and caching it (once, via singleflight) on a miss or after the TTL.
+func (c *basePoolCache) getOrCompute(ctx context.Context, r *resolver, input rankedEventsInput) ([]chstore.EventView, map[string]float64, error) {
+	key := basePoolKey(input)
+
+	c.mu.Lock()
+	if entry, ok := c.entries[key]; ok && c.now().Before(entry.expiresAt) {
+		c.mu.Unlock()
+		return entry.pool, entry.scores, nil
+	}
+	c.mu.Unlock()
+
+	value, err, _ := c.group.Do(key, func() (any, error) {
+		pool, scores, err := r.computeBasePool(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		entry := &basePoolEntry{pool: pool, scores: scores, expiresAt: c.now().Add(c.ttl)}
+		c.mu.Lock()
+		c.sweepExpiredLocked()
+		c.entries[key] = entry
+		c.mu.Unlock()
+		return entry, nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	entry := value.(*basePoolEntry)
+	return entry.pool, entry.scores, nil
+}
+
+// sweepExpiredLocked drops expired entries, and if the cache is still at the cap
+// clears it entirely (cheap and correct: a dropped pool is just recomputed).
+// Caller holds c.mu.
+func (c *basePoolCache) sweepExpiredLocked() {
+	now := c.now()
+	for key, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, key)
+		}
+	}
+	if len(c.entries) >= basePoolCacheMaxEntries {
+		c.entries = map[string]*basePoolEntry{}
+	}
+}
+
+// computeBasePool builds the viewer-independent ranked base pool: the top
+// basePoolDepth candidates by reference aggregate, hydrated and scored by the
+// weighted terms only. No follow-boost, shuffle, offset or limit is applied —
+// those are per-request and handled by finalizeRankedIDs.
+func (r *resolver) computeBasePool(ctx context.Context, input rankedEventsInput) ([]chstore.EventView, map[string]float64, error) {
+	poolInput := input
+	poolInput.Offset = 0
+	poolInput.Limit = basePoolDepth
+	poolInput.CandidateBoosts = nil
+	poolInput.Shuffle = shuffleSpec{}
+
+	rows, err := r.rankedEventRows(ctx, poolInput)
+	if err != nil {
+		return nil, nil, err
+	}
+	targetIDs := rankedTargetIDs(rows, 0, basePoolDepth)
+	if len(targetIDs) == 0 {
+		return nil, map[string]float64{}, nil
+	}
+	poolInput.Target.IDs = targetIDs
+	poolInput.Target.Limit = uint64(len(targetIDs))
+
+	events, err := r.queryEvents(ctx, poolInput.Target)
+	if err != nil {
+		return nil, nil, err
+	}
+	scores, err := weightedRankBaseScores(ctx, r.store, events, input.WeightedTerms)
+	if err != nil {
+		return nil, nil, err
+	}
+	return events, scores, nil
+}
+
+// basePoolKey is the viewer-free cache signature: it covers everything that
+// shapes the base pool (references, target filters, rank terms, depth) and
+// deliberately excludes the per-viewer/per-request follow-boost, shuffle, offset
+// and limit. The For You rank terms are themselves viewer-free, so two viewers
+// requesting the same spec collapse to one key.
+func basePoolKey(input rankedEventsInput) string {
+	keyData := struct {
+		References    chstore.AggregateInput
+		Target        chstore.EventQueryInput
+		RankVia       graphTagPredicate
+		WeightedTerms []weightedRankTerm
+		Depth         int
+	}{
+		References:    input.References,
+		Target:        input.Target,
+		RankVia:       input.RankVia,
+		WeightedTerms: input.WeightedTerms,
+		Depth:         basePoolDepth,
+	}
+	encoded, err := json.Marshal(keyData)
+	if err != nil {
+		// A non-marshalable input should never reach here; fall back to a
+		// non-colliding unique key so we degrade to "never cache" rather than
+		// serving the wrong pool.
+		return "uncacheable:" + input.ViewerPubkey
+	}
+	return string(encoded)
 }
 
 func (r *resolver) rankedEventRows(ctx context.Context, input rankedEventsInput) ([]chstore.AggregateRow, error) {
@@ -2310,27 +2493,43 @@ func weightedRankCandidateIDs(
 	if limit <= 0 || len(candidates) == 0 {
 		return nil, nil
 	}
+	baseScores, err := weightedRankBaseScores(ctx, store, candidates, terms)
+	if err != nil {
+		return nil, err
+	}
+	if len(baseScores) == 0 {
+		return nil, nil
+	}
+	return finalizeRankedIDs(candidates, baseScores, boosts, shuffle, offset, limit), nil
+}
+
+// weightedRankBaseScores computes the per-candidate base score from the weighted
+// rank terms only. This is the expensive part of ranking (engagement
+// aggregation, pubkey scores, derived metrics) and is independent of the
+// requesting viewer and of the shuffle seed, so the result is safe to cache and
+// reuse across viewers — the viewer follow-boost and shuffle jitter are applied
+// later in finalizeRankedIDs. Returns a score per distinct candidate id (0 when
+// no term contributes).
+func weightedRankBaseScores(
+	ctx context.Context,
+	store Store,
+	candidates []chstore.EventView,
+	terms []weightedRankTerm,
+) (map[string]float64, error) {
 	scores := make(map[string]float64, len(candidates))
 	candidateIDs := make([]string, 0, len(candidates))
-	seen := map[string]struct{}{}
 	for _, candidate := range candidates {
 		if candidate.ID == "" {
 			continue
 		}
-		if _, ok := seen[candidate.ID]; ok {
+		if _, ok := scores[candidate.ID]; ok {
 			continue
 		}
-		seen[candidate.ID] = struct{}{}
-		candidateIDs = append(candidateIDs, candidate.ID)
 		scores[candidate.ID] = 0
-		for _, boost := range boosts {
-			if _, ok := boost.PubKeys[candidate.PubKey]; ok {
-				scores[candidate.ID] += boost.Weight
-			}
-		}
+		candidateIDs = append(candidateIDs, candidate.ID)
 	}
 	if len(candidateIDs) == 0 {
-		return nil, nil
+		return scores, nil
 	}
 	for _, term := range terms {
 		switch term.Kind {
@@ -2364,18 +2563,43 @@ func weightedRankCandidateIDs(
 			scores[candidateID] += transformedRankValue(value, term.Transform) * term.Weight
 		}
 	}
+	return scores, nil
+}
 
+// finalizeRankedIDs applies the per-request layer on top of cached base scores:
+// the viewer follow-boost and the deterministic shuffle jitter, then sorts and
+// slices to the requested page. Boost and terms both only add to the score, so
+// applying the boost here yields an identical final score to folding it into the
+// base loop.
+func finalizeRankedIDs(
+	candidates []chstore.EventView,
+	baseScores map[string]float64,
+	boosts []candidatePubkeyBoost,
+	shuffle shuffleSpec,
+	offset int,
+	limit int,
+) []string {
+	if limit <= 0 {
+		return nil
+	}
 	ranked := make([]candidateRank, 0, len(candidates))
 	added := map[string]struct{}{}
 	for _, candidate := range candidates {
-		if _, ok := scores[candidate.ID]; !ok {
+		base, ok := baseScores[candidate.ID]
+		if !ok {
 			continue
 		}
 		if _, ok := added[candidate.ID]; ok {
 			continue
 		}
 		added[candidate.ID] = struct{}{}
-		ranked = append(ranked, candidateRank{event: candidate, score: scores[candidate.ID]})
+		score := base
+		for _, boost := range boosts {
+			if _, ok := boost.PubKeys[candidate.PubKey]; ok {
+				score += boost.Weight
+			}
+		}
+		ranked = append(ranked, candidateRank{event: candidate, score: score})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
 		scoreI := ranked[i].score + shuffleJitter(ranked[i].event.ID, shuffle)
@@ -2392,7 +2616,7 @@ func weightedRankCandidateIDs(
 		offset = 0
 	}
 	if offset >= len(ranked) {
-		return nil, nil
+		return nil
 	}
 	ranked = ranked[offset:]
 	if len(ranked) > limit {
@@ -2402,7 +2626,7 @@ func weightedRankCandidateIDs(
 	for _, entry := range ranked {
 		out = append(out, entry.event.ID)
 	}
-	return out, nil
+	return out
 }
 
 func applyPubkeyScoreRankTerm(

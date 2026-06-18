@@ -2091,6 +2091,87 @@ func TestRankedEventsPropagatesPubkeyScoreFilterToEngagementReferences(t *testin
 	}
 }
 
+func TestRankedEventsCachesBasePoolAcrossRequests(t *testing.T) {
+	topID := strings.Repeat("a", 64)
+	secondID := strings.Repeat("b", 64)
+	newStore := func() *fakeStore {
+		return &fakeStore{
+			aggregateRows: [][]chstore.AggregateRow{{
+				{Dimensions: map[string]string{"tag_value": topID}, Metrics: map[string]uint64{"unique_pubkeys": 3}},
+				{Dimensions: map[string]string{"tag_value": secondID}, Metrics: map[string]uint64{"unique_pubkeys": 2}},
+			}},
+			events: [][]chstore.EventView{{
+				{ID: topID, PubKey: testPubkey, Kind: 1, CreatedAt: time.Unix(1_710_000_001, 0), Content: "top", Tags: [][]string{}, Sig: strings.Repeat("c", 128)},
+				{ID: secondID, PubKey: testPubkey, Kind: 1, CreatedAt: time.Unix(1_710_000_000, 0), Content: "second", Tags: [][]string{}, Sig: strings.Repeat("d", 128)},
+			}},
+			referenceAggregateSupported: true,
+			referenceAggregateRows: map[string][]chstore.AggregateRow{
+				topID:    {{Metrics: map[string]uint64{"value": 2}}},
+				secondID: {{Metrics: map[string]uint64{"value": 1}}},
+			},
+		}
+	}
+
+	query := `query {
+		rankedEvents(input:{
+			references:{kinds:[7,9735,6,16,1,1111], pubkeyScore:{source:"vertex"}}
+			via:{key:"e"}
+			target:{kinds:[1,1111]}
+			metric:{name:"actors", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+			terms:[{
+				references:{kinds:[7], limit:500}
+				via:{key:"e"}
+				metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"}
+				weight:3.0
+				transform:"LOG1P"
+			}]
+			limit:2
+		}) {
+			nodes { id content }
+		}
+	}`
+
+	store := newStore()
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		result := graphql.Do(graphql.Params{Schema: schema, RequestString: query, Context: context.Background()})
+		if len(result.Errors) > 0 {
+			t.Fatalf("request %d graphql errors = %+v", i, result.Errors)
+		}
+		nodes := result.Data.(map[string]any)["rankedEvents"].(map[string]any)["nodes"].([]any)
+		if len(nodes) != 2 || nodes[0].(map[string]any)["id"] != topID {
+			t.Fatalf("request %d nodes = %+v", i, nodes)
+		}
+	}
+
+	// Two identical viewer-free requests must share one cached base pool: the
+	// expensive reference aggregation and per-candidate term aggregation run once.
+	if len(store.aggregateInputs) != 1 {
+		t.Fatalf("expected base pool computed once, got %d reference aggregations", len(store.aggregateInputs))
+	}
+	if len(store.referenceAggregateInputs) != 2 {
+		t.Fatalf("expected term aggregation computed once (2 candidate inputs), got %d", len(store.referenceAggregateInputs))
+	}
+
+	// A fresh schema (fresh cache) recomputes — proving the cache is the reason,
+	// and that it is instance-scoped rather than a shared global.
+	store2 := newStore()
+	schema2, err := NewSchema(store2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := graphql.Do(graphql.Params{Schema: schema2, RequestString: query, Context: context.Background()}); len(result.Errors) > 0 {
+		t.Fatalf("fresh-schema graphql errors = %+v", result.Errors)
+	}
+	if len(store2.aggregateInputs) != 1 {
+		t.Fatalf("fresh schema expected 1 aggregation, got %d", len(store2.aggregateInputs))
+	}
+}
+
 func TestRankedEventsAggregatesInsideDerivedTargetFilters(t *testing.T) {
 	topID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	followedAuthor := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
