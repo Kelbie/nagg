@@ -2310,27 +2310,43 @@ func weightedRankCandidateIDs(
 	if limit <= 0 || len(candidates) == 0 {
 		return nil, nil
 	}
+	baseScores, err := weightedRankBaseScores(ctx, store, candidates, terms)
+	if err != nil {
+		return nil, err
+	}
+	if len(baseScores) == 0 {
+		return nil, nil
+	}
+	return finalizeRankedIDs(candidates, baseScores, boosts, shuffle, offset, limit), nil
+}
+
+// weightedRankBaseScores computes the per-candidate base score from the weighted
+// rank terms only. This is the expensive part of ranking (engagement
+// aggregation, pubkey scores, derived metrics) and is independent of the
+// requesting viewer and of the shuffle seed, so the result is safe to cache and
+// reuse across viewers — the viewer follow-boost and shuffle jitter are applied
+// later in finalizeRankedIDs. Returns a score per distinct candidate id (0 when
+// no term contributes).
+func weightedRankBaseScores(
+	ctx context.Context,
+	store Store,
+	candidates []chstore.EventView,
+	terms []weightedRankTerm,
+) (map[string]float64, error) {
 	scores := make(map[string]float64, len(candidates))
 	candidateIDs := make([]string, 0, len(candidates))
-	seen := map[string]struct{}{}
 	for _, candidate := range candidates {
 		if candidate.ID == "" {
 			continue
 		}
-		if _, ok := seen[candidate.ID]; ok {
+		if _, ok := scores[candidate.ID]; ok {
 			continue
 		}
-		seen[candidate.ID] = struct{}{}
-		candidateIDs = append(candidateIDs, candidate.ID)
 		scores[candidate.ID] = 0
-		for _, boost := range boosts {
-			if _, ok := boost.PubKeys[candidate.PubKey]; ok {
-				scores[candidate.ID] += boost.Weight
-			}
-		}
+		candidateIDs = append(candidateIDs, candidate.ID)
 	}
 	if len(candidateIDs) == 0 {
-		return nil, nil
+		return scores, nil
 	}
 	for _, term := range terms {
 		switch term.Kind {
@@ -2364,18 +2380,43 @@ func weightedRankCandidateIDs(
 			scores[candidateID] += transformedRankValue(value, term.Transform) * term.Weight
 		}
 	}
+	return scores, nil
+}
 
+// finalizeRankedIDs applies the per-request layer on top of cached base scores:
+// the viewer follow-boost and the deterministic shuffle jitter, then sorts and
+// slices to the requested page. Boost and terms both only add to the score, so
+// applying the boost here yields an identical final score to folding it into the
+// base loop.
+func finalizeRankedIDs(
+	candidates []chstore.EventView,
+	baseScores map[string]float64,
+	boosts []candidatePubkeyBoost,
+	shuffle shuffleSpec,
+	offset int,
+	limit int,
+) []string {
+	if limit <= 0 {
+		return nil
+	}
 	ranked := make([]candidateRank, 0, len(candidates))
 	added := map[string]struct{}{}
 	for _, candidate := range candidates {
-		if _, ok := scores[candidate.ID]; !ok {
+		base, ok := baseScores[candidate.ID]
+		if !ok {
 			continue
 		}
 		if _, ok := added[candidate.ID]; ok {
 			continue
 		}
 		added[candidate.ID] = struct{}{}
-		ranked = append(ranked, candidateRank{event: candidate, score: scores[candidate.ID]})
+		score := base
+		for _, boost := range boosts {
+			if _, ok := boost.PubKeys[candidate.PubKey]; ok {
+				score += boost.Weight
+			}
+		}
+		ranked = append(ranked, candidateRank{event: candidate, score: score})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
 		scoreI := ranked[i].score + shuffleJitter(ranked[i].event.ID, shuffle)
@@ -2392,7 +2433,7 @@ func weightedRankCandidateIDs(
 		offset = 0
 	}
 	if offset >= len(ranked) {
-		return nil, nil
+		return nil
 	}
 	ranked = ranked[offset:]
 	if len(ranked) > limit {
@@ -2402,7 +2443,7 @@ func weightedRankCandidateIDs(
 	for _, entry := range ranked {
 		out = append(out, entry.event.ID)
 	}
-	return out, nil
+	return out
 }
 
 func applyPubkeyScoreRankTerm(
