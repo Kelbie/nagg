@@ -82,6 +82,26 @@ func TestOpenWithRetryStopsWhenContextIsCanceled(t *testing.T) {
 	}
 }
 
+func TestDefaultOpenRetryConfigEnvOverride(t *testing.T) {
+	t.Setenv("NAGG_CLICKHOUSE_CONNECT_ATTEMPTS", "80")
+	t.Setenv("NAGG_CLICKHOUSE_CONNECT_MAX_DELAY_SECONDS", "10")
+	cfg := defaultOpenRetryConfig()
+	if cfg.Attempts != 80 {
+		t.Fatalf("attempts = %d, want 80", cfg.Attempts)
+	}
+	if cfg.MaxDelay != 10*time.Second {
+		t.Fatalf("max delay = %s, want 10s", cfg.MaxDelay)
+	}
+
+	// Malformed / non-positive values are ignored, keeping the defaults.
+	t.Setenv("NAGG_CLICKHOUSE_CONNECT_ATTEMPTS", "nope")
+	t.Setenv("NAGG_CLICKHOUSE_CONNECT_MAX_DELAY_SECONDS", "-3")
+	cfg = defaultOpenRetryConfig()
+	if cfg.Attempts != 42 || cfg.MaxDelay != 5*time.Second {
+		t.Fatalf("malformed env should keep defaults, got attempts=%d maxDelay=%s", cfg.Attempts, cfg.MaxDelay)
+	}
+}
+
 func TestDefaultOpenRetryConfigFitsRailwayHealthcheckWindow(t *testing.T) {
 	cfg := defaultOpenRetryConfig()
 	if cfg.Attempts != 42 {

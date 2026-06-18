@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -153,7 +154,7 @@ func OpenWithRetry(ctx context.Context, cfg Config, logger *slog.Logger) (*Store
 }
 
 func defaultOpenRetryConfig() openRetryConfig {
-	return openRetryConfig{
+	cfg := openRetryConfig{
 		// Railway production healthchecks allow 300s. Keep probes short and
 		// frequent so transient ClickHouse connection resets get many recovery
 		// chances before Railway gives up on the deployment.
@@ -161,6 +162,27 @@ func defaultOpenRetryConfig() openRetryConfig {
 		InitialDelay: time.Second,
 		MaxDelay:     5 * time.Second,
 	}
+	// The pre-deploy migrate command is not bound by the app healthcheck window,
+	// so when ClickHouse is saturated (e.g. heavy queries starving new native
+	// connections) a deploy can ride out a longer outage by raising the budget
+	// via env, without a code change and without affecting app-startup defaults.
+	if v := envPositiveInt("NAGG_CLICKHOUSE_CONNECT_ATTEMPTS"); v > 0 {
+		cfg.Attempts = v
+	}
+	if v := envPositiveInt("NAGG_CLICKHOUSE_CONNECT_MAX_DELAY_SECONDS"); v > 0 {
+		cfg.MaxDelay = time.Duration(v) * time.Second
+	}
+	return cfg
+}
+
+// envPositiveInt reads a strictly-positive integer from an env var, returning 0
+// when unset, empty, malformed or non-positive (so callers keep their default).
+func envPositiveInt(name string) int {
+	v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name)))
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func openWithRetry(
