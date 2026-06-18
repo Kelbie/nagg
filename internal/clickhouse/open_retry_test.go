@@ -81,3 +81,30 @@ func TestOpenWithRetryStopsWhenContextIsCanceled(t *testing.T) {
 		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
+
+func TestDefaultOpenRetryConfigFitsRailwayHealthcheckWindow(t *testing.T) {
+	cfg := defaultOpenRetryConfig()
+	if cfg.Attempts != 42 {
+		t.Fatalf("attempts = %d, want 42", cfg.Attempts)
+	}
+	if cfg.InitialDelay != time.Second {
+		t.Fatalf("initial delay = %s, want 1s", cfg.InitialDelay)
+	}
+	if cfg.MaxDelay != 5*time.Second {
+		t.Fatalf("max delay = %s, want 5s", cfg.MaxDelay)
+	}
+
+	delay := cfg.InitialDelay
+	var sleeping time.Duration
+	for range cfg.Attempts - 1 {
+		sleeping += delay
+		delay *= 2
+		if delay > cfg.MaxDelay {
+			delay = cfg.MaxDelay
+		}
+	}
+	maxProbeTime := time.Duration(cfg.Attempts) * clickHouseStartupProbeTimeout
+	if total := sleeping + maxProbeTime; total > 290*time.Second {
+		t.Fatalf("retry budget = %s, want under Railway healthcheck window", total)
+	}
+}

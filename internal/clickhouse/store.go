@@ -44,6 +44,8 @@ type Store struct {
 	conn ch.Conn
 }
 
+const clickHouseStartupProbeTimeout = 2 * time.Second
+
 // retryConn wraps the driver connection so a single transient connection-level
 // failure (a pooled connection the server closed out from under us — "connection
 // reset by peer", broken pipe, EOF) retries once instead of surfacing as a 5xx.
@@ -113,7 +115,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			Username: cfg.Username,
 			Password: cfg.Password,
 		},
-		DialTimeout:      10 * time.Second,
+		DialTimeout:      5 * time.Second,
 		ConnOpenStrategy: ch.ConnOpenInOrder,
 		MaxOpenConns:     maxOpenConns,
 		MaxIdleConns:     maxIdleConns,
@@ -125,7 +127,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.Ping(ctx); err != nil {
+	pingCtx, cancel := context.WithTimeout(ctx, clickHouseStartupProbeTimeout)
+	defer cancel()
+	if err := conn.Ping(pingCtx); err != nil {
 		return nil, err
 	}
 	return &Store{conn: retryConn{Conn: conn}}, nil
@@ -141,13 +145,18 @@ type openRetryConfig struct {
 // deploys. Heavy background mutations can briefly reset TCP connections; a
 // single failed Ping should not fail the whole pre-deploy or app startup.
 func OpenWithRetry(ctx context.Context, cfg Config, logger *slog.Logger) (*Store, error) {
-	return openWithRetry(ctx, cfg, openRetryConfig{
-		// With the 15s cap, 18 attempts waits about 4 minutes before the final
-		// failure, staying inside Railway's 300s production healthcheck window.
-		Attempts:     18,
-		InitialDelay: 2 * time.Second,
-		MaxDelay:     15 * time.Second,
-	}, logger, Open)
+	return openWithRetry(ctx, cfg, defaultOpenRetryConfig(), logger, Open)
+}
+
+func defaultOpenRetryConfig() openRetryConfig {
+	return openRetryConfig{
+		// Railway production healthchecks allow 300s. Keep probes short and
+		// frequent so transient ClickHouse connection resets get many recovery
+		// chances before Railway gives up on the deployment.
+		Attempts:     42,
+		InitialDelay: time.Second,
+		MaxDelay:     5 * time.Second,
+	}
 }
 
 func openWithRetry(
