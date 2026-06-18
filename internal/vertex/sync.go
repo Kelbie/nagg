@@ -19,6 +19,10 @@ type SyncConfig struct {
 	MinFollowers uint64
 	BatchSize    int
 	Interval     time.Duration
+	// Throttle is the minimum delay between upstream Vertex profile fetches. It
+	// protects the credit-limited upstream API from a burst when a large backlog
+	// of stale/unscored authors accumulates. Zero disables throttling.
+	Throttle time.Duration
 }
 
 type Syncer struct {
@@ -71,11 +75,18 @@ func (s *Syncer) RunOnce(ctx context.Context) (int, int, error) {
 	var refreshed int
 	var failed int
 	var scoreAvailable int
-	for _, pubkey := range pubkeys {
+	for i, pubkey := range pubkeys {
 		select {
 		case <-ctx.Done():
 			return refreshed, failed, ctx.Err()
 		default:
+		}
+		// Throttle upstream fetches (after the first) to stay within Vertex credit
+		// limits when the candidate backlog is large.
+		if i > 0 && s.config.Throttle > 0 {
+			if err := sleep(ctx, s.config.Throttle); err != nil {
+				return refreshed, failed, err
+			}
 		}
 		profile, err := s.client.ProfileRefresh(ctx, pubkey)
 		if err != nil {

@@ -115,6 +115,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
 			MinFollowers: uint64(cfg.Vertex.RankMinFollowers),
 			BatchSize:    cfg.Vertex.SyncBatch,
+			Throttle:     cfg.Vertex.SyncThrottle,
 		}, logger)
 		go vertexSyncer.Run(ctx)
 	}

@@ -84,6 +84,7 @@ type VertexConfig struct {
 	ProfileMinFollowers int
 	RankMinFollowers    int
 	SyncBatch           int
+	SyncThrottle        time.Duration
 }
 
 type ViewerConfig struct {
@@ -150,6 +151,7 @@ func Load() (Config, error) {
 			ProfileMinFollowers: parseInt(env("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "500")),
 			RankMinFollowers:    parseInt(env("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "500")),
 			SyncBatch:           parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
+			SyncThrottle:        parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,

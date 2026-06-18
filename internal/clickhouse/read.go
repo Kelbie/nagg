@@ -117,6 +117,13 @@ type NoteStats struct {
 	RepostCount uint64 `json:"repostCount"`
 	ReplyCount  uint64 `json:"replyCount"`
 	SatsZapped  uint64 `json:"satsZapped"`
+	// Vertex-real counts: distinct engagers whose saved Vertex score clears the
+	// rollup threshold (bot-resistant). Sourced from note_engagement_real; zero
+	// until the rollup has computed a row for the event.
+	RealLikeCount   uint64 `json:"realLikeCount"`
+	RealRepostCount uint64 `json:"realRepostCount"`
+	RealReplyCount  uint64 `json:"realReplyCount"`
+	RealSatsZapped  uint64 `json:"realSatsZapped"`
 }
 
 type FollowCounts struct {
@@ -273,10 +280,44 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 			set(id, func(stats *NoteStats) { stats.SatsZapped = value })
 		})
 	})
+	g.Go(func() error {
+		return s.mergeRealStats(ctx, ids, func(id string, real NoteStats) {
+			set(id, func(stats *NoteStats) {
+				stats.RealLikeCount = real.RealLikeCount
+				stats.RealRepostCount = real.RealRepostCount
+				stats.RealReplyCount = real.RealReplyCount
+				stats.RealSatsZapped = real.RealSatsZapped
+			})
+		})
+	})
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// mergeRealStats reads the vertex-real engagement counts from note_engagement_real
+// (keyed by event_id, so this is an indexed lookup). FINAL collapses the
+// ReplacingMergeTree to the latest computed row per event.
+func (s *Store) mergeRealStats(ctx context.Context, ids []string, set func(string, NoteStats)) error {
+	rows, err := s.conn.Query(ctx, `
+		SELECT event_id, real_likes, real_reposts, real_replies, real_zap_sats
+		FROM note_engagement_real FINAL
+		WHERE event_id IN (?)
+	`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var real NoteStats
+		if err := rows.Scan(&id, &real.RealLikeCount, &real.RealRepostCount, &real.RealReplyCount, &real.RealSatsZapped); err != nil {
+			return err
+		}
+		set(id, real)
+	}
+	return rows.Err()
 }
 
 func (s *Store) mergeZapStats(ctx context.Context, ids []string, set func(string, uint64)) error {
@@ -581,10 +622,14 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 		) AS recent
 		INNER JOIN
 		(
-			SELECT tag_value AS pubkey, uniqExact(pubkey) AS followers
-			FROM event_tags
-			WHERE kind = 3 AND tag_key = 'p' AND length(tag_value) = 64
-			GROUP BY tag_value
+			-- Follower count from the LATEST contact list per follower (NIP-02 is
+			-- replaceable). The legacy uniqExact over all kind-3 history counted
+			-- anyone who EVER followed you, inflating the count and wasting Vertex
+			-- credits on over-qualified authors. user_contacts_latest is MV-fed +
+			-- backfilled, so this needs no rollup bootstrap.
+			SELECT follow AS pubkey, count() AS followers
+			FROM (SELECT arrayJoin(contacts) AS follow FROM user_contacts_latest FINAL)
+			GROUP BY follow
 			HAVING followers >= ?
 		) AS follower_counts ON follower_counts.pubkey = recent.pubkey
 		LEFT JOIN
