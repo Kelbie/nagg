@@ -1494,15 +1494,10 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 			if err != nil {
 				return nil, err
 			}
-			slog.Info("rank feature path", "served", served, "views", len(views), "weights", weights)
 			if served {
 				return views, nil
 			}
-		} else {
-			slog.Info("rank feature path bailed", "terms", len(input.WeightedTerms), "weightsOK", false)
 		}
-	} else {
-		slog.Info("rank feature path skipped", "terms", len(input.WeightedTerms), "global", featureRankTargetIsGlobal(input.Target))
 	}
 
 	if r.basePool != nil && len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
@@ -1519,11 +1514,13 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	return r.rankedEventViewsDirect(ctx, input)
 }
 
-// featureRankWindow bounds the recent-events window the feature scan reads. The
-// recency half-life makes content older than a few days contribute negligibly,
-// and the rollup only maintains features for its own recent window, so this is a
-// generous read bound, not a hard product filter.
-const featureRankWindow = 7 * 24 * time.Hour
+// featureRankWindow bounds the recent-events window the feature scan reads. It
+// matches the rollup's maintained window (RecentWindow, 48h): rows older than that
+// are not refreshed, and the recency half-life makes them score negligibly anyway.
+// A tighter bound is also a real speedup — note_rank_features carries a row per
+// (event, rollup tick) until background merges collapse the ReplacingMergeTree, so
+// the FINAL scan cost grows with the window.
+const featureRankWindow = 48 * time.Hour
 
 // featureRankTargetIsGlobal reports whether a ranked request targets a global
 // (kind-only) candidate pool — the only shape note_rank_features can serve. The
