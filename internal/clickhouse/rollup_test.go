@@ -51,6 +51,29 @@ func TestBuildDirectReplyCountsSQL_IdempotentUnion(t *testing.T) {
 	}
 }
 
+func TestTargetIDsSubquery_RecencyOrderedEngagedOnly(t *testing.T) {
+	sql := targetIDsSubquery(time.Unix(1_700_000_000, 0), 50000)
+	for _, want := range []string{
+		"max(engaged_at) AS engaged_at", // engagement recency
+		"ORDER BY engaged_at DESC",      // freshest engaged notes first
+		"LIMIT 50000",                   // bounded
+		"note_zaps",                     // zapped notes
+		"tag_key = 'e'",                 // reaction/repost/reply/quote targets
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("targetIDsSubquery missing %q", want)
+		}
+	}
+	// Must NOT enumerate every recent post (the old UNION DISTINCT flood) nor use a
+	// bare LIMIT with no ordering.
+	if strings.Contains(sql, "UNION DISTINCT") {
+		t.Error("targetIDsSubquery should not UNION DISTINCT the full recent-post set")
+	}
+	if strings.Contains(sql, "kind IN (1, 1111)") {
+		t.Error("targetIDsSubquery should not enumerate all recent posts")
+	}
+}
+
 func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing.T) {
 	since := time.Unix(1_700_000_000, 0)
 	computedAt := time.Unix(1_700_009_999, 0)

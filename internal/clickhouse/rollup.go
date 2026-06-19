@@ -22,6 +22,46 @@ func rollupExecCtx(ctx context.Context) context.Context {
 	}))
 }
 
+// isRetryableConnErr reports whether a rollup statement failed on a transient
+// native-connection fault (the prod ClickHouse resets :9000 connections under
+// load — the same fault that breaks concurrent reads; see read.go NoteStats).
+// These surface BEFORE the query reaches the server, so a retry on a fresh
+// pooled connection succeeds.
+func isRetryableConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "use of closed network connection")
+}
+
+// execRollup runs one rollup statement, retrying on transient connection resets
+// with a small linear backoff (each retry acquires a fresh pooled connection).
+// Rollup INSERTs are idempotent (ReplacingMergeTree / uniqState), so a retry is
+// always safe even if a prior attempt partially landed.
+func (s *Store) execRollup(ctx context.Context, label, sql string) error {
+	const maxAttempts = 4
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = s.conn.Exec(rollupExecCtx(ctx), sql); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil || !isRetryableConnErr(err) {
+			return fmt.Errorf("%s: %w", label, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 3 * time.Second):
+		}
+	}
+	return fmt.Errorf("%s after %d attempts: %w", label, maxAttempts, err)
+}
+
 // Thresholds parameterize the vertex-real engagement rollup. An engagement actor
 // (liker / reposter / replier / quoter / zapper) counts toward a "real" count iff
 // their latest saved Vertex score is >= MinActorScore. Version is stamped into the
@@ -108,23 +148,32 @@ func recentChildrenSubquery(since time.Time, limit int) string {
 		LIMIT %d`, since.Unix(), limit)
 }
 
-// targetIDsSubquery is the bounded set of events whose engagement may have changed
-// since `since`: recent posts, posts that received engagement, or posts that were
-// zapped. Used by the real-engagement and rank-feature rebuilds.
+// targetIDsSubquery is the bounded set of notes whose engagement changed since
+// `since`: notes that received a reaction/repost/reply/quote (e-tag references)
+// or a zap. Ordered by MOST RECENT engagement and capped at `limit`, so the
+// feature rebuild always covers the freshest engaged notes — the ones For-You
+// ranks — rather than an arbitrary slice of the window.
+//
+// It deliberately does NOT enumerate every recent post (that was ~1.7M rows/48h,
+// too heavy to materialize each tick AND, with a bare LIMIT, it grabbed an
+// arbitrary OLD slice that excluded recent notes). For-You ranks engaged notes,
+// so a post with no engagement yet does not need a feature row; it gets one on
+// the next tick once it is engaged.
 func targetIDsSubquery(since time.Time, limit int) string {
 	return fmt.Sprintf(`
 		SELECT event_id FROM (
-			SELECT id AS event_id FROM nostr_events
-			WHERE created_at >= toDateTime(%d) AND kind IN (1, 1111)
-			UNION DISTINCT
-			SELECT tag_value AS event_id FROM event_tags
-			WHERE tag_key = 'e' AND length(tag_value) = 64
-			  AND created_at >= toDateTime(%d) AND kind IN (1, 6, 7, 16, 1111)
-			UNION DISTINCT
-			SELECT target_event_id AS event_id FROM note_zaps
-			WHERE created_at >= toDateTime(%d)
-		)
-		LIMIT %d`, since.Unix(), since.Unix(), since.Unix(), limit)
+			SELECT event_id, max(engaged_at) AS engaged_at FROM (
+				SELECT tag_value AS event_id, created_at AS engaged_at FROM event_tags
+				WHERE tag_key = 'e' AND length(tag_value) = 64
+				  AND created_at >= toDateTime(%d) AND kind IN (1, 6, 7, 16, 1111)
+				UNION ALL
+				SELECT target_event_id AS event_id, created_at AS engaged_at FROM note_zaps
+				WHERE created_at >= toDateTime(%d)
+			)
+			GROUP BY event_id
+			ORDER BY engaged_at DESC
+			LIMIT %d
+		)`, since.Unix(), since.Unix(), limit)
 }
 
 // scoredActorsSubquery is the set of pubkeys whose latest Vertex score clears the
@@ -181,13 +230,10 @@ func buildDirectReplyCountsSQL(since time.Time, limit int) string {
 // RecomputeReplyEdges rebuilds the direct-reply edges and counts for recent reply
 // candidates. uniqState makes the count rebuild idempotent (set union).
 func (s *Store) RecomputeReplyEdges(ctx context.Context, since time.Time, limit int) error {
-	if err := s.conn.Exec(rollupExecCtx(ctx), buildReplyEdgesSQL(since, limit)); err != nil {
-		return fmt.Errorf("recompute reply edges: %w", err)
+	if err := s.execRollup(ctx, "recompute reply edges", buildReplyEdgesSQL(since, limit)); err != nil {
+		return err
 	}
-	if err := s.conn.Exec(rollupExecCtx(ctx), buildDirectReplyCountsSQL(since, limit)); err != nil {
-		return fmt.Errorf("recompute direct reply counts: %w", err)
-	}
-	return nil
+	return s.execRollup(ctx, "recompute direct reply counts", buildDirectReplyCountsSQL(since, limit))
 }
 
 func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
@@ -281,10 +327,7 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 // RecomputeEngagementReal recomputes vertex-real engagement counts for the bounded
 // target set. ReplacingMergeTree(computed_at) overwrites, so this is idempotent.
 func (s *Store) RecomputeEngagementReal(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
-	if err := s.conn.Exec(rollupExecCtx(ctx), buildEngagementRealSQL(since, limit, th, computedAt)); err != nil {
-		return fmt.Errorf("recompute engagement real: %w", err)
-	}
-	return nil
+	return s.execRollup(ctx, "recompute engagement real", buildEngagementRealSQL(since, limit, th, computedAt))
 }
 
 func touchedAuthorsSubquery(since time.Time, limit int) string {
@@ -336,10 +379,7 @@ func buildUserStatsSQL(since time.Time, limit int, computedAt time.Time) string 
 // touched since `since`. Fixes the legacy follower-count bug (which counted all
 // kind-3 history instead of only the latest contact list per follower).
 func (s *Store) RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error {
-	if err := s.conn.Exec(rollupExecCtx(ctx), buildUserStatsSQL(since, limit, computedAt)); err != nil {
-		return fmt.Errorf("recompute user stats: %w", err)
-	}
-	return nil
+	return s.execRollup(ctx, "recompute user stats", buildUserStatsSQL(since, limit, computedAt))
 }
 
 func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
@@ -386,8 +426,5 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 // RecomputeRankFeatures assembles the per-event hot-path feature row (raw + real
 // counts, author score, contribution quality) for the bounded target set.
 func (s *Store) RecomputeRankFeatures(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
-	if err := s.conn.Exec(rollupExecCtx(ctx), buildRankFeaturesSQL(since, limit, th, computedAt)); err != nil {
-		return fmt.Errorf("recompute rank features: %w", err)
-	}
-	return nil
+	return s.execRollup(ctx, "recompute rank features", buildRankFeaturesSQL(since, limit, th, computedAt))
 }
