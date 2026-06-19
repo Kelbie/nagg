@@ -1494,10 +1494,15 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 			if err != nil {
 				return nil, err
 			}
+			slog.Info("rank feature path", "served", served, "views", len(views), "weights", weights)
 			if served {
 				return views, nil
 			}
+		} else {
+			slog.Info("rank feature path bailed", "terms", len(input.WeightedTerms), "weightsOK", false)
 		}
+	} else {
+		slog.Info("rank feature path skipped", "terms", len(input.WeightedTerms), "global", featureRankTargetIsGlobal(input.Target))
 	}
 
 	if r.basePool != nil && len(input.WeightedTerms) > 0 && len(input.Target.IDs) == 0 {
