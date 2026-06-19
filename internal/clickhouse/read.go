@@ -8,11 +8,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/vertex-lab/nagg/internal/vertex"
-	"golang.org/x/sync/errgroup"
 )
 
 type EventView struct {
@@ -247,50 +245,50 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 		return out, nil
 	}
 
-	var mu sync.Mutex
+	// Run the per-metric reads SEQUENTIALLY on one pooled connection. The previous
+	// errgroup issued five concurrent queries, each grabbing its own native
+	// connection; under load the ClickHouse native protocol resets those
+	// concurrent connections ("read tcp ...:9000: connection reset by peer"),
+	// which broke the feed's noteStats field AND was the cause of the REST
+	// /nostr/feed/ranked 500s (that path calls NoteStats too). Single-connection
+	// query paths (ranking, followed-reply) stay reliable, so these indexed id
+	// lookups run one-at-a-time — a few extra round-trips, no concurrency.
 	set := func(id string, update func(*NoteStats)) {
-		mu.Lock()
-		defer mu.Unlock()
 		stats := out[id]
 		update(&stats)
 		out[id] = stats
 	}
-
-	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		return s.mergeCount(ctx, "note_like_counts", "likes", ids, func(id string, value uint64) {
-			set(id, func(stats *NoteStats) { stats.LikeCount = value })
+	if err := s.mergeCount(ctx, "note_like_counts", "likes", ids, func(id string, value uint64) {
+		set(id, func(stats *NoteStats) { stats.LikeCount = value })
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.mergeCount(ctx, "note_repost_counts", "reposts", ids, func(id string, value uint64) {
+		set(id, func(stats *NoteStats) { stats.RepostCount = value })
+	}); err != nil {
+		return nil, err
+	}
+	// Direct (NIP-10/22) replies only — note_direct_reply_counts excludes
+	// grandchildren and quotes that the legacy any-e-tag note_reply_counts
+	// (retired in migration 007) over-counted.
+	if err := s.mergeCount(ctx, "note_direct_reply_counts", "replies", ids, func(id string, value uint64) {
+		set(id, func(stats *NoteStats) { stats.ReplyCount = value })
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.mergeZapStats(ctx, ids, func(id string, value uint64) {
+		set(id, func(stats *NoteStats) { stats.SatsZapped = value })
+	}); err != nil {
+		return nil, err
+	}
+	if err := s.mergeRealStats(ctx, ids, func(id string, real NoteStats) {
+		set(id, func(stats *NoteStats) {
+			stats.RealLikeCount = real.RealLikeCount
+			stats.RealRepostCount = real.RealRepostCount
+			stats.RealReplyCount = real.RealReplyCount
+			stats.RealSatsZapped = real.RealSatsZapped
 		})
-	})
-	g.Go(func() error {
-		return s.mergeCount(ctx, "note_repost_counts", "reposts", ids, func(id string, value uint64) {
-			set(id, func(stats *NoteStats) { stats.RepostCount = value })
-		})
-	})
-	g.Go(func() error {
-		// Direct (NIP-10/22) replies only — note_direct_reply_counts excludes
-		// grandchildren and quotes that the legacy any-e-tag note_reply_counts
-		// (retired in migration 007) over-counted.
-		return s.mergeCount(ctx, "note_direct_reply_counts", "replies", ids, func(id string, value uint64) {
-			set(id, func(stats *NoteStats) { stats.ReplyCount = value })
-		})
-	})
-	g.Go(func() error {
-		return s.mergeZapStats(ctx, ids, func(id string, value uint64) {
-			set(id, func(stats *NoteStats) { stats.SatsZapped = value })
-		})
-	})
-	g.Go(func() error {
-		return s.mergeRealStats(ctx, ids, func(id string, real NoteStats) {
-			set(id, func(stats *NoteStats) {
-				stats.RealLikeCount = real.RealLikeCount
-				stats.RealRepostCount = real.RealRepostCount
-				stats.RealReplyCount = real.RealReplyCount
-				stats.RealSatsZapped = real.RealSatsZapped
-			})
-		})
-	})
-	if err := g.Wait(); err != nil {
+	}); err != nil {
 		return nil, err
 	}
 	return out, nil
