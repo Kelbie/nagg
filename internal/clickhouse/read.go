@@ -245,131 +245,58 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 		return out, nil
 	}
 
-	// Run the per-metric reads SEQUENTIALLY on one pooled connection. The previous
-	// errgroup issued five concurrent queries, each grabbing its own native
-	// connection; under load the ClickHouse native protocol resets those
-	// concurrent connections ("read tcp ...:9000: connection reset by peer"),
-	// which broke the feed's noteStats field AND was the cause of the REST
-	// /nostr/feed/ranked 500s (that path calls NoteStats too). Single-connection
-	// query paths (ranking, followed-reply) stay reliable, so these indexed id
-	// lookups run one-at-a-time — a few extra round-trips, no concurrency.
-	set := func(id string, update func(*NoteStats)) {
-		stats := out[id]
-		update(&stats)
-		out[id] = stats
-	}
-	if err := s.mergeCount(ctx, "note_like_counts", "likes", ids, func(id string, value uint64) {
-		set(id, func(stats *NoteStats) { stats.LikeCount = value })
-	}); err != nil {
-		return nil, err
-	}
-	if err := s.mergeCount(ctx, "note_repost_counts", "reposts", ids, func(id string, value uint64) {
-		set(id, func(stats *NoteStats) { stats.RepostCount = value })
-	}); err != nil {
-		return nil, err
-	}
-	// Direct (NIP-10/22) replies only — note_direct_reply_counts excludes
-	// grandchildren and quotes that the legacy any-e-tag note_reply_counts
-	// (retired in migration 007) over-counted.
-	if err := s.mergeCount(ctx, "note_direct_reply_counts", "replies", ids, func(id string, value uint64) {
-		set(id, func(stats *NoteStats) { stats.ReplyCount = value })
-	}); err != nil {
-		return nil, err
-	}
-	if err := s.mergeZapStats(ctx, ids, func(id string, value uint64) {
-		set(id, func(stats *NoteStats) { stats.SatsZapped = value })
-	}); err != nil {
-		return nil, err
-	}
-	if err := s.mergeRealStats(ctx, ids, func(id string, real NoteStats) {
-		set(id, func(stats *NoteStats) {
-			stats.RealLikeCount = real.RealLikeCount
-			stats.RealRepostCount = real.RealRepostCount
-			stats.RealReplyCount = real.RealReplyCount
-			stats.RealSatsZapped = real.RealSatsZapped
-		})
-	}); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// mergeRealStats reads the vertex-real engagement counts from note_engagement_real
-// (keyed by event_id, so this is an indexed lookup). FINAL collapses the
-// ReplacingMergeTree to the latest computed row per event.
-func (s *Store) mergeRealStats(ctx context.Context, ids []string, set func(string, NoteStats)) error {
-	// argMax over computed_at collapses ReplacingMergeTree rows AND any extra
-	// threshold_version rows to one value per event (FINAL alone would keep one
-	// row per (event_id, threshold_version) and emit duplicate event_id rows once
-	// a second threshold version exists).
-	rows, err := s.conn.Query(ctx, `
-		SELECT event_id,
-			argMax(real_likes, computed_at),
-			argMax(real_reposts, computed_at),
-			argMax(real_replies, computed_at),
-			argMax(real_zap_sats, computed_at)
-		FROM note_engagement_real
-		WHERE event_id IN (?)
-		GROUP BY event_id
-	`, ids)
+	// ONE query on ONE connection. The earlier errgroup opened five concurrent
+	// native connections, which the capacity-limited ClickHouse resets under load
+	// (the cause of the feed noteStats break + the REST /nostr/feed/ranked 500s).
+	// LEFT JOIN every precomputed count onto the engaged-id set (UNION of the
+	// per-table keys) so the whole page's stats come back in a single round-trip.
+	// Direct (NIP-10/22) replies come from note_direct_reply_counts; real_* are the
+	// vertex-real counts (argMax over computed_at collapses the ReplacingMergeTree
+	// + threshold rows). Ids with no engagement anywhere stay pre-filled at zero.
+	query := `
+		SELECT
+			ids.id,
+			ifNull(l.c, 0)  AS likes,
+			ifNull(rp.c, 0) AS reposts,
+			ifNull(dr.c, 0) AS replies,
+			ifNull(z.s, 0)  AS zap_sats,
+			ifNull(er.rl, 0) AS real_likes,
+			ifNull(er.rr, 0) AS real_reposts,
+			ifNull(er.re, 0) AS real_replies,
+			ifNull(er.rz, 0) AS real_zap_sats
+		FROM (
+			SELECT target_event_id AS id FROM note_like_counts WHERE target_event_id IN (?)
+			UNION DISTINCT SELECT target_event_id FROM note_repost_counts WHERE target_event_id IN (?)
+			UNION DISTINCT SELECT target_event_id FROM note_direct_reply_counts WHERE target_event_id IN (?)
+			UNION DISTINCT SELECT target_event_id FROM note_zap_totals WHERE target_event_id IN (?)
+			UNION DISTINCT SELECT event_id FROM note_engagement_real WHERE event_id IN (?)
+		) ids
+		LEFT JOIN (SELECT target_event_id, uniqMerge(likes) AS c FROM note_like_counts WHERE target_event_id IN (?) GROUP BY target_event_id) l ON l.target_event_id = ids.id
+		LEFT JOIN (SELECT target_event_id, uniqMerge(reposts) AS c FROM note_repost_counts WHERE target_event_id IN (?) GROUP BY target_event_id) rp ON rp.target_event_id = ids.id
+		LEFT JOIN (SELECT target_event_id, uniqMerge(replies) AS c FROM note_direct_reply_counts WHERE target_event_id IN (?) GROUP BY target_event_id) dr ON dr.target_event_id = ids.id
+		LEFT JOIN (SELECT target_event_id, sumMerge(sats) AS s FROM note_zap_totals WHERE target_event_id IN (?) GROUP BY target_event_id) z ON z.target_event_id = ids.id
+		LEFT JOIN (
+			SELECT event_id,
+				argMax(real_likes, computed_at) AS rl,
+				argMax(real_reposts, computed_at) AS rr,
+				argMax(real_replies, computed_at) AS re,
+				argMax(real_zap_sats, computed_at) AS rz
+			FROM note_engagement_real WHERE event_id IN (?) GROUP BY event_id
+		) er ON er.event_id = ids.id`
+	rows, err := s.conn.Query(ctx, query, ids, ids, ids, ids, ids, ids, ids, ids, ids, ids)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var id string
-		var real NoteStats
-		if err := rows.Scan(&id, &real.RealLikeCount, &real.RealRepostCount, &real.RealReplyCount, &real.RealSatsZapped); err != nil {
-			return err
+		var st NoteStats
+		if err := rows.Scan(&id, &st.LikeCount, &st.RepostCount, &st.ReplyCount, &st.SatsZapped, &st.RealLikeCount, &st.RealRepostCount, &st.RealReplyCount, &st.RealSatsZapped); err != nil {
+			return nil, err
 		}
-		set(id, real)
+		out[id] = st
 	}
-	return rows.Err()
-}
-
-func (s *Store) mergeZapStats(ctx context.Context, ids []string, set func(string, uint64)) error {
-	rows, err := s.conn.Query(ctx, `
-		SELECT target_event_id, sumMerge(sats)
-		FROM note_zap_totals
-		WHERE target_event_id IN (?)
-		GROUP BY target_event_id
-	`, ids)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var value uint64
-		if err := rows.Scan(&id, &value); err != nil {
-			return err
-		}
-		set(id, value)
-	}
-	return rows.Err()
-}
-
-func (s *Store) mergeCount(ctx context.Context, table, column string, ids []string, set func(string, uint64)) error {
-	query := fmt.Sprintf(`
-		SELECT target_event_id, uniqMerge(%s)
-		FROM %s
-		WHERE target_event_id IN (?)
-		GROUP BY target_event_id
-	`, column, table)
-	rows, err := s.conn.Query(ctx, query, ids)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var value uint64
-		if err := rows.Scan(&id, &value); err != nil {
-			return err
-		}
-		set(id, value)
-	}
-	return rows.Err()
+	return out, rows.Err()
 }
 
 // FeatureWeights are the rank weights applied to the precomputed per-event
