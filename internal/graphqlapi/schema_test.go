@@ -48,11 +48,28 @@ type fakeStore struct {
 	featureRankInputs           []chstore.FeatureRankInput
 	directReplyIDs              map[string][]string
 	directReplyParents          []string
+	rankedDirectReplyIDs        map[string][]string
+	rankedDirectReplyCalls      []rankedDirectReplyCall
+	authoredReplyChains         map[string][]string
+	authoredReplyChainCalls     []authoredReplyChainCall
 	noteStatsRows               map[string]chstore.NoteStats
 	noteStatsInputs             [][]string
 	followedReplyRows           map[string]string
 	followedReplyViewer         string
 	followedReplyParents        [][]string
+}
+
+type rankedDirectReplyCall struct {
+	parentID string
+	sort     string
+	limit    int
+	offset   int
+}
+
+type authoredReplyChainCall struct {
+	rootID   string
+	author   string
+	maxDepth int
 }
 
 type latestEventsInput struct {
@@ -360,6 +377,24 @@ func (s *fakeStore) DirectReplyIDs(_ context.Context, parentID string) ([]string
 	return s.directReplyIDs[parentID], nil
 }
 
+func (s *fakeStore) RankedDirectReplyIDs(_ context.Context, parentID, sort string, limit, offset int) ([]string, error) {
+	s.rankedDirectReplyCalls = append(s.rankedDirectReplyCalls, rankedDirectReplyCall{parentID: parentID, sort: sort, limit: limit, offset: offset})
+	ids := s.rankedDirectReplyIDs[parentID]
+	if offset >= len(ids) {
+		return nil, nil
+	}
+	ids = ids[offset:]
+	if limit > 0 && limit < len(ids) {
+		ids = ids[:limit]
+	}
+	return ids, nil
+}
+
+func (s *fakeStore) AuthoredReplyChain(_ context.Context, rootID, author string, maxDepth int) ([]string, error) {
+	s.authoredReplyChainCalls = append(s.authoredReplyChainCalls, authoredReplyChainCall{rootID: rootID, author: author, maxDepth: maxDepth})
+	return s.authoredReplyChains[rootID], nil
+}
+
 func (s *fakeStore) NoteStats(_ context.Context, ids []string) (map[string]chstore.NoteStats, error) {
 	s.noteStatsInputs = append(s.noteStatsInputs, ids)
 	out := make(map[string]chstore.NoteStats, len(ids))
@@ -464,6 +499,64 @@ func TestReverseReferenceQuery_DirectRepliesUsesEdgeTable(t *testing.T) {
 	}
 	if len(input.IDs) != 2 || input.IDs[0] != "childA" {
 		t.Errorf("expected direct child ids [childA childB], got %v", input.IDs)
+	}
+}
+
+func TestRankedReferencedBy_DirectRepliesUsesPrecomputedRanking(t *testing.T) {
+	root := testHex("a")
+	r1, r2 := testHex("b"), testHex("c")
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{{ID: root, PubKey: testPubkey, Kind: 1, CreatedAt: time.Unix(3, 0), Tags: [][]string{}}},
+			// hydration of the ranked direct replies
+			{
+				{ID: r1, PubKey: testHex("d"), Kind: 1, CreatedAt: time.Unix(2, 0), Tags: [][]string{}},
+				{ID: r2, PubKey: testHex("e"), Kind: 1, CreatedAt: time.Unix(1, 0), Tags: [][]string{}},
+			},
+		},
+		rankedDirectReplyIDs: map[string][]string{root: {r1, r2}}, // already in ranked order
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:10}) {
+				nodes {
+					id
+					replies: rankedReferencedBy(input:{
+						via:{key:"e", directReplies:true}
+						events:{kinds:[1,1111], limit:50}
+						rank:{ references:{kinds:[7], limit:500} via:{key:"e"} metric:{name:"likes", op:"COUNT_DISTINCT", distinctField:"PUBKEY"} }
+						limit:10
+					}) { nodes { id } }
+				}
+			}
+		}`,
+		Context: context.Background(),
+	})
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+
+	// Routed to the precomputed ranking with the right sort, NOT a live aggregation.
+	if len(store.rankedDirectReplyCalls) != 1 {
+		t.Fatalf("expected 1 RankedDirectReplyIDs call, got %d", len(store.rankedDirectReplyCalls))
+	}
+	if got := store.rankedDirectReplyCalls[0]; got.parentID != root || got.sort != "likes" {
+		t.Fatalf("RankedDirectReplyIDs called with %+v, want parent=%s sort=likes", got, root)
+	}
+	if len(store.referenceAggregateInputs) != 0 || store.aggregateCalls != 0 {
+		t.Fatalf("precomputed path must not run a live aggregation; agg calls=%d refAggInputs=%d", store.aggregateCalls, len(store.referenceAggregateInputs))
+	}
+
+	nodes := result.Data.(map[string]any)["events"].(map[string]any)["nodes"].([]any)
+	replies := nodes[0].(map[string]any)["replies"].(map[string]any)["nodes"].([]any)
+	if len(replies) != 2 || replies[0].(map[string]any)["id"] != r1 || replies[1].(map[string]any)["id"] != r2 {
+		t.Fatalf("replies not in precomputed ranked order: %+v", replies)
 	}
 }
 
@@ -1115,9 +1208,7 @@ func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
 	rootID := testHex("1")
 	replyID := testHex("2")
 	secondReplyID := testHex("3")
-	otherParentID := testHex("4")
 	author := testPubkey
-	otherPubkey := testHex("a")
 	root := chstore.EventView{
 		ID:        rootID,
 		PubKey:    author,
@@ -1131,20 +1222,6 @@ func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
 		CreatedAt: time.Unix(110, 0).UTC(),
 		Tags:      [][]string{{"e", rootID, "", "reply"}},
 	}
-	nonAuthorReply := chstore.EventView{
-		ID:        testHex("5"),
-		PubKey:    otherPubkey,
-		Kind:      1,
-		CreatedAt: time.Unix(105, 0).UTC(),
-		Tags:      [][]string{{"e", rootID, "", "reply"}},
-	}
-	decoyNestedReply := chstore.EventView{
-		ID:        testHex("6"),
-		PubKey:    author,
-		Kind:      1,
-		CreatedAt: time.Unix(106, 0).UTC(),
-		Tags:      [][]string{{"e", rootID, "", "root"}, {"e", otherParentID, "", "reply"}},
-	}
 	secondReply := chstore.EventView{
 		ID:        secondReplyID,
 		PubKey:    author,
@@ -1153,12 +1230,9 @@ func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
 		Tags:      [][]string{{"e", rootID, "", "root"}, {"e", replyID, "", "reply"}},
 	}
 	store := &fakeStore{
-		eventByID: map[string]chstore.EventView{rootID: root},
-		events: [][]chstore.EventView{
-			{nonAuthorReply, decoyNestedReply, firstReply},
-			{secondReply},
-			{},
-		},
+		eventByID:           map[string]chstore.EventView{rootID: root},
+		events:              [][]chstore.EventView{{firstReply, secondReply}}, // hydration of the precomputed chain
+		authoredReplyChains: map[string][]string{rootID: {replyID, secondReplyID}},
 	}
 	schema, err := NewSchema(store)
 	if err != nil {
@@ -1194,14 +1268,11 @@ func TestAuthoredReplyChainRecursesThroughDirectAuthorReplies(t *testing.T) {
 	if got := nodes[1].(map[string]any)["id"]; got != secondReplyID {
 		t.Fatalf("second chain id = %v, want %s", got, secondReplyID)
 	}
-	if len(store.referenceInputs) < 2 {
-		t.Fatalf("reference inputs = %d, want at least 2", len(store.referenceInputs))
+	if len(store.authoredReplyChainCalls) != 1 || store.authoredReplyChainCalls[0].rootID != rootID || store.authoredReplyChainCalls[0].author != author {
+		t.Fatalf("AuthoredReplyChain not called for the source author: %+v", store.authoredReplyChainCalls)
 	}
-	if got := store.referenceInputs[0].limitPerTarget; got != 32 {
-		t.Fatalf("fanout limit = %d, want 32", got)
-	}
-	if got := store.referenceInputs[0].input.PubKeys; len(got) != 1 || got[0] != author {
-		t.Fatalf("query pubkeys = %+v, want author only", got)
+	if len(store.referenceInputs) != 0 {
+		t.Fatalf("precomputed authored chain must not run the live event_tags walk; referenceInputs=%d", len(store.referenceInputs))
 	}
 }
 

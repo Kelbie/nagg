@@ -42,6 +42,8 @@ type Store interface {
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	RankedEventsByFeatures(context.Context, chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error)
 	DirectReplyIDs(context.Context, string) ([]string, error)
+	RankedDirectReplyIDs(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error)
+	AuthoredReplyChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error)
 	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
 	FollowedReplies(context.Context, string, []string) (map[string]string, error)
 }
@@ -1944,6 +1946,37 @@ type rankedReverseReferenceBatchInput struct {
 	Shuffle         shuffleSpec
 	Limit           int
 	Offset          int
+	// DirectReplySort is the precomputed sort key (likes/reposts/replies/zaps/new)
+	// derived from the rank references when via.DirectReplies is set, so the thread
+	// reply list can be served from note_reply_edges + note_*_counts instead of a
+	// live aggregation. Empty when the rank shape has no precomputed equivalent.
+	DirectReplySort string
+}
+
+// directReplySortFromKinds maps a rank's reference kinds to the precomputed
+// note_*_counts sort: kind 7 → likes, 9735 → zaps, 6/16 → reposts, 1/1111 →
+// replies. Returns "" when no precomputed table ranks that engagement type.
+func directReplySortFromKinds(kinds []int) string {
+	has := func(k int) bool {
+		for _, x := range kinds {
+			if x == k {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has(7):
+		return "likes"
+	case has(9735):
+		return "zaps"
+	case has(6) || has(16):
+		return "reposts"
+	case has(1) || has(1111):
+		return "replies"
+	default:
+		return ""
+	}
 }
 
 type authoredReplyChainInput struct {
@@ -2250,6 +2283,9 @@ func (c *eventRelationCache) rankedReverseReferenceBatchQuery(ctx context.Contex
 		return out, err
 	}
 	out.Shuffle = shuffleInput(rankRaw["shuffle"])
+	if out.Via.DirectReplies {
+		out.DirectReplySort = directReplySortFromKinds(references.Kinds)
+	}
 	out.Limit = intValue(m["limit"], 1)
 	if out.Limit <= 0 {
 		out.Limit = 1
@@ -4836,6 +4872,77 @@ func (c *eventRelationCache) loadRankedReferencedBy(ctx context.Context, r *reso
 	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
 }
 
+// loadDirectRepliesRankedBatch serves the thread reply list from the precomputed
+// note_reply_edges + note_*_counts tables (via Store.RankedDirectReplyIDs), in
+// ranked order, hydrating once for the whole page. It replaces the live
+// reverse-reference ranking when via.DirectReplies + a precomputed sort are set.
+func (c *eventRelationCache) loadDirectRepliesRankedBatch(ctx context.Context, r *resolver, input rankedReverseReferenceBatchInput) (map[string][]chstore.EventView, error) {
+	out := make(map[string][]chstore.EventView, len(c.events))
+	for _, event := range c.events {
+		out[event.ID] = nil
+	}
+
+	targetToParentIDs := make(map[string][]string, len(c.events))
+	targets := make([]string, 0, len(c.events))
+	seenTargets := map[string]struct{}{}
+	for _, event := range c.events {
+		target := targetValue(event, input.Target)
+		if input.Via.Value != "" {
+			target = input.Via.Value
+		}
+		if target == "" {
+			continue
+		}
+		targetToParentIDs[target] = append(targetToParentIDs[target], event.ID)
+		if _, ok := seenTargets[target]; ok {
+			continue
+		}
+		seenTargets[target] = struct{}{}
+		targets = append(targets, target)
+	}
+	if len(targets) == 0 {
+		return out, nil
+	}
+
+	idsByTarget := make(map[string][]string, len(targets))
+	allIDs := make([]string, 0)
+	seenIDs := map[string]struct{}{}
+	for _, target := range targets {
+		ids, err := c.store.RankedDirectReplyIDs(ctx, target, input.DirectReplySort, input.Limit, input.Offset)
+		if err != nil {
+			return nil, err
+		}
+		idsByTarget[target] = ids
+		for _, id := range ids {
+			if _, ok := seenIDs[id]; ok {
+				continue
+			}
+			seenIDs[id] = struct{}{}
+			allIDs = append(allIDs, id)
+		}
+	}
+	if len(allIDs) == 0 {
+		return out, nil
+	}
+
+	fetched, err := c.queryEventsByIDs(ctx, r, allIDs)
+	if err != nil {
+		return nil, err
+	}
+	for _, target := range targets {
+		ordered := make([]chstore.EventView, 0, len(idsByTarget[target]))
+		for _, id := range idsByTarget[target] {
+			if event, ok := fetched[id]; ok {
+				ordered = append(ordered, event)
+			}
+		}
+		for _, parentID := range targetToParentIDs[target] {
+			out[parentID] = ordered
+		}
+	}
+	return out, nil
+}
+
 func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.EventView, error) {
 	out := make(map[string][]chstore.EventView, len(c.events))
 	for _, event := range c.events {
@@ -4848,6 +4955,14 @@ func (c *eventRelationCache) loadRankedReferencedByBatch(ctx context.Context, r 
 	}
 	if input.Events.Empty {
 		return out, nil
+	}
+
+	// Database-first thread reply list: when the request asks for direct replies
+	// ranked by an engagement type with a precomputed table, serve the ranked set
+	// from note_reply_edges + note_*_counts (RankedDirectReplyIDs) — no live
+	// reverse-reference aggregation per thread open.
+	if input.Via.DirectReplies && input.DirectReplySort != "" {
+		return c.loadDirectRepliesRankedBatch(ctx, r, input)
 	}
 
 	targetToParentIDs := make(map[string][]string, len(c.events))
@@ -5046,6 +5161,61 @@ type authoredReplyChainState struct {
 	done           bool
 }
 
+// loadAuthoredReplyChainsPrecomputed serves each source event's author self-reply
+// chain from Store.AuthoredReplyChain (note_reply_edges walk), hydrating once.
+func (c *eventRelationCache) loadAuthoredReplyChainsPrecomputed(ctx context.Context, r *resolver, input authoredReplyChainInput) (map[string][]chstore.EventView, error) {
+	out := make(map[string][]chstore.EventView, len(c.events))
+	for _, event := range c.events {
+		out[event.ID] = nil
+	}
+	maxDepth := input.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 8
+	}
+
+	chainByEvent := make(map[string][]string, len(c.events))
+	allIDs := make([]string, 0)
+	seen := map[string]struct{}{}
+	for _, event := range c.events {
+		if event.PubKey == "" {
+			continue
+		}
+		ids, err := c.store.AuthoredReplyChain(ctx, event.ID, event.PubKey, maxDepth)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		chainByEvent[event.ID] = ids
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			allIDs = append(allIDs, id)
+		}
+	}
+	if len(allIDs) == 0 {
+		return out, nil
+	}
+
+	fetched, err := c.queryEventsByIDs(ctx, r, allIDs)
+	if err != nil {
+		return nil, err
+	}
+	for eventID, ids := range chainByEvent {
+		ordered := make([]chstore.EventView, 0, len(ids))
+		for _, id := range ids {
+			if event, ok := fetched[id]; ok {
+				ordered = append(ordered, event)
+			}
+		}
+		out[eventID] = ordered
+	}
+	return out, nil
+}
+
 func (c *eventRelationCache) loadAuthoredReplyChainsBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.EventView, error) {
 	out := make(map[string][]chstore.EventView, len(c.events))
 	for _, event := range c.events {
@@ -5058,6 +5228,13 @@ func (c *eventRelationCache) loadAuthoredReplyChainsBatch(ctx context.Context, r
 	}
 	if input.Events.Empty {
 		return out, nil
+	}
+
+	// Database-first: the common authorReplies case (each source event's own
+	// author, via 'e') is the author's self-reply chain — walk the precomputed
+	// note_reply_edges instead of a per-depth live event_tags scan.
+	if input.Via.Key == "e" && input.UseSourceEventAuthor && len(input.Events.PubKeys) == 0 {
+		return c.loadAuthoredReplyChainsPrecomputed(ctx, r, input)
 	}
 
 	states := make(map[string]*authoredReplyChainState, len(c.events))

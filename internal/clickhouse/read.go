@@ -525,6 +525,154 @@ func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, 
 	return out, rows.Err()
 }
 
+// directReplySort maps a thread reply sort to the precomputed count table that
+// ranks it. The table/column/merge are fixed (never request input), so they are
+// safe to format into SQL; the parent id is always a bind param.
+type directReplySort struct {
+	table  string
+	column string
+	merge  string
+}
+
+var directReplySorts = map[string]directReplySort{
+	"likes":   {"note_like_counts", "likes", "uniqMerge"},
+	"reposts": {"note_repost_counts", "reposts", "uniqMerge"},
+	"replies": {"note_direct_reply_counts", "replies", "uniqMerge"},
+	"zaps":    {"note_zap_totals", "sats", "sumMerge"},
+}
+
+// RankedDirectReplySupported reports whether a sort key has a precomputed ranking
+// path (so the GraphQL resolver can decide to skip the live aggregation).
+func RankedDirectReplySupported(sort string) bool {
+	if sort == "" || sort == "new" {
+		return true
+	}
+	_, ok := directReplySorts[sort]
+	return ok
+}
+
+// RankedDirectReplyIDs returns the DIRECT (NIP-10/22) replies to parentID ordered
+// by a PRECOMPUTED engagement count (likes/reposts/replies/zaps) or by recency
+// ("new"/""). It reads only precomputed tables — note_reply_edges for the reply
+// set + the matching note_*_counts table for the sort — so the thread reply list
+// ranks without a live aggregation. A LEFT JOIN keeps replies with zero engagement
+// (recency tiebreak), so the full reply set is returned, ranked.
+func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error) {
+	if len(parentID) != 64 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 5000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	spec, ranked := directReplySorts[sort]
+	var query string
+	var args []any
+	if !ranked {
+		// Recency: the edge table already carries the reply created_at.
+		query = `
+			SELECT child_id
+			FROM note_reply_edges
+			WHERE parent_id = ?
+			GROUP BY child_id
+			ORDER BY max(created_at) DESC, child_id DESC
+			LIMIT ? OFFSET ?`
+		args = []any{parentID, limit, offset}
+	} else {
+		query = fmt.Sprintf(`
+			SELECT e.child_id
+			FROM (
+				SELECT child_id, max(created_at) AS created_at
+				FROM note_reply_edges WHERE parent_id = ? GROUP BY child_id
+			) e
+			LEFT JOIN (
+				SELECT target_event_id, %s(%s) AS c
+				FROM %s
+				WHERE target_event_id IN (SELECT child_id FROM note_reply_edges WHERE parent_id = ?)
+				GROUP BY target_event_id
+			) m ON m.target_event_id = e.child_id
+			ORDER BY ifNull(m.c, 0) DESC, e.created_at DESC, e.child_id DESC
+			LIMIT ? OFFSET ?`, spec.merge, spec.column, spec.table)
+		args = []any{parentID, parentID, limit, offset}
+	}
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// AuthoredReplyChain walks the precomputed direct-reply edges (note_reply_edges)
+// down from rootID, following the single EARLIEST direct reply authored by
+// `author` at each level — the author's self-reply chain that the live
+// authoredReplyChain field computed with a per-depth event_tags scan. Each step is
+// an indexed parent_id lookup; bounded by maxDepth.
+func (s *Store) AuthoredReplyChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error) {
+	if len(rootID) != 64 || len(author) != 64 {
+		return nil, nil
+	}
+	if maxDepth <= 0 || maxDepth > 64 {
+		maxDepth = 8
+	}
+	chain := make([]string, 0, maxDepth)
+	visited := map[string]struct{}{rootID: {}}
+	current := rootID
+	for depth := 0; depth < maxDepth; depth++ {
+		child, err := s.earliestAuthoredChild(ctx, current, author)
+		if err != nil {
+			return nil, err
+		}
+		if child == "" {
+			break
+		}
+		if _, seen := visited[child]; seen {
+			break
+		}
+		visited[child] = struct{}{}
+		chain = append(chain, child)
+		current = child
+	}
+	return chain, nil
+}
+
+// earliestAuthoredChild returns the earliest direct reply to parentID authored by
+// `author` (matching bestAuthoredDirectChild's selection), or "" when none.
+func (s *Store) earliestAuthoredChild(ctx context.Context, parentID, author string) (string, error) {
+	rows, err := s.conn.Query(ctx, `
+		SELECT child_id
+		FROM note_reply_edges
+		WHERE parent_id = ? AND child_pubkey = ?
+		GROUP BY child_id
+		ORDER BY min(created_at) ASC, child_id ASC
+		LIMIT 1
+	`, parentID, author)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return "", rows.Err()
+	}
+	var child string
+	if err := rows.Scan(&child); err != nil {
+		return "", err
+	}
+	return child, rows.Err()
+}
+
 // FollowedReplies returns, for each parent in parentIDs, the single best reply
 // authored by someone the viewer follows — the precomputed, BATCHED replacement
 // for the per-node followedReply (rankedReferencedBy over the viewer's follow list)
