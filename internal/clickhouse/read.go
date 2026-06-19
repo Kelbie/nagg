@@ -377,10 +377,14 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		+ ? * contribution_quality
 		+ ? * pow(0.5, greatest(toUnixTimestamp(now()) - toUnixTimestamp(created_at), 0) / ?)`
 
-	where := "WHERE created_at >= toDateTime(?)"
+	// Filters run in the inner (pre-GROUP BY) WHERE. created_at and pubkey are
+	// qualified with the table name so they bind to the raw columns rather than the
+	// argMax/max aliases of the same name in the SELECT (ClickHouse's analyzer would
+	// otherwise reject "max(created_at) found in WHERE").
+	where := "WHERE note_rank_features.created_at >= toDateTime(?)"
 	args = append(args, in.Since)
 	if in.Until > 0 {
-		where += " AND created_at <= toDateTime(?)"
+		where += " AND note_rank_features.created_at <= toDateTime(?)"
 		args = append(args, in.Until)
 	}
 	if len(in.Kinds) > 0 {
@@ -391,14 +395,36 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		args = append(args, in.ExcludeIDs)
 	}
 	if len(in.ExcludePubKeys) > 0 {
-		where += " AND pubkey NOT IN (?)"
+		where += " AND note_rank_features.pubkey NOT IN (?)"
 		args = append(args, in.ExcludePubKeys)
 	}
 
+	// Collapse the ReplacingMergeTree(computed_at) duplicates with argMax/GROUP BY
+	// instead of FINAL. The rollup re-inserts the whole target set each tick, so
+	// note_rank_features carries several unmerged versions per event until a
+	// background merge; FINAL merges every part on each read, whereas a hash
+	// aggregation over the (partition-pruned) recent window does not. The score
+	// expression and bind order are unchanged — only the source is grouped.
 	query := fmt.Sprintf(`
 		SELECT event_id, pubkey, (%s) AS score
-		FROM note_rank_features FINAL
-		%s
+		FROM (
+			SELECT
+				event_id,
+				argMax(pubkey, computed_at) AS pubkey,
+				max(created_at) AS created_at,
+				argMax(real_likes, computed_at) AS real_likes,
+				argMax(real_replies, computed_at) AS real_replies,
+				argMax(real_reposts, computed_at) AS real_reposts,
+				argMax(real_quotes, computed_at) AS real_quotes,
+				argMax(real_zap_sats, computed_at) AS real_zap_sats,
+				argMax(real_actors, computed_at) AS real_actors,
+				argMax(author_followers, computed_at) AS author_followers,
+				argMax(author_vertex_score, computed_at) AS author_vertex_score,
+				argMax(contribution_quality, computed_at) AS contribution_quality
+			FROM note_rank_features
+			%s
+			GROUP BY event_id
+		)
 		ORDER BY score DESC, created_at DESC, event_id DESC
 		LIMIT %d
 	`, score, where, in.Limit)
