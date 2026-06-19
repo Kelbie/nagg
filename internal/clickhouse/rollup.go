@@ -242,8 +242,14 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 	version := sanitizeVersion(th.Version)
 	// Each metric subquery counts only scored actors and excludes the target's
 	// own author (self-engagement). The author per target comes from `authors`.
+	// Explicit column list: real_actors was added to note_engagement_real via a
+	// later ALTER ADD COLUMN, so it is physically LAST in the table while the SELECT
+	// emits it mid-row. Without this list the positional INSERT shifts every column
+	// after it (threshold_version → computed_at), failing with a DateTime parse
+	// error (code 41) on every tick — which is why the feature table went stale.
 	return fmt.Sprintf(`
 		INSERT INTO note_engagement_real
+			(event_id, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, threshold_version, computed_at)
 		WITH
 			target_ids AS (%s),
 			scored AS (%s),
@@ -385,8 +391,12 @@ func (s *Store) RecomputeUserStats(ctx context.Context, since time.Time, limit i
 func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
 	targets := targetIDsSubquery(since, limit)
 	version := sanitizeVersion(th.Version)
+	// Explicit column list — see buildEngagementRealSQL: real_actors is physically
+	// last (ALTER-appended) but emitted mid-row, so a positional INSERT misaligns
+	// every following column and fails. Mapping by name is order-independent.
 	return fmt.Sprintf(`
 		INSERT INTO note_rank_features
+			(event_id, pubkey, kind, created_at, raw_likes, raw_reposts, raw_replies, raw_quotes, raw_zaps, raw_zap_sats, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)
 		WITH target_ids AS (%s)
 		SELECT
 			n.id AS event_id,

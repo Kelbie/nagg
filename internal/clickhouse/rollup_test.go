@@ -80,6 +80,8 @@ func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing
 	sql := buildEngagementRealSQL(since, 500, Thresholds{MinActorScore: 0.42, Version: "v3"}, computedAt)
 	for _, want := range []string{
 		"INSERT INTO note_engagement_real",
+		// explicit column list (real_actors is ALTER-appended / physically last)
+		"(event_id, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, threshold_version, computed_at)",
 		"sc >= 0.42",                          // threshold gate
 		"et.pubkey IN (scored)",               // only scored actors
 		"uniqExactIf(et.pubkey, et.pubkey != a2.author)", // self-exclusion
@@ -116,6 +118,8 @@ func TestBuildRankFeaturesSQL_AssemblesRawAndReal(t *testing.T) {
 	sql := buildRankFeaturesSQL(time.Unix(1_700_000_000, 0), 50000, Thresholds{Version: "v1"}, time.Unix(1_700_002_000, 0))
 	for _, want := range []string{
 		"INSERT INTO note_rank_features",
+		// explicit column list maps by name (real_actors is physically last)
+		"real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)",
 		"uniqMerge(likes)",
 		"note_direct_reply_counts",                  // direct replies, not any-e-tag
 		"uniqMerge(quotes)",
