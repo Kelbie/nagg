@@ -51,6 +51,9 @@ var userAggregatesMigration string
 //go:embed migrations/011_rank_features.sql
 var rankFeaturesMigration string
 
+//go:embed migrations/012_feature_ttl.sql
+var featureTTLMigration string
+
 type Config struct {
 	Addr         string
 	Database     string
@@ -398,6 +401,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	migCtx := ch.Context(ctx, ch.WithSettings(ch.Settings{
 		"max_threads":        1,
 		"max_insert_threads": 1,
+		// MODIFY TTL (012) must not materialize over the whole table at deploy time;
+		// let background merges apply it so the migrate stays a metadata change.
+		"materialize_ttl_after_modify": 0,
 	}))
 	for _, migration := range embeddedMigrations() {
 		for _, stmt := range splitSQLStatements(migration) {

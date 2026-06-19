@@ -75,6 +75,7 @@ func embeddedMigrations() []string {
 		engagementRealMigration,
 		userAggregatesMigration,
 		rankFeaturesMigration,
+		featureTTLMigration,
 	}
 }
 
