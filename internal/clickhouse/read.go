@@ -527,6 +527,60 @@ func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, 
 	return out, rows.Err()
 }
 
+// FollowedReplies returns, for each parent in parentIDs, the single best reply
+// authored by someone the viewer follows — the precomputed, BATCHED replacement
+// for the per-node followedReply (rankedReferencedBy over the viewer's follow list)
+// the feed used to embed. "Best" = most-liked (note_like_counts), tie-broken by
+// recency. Reads only precomputed tables: note_reply_edges (NIP-10/22 direct
+// replies), note_like_counts (ranking), user_contacts_latest (the viewer's
+// replaceable-aware follow set) — no live aggregation, one round-trip for the page.
+func (s *Store) FollowedReplies(ctx context.Context, viewerPubkey string, parentIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(parentIDs))
+	if len(viewerPubkey) != 64 || len(parentIDs) == 0 {
+		return out, nil
+	}
+	parentIDs = uniqueStrings(parentIDs)
+	// sort_key packs likes into the high 32 bits and the reply timestamp into the
+	// low 32 bits, so argMax picks the most-liked reply, tie-broken by newest.
+	rows, err := s.conn.Query(ctx, `
+		SELECT parent_id, argMax(child_id, sort_key) AS reply_id
+		FROM (
+			SELECT
+				e.parent_id AS parent_id,
+				e.child_id  AS child_id,
+				bitShiftLeft(toUInt64(ifNull(lc.likes, 0)), 32) + toUInt64(toUnixTimestamp(e.created_at)) AS sort_key
+			FROM note_reply_edges e
+			LEFT JOIN (
+				SELECT target_event_id, uniqMerge(likes) AS likes
+				FROM note_like_counts
+				WHERE target_event_id IN (
+					SELECT child_id FROM note_reply_edges WHERE parent_id IN (?)
+				)
+				GROUP BY target_event_id
+			) lc ON e.child_id = lc.target_event_id
+			WHERE e.parent_id IN (?)
+			  AND e.child_pubkey IN (
+				SELECT arrayJoin(contacts) FROM user_contacts_latest FINAL WHERE pubkey = ?
+			  )
+		)
+		GROUP BY parent_id
+	`, parentIDs, parentIDs, viewerPubkey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var parentID, replyID string
+		if err := rows.Scan(&parentID, &replyID); err != nil {
+			return nil, err
+		}
+		if replyID != "" {
+			out[parentID] = replyID
+		}
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, error) {
 	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
 	if err != nil {

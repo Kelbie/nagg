@@ -48,6 +48,11 @@ type fakeStore struct {
 	featureRankInputs           []chstore.FeatureRankInput
 	directReplyIDs              map[string][]string
 	directReplyParents          []string
+	noteStatsRows               map[string]chstore.NoteStats
+	noteStatsInputs             [][]string
+	followedReplyRows           map[string]string
+	followedReplyViewer         string
+	followedReplyParents        [][]string
 }
 
 type latestEventsInput struct {
@@ -353,6 +358,27 @@ func (s *fakeStore) RankedEventsByFeatures(_ context.Context, input chstore.Feat
 func (s *fakeStore) DirectReplyIDs(_ context.Context, parentID string) ([]string, error) {
 	s.directReplyParents = append(s.directReplyParents, parentID)
 	return s.directReplyIDs[parentID], nil
+}
+
+func (s *fakeStore) NoteStats(_ context.Context, ids []string) (map[string]chstore.NoteStats, error) {
+	s.noteStatsInputs = append(s.noteStatsInputs, ids)
+	out := make(map[string]chstore.NoteStats, len(ids))
+	for _, id := range ids {
+		out[id] = s.noteStatsRows[id]
+	}
+	return out, nil
+}
+
+func (s *fakeStore) FollowedReplies(_ context.Context, viewer string, parentIDs []string) (map[string]string, error) {
+	s.followedReplyViewer = viewer
+	s.followedReplyParents = append(s.followedReplyParents, parentIDs)
+	out := make(map[string]string, len(parentIDs))
+	for _, id := range parentIDs {
+		if reply, ok := s.followedReplyRows[id]; ok {
+			out[id] = reply
+		}
+	}
+	return out, nil
 }
 
 // forYouTerms mirrors the nagg-ts For-You recipe terms (rank.ts engagementRankTerms
@@ -935,6 +961,121 @@ func TestEventsQueryAcceptsContentSearch(t *testing.T) {
 	}
 	if got := nodes[0].(map[string]any)["content"]; got != `{"name":"calle"}` {
 		t.Fatalf("content = %v", got)
+	}
+}
+
+func TestNoteStatsFieldBatchesPrecomputedCounts(t *testing.T) {
+	idA, idB := testHex("a"), testHex("d")
+	store := &fakeStore{
+		events: [][]chstore.EventView{{
+			{ID: idA, PubKey: testPubkey, Kind: 1, CreatedAt: time.Unix(2, 0), Tags: [][]string{}},
+			{ID: idB, PubKey: testHex("e"), Kind: 1, CreatedAt: time.Unix(1, 0), Tags: [][]string{}},
+		}},
+		noteStatsRows: map[string]chstore.NoteStats{
+			idA: {LikeCount: 5, RepostCount: 2, ReplyCount: 3, SatsZapped: 1000, RealLikeCount: 4},
+			idB: {LikeCount: 9, RepostCount: 0, ReplyCount: 1, SatsZapped: 50, RealLikeCount: 7},
+		},
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:10}) {
+				nodes { id noteStats { likes reposts replies zapSats realLikes } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+
+	// One batched NoteStats call covering BOTH node ids — not one per node.
+	if len(store.noteStatsInputs) != 1 {
+		t.Fatalf("expected 1 batched NoteStats call, got %d: %+v", len(store.noteStatsInputs), store.noteStatsInputs)
+	}
+	if !containsString(store.noteStatsInputs[0], idA) || !containsString(store.noteStatsInputs[0], idB) {
+		t.Fatalf("batched call missing ids: %+v", store.noteStatsInputs[0])
+	}
+
+	nodes := result.Data.(map[string]any)["events"].(map[string]any)["nodes"].([]any)
+	if len(nodes) != 2 {
+		t.Fatalf("nodes len = %d", len(nodes))
+	}
+	byID := map[string]map[string]any{}
+	for _, n := range nodes {
+		node := n.(map[string]any)
+		byID[node["id"].(string)] = node["noteStats"].(map[string]any)
+	}
+	if got := byID[idA]; got["likes"] != 5 || got["reposts"] != 2 || got["replies"] != 3 || got["zapSats"] != 1000 || got["realLikes"] != 4 {
+		t.Fatalf("idA noteStats = %+v", got)
+	}
+	if got := byID[idB]; got["likes"] != 9 || got["replies"] != 1 || got["realLikes"] != 7 {
+		t.Fatalf("idB noteStats = %+v", got)
+	}
+}
+
+func TestFollowedReplyFieldBatchesPrecomputedReplies(t *testing.T) {
+	parentA, parentB := testHex("a"), testHex("b")
+	replyID := testHex("c")
+	viewer := testHex("e") // 64-hex viewer pubkey
+	store := &fakeStore{
+		events: [][]chstore.EventView{
+			{
+				{ID: parentA, PubKey: testPubkey, Kind: 1, CreatedAt: time.Unix(3, 0), Tags: [][]string{}},
+				{ID: parentB, PubKey: testHex("d"), Kind: 1, CreatedAt: time.Unix(2, 0), Tags: [][]string{}},
+			},
+			// Second QueryEvents call (the followed-reply hydration) returns the reply.
+			{
+				{ID: replyID, PubKey: testHex("f"), Kind: 1, CreatedAt: time.Unix(1, 0), Tags: [][]string{}},
+			},
+		},
+		followedReplyRows: map[string]string{parentA: replyID}, // only parentA has a followed reply
+	}
+	schema, err := NewSchema(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := graphql.Do(graphql.Params{
+		Schema: schema,
+		RequestString: `query {
+			events(input:{kinds:[1], limit:10}) {
+				nodes { id followedReply(viewer:"` + viewer + `") { nodes { id pubkey } } }
+			}
+		}`,
+		Context: context.Background(),
+	})
+	if len(result.Errors) > 0 {
+		t.Fatalf("graphql errors = %+v", result.Errors)
+	}
+
+	// One batched FollowedReplies call for the whole page (both parents, one viewer).
+	if len(store.followedReplyParents) != 1 {
+		t.Fatalf("expected 1 batched FollowedReplies call, got %d", len(store.followedReplyParents))
+	}
+	if store.followedReplyViewer != viewer {
+		t.Fatalf("viewer = %q, want %q", store.followedReplyViewer, viewer)
+	}
+	if !containsString(store.followedReplyParents[0], parentA) || !containsString(store.followedReplyParents[0], parentB) {
+		t.Fatalf("batched call missing parents: %+v", store.followedReplyParents[0])
+	}
+
+	nodes := result.Data.(map[string]any)["events"].(map[string]any)["nodes"].([]any)
+	byID := map[string][]any{}
+	for _, n := range nodes {
+		node := n.(map[string]any)
+		byID[node["id"].(string)] = node["followedReply"].(map[string]any)["nodes"].([]any)
+	}
+	if got := byID[parentA]; len(got) != 1 || got[0].(map[string]any)["id"] != replyID {
+		t.Fatalf("parentA followedReply = %+v", got)
+	}
+	if got := byID[parentB]; len(got) != 0 {
+		t.Fatalf("parentB should have no followed reply, got %+v", got)
 	}
 }
 

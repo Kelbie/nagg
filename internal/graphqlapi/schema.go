@@ -42,6 +42,8 @@ type Store interface {
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	RankedEventsByFeatures(context.Context, chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error)
 	DirectReplyIDs(context.Context, string) ([]string, error)
+	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
+	FollowedReplies(context.Context, string, []string) (map[string]string, error)
 }
 
 var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
@@ -220,6 +222,10 @@ type eventRelationCache struct {
 	selectedConnections map[string]eventConnectionCaches
 	rankedConnections   map[string]eventConnectionCaches
 	authoredConnections map[string]eventConnectionCaches
+	noteStats           map[string]chstore.NoteStats
+	noteStatsLoaded     bool
+	followedReplies     map[string]map[string][]chstore.EventView
+	followedConnections map[string]eventConnectionCaches
 }
 
 type eventConnectionCaches struct {
@@ -250,6 +256,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 
 	var eventConnectionType *graphql.Object
 	var aggregationResultType *graphql.Object
+	var noteStatsType *graphql.Object
 	var tagFilterType *graphql.InputObject
 	var latestEventTagPubkeySourceInputType *graphql.InputObject
 	var pubkeySourceInputType *graphql.InputObject
@@ -376,6 +383,42 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 							return map[string]any{"rows": []chstore.AggregateRow{}}, nil
 						}
 						return r.eventAggregateReferencedBy(p.Context, event, p.Args["input"])
+					},
+				},
+				"noteStats": &graphql.Field{
+					Type: graphql.NewNonNull(noteStatsType),
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						node, ok := asEventNode(p.Source)
+						if ok && node.eventRelations != nil {
+							return node.eventRelations.loadNoteStats(p.Context, r, node.event)
+						}
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return chstore.NoteStats{}, nil
+						}
+						return r.eventNoteStats(p.Context, event)
+					},
+				},
+				// followedReply is the precomputed, BATCHED "a person you follow
+				// replied" preview: the single most-liked direct reply to this event
+				// authored by someone `viewer` follows. Served from note_reply_edges +
+				// note_like_counts + the viewer's user_contacts_latest follow set in one
+				// round-trip for the whole page, replacing the per-node rankedReferencedBy
+				// over the 2000-entry follow list the feed used to embed.
+				"followedReply": &graphql.Field{
+					Type: graphql.NewNonNull(eventConnectionType),
+					Args: graphql.FieldConfigArgument{"viewer": &graphql.ArgumentConfig{Type: graphql.NewNonNull(graphql.String)}},
+					Resolve: func(p graphql.ResolveParams) (any, error) {
+						viewer, _ := p.Args["viewer"].(string)
+						node, ok := asEventNode(p.Source)
+						if ok && node.eventRelations != nil {
+							return node.eventRelations.loadFollowedReply(p.Context, r, node.event, viewer)
+						}
+						event, ok := eventFromSource(p.Source)
+						if !ok {
+							return eventConnectionSource{}, nil
+						}
+						return r.eventFollowedReply(p.Context, event, viewer)
 					},
 				},
 			}
@@ -641,6 +684,23 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		Name: "AggregationResult",
 		Fields: graphql.Fields{
 			"rows": &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(aggregateRowType)))},
+		},
+	})
+	// noteStatsType exposes the PRECOMPUTED per-event engagement counts (read from
+	// the rollup count tables via Store.NoteStats) so a feed page does not need a
+	// live aggregateReferencedBy per node. `real*` are the Vertex-resistant counts
+	// (distinct engagers whose saved Vertex score clears the rollup threshold).
+	noteStatsType = graphql.NewObject(graphql.ObjectConfig{
+		Name: "NoteStats",
+		Fields: graphql.Fields{
+			"likes":       &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.LikeCount) })},
+			"reposts":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.RepostCount) })},
+			"replies":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.ReplyCount) })},
+			"zapSats":     &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.SatsZapped) })},
+			"realLikes":   &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.RealLikeCount) })},
+			"realReposts": &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.RealRepostCount) })},
+			"realReplies": &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.RealReplyCount) })},
+			"realZapSats": &graphql.Field{Type: graphql.NewNonNull(graphql.Int), Resolve: noteStatField(func(s chstore.NoteStats) any { return int(s.RealSatsZapped) })},
 		},
 	})
 	aggregationInputType := graphql.NewInputObject(graphql.InputObjectConfig{
@@ -1303,6 +1363,36 @@ func (r *resolver) eventAggregateReferencedBy(ctx context.Context, event chstore
 		return nil, err
 	}
 	return map[string]any{"rows": aggregateReferencedRows(events, dimensions, metrics, first, orderBy)}, nil
+}
+
+// eventNoteStats is the un-batched fallback for the noteStats field (used when
+// the event is not part of a request cache, e.g. a single-event query).
+func (r *resolver) eventNoteStats(ctx context.Context, event chstore.EventView) (chstore.NoteStats, error) {
+	stats, err := r.store.NoteStats(ctx, []string{event.ID})
+	if err != nil {
+		return chstore.NoteStats{}, err
+	}
+	return stats[event.ID], nil
+}
+
+// eventFollowedReply is the un-batched fallback for the followedReply field.
+func (r *resolver) eventFollowedReply(ctx context.Context, event chstore.EventView, viewer string) (eventConnectionSource, error) {
+	if viewer == "" {
+		return eventConnectionSource{}, nil
+	}
+	byParent, err := r.store.FollowedReplies(ctx, viewer, []string{event.ID})
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	replyID, ok := byParent[event.ID]
+	if !ok {
+		return eventConnectionSource{}, nil
+	}
+	events, err := r.queryEvents(ctx, chstore.EventQueryInput{IDs: []string{replyID}, Limit: 1})
+	if err != nil {
+		return eventConnectionSource{}, err
+	}
+	return newEventConnection(r.store, events), nil
 }
 
 func aggregateReferencedRows(events []chstore.EventView, dimensions []genericDimension, metrics []genericMetric, first int, orderBy string) []chstore.AggregateRow {
@@ -3941,6 +4031,18 @@ func eventField(fn func(chstore.EventView) any) graphql.FieldResolveFn {
 	}
 }
 
+// noteStatField resolves one field of the noteStatsType from a chstore.NoteStats
+// source (the value the eventType.noteStats resolver returns).
+func noteStatField(fn func(chstore.NoteStats) any) graphql.FieldResolveFn {
+	return func(p graphql.ResolveParams) (any, error) {
+		stats, ok := p.Source.(chstore.NoteStats)
+		if !ok {
+			return 0, nil
+		}
+		return fn(stats), nil
+	}
+}
+
 func profileSearchResultField(fn func(profileSearchResultNode) any) graphql.FieldResolveFn {
 	return func(p graphql.ResolveParams) (any, error) {
 		switch node := p.Source.(type) {
@@ -4136,6 +4238,9 @@ func newEventRelationCacheWithPubkeyScoreMinFollowers(store Store, events []chst
 		selectedConnections:     map[string]eventConnectionCaches{},
 		rankedConnections:       map[string]eventConnectionCaches{},
 		authoredConnections:     map[string]eventConnectionCaches{},
+		noteStats:               map[string]chstore.NoteStats{},
+		followedReplies:         map[string]map[string][]chstore.EventView{},
+		followedConnections:     map[string]eventConnectionCaches{},
 	}
 }
 
@@ -4181,6 +4286,155 @@ func (c *eventRelationCache) loadAggregateReferencedBy(ctx context.Context, r *r
 		cached, _ = value.(map[string][]chstore.AggregateRow)
 	}
 	return map[string]any{"rows": cached[event.ID]}, nil
+}
+
+// loadNoteStats returns the precomputed engagement counts for one event, loading
+// Store.NoteStats ONCE for every parent node in this request's cache (mirroring
+// loadAggregateReferencedBy's singleflight batch). This replaces the four live
+// aggregateReferencedBy/node the feed used to embed with a single indexed read.
+func (c *eventRelationCache) loadNoteStats(ctx context.Context, r *resolver, event chstore.EventView) (chstore.NoteStats, error) {
+	if c == nil {
+		return r.eventNoteStats(ctx, event)
+	}
+	c.mu.Lock()
+	if c.noteStatsLoaded {
+		stats := c.noteStats[event.ID]
+		c.mu.Unlock()
+		return stats, nil
+	}
+	c.mu.Unlock()
+
+	value, err, _ := c.group.Do("noteStats", func() (any, error) {
+		c.mu.Lock()
+		if c.noteStatsLoaded {
+			existing := c.noteStats
+			c.mu.Unlock()
+			return existing, nil
+		}
+		c.mu.Unlock()
+
+		started := time.Now()
+		ids := make([]string, 0, len(c.events))
+		for _, ev := range c.events {
+			ids = append(ids, ev.ID)
+		}
+		loaded, err := c.store.NoteStats(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+
+		c.mu.Lock()
+		c.noteStats = loaded
+		c.noteStatsLoaded = true
+		c.mu.Unlock()
+
+		slog.Debug(
+			"graphql batched note stats loaded",
+			"parents", len(c.events),
+			"results", len(loaded),
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
+		return loaded, nil
+	})
+	if err != nil {
+		return chstore.NoteStats{}, err
+	}
+	loaded, _ := value.(map[string]chstore.NoteStats)
+	return loaded[event.ID], nil
+}
+
+// loadFollowedReply returns the precomputed followed-reply preview for one event,
+// loading Store.FollowedReplies ONCE for every parent node in this request's cache
+// (singleflight, keyed by viewer) and hydrating the chosen reply ids in one batch.
+func (c *eventRelationCache) loadFollowedReply(ctx context.Context, r *resolver, event chstore.EventView, viewer string) (eventConnectionSource, error) {
+	if c == nil {
+		return r.eventFollowedReply(ctx, event, viewer)
+	}
+	key := "followedReply:" + viewer
+
+	c.mu.Lock()
+	cached, ok := c.followedReplies[key]
+	connectionCaches := c.followedConnections[key]
+	c.mu.Unlock()
+	if !ok {
+		value, err, _ := c.group.Do(key, func() (any, error) {
+			c.mu.Lock()
+			if existing, exists := c.followedReplies[key]; exists {
+				connectionCaches = c.followedConnections[key]
+				c.mu.Unlock()
+				return existing, nil
+			}
+			c.mu.Unlock()
+
+			started := time.Now()
+			loaded, err := c.loadFollowedReplyBatch(ctx, r, viewer)
+			if err != nil {
+				return nil, err
+			}
+
+			c.mu.Lock()
+			c.followedReplies[key] = loaded
+			c.followedConnections[key] = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, loaded, c.pubkeyScoreMinFollowers)
+			c.mu.Unlock()
+
+			slog.Debug(
+				"graphql batched followed reply loaded",
+				"parents", len(c.events),
+				"results", eventViewMapLen(loaded),
+				"duration_ms", time.Since(started).Milliseconds(),
+			)
+			return loaded, nil
+		})
+		if err != nil {
+			return eventConnectionSource{}, err
+		}
+		cached, _ = value.(map[string][]chstore.EventView)
+		c.mu.Lock()
+		connectionCaches = c.followedConnections[key]
+		c.mu.Unlock()
+	}
+	if connectionCaches.relations == nil || connectionCaches.eventRelations == nil {
+		connectionCaches = newEventConnectionCachesWithPubkeyScoreMinFollowers(c.store, cached, c.pubkeyScoreMinFollowers)
+		c.mu.Lock()
+		c.followedConnections[key] = connectionCaches
+		c.mu.Unlock()
+	}
+	return newEventConnectionWithCaches(cached[event.ID], connectionCaches.relations, connectionCaches.eventRelations), nil
+}
+
+func (c *eventRelationCache) loadFollowedReplyBatch(ctx context.Context, r *resolver, viewer string) (map[string][]chstore.EventView, error) {
+	out := make(map[string][]chstore.EventView, len(c.events))
+	for _, event := range c.events {
+		out[event.ID] = nil
+	}
+	if viewer == "" {
+		return out, nil
+	}
+	parentIDs := make([]string, 0, len(c.events))
+	for _, event := range c.events {
+		parentIDs = append(parentIDs, event.ID)
+	}
+	byParent, err := c.store.FollowedReplies(ctx, viewer, parentIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(byParent) == 0 {
+		return out, nil
+	}
+	replyIDs := make([]string, 0, len(byParent))
+	for _, replyID := range byParent {
+		replyIDs = append(replyIDs, replyID)
+	}
+	fetched, err := c.queryEventsByIDs(ctx, r, replyIDs)
+	if err != nil {
+		return nil, err
+	}
+	for parentID, replyID := range byParent {
+		if reply, ok := fetched[replyID]; ok {
+			out[parentID] = []chstore.EventView{reply}
+		}
+	}
+	return out, nil
 }
 
 func (c *eventRelationCache) loadAggregateReferencedByBatch(ctx context.Context, r *resolver, raw any) (map[string][]chstore.AggregateRow, error) {
