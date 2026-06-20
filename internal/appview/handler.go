@@ -222,6 +222,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/mint/discover", h.discoverMints, true},
 		{"/nostr/social-graph", h.socialGraph, true},
 		{"/nostr/own/", h.ownHistory, true},
+		{"/nostr/notifications/seen", h.notificationsSeen, false},
 		{"/nostr/profiles", h.profiles, false},
 		{"/nostr/profile", h.profile, false},
 		{"/nostr/search", h.search, false},
