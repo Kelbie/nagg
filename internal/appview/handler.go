@@ -310,7 +310,11 @@ type FeedItem struct {
 }
 
 type FeedResponse struct {
-	Items            []FeedItem                   `json:"items"`
+	Items   []FeedItem `json:"items"`
+	// Ordering is the server-authoritative render order + its semantic. The
+	// client renders strictly by Ordering.Elements; Ordering.OrderBy tells it
+	// whether live items may prepend ("created_at") or not ("rank").
+	Ordering         OrderingManifest             `json:"ordering"`
 	Metrics          map[string]chstore.NoteStats `json:"metrics"`
 	Profiles         map[string]ProfileInfo       `json:"profiles"`
 	Quoted           map[string]FeedEvent         `json:"quoted"`
@@ -325,6 +329,7 @@ type FeedResponse struct {
 type ThreadResponse struct {
 	Root     FeedEvent                    `json:"root"`
 	Events   []FeedEvent                  `json:"events"`
+	Ordering OrderingManifest             `json:"ordering"`
 	Metrics  map[string]chstore.NoteStats `json:"metrics"`
 	Profiles map[string]ProfileInfo       `json:"profiles"`
 	Quoted   map[string]FeedEvent         `json:"quoted"`
@@ -441,7 +446,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 
 	authors := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
 	if len(authors) == 0 {
-		h.writeFeedResponse(w, r, nil)
+		h.writeFeedResponse(w, r, nil, orderByCreatedAt)
 		return
 	}
 	var events []chstore.EventView
@@ -462,7 +467,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	h.writeFeedResponse(w, r, events)
+	h.writeFeedResponse(w, r, events, orderByCreatedAt)
 }
 
 func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
@@ -545,7 +550,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	h.writeFeedResponse(w, r, events)
+	h.writeFeedResponse(w, r, events, orderByCreatedAt)
 }
 
 func (h *Handler) shouldBackfillUserFeed(events []chstore.EventView, until int64, limit uint64, offset uint64) bool {
@@ -568,8 +573,8 @@ func (h *Handler) shouldBackfillAuthoredFeed(events []chstore.EventView, authors
 	return len(events) < int(limit)
 }
 
-func (h *Handler) writeFeedResponse(w http.ResponseWriter, r *http.Request, events []chstore.EventView) {
-	response, err := h.feedResponse(r.Context(), events)
+func (h *Handler) writeFeedResponse(w http.ResponseWriter, r *http.Request, events []chstore.EventView, orderBy string) {
+	response, err := h.feedResponse(r.Context(), events, orderBy)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -577,7 +582,7 @@ func (h *Handler) writeFeedResponse(w http.ResponseWriter, r *http.Request, even
 	writeJSON(w, response)
 }
 
-func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) (FeedResponse, error) {
+func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView, orderBy string) (FeedResponse, error) {
 	originalIDs := make([]string, 0)
 	for _, event := range events {
 		if event.Kind == 6 || event.Kind == 16 {
@@ -655,6 +660,7 @@ func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView) 
 
 	return FeedResponse{
 		Items:            items,
+		Ordering:         feedItemsOrdering(items, orderBy),
 		Metrics:          hydration.Metrics,
 		Profiles:         hydration.Profiles,
 		Quoted:           hydration.Quoted,
@@ -688,7 +694,7 @@ func (h *Handler) rankedFeed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	h.writeFeedResponse(w, r, events)
+	h.writeFeedResponse(w, r, events, orderByRank)
 }
 
 // NotificationActor is one participant in a grouped notification (a follower /
@@ -1163,9 +1169,11 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	replies := eventsJSON(events)
 	writeJSON(w, ThreadResponse{
 		Root:     eventJSON(*root),
-		Events:   eventsJSON(events),
+		Events:   replies,
+		Ordering: eventsOrdering(replies, orderByRank),
 		Metrics:  hydration.Metrics,
 		Profiles: hydration.Profiles,
 		Quoted:   hydration.Quoted,
