@@ -220,6 +220,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/dm/envelopes", h.dmEnvelopes, true},
 		{"/nostr/mint/reviews", h.mintReviews, true},
 		{"/nostr/mint/discover", h.discoverMints, true},
+		{"/nostr/social-graph", h.socialGraph, true},
 		{"/nostr/profiles", h.profiles, false},
 		{"/nostr/profile", h.profile, false},
 		{"/nostr/search", h.search, false},
