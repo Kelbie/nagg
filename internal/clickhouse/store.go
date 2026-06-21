@@ -54,6 +54,9 @@ var rankFeaturesMigration string
 //go:embed migrations/012_feature_ttl.sql
 var featureTTLMigration string
 
+//go:embed migrations/013_like_repost_backfill.sql
+var likeRepostBackfillMigration string
+
 type Config struct {
 	Addr         string
 	Database     string

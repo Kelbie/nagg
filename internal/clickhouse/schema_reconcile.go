@@ -76,6 +76,7 @@ func embeddedMigrations() []string {
 		userAggregatesMigration,
 		rankFeaturesMigration,
 		featureTTLMigration,
+		likeRepostBackfillMigration,
 	}
 }
 
