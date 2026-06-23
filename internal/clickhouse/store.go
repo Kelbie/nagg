@@ -72,16 +72,54 @@ type Store struct {
 
 const clickHouseStartupProbeTimeout = 2 * time.Second
 
-// retryConn wraps the driver connection so a single transient connection-level
-// failure (a pooled connection the server closed out from under us — "connection
-// reset by peer", broken pipe, EOF) retries once instead of surfacing as a 5xx.
-// Under back-to-back/concurrent load these blips are the dominant non-fatal
-// error; one retry on a fresh pooled connection makes reads resilient. It only
-// retries reads (Query/QueryRow) and never on context cancel/deadline (the
-// caller gave up or the query is genuinely too slow — retrying would pile on) or
-// on Exec/inserts (not idempotent). All other driver methods promote unchanged.
+// retryConn wraps the driver connection so transient connection-level failures
+// (a pooled connection the server closed out from under us — "connection reset
+// by peer", broken pipe, EOF) are retried instead of surfacing as a 5xx. Under
+// concurrent/burst load — e.g. a phone opening several profiles at once, each
+// firing feed + thread + notification reads — these resets are the dominant
+// non-fatal error, and ClickHouse can transiently shed connections when busy
+// (TOO_MANY_SIMULTANEOUS_QUERIES). A few retries on a fresh pooled connection,
+// spaced by a small backoff, ride out the blip rather than piling straight back
+// on. It only retries reads (Query/QueryRow), never on context cancel/deadline
+// (the caller gave up or the query is genuinely too slow) or on Exec/inserts
+// (not idempotent). All other driver methods promote unchanged.
 type retryConn struct {
 	chdriver.Conn
+}
+
+const (
+	// retryReadAttempts is the total number of read attempts (1 initial + retries).
+	retryReadAttempts = 3
+	// retryReadBackoff is the base delay between read attempts; it scales linearly
+	// per attempt (25ms, 50ms), so the worst-case added latency stays well under
+	// 100ms while spreading retries out enough to let a busy server recover.
+	retryReadBackoff = 25 * time.Millisecond
+)
+
+// retryTransientRead runs op up to attempts times, retrying only on transient
+// connection errors (isTransientConnErr) with a linear backoff, and bailing
+// immediately on a non-transient error, success, or a cancelled/expired context.
+// op must re-issue the read; the driver hands out a fresh pooled connection each
+// call, which is what recovers a server-closed connection.
+func retryTransientRead(ctx context.Context, attempts int, backoff time.Duration, op func() error) error {
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = op()
+		if !isTransientConnErr(err) {
+			return err
+		}
+		if attempt == attempts-1 || ctx.Err() != nil {
+			return err
+		}
+		timer := time.NewTimer(backoff * time.Duration(attempt+1))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+	}
+	return err
 }
 
 func isTransientConnErr(err error) bool {
@@ -107,18 +145,21 @@ func isTransientConnErr(err error) bool {
 }
 
 func (c retryConn) Query(ctx context.Context, query string, args ...any) (chdriver.Rows, error) {
-	rows, err := c.Conn.Query(ctx, query, args...)
-	if isTransientConnErr(err) {
-		return c.Conn.Query(ctx, query, args...)
-	}
+	var rows chdriver.Rows
+	err := retryTransientRead(ctx, retryReadAttempts, retryReadBackoff, func() error {
+		var e error
+		rows, e = c.Conn.Query(ctx, query, args...)
+		return e
+	})
 	return rows, err
 }
 
 func (c retryConn) QueryRow(ctx context.Context, query string, args ...any) chdriver.Row {
-	row := c.Conn.QueryRow(ctx, query, args...)
-	if isTransientConnErr(row.Err()) {
-		return c.Conn.QueryRow(ctx, query, args...)
-	}
+	var row chdriver.Row
+	_ = retryTransientRead(ctx, retryReadAttempts, retryReadBackoff, func() error {
+		row = c.Conn.QueryRow(ctx, query, args...)
+		return row.Err()
+	})
 	return row
 }
 
