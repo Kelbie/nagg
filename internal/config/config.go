@@ -128,14 +128,15 @@ func Load() (Config, error) {
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
-			// Default on (12) rather than unlimited: a burst of concurrent
+			// Default on (24) rather than unlimited: a burst of concurrent
 			// cache-miss reads (e.g. a phone opening several profiles at once) was
 			// firing enough simultaneous ClickHouse queries to make the server
 			// reset connections ("read tcp …:9000: connection reset by peer") and
-			// even destabilise the instance. 12 keeps nagg under that threshold
-			// while excess requests queue on the semaphore (bounded by the request
-			// context) instead of 5xx-ing. Raise via env for a beefier ClickHouse.
-			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "12")),
+			// even destabilise the instance. A bounded cap makes excess requests
+			// queue on the semaphore (bounded by the request context) instead of
+			// 5xx-ing. 24 leaves headroom for organic multi-user traffic while still
+			// protecting ClickHouse; tune via env for a beefier (or smaller) instance.
+			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "24")),
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
