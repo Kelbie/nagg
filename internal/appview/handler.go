@@ -33,6 +33,11 @@ type Store interface {
 	SaveVertexProfile(context.Context, vertex.ProfileResult) error
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
+	BatchFollowCounts(context.Context, []string) (map[string]chstore.FollowCounts, error)
+	FollowEdges(context.Context, string, []string) (map[string]chstore.FollowEdge, error)
+	RankedDirectReplyIDs(context.Context, string, string, int, int) ([]string, error)
+	AuthoredReplyChain(context.Context, string, string, int) ([]string, error)
+	FollowedReplies(context.Context, string, []string) (map[string]string, error)
 }
 
 // RankedFeedProvider runs the shared ranked-feed ranking pipeline. It is
@@ -217,10 +222,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/thread", h.thread, true},
 		{"/nostr/follows", h.follows, false},
 		{"/nostr/events", h.events, false},
+		{"/nostr/events/query", h.eventsQuery, true},
 		{"/nostr/dm/envelopes", h.dmEnvelopes, true},
+		{"/nostr/dm/conversation", h.dmConversation, true},
+		{"/nostr/follow-status", h.followStatus, false},
 		{"/nostr/mint/reviews", h.mintReviews, true},
 		{"/nostr/mint/discover", h.discoverMints, true},
 		{"/nostr/social-graph", h.socialGraph, true},
+		// Exact path; ServeMux routes it ahead of the /nostr/own/ subtree.
+		{"/nostr/own/profiles", h.ownProfiles, false},
 		{"/nostr/own/", h.ownHistory, true},
 		{"/nostr/notifications/seen", h.notificationsSeen, false},
 		{"/nostr/profiles", h.profiles, false},
@@ -1178,14 +1188,174 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replies := eventsJSON(events)
+	ordering := h.threadOrdering(r.Context(), threadOrderParams{
+		rootID:         id,
+		author:         root.PubKey,
+		replies:        replies,
+		sort:           strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort"))),
+		viewer:         queryViewerParam(r),
+		offset:         intParam(r, "offset", 0),
+		replyLimit:     intParam(r, "replyLimit", 0),
+		candidateLimit: intParam(r, "candidateLimit", 0),
+		rankedLimit:    intParam(r, "rankedLimit", 0),
+	})
 	writeJSON(w, ThreadResponse{
 		Root:     eventJSON(*root),
 		Events:   replies,
-		Ordering: eventsOrdering(replies, orderByRank),
+		Ordering: ordering,
 		Metrics:  hydration.Metrics,
 		Profiles: hydration.Profiles,
 		Quoted:   hydration.Quoted,
 	})
+}
+
+// threadOrderParams carries the inputs that decide a thread's reply render order.
+type threadOrderParams struct {
+	rootID         string
+	author         string
+	sort           string
+	viewer         string
+	replies        []FeedEvent
+	offset         int
+	replyLimit     int
+	candidateLimit int
+	rankedLimit    int
+}
+
+const (
+	// threadRankedSort is the engagement metric the ranked/relevant reply order
+	// uses for its ranked tier (matches the feed's primary signal).
+	threadRankedSort        = "likes"
+	threadCandidateDefault  = 200
+	threadRankedTierDefault = 50
+	threadAuthorChainDepth  = 8
+)
+
+// threadOrdering builds the server-authoritative reply manifest. The default
+// ("" / "new") order is the chronological/rank descendant order ThreadEvents
+// already returned — unchanged, backward-compatible. "ranked" orders direct
+// replies by engagement; "relevant" reproduces the viewer-specific merge the
+// client used to assemble from nested GraphQL resolvers (author self-reply chain
+// → one followed-tail reply → ranked direct replies → the rest), all from
+// precomputed store primitives. Any id without fetched event data is dropped and
+// remaining available replies are appended so the page is always complete.
+func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) OrderingManifest {
+	if p.sort != "relevant" && p.sort != "ranked" {
+		return eventsOrdering(p.replies, orderByRank)
+	}
+
+	var ordered []string
+	var err error
+	switch p.sort {
+	case "relevant":
+		ordered, err = h.relevantReplyOrder(ctx, p)
+	case "ranked":
+		ordered, err = h.store.RankedDirectReplyIDs(ctx, p.rootID, threadRankedSort, candidateLimitOr(p.candidateLimit), 0)
+	}
+	if err != nil {
+		slog.Warn("appview.thread.order failed; using rank fallback", "sort", p.sort, "root", p.rootID, "error", err)
+		return eventsOrdering(p.replies, orderByRank)
+	}
+
+	available := make(map[string]struct{}, len(p.replies))
+	for _, e := range p.replies {
+		available[e.ID] = struct{}{}
+	}
+	elements := make([]string, 0, len(p.replies))
+	seen := make(map[string]struct{}, len(p.replies))
+	add := func(id string) {
+		if id == "" || id == p.rootID {
+			return
+		}
+		if _, ok := available[id]; !ok {
+			return
+		}
+		if _, dup := seen[id]; dup {
+			return
+		}
+		seen[id] = struct{}{}
+		elements = append(elements, id)
+	}
+	for _, id := range ordered {
+		add(id)
+	}
+	// Replies the merge didn't surface (e.g. nested descendants) keep their
+	// ThreadEvents order at the tail so the flat list stays complete.
+	for _, e := range p.replies {
+		add(e.ID)
+	}
+	elements = pageElements(elements, p.offset, p.replyLimit)
+	slog.Info("appview.thread.relevant.merge", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "elements", len(elements))
+	return OrderingManifest{OrderBy: orderByRank, Elements: elements}
+}
+
+// relevantReplyOrder reproduces the client's mergeRelevantReplyNodes ordering
+// server-side using only precomputed store primitives.
+func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) ([]string, error) {
+	candidateLimit := candidateLimitOr(p.candidateLimit)
+	rankedLimit := p.rankedLimit
+	if rankedLimit <= 0 {
+		rankedLimit = threadRankedTierDefault
+	}
+	merged := make([]string, 0, candidateLimit)
+
+	// 1. The author's self-reply chain from the root.
+	authorChain, err := h.store.AuthoredReplyChain(ctx, p.rootID, p.author, threadAuthorChainDepth)
+	if err != nil {
+		return nil, err
+	}
+	merged = append(merged, authorChain...)
+
+	// 2. One best reply by someone the viewer follows, to the chain's tail.
+	if p.viewer != "" {
+		tail := p.rootID
+		if len(authorChain) > 0 {
+			tail = authorChain[len(authorChain)-1]
+		}
+		followed, err := h.store.FollowedReplies(ctx, p.viewer, []string{tail})
+		if err != nil {
+			return nil, err
+		}
+		if id := followed[tail]; id != "" {
+			merged = append(merged, id)
+		}
+	}
+
+	// 3. Ranked direct replies, then 4. all direct replies (recency).
+	ranked, err := h.store.RankedDirectReplyIDs(ctx, p.rootID, threadRankedSort, rankedLimit, 0)
+	if err != nil {
+		return nil, err
+	}
+	merged = append(merged, ranked...)
+	all, err := h.store.RankedDirectReplyIDs(ctx, p.rootID, "new", candidateLimit, 0)
+	if err != nil {
+		return nil, err
+	}
+	merged = append(merged, all...)
+	return merged, nil
+}
+
+func candidateLimitOr(n int) int {
+	if n <= 0 {
+		return threadCandidateDefault
+	}
+	return n
+}
+
+// pageElements slices ids to [offset, offset+limit); limit<=0 means "all from
+// offset".
+func pageElements(ids []string, offset, limit int) []string {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(ids) {
+		return []string{}
+	}
+	ids = ids[offset:]
+	if limit > 0 && limit < len(ids) {
+		ids = ids[:limit]
+	}
+	return ids
 }
 
 func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {

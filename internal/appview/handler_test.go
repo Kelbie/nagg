@@ -71,6 +71,34 @@ func (s fakeStore) Notifications(context.Context, chstore.NotificationInput) ([]
 	return nil, nil
 }
 
+func (s fakeStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
+	out := make(map[string]chstore.FollowCounts, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		out[pubkey] = chstore.FollowCounts{}
+	}
+	return out, nil
+}
+
+func (s fakeStore) FollowEdges(_ context.Context, _ string, candidates []string) (map[string]chstore.FollowEdge, error) {
+	out := make(map[string]chstore.FollowEdge, len(candidates))
+	for _, candidate := range candidates {
+		out[candidate] = chstore.FollowEdge{}
+	}
+	return out, nil
+}
+
+func (s fakeStore) RankedDirectReplyIDs(context.Context, string, string, int, int) ([]string, error) {
+	return nil, nil
+}
+
+func (s fakeStore) AuthoredReplyChain(context.Context, string, string, int) ([]string, error) {
+	return nil, nil
+}
+
+func (s fakeStore) FollowedReplies(context.Context, string, []string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
 type followCountSpyStore struct {
 	fakeStore
 	calls   int
