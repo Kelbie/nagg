@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
@@ -16,17 +17,20 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if len(cfg.Firehose.Relays) == 0 {
 		t.Fatal("expected default relays")
 	}
-	if cfg.OnDemand.UserFeed {
-		t.Fatal("on-demand user feed backfill should be opt-in by default")
+	if !cfg.OnDemand.UserFeed {
+		t.Fatal("on-demand user feed backfill should default on so profiles return posts on first load")
 	}
 	if !cfg.RunIngester || !cfg.RunEnricher {
 		t.Fatalf("in-process workers should default on: ingester=%v enricher=%v", cfg.RunIngester, cfg.RunEnricher)
 	}
-	if cfg.OnDemand.GraphQLHydration {
-		t.Fatal("graphql relay hydration should follow the disabled user-feed default")
+	if !cfg.OnDemand.GraphQLHydration {
+		t.Fatal("graphql relay hydration should follow the enabled user-feed default")
 	}
 	if cfg.OnDemand.Wait != 0 {
-		t.Fatalf("on-demand wait = %s, want instant default", cfg.OnDemand.Wait)
+		t.Fatalf("on-demand wait = %s, want instant (async) default for generic paths", cfg.OnDemand.Wait)
+	}
+	if cfg.OnDemand.UserFeedWait != 3*time.Second {
+		t.Fatalf("on-demand user-feed wait = %s, want 3s so cold profiles block briefly for backfill", cfg.OnDemand.UserFeedWait)
 	}
 	if cfg.ClickHouse.MaxOpenConns != 30 || cfg.ClickHouse.MaxIdleConns != 10 {
 		t.Fatalf("clickhouse pool = open %d idle %d", cfg.ClickHouse.MaxOpenConns, cfg.ClickHouse.MaxIdleConns)

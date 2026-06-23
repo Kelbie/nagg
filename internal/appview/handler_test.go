@@ -516,6 +516,120 @@ func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	}
 }
 
+func TestUserFeedWaitsThenReturnsBackfilledPosts(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		feeds: [][]chstore.EventView{
+			nil,
+			{{
+				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "backfilled",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	// completed=true models the synchronous UserFeedWait latching onto the
+	// finished backfill job, so the handler re-queries and serves the posts.
+	backfiller := &fakeHydratingUserBackfiller{completed: true}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey="+testPubkey+"&limit=5", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.hydrated != 1 {
+		t.Fatalf("hydrated = %d, want 1", backfiller.hydrated)
+	}
+	if store.calls != 2 {
+		t.Fatalf("store calls = %d, want 2 (cold + requery)", store.calls)
+	}
+	var response FeedResponse
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "backfilled" {
+		t.Fatalf("items = %+v, want the backfilled post", response.Items)
+	}
+}
+
+func TestUserFeedWarmSkipsBackfill(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		feeds: [][]chstore.EventView{
+			{{
+				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				PubKey:    testPubkey,
+				Kind:      1,
+				CreatedAt: time.Unix(1_710_000_000, 0),
+				Content:   "already indexed",
+				Tags:      [][]string{},
+				Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			}},
+		},
+	}
+	backfiller := &fakeHydratingUserBackfiller{completed: true}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	// limit=1 and one indexed event: the first page is full, so it is warm.
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey="+testPubkey+"&limit=1", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.hydrated != 0 || backfiller.calls != 0 {
+		t.Fatalf("warm profile must not backfill: %+v", backfiller)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (no requery for a warm profile)", store.calls)
+	}
+}
+
+func TestUserFeedPaginationSkipsBackfill(t *testing.T) {
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		feeds:     [][]chstore.EventView{nil},
+	}
+	backfiller := &fakeHydratingUserBackfiller{completed: true}
+	handler := New(
+		store,
+		WithUserFeedBackfill(backfiller),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	// A paginated request (until>0) is a deliberate older-page fetch, never a
+	// cold first load, so it must not trigger relay backfill even when empty.
+	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/user?pubkey="+testPubkey+"&limit=5&until=1700000000", nil)
+	handler.userFeed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if backfiller.hydrated != 0 || backfiller.calls != 0 {
+		t.Fatalf("paginated request must not backfill: %+v", backfiller)
+	}
+	if store.calls != 1 {
+		t.Fatalf("store calls = %d, want 1 (no requery on pagination)", store.calls)
+	}
+}
+
 func TestDMEnvelopesHydratesViewerInbox(t *testing.T) {
 	store := &sequencedEventStore{fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}}}
 	backfiller := &fakeDMEnvelopeBackfiller{}
