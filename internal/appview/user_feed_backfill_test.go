@@ -17,7 +17,7 @@ func TestHydrationJobCompletesInsideWait(t *testing.T) {
 		return nil
 	})
 
-	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job})
+	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job}, backfiller.cfg.Wait)
 	if err != nil {
 		t.Fatalf("waitJobs err = %v", err)
 	}
@@ -34,7 +34,7 @@ func TestHydrationJobReturnsSlowAndContinues(t *testing.T) {
 		return nil
 	})
 
-	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job})
+	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job}, backfiller.cfg.Wait)
 	if err != nil {
 		t.Fatalf("waitJobs err = %v", err)
 	}
@@ -55,7 +55,7 @@ func TestHydrationJobReturnsImmediatelyWhenWaitIsZero(t *testing.T) {
 	})
 
 	started := time.Now()
-	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job})
+	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job}, backfiller.cfg.Wait)
 	if err != nil {
 		t.Fatalf("waitJobs err = %v", err)
 	}
@@ -123,7 +123,7 @@ func TestHydrationJobReturnsFirstError(t *testing.T) {
 		return wantErr
 	})
 
-	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job})
+	completed, err := backfiller.waitJobs(context.Background(), []*hydrationJob{job}, backfiller.cfg.Wait)
 	if !completed {
 		t.Fatal("waitJobs completed = false, want true")
 	}
@@ -131,6 +131,46 @@ func TestHydrationJobReturnsFirstError(t *testing.T) {
 		t.Fatalf("waitJobs err = %v, want %v", err, wantErr)
 	}
 }
+
+type fakeEventInserter struct{ inserted int }
+
+func (f *fakeEventInserter) InsertEvents(context.Context, []chstore.EventRecord) error {
+	f.inserted++
+	return nil
+}
+
+// The user/profile feed path must block on UserFeedWait so a cold profile
+// returns posts on first load, independent of the global async Wait.
+func TestHydrateUserFeedUsesUserFeedWaitNotGlobalWait(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(&fakeEventInserter{}, UserFeedBackfillConfig{
+		Wait:         0,                     // generic paths stay async
+		UserFeedWait: 2 * time.Second,       // profile path blocks briefly
+		Timeout:      50 * time.Millisecond, // bound the (relay-less) backfill job
+	})
+	completed, _ := backfiller.HydrateUserFeed(context.Background(), userFeedTestPubkey, 5)
+	if !completed {
+		t.Fatal("HydrateUserFeed completed = false; the user-feed path must wait on UserFeedWait, not the global Wait=0")
+	}
+}
+
+// Generic on-demand paths must remain async (global Wait) even when
+// UserFeedWait is large, so they never block a request on relay backfill.
+func TestHydrateEventsStaysAsyncOnGlobalWait(t *testing.T) {
+	backfiller := NewRelayUserFeedBackfiller(&fakeEventInserter{}, UserFeedBackfillConfig{
+		Wait:         0,
+		UserFeedWait: 5 * time.Second,
+		Timeout:      50 * time.Millisecond,
+	})
+	completed, _ := backfiller.HydrateEvents(context.Background(), []string{userFeedTestEventID})
+	if completed {
+		t.Fatal("HydrateEvents completed = true; generic paths must use the async global Wait=0, not UserFeedWait")
+	}
+}
+
+const (
+	userFeedTestPubkey  = "0000000000000000000000000000000000000000000000000000000000000001"
+	userFeedTestEventID = "1111111111111111111111111111111111111111111111111111111111111111"
+)
 
 func waitForHydrationJob(t *testing.T, job *hydrationJob) {
 	t.Helper()

@@ -310,7 +310,7 @@ type FeedItem struct {
 }
 
 type FeedResponse struct {
-	Items   []FeedItem `json:"items"`
+	Items []FeedItem `json:"items"`
 	// Ordering is the server-authoritative render order + its semantic. The
 	// client renders strictly by Ordering.Elements; Ordering.OrderBy tells it
 	// whether live items may prepend ("created_at") or not ("rank").
@@ -542,12 +542,20 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.shouldBackfillUserFeed(events, until, limit, offset) {
+		coldCount := len(events)
+		slog.Info("profile.feed.cold", "pubkey", pubkey, "count", coldCount, "limit", limit)
+		backfillStart := time.Now()
 		if h.tryBackfillUserFeed(r.Context(), pubkey, limit) {
 			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
 			if err != nil {
 				writeError(w, err)
 				return
 			}
+			slog.Info("profile.feed.backfill", "pubkey", pubkey, "outcome", "waited",
+				"before", coldCount, "after", len(events), "ms", time.Since(backfillStart).Milliseconds())
+		} else {
+			slog.Info("profile.feed.backfill", "pubkey", pubkey, "outcome", "timeout",
+				"before", coldCount, "ms", time.Since(backfillStart).Milliseconds())
 		}
 	}
 	h.writeFeedResponse(w, r, events, orderByCreatedAt)

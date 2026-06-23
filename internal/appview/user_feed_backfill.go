@@ -100,11 +100,18 @@ type eventInserter interface {
 }
 
 type UserFeedBackfillConfig struct {
-	Relays          []string
-	ReadLimit       int64
-	Cooldown        time.Duration
-	Timeout         time.Duration
-	Wait            time.Duration
+	Relays    []string
+	ReadLimit int64
+	Cooldown  time.Duration
+	Timeout   time.Duration
+	// Wait is the synchronous wait applied to the generic on-demand paths
+	// (events, profiles, engagement, threads, follows, DMs, relay queries).
+	// Defaults to 0 (async) so those requests never block on relay backfill.
+	Wait time.Duration
+	// UserFeedWait is the synchronous wait applied only to the user/profile
+	// feed path. A cold profile blocks up to this long for its author backfill
+	// so the first load returns posts, while the generic paths above stay async.
+	UserFeedWait    time.Duration
 	AuthorLimit     int
 	EngagementLimit int
 	ThreadLimit     int
@@ -130,6 +137,9 @@ func NewRelayUserFeedBackfiller(store eventInserter, cfg UserFeedBackfillConfig)
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.UserFeedWait <= 0 {
+		cfg.UserFeedWait = 3 * time.Second
 	}
 	if cfg.AuthorLimit <= 0 {
 		cfg.AuthorLimit = 100
@@ -181,7 +191,7 @@ func (b *RelayUserFeedBackfiller) HydrateUserFeeds(ctx context.Context, pubkeys 
 			return b.BackfillUserFeed(jobCtx, pubkey, limit)
 		}))
 	}
-	return b.waitJobs(ctx, jobs)
+	return b.waitJobs(ctx, jobs, b.cfg.UserFeedWait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateEvents(ctx context.Context, ids []string) (bool, error) {
@@ -191,7 +201,7 @@ func (b *RelayUserFeedBackfiller) HydrateEvents(ctx context.Context, ids []strin
 	}
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("events", ids), func(jobCtx context.Context) error {
 		return b.BackfillEvents(jobCtx, ids)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateProfiles(ctx context.Context, pubkeys []string) (bool, error) {
@@ -201,7 +211,7 @@ func (b *RelayUserFeedBackfiller) HydrateProfiles(ctx context.Context, pubkeys [
 	}
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("profiles", pubkeys), func(jobCtx context.Context) error {
 		return b.BackfillProfiles(jobCtx, pubkeys)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateEngagement(ctx context.Context, ids []string) (bool, error) {
@@ -211,7 +221,7 @@ func (b *RelayUserFeedBackfiller) HydrateEngagement(ctx context.Context, ids []s
 	}
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, hydrationBatchKey("engagement", ids), func(jobCtx context.Context) error {
 		return b.BackfillEngagement(jobCtx, ids)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateThread(ctx context.Context, id string, limit int) (bool, error) {
@@ -222,7 +232,7 @@ func (b *RelayUserFeedBackfiller) HydrateThread(ctx context.Context, id string, 
 	id = ids[0]
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, "thread:"+id, func(jobCtx context.Context) error {
 		return b.BackfillThread(jobCtx, id, limit)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateFollows(ctx context.Context, pubkey string) (bool, error) {
@@ -233,7 +243,7 @@ func (b *RelayUserFeedBackfiller) HydrateFollows(ctx context.Context, pubkey str
 	pubkey = pubkeys[0]
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, "follows:"+pubkey, func(jobCtx context.Context) error {
 		return b.BackfillFollows(jobCtx, pubkey)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey string, kinds []int, until int64, limit uint64) (bool, error) {
@@ -249,7 +259,7 @@ func (b *RelayUserFeedBackfiller) HydrateDMEnvelopes(ctx context.Context, pubkey
 	key := "dm:" + pubkey + ":" + strconv.FormatInt(until, 10) + ":" + kindSignature(kinds)
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, key, func(jobCtx context.Context) error {
 		return b.BackfillDMEnvelopes(jobCtx, pubkey, kinds, until, limit)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) HydrateRelayEvents(ctx context.Context, input chstore.EventQueryInput, label string) (bool, error) {
@@ -263,7 +273,7 @@ func (b *RelayUserFeedBackfiller) HydrateRelayEvents(ctx context.Context, input 
 	key := "relay-query:" + strings.TrimSpace(label) + ":" + relayFilterSignature(filter)
 	return b.waitJobs(ctx, []*hydrationJob{b.scheduleJob(ctx, key, func(jobCtx context.Context) error {
 		return b.backfillRelayEventsWithFilter(jobCtx, input, label, filter, key)
-	})})
+	})}, b.cfg.Wait)
 }
 
 func (b *RelayUserFeedBackfiller) BackfillUserFeed(ctx context.Context, pubkey string, limit uint64) error {
@@ -705,11 +715,10 @@ func (b *RelayUserFeedBackfiller) scheduleJob(ctx context.Context, key string, w
 	return job
 }
 
-func (b *RelayUserFeedBackfiller) waitJobs(ctx context.Context, jobs []*hydrationJob) (bool, error) {
+func (b *RelayUserFeedBackfiller) waitJobs(ctx context.Context, jobs []*hydrationJob, wait time.Duration) (bool, error) {
 	if len(jobs) == 0 {
 		return true, nil
 	}
-	wait := b.cfg.Wait
 	if wait <= 0 {
 		return false, nil
 	}

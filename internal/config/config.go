@@ -104,6 +104,7 @@ type OnDemandConfig struct {
 	Cooldown                 time.Duration
 	Timeout                  time.Duration
 	Wait                     time.Duration
+	UserFeedWait             time.Duration
 	AuthorLimit              int
 	EngagementLimit          int
 	ThreadLimit              int
@@ -115,7 +116,7 @@ type OnDemandConfig struct {
 }
 
 func Load() (Config, error) {
-	onDemandUserFeed := parseBool(env("NAGG_ON_DEMAND_USER_FEED", "false"))
+	onDemandUserFeed := parseBool(env("NAGG_ON_DEMAND_USER_FEED", "true"))
 	cfg := Config{
 		ClickHouse: chstore.Config{
 			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
@@ -159,6 +160,7 @@ func Load() (Config, error) {
 			Cooldown:                 parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
 			Timeout:                  parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
 			Wait:                     parseDuration(env("NAGG_ON_DEMAND_WAIT", "0s")),
+			UserFeedWait:             parseDuration(env("NAGG_ON_DEMAND_USER_FEED_WAIT", "3s")),
 			AuthorLimit:              parseInt(env("NAGG_ON_DEMAND_AUTHOR_LIMIT", "100")),
 			EngagementLimit:          parseInt(env("NAGG_ON_DEMAND_ENGAGEMENT_LIMIT", "1000")),
 			ThreadLimit:              parseInt(env("NAGG_ON_DEMAND_THREAD_LIMIT", "1000")),
