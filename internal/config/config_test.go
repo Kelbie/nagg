@@ -32,6 +32,9 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeedWait != 3*time.Second {
 		t.Fatalf("on-demand user-feed wait = %s, want 3s so cold profiles block briefly for backfill", cfg.OnDemand.UserFeedWait)
 	}
+	if cfg.API.MaxConcurrentRequests != 12 {
+		t.Fatalf("max concurrent requests = %d, want 12 so a burst queues instead of overwhelming ClickHouse", cfg.API.MaxConcurrentRequests)
+	}
 	if cfg.ClickHouse.MaxOpenConns != 30 || cfg.ClickHouse.MaxIdleConns != 10 {
 		t.Fatalf("clickhouse pool = open %d idle %d", cfg.ClickHouse.MaxOpenConns, cfg.ClickHouse.MaxIdleConns)
 	}
