@@ -156,7 +156,7 @@ func Load() (Config, error) {
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,
-			GraphQLHydration:         parseBool(env("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", strconv.FormatBool(onDemandUserFeed))),
+			GraphQLHydration:         parseBool(env("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", "false")),
 			Cooldown:                 parseDuration(env("NAGG_ON_DEMAND_COOLDOWN", "5m")),
 			Timeout:                  parseDuration(env("NAGG_ON_DEMAND_TIMEOUT", "5s")),
 			Wait:                     parseDuration(env("NAGG_ON_DEMAND_WAIT", "0s")),

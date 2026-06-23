@@ -23,8 +23,8 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if !cfg.RunIngester || !cfg.RunEnricher {
 		t.Fatalf("in-process workers should default on: ingester=%v enricher=%v", cfg.RunIngester, cfg.RunEnricher)
 	}
-	if !cfg.OnDemand.GraphQLHydration {
-		t.Fatal("graphql relay hydration should follow the enabled user-feed default")
+	if cfg.OnDemand.GraphQLHydration {
+		t.Fatal("graphql relay hydration is decoupled from the user-feed default and must stay opt-in")
 	}
 	if cfg.OnDemand.Wait != 0 {
 		t.Fatalf("on-demand wait = %s, want instant (async) default for generic paths", cfg.OnDemand.Wait)
@@ -86,7 +86,7 @@ func TestLoadInProcessWorkerFlags(t *testing.T) {
 	}
 }
 
-func TestLoadGraphQLHydrationFollowsUserFeedDefault(t *testing.T) {
+func TestLoadGraphQLHydrationDecoupledFromUserFeed(t *testing.T) {
 	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
 	t.Setenv("NAGG_ON_DEMAND_USER_FEED", "true")
 
@@ -94,8 +94,14 @@ func TestLoadGraphQLHydrationFollowsUserFeedDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.OnDemand.UserFeed || !cfg.OnDemand.GraphQLHydration {
-		t.Fatalf("on-demand flags = userFeed %v graphql %v", cfg.OnDemand.UserFeed, cfg.OnDemand.GraphQLHydration)
+	// Enabling the user-feed/profile backfill must NOT implicitly turn on
+	// app-wide GraphQL relay hydration — the latter is gated separately to keep
+	// ClickHouse connection load bounded.
+	if !cfg.OnDemand.UserFeed {
+		t.Fatal("user feed backfill should be enabled by env")
+	}
+	if cfg.OnDemand.GraphQLHydration {
+		t.Fatalf("graphql hydration must stay opt-in independent of user feed, got %v", cfg.OnDemand.GraphQLHydration)
 	}
 }
 

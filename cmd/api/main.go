@@ -210,7 +210,13 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			MaxAge: 7 * 24 * time.Hour,
 		}, logger)),
 	}
-	if userFeedBackfiller != nil {
+	// Attach on-demand relay hydration to the GraphQL schema (and, via schemaOpts
+	// reuse below, the REST ranked-feed) only when explicitly enabled. This is
+	// decoupled from the user-feed/profile backfill (WithUserFeedBackfill on the
+	// appview, below): GraphQL hydration fans relay+ClickHouse work out across
+	// every GraphQL query app-wide, which can exhaust the ClickHouse connection
+	// pool, so it stays opt-in independent of the profile feed default.
+	if userFeedBackfiller != nil && cfg.OnDemand.GraphQLHydration {
 		schemaOpts = append(schemaOpts, graphqlapi.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	schema, err := graphqlapi.NewSchema(store, schemaOpts...)
