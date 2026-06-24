@@ -38,6 +38,7 @@ type Store interface {
 	RankedDirectReplyIDs(context.Context, string, string, int, int) ([]string, error)
 	AuthoredReplyChain(context.Context, string, string, int) ([]string, error)
 	FollowedReplies(context.Context, string, []string) (map[string]string, error)
+	SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 }
 
 // RankedFeedProvider runs the shared ranked-feed ranking pipeline. It is
@@ -1597,10 +1598,6 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/search only", http.StatusMethodNotAllowed)
 		return
 	}
-	if h.vertex == nil {
-		http.Error(w, "Vertex DVM proxy not configured", http.StatusServiceUnavailable)
-		return
-	}
 	query := strings.TrimSpace(r.URL.Query().Get("query"))
 	if len(query) < 3 {
 		http.Error(w, "query must be at least 3 characters", http.StatusBadRequest)
@@ -1608,15 +1605,80 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := intParam(r, "limit", 5)
 	sortKey := r.URL.Query().Get("sort")
-	results, fromCache, err := h.vertex.Search(r.Context(), vertex.SearchArgs{
-		Query: query,
-		Limit: limit,
-		Sort:  sortKey,
-	})
-	if err != nil {
-		writeVertexError(w, err)
-		return
+
+	var results []vertex.SearchResult
+	fromCache := false
+	seen := make(map[string]struct{})
+
+	// Gold path: Vertex-pagerank DVM. A DVM failure (notably exhausted credits)
+	// must not fail the request — fall through to the locally-indexed profiles
+	// below, mirroring the GraphQL profileSearch resolver. Live DVM ranking is a
+	// quality boost, not a hard dependency, so search keeps working off the
+	// ClickHouse index when the upstream DVM is unavailable.
+	if h.vertex != nil {
+		vertexRows, vertexFromCache, err := h.vertex.Search(r.Context(), vertex.SearchArgs{
+			Query: query,
+			Limit: limit,
+			Sort:  sortKey,
+		})
+		if err != nil {
+			slog.Warn("vertex profile search failed; falling back to local index",
+				"query_len", len(query), "sort", sortKey, "error", err)
+		} else {
+			fromCache = vertexFromCache
+			for _, row := range vertexRows {
+				pubkey, ok := vertex.NormalizePubkey(row.PubKey)
+				if !ok {
+					continue
+				}
+				if _, dup := seen[pubkey]; dup {
+					continue
+				}
+				row.PubKey = pubkey
+				if row.Npub == "" {
+					row.Npub = vertex.Npub(pubkey)
+				}
+				results = append(results, row)
+				seen[pubkey] = struct{}{}
+				if len(results) >= limit {
+					break
+				}
+			}
+		}
 	}
+
+	// Fill the remaining slots from the locally-indexed profiles. This is the
+	// credit-free path: it serves any indexed profile (including brand-new
+	// queries) without touching the live DVM.
+	if len(results) < limit {
+		localRows, err := h.store.SearchProfiles(r.Context(), query, uint64(limit-len(results)))
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		for _, local := range localRows {
+			pubkey, ok := vertex.NormalizePubkey(local.Profile.PubKey)
+			if !ok {
+				continue
+			}
+			if _, dup := seen[pubkey]; dup {
+				continue
+			}
+			rank := local.Rank
+			score := local.Score
+			results = append(results, vertex.SearchResult{
+				PubKey: pubkey,
+				Npub:   vertex.Npub(pubkey),
+				Rank:   &rank,
+				Score:  &score,
+			})
+			seen[pubkey] = struct{}{}
+			if len(results) >= limit {
+				break
+			}
+		}
+	}
+
 	enriched, err := h.enrichSearchResults(r.Context(), results)
 	if err != nil {
 		writeError(w, err)
