@@ -32,8 +32,11 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeedWait != 3*time.Second {
 		t.Fatalf("on-demand user-feed wait = %s, want 3s so cold profiles block briefly for backfill", cfg.OnDemand.UserFeedWait)
 	}
-	if cfg.API.MaxConcurrentRequests != 24 {
-		t.Fatalf("max concurrent requests = %d, want 24 so a burst queues instead of overwhelming ClickHouse", cfg.API.MaxConcurrentRequests)
+	if cfg.API.MaxConcurrentRequests != 2 {
+		t.Fatalf("max concurrent requests = %d, want 2 (the measured shared-ClickHouse ceiling) so a burst queues instead of being shed as 5xx", cfg.API.MaxConcurrentRequests)
+	}
+	if cfg.ClickHouse.MaxQueryMemoryBytes != 0 {
+		t.Fatalf("max query memory = %d, want 0 (per-query cap unset by default)", cfg.ClickHouse.MaxQueryMemoryBytes)
 	}
 	if cfg.ClickHouse.MaxOpenConns != 30 || cfg.ClickHouse.MaxIdleConns != 10 {
 		t.Fatalf("clickhouse pool = open %d idle %d", cfg.ClickHouse.MaxOpenConns, cfg.ClickHouse.MaxIdleConns)
@@ -127,6 +130,23 @@ func TestLoadGraphQLHydrationOverride(t *testing.T) {
 	}
 	if cfg.OnDemand.GraphQLLimit != 75 || cfg.OnDemand.GraphQLMaxJobsPerRequest != 2 {
 		t.Fatalf("graphql hydration config = limit %d jobs %d", cfg.OnDemand.GraphQLLimit, cfg.OnDemand.GraphQLMaxJobsPerRequest)
+	}
+}
+
+func TestLoadClickHouseCapacityKnobOverrides(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_MAX_CONCURRENT_REQUESTS", "6")
+	t.Setenv("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "8000000000")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.API.MaxConcurrentRequests != 6 {
+		t.Fatalf("max concurrent requests = %d, want 6 from env override", cfg.API.MaxConcurrentRequests)
+	}
+	if cfg.ClickHouse.MaxQueryMemoryBytes != 8_000_000_000 {
+		t.Fatalf("max query memory = %d, want 8000000000 from env override", cfg.ClickHouse.MaxQueryMemoryBytes)
 	}
 }
 

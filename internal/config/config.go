@@ -125,18 +125,29 @@ func Load() (Config, error) {
 			Password:     os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
 			MaxOpenConns: parseInt(env("NAGG_CLICKHOUSE_MAX_OPEN_CONNS", "30")),
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
+			// Per-query memory ceiling (bytes) applied to every app-view read, as a
+			// runaway guard: an over-budget query is rejected by ClickHouse with a
+			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed
+			// request) instead of consuming the whole instance and cgroup-OOMing the
+			// container (the source of the 502/restart flaps). 0 = unset (no per-query
+			// cap); set once the real per-query footprint is measured.
+			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "0")),
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
-			// Default on (24) rather than unlimited: a burst of concurrent
-			// cache-miss reads (e.g. a phone opening several profiles at once) was
-			// firing enough simultaneous ClickHouse queries to make the server
-			// reset connections ("read tcp …:9000: connection reset by peer") and
-			// even destabilise the instance. A bounded cap makes excess requests
-			// queue on the semaphore (bounded by the request context) instead of
-			// 5xx-ing. 24 leaves headroom for organic multi-user traffic while still
-			// protecting ClickHouse; tune via env for a beefier (or smaller) instance.
-			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "24")),
+			// Default 2, matching the measured concurrency ceiling of the shared
+			// ~30 GB Railway ClickHouse: a single heavy app-view read (e.g. an
+			// engaged account's notifications, ~7 s, multiple GB) is so memory-hungry
+			// that only two run at once before ClickHouse sheds the rest with a fast
+			// 5xx. An app launch fires feed + notifications + search + profiles
+			// concurrently, so an over-high cap (the previous 24) never engaged —
+			// ClickHouse rejected first, the client saw nagg fail, and fell back. At
+			// 2 the excess queues on the semaphore (bounded by the request context)
+			// and succeeds slower instead of 5xx-ing. This is a low-traffic ceiling:
+			// raise it via env only after the per-query cost drops (the materialized
+			// notifications read-model — see docs/notifications-performance.md §9) or
+			// the ClickHouse instance is scaled / its workers split out.
+			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "2")),
 		},
 		Firehose: firehose.Config{
 			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
