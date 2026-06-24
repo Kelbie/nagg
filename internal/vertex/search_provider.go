@@ -74,7 +74,7 @@ func (p *SearchProvider) refreshAsync(args SearchArgs) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := p.refresh(ctx, args); err != nil {
-			p.logger.Warn("vertex search refresh failed", "query", args.Query, "sort", args.Sort, "source", args.Source, "error", err)
+			p.logger.Warn("vertex search refresh failed", "query_len", len(args.Query), "sort", args.Sort, "source", args.Source, "error", err)
 		}
 	}()
 }
@@ -90,7 +90,7 @@ func (p *SearchProvider) refresh(ctx context.Context, args SearchArgs) ([]Search
 		}
 		if p.store != nil {
 			if err := p.store.SaveVertexSearch(ctx, args, rows); err != nil {
-				p.logger.Warn("vertex search cache save failed", "query", args.Query, "sort", args.Sort, "source", args.Source, "error", err)
+				p.logger.Warn("vertex search cache save failed", "query_len", len(args.Query), "sort", args.Sort, "source", args.Source, "error", err)
 			}
 		}
 		return rows, nil
