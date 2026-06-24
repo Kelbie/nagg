@@ -204,11 +204,23 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		})
 	}
 
+	// One cache-backed profile-search provider, shared by the GraphQL resolver and
+	// the REST /nostr/search handler so both serve identical Vertex-pagerank
+	// results from the same ClickHouse cache (and dedup live refreshes via the
+	// provider's singleflight). vertexClient is a *vertex.Client, which is a typed
+	// nil when no Vertex key is configured; assign through the interface so the
+	// provider sees a true nil and returns ErrUnavailable (callers fall back to the
+	// local index) instead of panicking on a nil-pointer method call.
+	var searchRefresh vertex.SearchRefreshClient
+	if vertexClient != nil {
+		searchRefresh = vertexClient
+	}
+	searchProvider := vertex.NewSearchProvider(store, searchRefresh, vertex.SearchProviderConfig{
+		MaxAge: 7 * 24 * time.Hour,
+	}, logger)
 	schemaOpts := []graphqlapi.Option{
 		graphqlapi.WithPubkeyScoreMinFollowers(cfg.Vertex.RankMinFollowers),
-		graphqlapi.WithProfileSearch(vertex.NewSearchProvider(store, vertexClient, vertex.SearchProviderConfig{
-			MaxAge: 7 * 24 * time.Hour,
-		}, logger)),
+		graphqlapi.WithProfileSearch(searchProvider),
 	}
 	// Attach on-demand relay hydration to the GraphQL schema (and, via schemaOpts
 	// reuse below, the REST ranked-feed) only when explicitly enabled. This is
@@ -250,6 +262,11 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appview.WithRankedFeed(ranker),
 		appview.WithMaxConcurrentRequests(cfg.API.MaxConcurrentRequests),
 	}
+	// Route REST profile search through the same cache-backed provider as GraphQL.
+	// Injected unconditionally: with no Vertex key the provider returns
+	// ErrUnavailable on a cache miss and the search handler falls back to the local
+	// index, so it is safe even when vertexClient is nil.
+	appviewOpts = append(appviewOpts, appview.WithProfileSearch(searchProvider))
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}

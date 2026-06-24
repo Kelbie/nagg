@@ -54,6 +54,7 @@ type RankedFeedProvider interface {
 type Handler struct {
 	store                     Store
 	vertex                    VertexClient
+	profileSearcher           ProfileSearcher
 	userBackfiller            UserFeedBackfiller
 	eventBackfiller           EventBackfiller
 	profileBackfiller         ProfileBackfiller
@@ -82,6 +83,15 @@ type VertexClient interface {
 	ProfileRefresh(context.Context, string) (vertex.ProfileResult, error)
 }
 
+// ProfileSearcher is the search-only seam the /nostr/search handler depends on.
+// It is satisfied by *vertex.SearchProvider (cache-backed: serves Vertex-pagerank
+// results from ClickHouse, refreshes the live DVM asynchronously, degrades to
+// ErrUnavailable instead of failing). Search needs only ranking; recommended() and
+// vertexProfile() keep the wider VertexClient because they also need the live DVM.
+type ProfileSearcher interface {
+	Search(context.Context, vertex.SearchArgs) ([]vertex.SearchResult, bool, error)
+}
+
 type Option func(*Handler)
 
 const defaultVertexProfileMinFollowers uint64 = 500
@@ -89,6 +99,14 @@ const defaultVertexProfileMinFollowers uint64 = 500
 func WithVertex(client VertexClient) Option {
 	return func(h *Handler) {
 		h.vertex = client
+	}
+}
+
+// WithProfileSearch wires the cache-backed profile-search provider used by
+// /nostr/search. Without it the route serves only the local ClickHouse index.
+func WithProfileSearch(searcher ProfileSearcher) Option {
+	return func(h *Handler) {
+		h.profileSearcher = searcher
 	}
 }
 
@@ -1603,20 +1621,24 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "query must be at least 3 characters", http.StatusBadRequest)
 		return
 	}
-	limit := intParam(r, "limit", 5)
+	// Clamp up front (matches vertex.NormalizeSearchArgs) so the Vertex cache
+	// lookup, the local-fallback slot math, and the echoed limit all agree.
+	limit := limitClamp(intParam(r, "limit", 5), 5)
 	sortKey := r.URL.Query().Get("sort")
 
 	var results []vertex.SearchResult
 	fromCache := false
 	seen := make(map[string]struct{})
 
-	// Gold path: Vertex-pagerank DVM. A DVM failure (notably exhausted credits)
-	// must not fail the request — fall through to the locally-indexed profiles
-	// below, mirroring the GraphQL profileSearch resolver. Live DVM ranking is a
-	// quality boost, not a hard dependency, so search keeps working off the
-	// ClickHouse index when the upstream DVM is unavailable.
-	if h.vertex != nil {
-		vertexRows, vertexFromCache, err := h.vertex.Search(r.Context(), vertex.SearchArgs{
+	// Gold path: the cache-backed Vertex-pagerank provider (shared with the
+	// GraphQL profileSearch resolver). It serves ranked results from the ClickHouse
+	// cache and refreshes the live DVM asynchronously, so a DVM failure (notably
+	// exhausted credits) never fails the request — we fall through to the
+	// locally-indexed profiles below. Live DVM ranking is a quality boost, not a
+	// hard dependency.
+	vertexCount := 0
+	if h.profileSearcher != nil {
+		vertexRows, vertexFromCache, err := h.profileSearcher.Search(r.Context(), vertex.SearchArgs{
 			Query: query,
 			Limit: limit,
 			Sort:  sortKey,
@@ -1644,6 +1666,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			}
+			vertexCount = len(results)
 		}
 	}
 
@@ -1678,6 +1701,13 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Seam observability: how the fetch→merge resolved (Vertex pagerank vs local
+	// index, cache vs live). query_len only — never the raw search term.
+	slog.Debug("appview.search",
+		"query_len", len(query), "sort", sortKey, "limit", limit,
+		"vertex_count", vertexCount, "local_count", len(results)-vertexCount,
+		"from_cache", fromCache)
 
 	enriched, err := h.enrichSearchResults(r.Context(), results)
 	if err != nil {
