@@ -64,6 +64,9 @@ type Config struct {
 	Password     string
 	MaxOpenConns int
 	MaxIdleConns int
+	// MaxQueryMemoryBytes caps per-read ClickHouse memory via the max_memory_usage
+	// setting. 0 leaves it unset (server default). See config.APIConfig docs.
+	MaxQueryMemoryBytes int64
 }
 
 type Store struct {
@@ -85,6 +88,19 @@ const clickHouseStartupProbeTimeout = 2 * time.Second
 // (not idempotent). All other driver methods promote unchanged.
 type retryConn struct {
 	chdriver.Conn
+	// readSettings, when non-nil, is layered onto every read's context (e.g. a
+	// max_memory_usage cap). Reads carry no settings of their own, so this never
+	// clobbers a caller's — rollup/insert paths use Exec, which bypasses this.
+	readSettings ch.Settings
+}
+
+// withReadSettings layers readSettings onto ctx for a read. Inserts (Exec) never
+// reach here, so they keep their own per-statement settings (see rollup.go).
+func (c retryConn) withReadSettings(ctx context.Context) context.Context {
+	if len(c.readSettings) == 0 {
+		return ctx
+	}
+	return ch.Context(ctx, ch.WithSettings(c.readSettings))
 }
 
 const (
@@ -145,6 +161,7 @@ func isTransientConnErr(err error) bool {
 }
 
 func (c retryConn) Query(ctx context.Context, query string, args ...any) (chdriver.Rows, error) {
+	ctx = c.withReadSettings(ctx)
 	var rows chdriver.Rows
 	err := retryTransientRead(ctx, retryReadAttempts, retryReadBackoff, func() error {
 		var e error
@@ -155,6 +172,7 @@ func (c retryConn) Query(ctx context.Context, query string, args ...any) (chdriv
 }
 
 func (c retryConn) QueryRow(ctx context.Context, query string, args ...any) chdriver.Row {
+	ctx = c.withReadSettings(ctx)
 	var row chdriver.Row
 	_ = retryTransientRead(ctx, retryReadAttempts, retryReadBackoff, func() error {
 		row = c.Conn.QueryRow(ctx, query, args...)
@@ -199,7 +217,11 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if err := conn.Ping(pingCtx); err != nil {
 		return nil, err
 	}
-	return &Store{conn: retryConn{Conn: conn}}, nil
+	var readSettings ch.Settings
+	if cfg.MaxQueryMemoryBytes > 0 {
+		readSettings = ch.Settings{"max_memory_usage": cfg.MaxQueryMemoryBytes}
+	}
+	return &Store{conn: retryConn{Conn: conn, readSettings: readSettings}}, nil
 }
 
 type openRetryConfig struct {

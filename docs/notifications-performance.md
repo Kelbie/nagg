@@ -415,3 +415,61 @@ falls back to client-side consecutive grouping for the GraphQL path.
 - `sovran-app` (committed, needs nagg-ts `0.4.0`):
   - `feat(feed)!: pass pubkey to nagg notifications (API rename)`
   - `feat(notifications): render server-grouped notifications with a mixture`
+
+---
+
+## 12. Concurrency ceiling — the real prod limit (June 24)
+
+Symptom: in the app, feed / notifications / search intermittently showed **no
+nagg results** while nagg "seemed online". Device logs showed the app calling
+every nagg endpoint correctly and degrading through `nagg → primal → relay`, but
+a chunk of nagg reads returned **HTTP 500 (slow, ~2 s — a ClickHouse read that
+ran then failed) or 502 (fast, ~110 ms — the container shedding/restarting)**,
+interleaved with successes. So the client fell back and the user saw
+primal/relay content (or nothing) instead of nagg's ranked results.
+
+Root cause is **concurrency, not the per-query restructure (§5, still intact) and
+not the client.** A graduated live test against prod (`/nostr/notifications`,
+fiatjaf, cold, unique cache key per request) found a hard ceiling:
+
+| concurrent cold reads | result |
+|--:|---|
+| 2 | both `200` (~7 s) |
+| 3 | 2× `200` + **1× `500`** (fast, ~0.3 s) |
+| 4 | 2× `200` + **2× `500`** |
+| 5 | 2× `200` + **3× `500`** |
+
+**Exactly two heavy reads fit**; ClickHouse sheds every additional one
+immediately. A single engaged-account notifications query is multi-GB and ~7 s,
+so two of them already saturate the shared ~30 GB instance (and the in-process
+firehose / enricher / rollup workers compete for the same memory). An app launch
+fires feed + notifications + search + profiles **concurrently**, so the burst
+always overran the ceiling. The `NAGG_MAX_CONCURRENT_REQUESTS` guard was set to
+**24** — far above the ceiling, so it never engaged: ClickHouse rejected first.
+
+### What shipped
+
+- **`NAGG_MAX_CONCURRENT_REQUESTS` default `24 → 2`** (`internal/config/config.go`).
+  At 2 the semaphore admits only what ClickHouse can serve; excess **queues**
+  (bounded by the 30 s request context) and succeeds slower instead of being shed
+  as 5xx → the client keeps nagg instead of falling back.
+- **New `NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES`** (`0` = unset) — a per-read
+  `max_memory_usage` cap injected on the read path (`internal/clickhouse/store.go`,
+  via the `retryConn` read wrapper; inserts/rollup keep their own settings). A
+  runaway read is rejected cleanly (`MEMORY_LIMIT_EXCEEDED`) instead of
+  cgroup-OOMing the container (the 502/flap source). Off by default — set it once
+  the real per-query footprint is measured.
+
+### Caveat — this is a low-traffic ceiling, not the durable fix
+
+A global limit of 2 with ~7 s heavy reads is ~0.3 cold-miss req/s; it stops the
+5xx storm at current traffic but will queue-timeout as users grow. The durable
+fixes that **raise** the safe concurrency are, in order: the materialized
+notifications read-model (§9, collapses cold latency + per-query memory), then
+scaling the ClickHouse instance and/or splitting the firehose/enricher/rollup
+workers off the API service (`railway.ingester.toml` / `railway.enricher.toml`)
+so reads don't compete with ingest for memory. Re-run the table above after any
+of those and raise `NAGG_MAX_CONCURRENT_REQUESTS` to the new measured ceiling.
+
+Immediate ops mitigation (no deploy of this change needed): set
+`NAGG_MAX_CONCURRENT_REQUESTS=2` on the Railway `nagg` service and redeploy.
