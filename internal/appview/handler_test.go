@@ -317,15 +317,19 @@ func (f *fakeAppBackfiller) BackfillFollows(_ context.Context, pubkey string) er
 }
 
 type fakeVertex struct {
-	profile      vertex.ProfileResult
-	profileErr   error
-	profileCalls *int
-	refreshCalls *int
-	search       []vertex.SearchResult
-	searchErr    error
+	profile        vertex.ProfileResult
+	profileErr     error
+	profileCalls   *int
+	refreshCalls   *int
+	search         []vertex.SearchResult
+	searchErr      error
+	lastSearchArgs *vertex.SearchArgs
 }
 
-func (v fakeVertex) Search(context.Context, vertex.SearchArgs) ([]vertex.SearchResult, bool, error) {
+func (v fakeVertex) Search(_ context.Context, args vertex.SearchArgs) ([]vertex.SearchResult, bool, error) {
+	if v.lastSearchArgs != nil {
+		*v.lastSearchArgs = args
+	}
 	if v.searchErr != nil {
 		return nil, false, v.searchErr
 	}
@@ -1522,7 +1526,7 @@ func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 				},
 			},
 		},
-		WithVertex(fakeVertex{
+		WithProfileSearch(fakeVertex{
 			search: []vertex.SearchResult{{
 				PubKey: testPubkey,
 				Npub:   vertex.Npub(testPubkey),
@@ -1581,7 +1585,7 @@ func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
 				Score:   score,
 			}},
 		},
-		WithVertex(fakeVertex{
+		WithProfileSearch(fakeVertex{
 			searchErr: errors.New("DVM 5315 error: you don't have enough credits to fulfil the request"),
 		}),
 		WithNIP05Validation(false),
@@ -1613,6 +1617,82 @@ func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
 	}
 	if response.Results[0].DisplayName == nil || *response.Results[0].DisplayName != "Sovran" {
 		t.Fatalf("displayName = %v", response.Results[0].DisplayName)
+	}
+}
+
+// Search must preserve the provider's Vertex-pagerank ordering verbatim (the
+// quality the REST endpoint was losing by serving the local index instead). The
+// provider returns Bob before Alice; the response must too.
+func TestSearchHonorsProviderOrdering(t *testing.T) {
+	const pubA = testPubkey
+	const pubB = "1111111111111111111111111111111111111111111111111111111111111111"
+	rA, rB := 0.1, 0.9
+	handler := New(
+		fakeStore{profiles: map[string]chstore.ProfileRow{
+			pubA: {PubKey: pubA, DisplayName: "Alice"},
+			pubB: {PubKey: pubB, DisplayName: "Bob"},
+		}},
+		WithProfileSearch(fakeVertex{search: []vertex.SearchResult{
+			{PubKey: pubB, Npub: vertex.Npub(pubB), Rank: &rB},
+			{PubKey: pubA, Npub: vertex.Npub(pubA), Rank: &rA},
+		}}),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/search?query=team&limit=5", nil)
+	handler.search(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Results []SearchResult `json:"results"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 {
+		t.Fatalf("results len = %d", len(response.Results))
+	}
+	if response.Results[0].PubKey != pubB || response.Results[1].PubKey != pubA {
+		t.Fatalf("order = %s,%s want %s,%s", response.Results[0].PubKey, response.Results[1].PubKey, pubB, pubA)
+	}
+}
+
+// limit must be clamped before it reaches the provider and the local-fallback
+// math, matching vertex.NormalizeSearchArgs, so REST and GraphQL agree on counts.
+func TestSearchClampsLimitAboveCeiling(t *testing.T) {
+	var captured vertex.SearchArgs
+	handler := New(
+		fakeStore{profiles: map[string]chstore.ProfileRow{
+			testPubkey: {PubKey: testPubkey, DisplayName: "Sovran"},
+		}},
+		WithProfileSearch(fakeVertex{
+			lastSearchArgs: &captured,
+			search:         []vertex.SearchResult{{PubKey: testPubkey, Npub: vertex.Npub(testPubkey)}},
+		}),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/search?query=sovran&limit=999", nil)
+	handler.search(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if captured.Limit != 100 {
+		t.Fatalf("provider limit = %d, want clamped 100", captured.Limit)
+	}
+	var response struct {
+		Limit int `json:"limit"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Limit != 100 {
+		t.Fatalf("echoed limit = %d, want 100", response.Limit)
 	}
 }
 

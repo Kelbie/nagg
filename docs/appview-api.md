@@ -33,7 +33,7 @@ pass through a concurrency limiter; light routes do not. All responses are JSON.
 | GET | `/nostr/profiles` | no | yes | `profilesAppView` — batch profile info by pubkey |
 | GET | `/nostr/profile` | no | yes | single profile summary (score + counts + top followers) |
 | GET | `/nostr/social-graph` | yes | yes | contacts + relays + mutes bundle |
-| GET | `/nostr/search` | no | yes | `profileSearchAppView` — profile search (Vertex DVM) |
+| GET | `/nostr/search` | no | yes | `profileSearchAppView` — profile search (cached Vertex pagerank via the shared `SearchProvider`, falls back to the local ClickHouse index) |
 | GET | `/nostr/recommended` | no | yes | recommended profiles |
 | GET | `/nostr/mint/reviews` | yes | yes | NIP-87 cashu mint reviews |
 | GET | `/nostr/mint/discover` | yes | yes | cashu mint discovery |
