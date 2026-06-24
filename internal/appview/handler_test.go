@@ -23,6 +23,11 @@ type fakeStore struct {
 	firstEventAt   *time.Time
 	cachedVertex   vertex.ProfileResult
 	cachedVertexOK bool
+	profileSearch  []chstore.ProfileSearchRow
+}
+
+func (s fakeStore) SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error) {
+	return s.profileSearch, nil
 }
 
 func (s fakeStore) FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error) {
@@ -317,9 +322,13 @@ type fakeVertex struct {
 	profileCalls *int
 	refreshCalls *int
 	search       []vertex.SearchResult
+	searchErr    error
 }
 
 func (v fakeVertex) Search(context.Context, vertex.SearchArgs) ([]vertex.SearchResult, bool, error) {
+	if v.searchErr != nil {
+		return nil, false, v.searchErr
+	}
 	return v.search, true, nil
 }
 
@@ -1544,6 +1553,63 @@ func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 	}
 	if len(response.Results) != 1 {
 		t.Fatalf("results len = %d", len(response.Results))
+	}
+	if response.Results[0].DisplayName == nil || *response.Results[0].DisplayName != "Sovran" {
+		t.Fatalf("displayName = %v", response.Results[0].DisplayName)
+	}
+}
+
+// When the Vertex DVM fails (e.g. exhausted credits), search must degrade to
+// the locally-indexed profiles and still return 200 — not surface the DVM's
+// error as a 502. This is the parity the REST endpoint was missing relative to
+// the GraphQL profileSearch resolver.
+func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
+	rank := 7.0
+	score := 88.0
+	handler := New(
+		fakeStore{
+			profiles: map[string]chstore.ProfileRow{
+				testPubkey: {
+					PubKey:      testPubkey,
+					DisplayName: "Sovran",
+					Picture:     "https://example.test/avatar.png",
+				},
+			},
+			profileSearch: []chstore.ProfileSearchRow{{
+				Profile: chstore.ProfileRow{PubKey: testPubkey, DisplayName: "Sovran"},
+				Rank:    rank,
+				Score:   score,
+			}},
+		},
+		WithVertex(fakeVertex{
+			searchErr: errors.New("DVM 5315 error: you don't have enough credits to fulfil the request"),
+		}),
+		WithNIP05Validation(false),
+	)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/search?query=sovran&limit=5", nil)
+	handler.search(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Query     string         `json:"query"`
+		Results   []SearchResult `json:"results"`
+		FromCache bool           `json:"fromCache"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.FromCache {
+		t.Fatalf("fromCache should be false when DVM errored, got %+v", response)
+	}
+	if len(response.Results) != 1 {
+		t.Fatalf("expected 1 local result, got %d", len(response.Results))
+	}
+	if response.Results[0].PubKey != testPubkey {
+		t.Fatalf("pubkey = %s", response.Results[0].PubKey)
 	}
 	if response.Results[0].DisplayName == nil || *response.Results[0].DisplayName != "Sovran" {
 		t.Fatalf("displayName = %v", response.Results[0].DisplayName)
