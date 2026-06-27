@@ -45,10 +45,14 @@ type MintAggregate struct {
 	ReviewCount  int      `json:"reviewCount"`
 }
 
-// MintReviewsResponse matches the nagg-ts MintReviewsResponseSchema.
+// MintReviewsResponse matches the nagg-ts MintReviewsResponseSchema. Profiles
+// bundles each reviewer's kind-0 (name/picture) keyed by pubkey, exactly like
+// the feed/thread/notifications responses, so the client renders reviewer
+// identity from this one call instead of resolving every pubkey on-device.
 type MintReviewsResponse struct {
-	Summary MintAggregate `json:"summary"`
-	Reviews []MintReview  `json:"reviews"`
+	Summary  MintAggregate          `json:"summary"`
+	Reviews  []MintReview           `json:"reviews"`
+	Profiles map[string]ProfileInfo `json:"profiles"`
 }
 
 // DiscoverMintsResponse matches the nagg-ts DiscoverMintsResponseSchema.
@@ -98,13 +102,24 @@ func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 		return deduped[i].EventID < deduped[j].EventID
 	})
 
+	reviewers := make([]string, 0, len(deduped))
+	for _, review := range deduped {
+		reviewers = append(reviewers, review.ReviewerPubkey)
+	}
+	profiles, perr := h.profileInfos(r.Context(), reviewers)
+	if perr != nil {
+		// Identity is best-effort enrichment; never fail the reviews on it.
+		profiles = map[string]ProfileInfo{}
+	}
+
 	writeJSON(w, MintReviewsResponse{
 		Summary: MintAggregate{
 			MintURL:      mintURL,
 			AverageScore: averageMintScore(deduped),
 			ReviewCount:  len(deduped),
 		},
-		Reviews: deduped,
+		Reviews:  deduped,
+		Profiles: profiles,
 	})
 }
 

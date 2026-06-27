@@ -70,6 +70,41 @@ func TestMintReviewsAggregatesAndDedupes(t *testing.T) {
 	}
 }
 
+func TestMintReviewsBundlesReviewerProfiles(t *testing.T) {
+	const alicePk = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const bobPk = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	store := mintReviewStore{
+		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{
+			alicePk: {PubKey: alicePk, DisplayName: "Alice", Picture: "https://a/pic.png"},
+			// bob has no kind-0 row → absent from the profiles map, not an error
+		}},
+		events: []chstore.EventView{
+			reviewEvent("1", alicePk, mintA, "great [5/5]", 100),
+			reviewEvent("2", bobPk, mintA, "ok [3/5]", 90),
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nostr/mint/reviews?u="+mintA, nil)
+	handler.mintReviews(rec, req)
+
+	var resp MintReviewsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Profiles == nil {
+		t.Fatalf("profiles map must be present (never nil)")
+	}
+	got, ok := resp.Profiles[alicePk]
+	if !ok || got.Name != "Alice" || got.Picture != "https://a/pic.png" {
+		t.Fatalf("alice profile = %+v (ok=%v), want Alice/https://a/pic.png", got, ok)
+	}
+	if _, ok := resp.Profiles[bobPk]; ok {
+		t.Fatalf("bob has no kind-0; should be absent from profiles, got %+v", resp.Profiles[bobPk])
+	}
+}
+
 func TestMintReviewsTrailingSlashIsSameMint(t *testing.T) {
 	store := mintReviewStore{events: []chstore.EventView{
 		reviewEvent("1", "alice", "https://mint.example", "[5/5]", 100),
