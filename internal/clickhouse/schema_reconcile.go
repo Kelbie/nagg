@@ -62,23 +62,6 @@ func schemaReconcileMode() string {
 }
 
 // embeddedMigrations returns the declarative migration SQL in apply order.
-func embeddedMigrations() []string {
-	return []string{
-		ingestionMigration,
-		appviewMigration,
-		rankingMigration,
-		derivedMigration,
-		replyParityMigration,
-		notificationsMigration,
-		directRepliesMigration,
-		rawCountsMigration,
-		engagementRealMigration,
-		userAggregatesMigration,
-		rankFeaturesMigration,
-		featureTTLMigration,
-		likeRepostBackfillMigration,
-	}
-}
 
 // parseDesiredSchema parses the embedded migration SQL into a DesiredSchema.
 // It understands CREATE TABLE column blocks (paren-aware, so nested types such

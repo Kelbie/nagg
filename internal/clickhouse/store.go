@@ -2,13 +2,15 @@ package clickhouse
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,44 +20,50 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 )
 
-//go:embed migrations/001_ingestion.sql
-var ingestionMigration string
+// migrationsFS holds every migrations/NNN_*.sql file, compiled into the binary.
+// Adding a migration is just dropping a correctly-numbered .sql file into the
+// directory — no Go edit, no hand-maintained order list.
+//
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
-//go:embed migrations/002_appview.sql
-var appviewMigration string
+// embeddedMigrations returns every migration SQL payload in filename order. The
+// zero-padded numeric prefix (001_, 002_, …) makes lexical sort == apply order
+// (safe up to 999 migrations). A read error is impossible at runtime — the
+// directory is embedded in the binary — so it signals a build/programming bug
+// and panics rather than widening every caller's signature.
+func embeddedMigrations() []string {
+	names := migrationNames()
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, mustReadMigration(name))
+	}
+	return out
+}
 
-//go:embed migrations/003_ranking.sql
-var rankingMigration string
+// migrationNames lists the embedded migration filenames in apply order.
+func migrationNames() []string {
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		panic(fmt.Sprintf("read embedded migrations dir: %v", err))
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
+}
 
-//go:embed migrations/004_derived.sql
-var derivedMigration string
-
-//go:embed migrations/005_reply_parity.sql
-var replyParityMigration string
-
-//go:embed migrations/006_notifications.sql
-var notificationsMigration string
-
-//go:embed migrations/007_direct_replies.sql
-var directRepliesMigration string
-
-//go:embed migrations/008_raw_counts.sql
-var rawCountsMigration string
-
-//go:embed migrations/009_engagement_real.sql
-var engagementRealMigration string
-
-//go:embed migrations/010_user_aggregates.sql
-var userAggregatesMigration string
-
-//go:embed migrations/011_rank_features.sql
-var rankFeaturesMigration string
-
-//go:embed migrations/012_feature_ttl.sql
-var featureTTLMigration string
-
-//go:embed migrations/013_like_repost_backfill.sql
-var likeRepostBackfillMigration string
+func mustReadMigration(name string) string {
+	b, err := migrationsFS.ReadFile("migrations/" + name)
+	if err != nil {
+		panic(fmt.Sprintf("read embedded migration %s: %v", name, err))
+	}
+	return string(b)
+}
 
 type Config struct {
 	Addr         string

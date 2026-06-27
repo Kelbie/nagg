@@ -292,7 +292,7 @@ func TestSchemaReconcileMode_Default(t *testing.T) {
 // deployments (CREATE ... IF NOT EXISTS alone is a no-op there). It must also
 // backfill historical replies.
 func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
-	sql := replyParityMigration
+	sql := mustReadMigration("005_reply_parity.sql")
 	if !strings.Contains(sql, "DROP VIEW IF EXISTS mv_note_reply_counts") {
 		t.Error("reply-parity migration must DROP the old reply MV before recreating it")
 	}
@@ -302,16 +302,9 @@ func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
 	if !strings.Contains(sql, "INSERT INTO note_reply_counts") {
 		t.Error("reply-parity migration must backfill historical replies")
 	}
-	// The migration must be wired into the apply order, or it never runs.
-	found := false
-	for _, m := range embeddedMigrations() {
-		if m == replyParityMigration {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("reply-parity migration is not wired into embeddedMigrations()")
+	// The file must be discovered by the embed glob, or it never runs.
+	if !migrationFilePresent("005_reply_parity.sql") {
+		t.Error("005_reply_parity.sql is not discovered by embeddedMigrations()")
 	}
 }
 
@@ -320,7 +313,7 @@ func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
 // tables, derive the parent with the reply > unmarked-last > root coalesce, and
 // exclude quotes. It must also be wired into the apply order.
 func TestDirectRepliesMigration_DeclaresEdgeAndCountTables(t *testing.T) {
-	sql := directRepliesMigration
+	sql := mustReadMigration("007_direct_replies.sql")
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS note_reply_edges",
 		"CREATE TABLE IF NOT EXISTS note_direct_reply_counts",
@@ -346,15 +339,8 @@ func TestDirectRepliesMigration_DeclaresEdgeAndCountTables(t *testing.T) {
 		}
 	}
 
-	found := false
-	for _, m := range embeddedMigrations() {
-		if m == directRepliesMigration {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("007 direct-replies migration is not wired into embeddedMigrations()")
+	if !migrationFilePresent("007_direct_replies.sql") {
+		t.Error("007_direct_replies.sql is not discovered by embeddedMigrations()")
 	}
 }
 

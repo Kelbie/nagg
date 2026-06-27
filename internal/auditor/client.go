@@ -43,16 +43,15 @@ type Client interface {
 // StaleFor) when the upstream is briefly unavailable — mirroring how
 // api.sovran.money wraps the same upstream so behavior is unchanged.
 type HTTPClient struct {
-	baseURL string
-	limit   int
-	ttl     time.Duration
+	baseURL  string
+	limit    int
+	ttl      time.Duration
 	staleFor time.Duration
-	http    *http.Client
+	http     *http.Client
 
 	mu        sync.Mutex
 	cached    []Mint
 	fetchedAt time.Time
-	inflight  bool
 }
 
 // Option configures the HTTPClient.
