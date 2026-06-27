@@ -87,7 +87,9 @@ func NewHTTPClient(baseURL string, opts ...Option) *HTTPClient {
 		limit:    200,
 		ttl:      time.Hour,
 		staleFor: 24 * time.Hour,
-		http:     &http.Client{Timeout: 20 * time.Second},
+		// Tight timeout so a slow/down auditor degrades discovery to Nostr-only
+		// quickly instead of hanging past the client's request budget.
+		http: &http.Client{Timeout: 8 * time.Second},
 	}
 	for _, opt := range opts {
 		opt(c)

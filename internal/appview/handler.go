@@ -31,6 +31,7 @@ type Store interface {
 	FollowCounts(context.Context, string) (chstore.FollowCounts, error)
 	ProfileFirstEventCreatedAt(context.Context, string) (*time.Time, error)
 	CachedVertexProfile(context.Context, string) (vertex.ProfileResult, bool, error)
+	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	SaveVertexProfile(context.Context, vertex.ProfileResult) error
 	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)

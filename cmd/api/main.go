@@ -275,6 +275,15 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		auditorClient := auditor.NewHTTPClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
 		appviewOpts = append(appviewOpts, appview.WithAuditor(auditorClient))
 		slog.Info("mint auditor enabled", "url", cfg.Auditor.URL, "limit", cfg.Auditor.Limit)
+		// Warm the auditor cache in the background so the first /nostr/mint/discover
+		// request doesn't pay the cold upstream fetch.
+		go func() {
+			warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if _, err := auditorClient.Mints(warmCtx); err != nil {
+				slog.Warn("mint auditor warm-up failed", "error", err)
+			}
+		}()
 	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage))
 	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {

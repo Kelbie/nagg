@@ -122,15 +122,28 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		operatorPubkeys = append(operatorPubkeys, pk)
 	}
 
+	// Operator social enrichment in THREE batched reads (kind-0, follow counts,
+	// cached Vertex scores) instead of two CH queries + a live Vertex DVM call
+	// per operator. The DVM round-trips (which were even failing on credits) blew
+	// the client's timeout → "no mints available"; this keeps discovery as cheap
+	// as the reviews endpoint (cache-only, no live DVM).
 	profiles, perr := h.profileInfos(ctx, operatorPubkeys)
 	if perr != nil {
 		profiles = map[string]ProfileInfo{}
 	}
+	followCounts, ferr := h.store.BatchFollowCounts(ctx, operatorPubkeys)
+	if ferr != nil {
+		followCounts = map[string]chstore.FollowCounts{}
+	}
+	vertexProfiles, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys)
+	if verr != nil {
+		vertexProfiles = map[string]vertex.ProfileResult{}
+	}
 
-	// 5) Build a row per mint, enriching with operator social reputation.
+	// 5) Build a row per mint, enriching from the batched maps (no per-mint CH/DVM).
 	mints := make([]DiscoverMint, 0, len(keys))
 	for key := range keys {
-		row := h.buildDiscoverMint(ctx, key, aggByKey[key], auditByKey, operatorByKey)
+		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, followCounts, vertexProfiles)
 		mints = append(mints, row)
 	}
 
@@ -214,12 +227,13 @@ func pruneProfilesToMints(mints []DiscoverMint, profiles map[string]ProfileInfo)
 	return kept
 }
 
-func (h *Handler) buildDiscoverMint(
-	ctx context.Context,
+func buildDiscoverMint(
 	key string,
 	agg mintReviewAgg,
 	auditByKey map[string]auditor.Mint,
 	operatorByKey map[string]string,
+	followCounts map[string]chstore.FollowCounts,
+	vertexProfiles map[string]vertex.ProfileResult,
 ) DiscoverMint {
 	var row DiscoverMint
 	if audit, ok := auditByKey[key]; ok {
@@ -244,13 +258,13 @@ func (h *Handler) buildDiscoverMint(
 	if pk, ok := operatorByKey[key]; ok {
 		row.OperatorPubkey = pk
 		row.OperatorNpub = vertex.Npub(pk)
-		if counts, err := h.store.FollowCounts(ctx, pk); err == nil {
+		if counts, ok := followCounts[pk]; ok {
 			row.Followers = counts.Followers
 			row.Follows = counts.Follows
-			if dvm, _ := h.vertexProfile(ctx, pk, counts.Followers); dvm.PubKey != "" {
-				row.VertexRank = dvm.Rank
-				row.VertexScore = dvm.Score
-			}
+		}
+		if dvm, ok := vertexProfiles[pk]; ok && dvm.PubKey != "" {
+			row.VertexRank = dvm.Rank
+			row.VertexScore = dvm.Score
 		}
 	}
 	return row

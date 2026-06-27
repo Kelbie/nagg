@@ -64,6 +64,16 @@ func (s fakeStore) CachedVertexProfile(context.Context, string) (vertex.ProfileR
 	return s.cachedVertex, s.cachedVertexOK, nil
 }
 
+func (s fakeStore) CachedVertexProfiles(_ context.Context, pubkeys []string) (map[string]vertex.ProfileResult, error) {
+	out := make(map[string]vertex.ProfileResult, len(pubkeys))
+	if s.cachedVertexOK {
+		for _, pubkey := range pubkeys {
+			out[pubkey] = s.cachedVertex
+		}
+	}
+	return out, nil
+}
+
 func (s fakeStore) SaveVertexProfile(context.Context, vertex.ProfileResult) error {
 	return nil
 }
@@ -79,7 +89,7 @@ func (s fakeStore) Notifications(context.Context, chstore.NotificationInput) ([]
 func (s fakeStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
 	out := make(map[string]chstore.FollowCounts, len(pubkeys))
 	for _, pubkey := range pubkeys {
-		out[pubkey] = chstore.FollowCounts{}
+		out[pubkey] = s.counts
 	}
 	return out, nil
 }
