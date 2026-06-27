@@ -55,6 +55,12 @@ type DiscoverMintsResponse struct {
 	Profiles map[string]ProfileInfo `json:"profiles"`
 }
 
+// discoverReviewScanCap bounds how many kind-38000 review events the discovery
+// aggregate scans. It must comfortably exceed the total cashu-mint review count
+// so per-mint aggregates match the dedicated reviews endpoint; cashu mint
+// reviews number in the low thousands globally, so this is generous and cheap.
+const discoverReviewScanCap = 5000
+
 type mintReviewAgg struct {
 	display    string
 	avg        *float64
@@ -68,10 +74,14 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	limit := intParam(r, "limit", 200)
+	// limit caps the number of MINTS returned, not the reviews scanned — the
+	// review scan must be wide enough that each mint's aggregate is accurate
+	// (otherwise a popular mint shows far fewer reviews here than on its own
+	// reviews page).
+	mintsLimit := intParam(r, "limit", 200)
 
-	// 1) Nostr reviews (kind-38000) → per-mint aggregate.
-	aggByKey, err := h.mintReviewAggregates(ctx, limit)
+	// 1) Nostr reviews (kind-38000) → per-mint aggregate, over a wide scan.
+	aggByKey, err := h.mintReviewAggregates(ctx, discoverReviewScanCap)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -135,6 +145,10 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		}
 		return mints[i].MintURL < mints[j].MintURL
 	})
+	if mintsLimit > 0 && len(mints) > mintsLimit {
+		mints = mints[:mintsLimit]
+		profiles = pruneProfilesToMints(mints, profiles)
+	}
 
 	writeJSON(w, DiscoverMintsResponse{Mints: mints, Profiles: profiles})
 }
@@ -180,6 +194,24 @@ func (h *Handler) mintReviewAggregates(ctx context.Context, limit int) (map[stri
 		}
 	}
 	return out, nil
+}
+
+// pruneProfilesToMints drops operator profiles whose mint fell outside the
+// returned slice, so the profiles map stays scoped to what's rendered.
+func pruneProfilesToMints(mints []DiscoverMint, profiles map[string]ProfileInfo) map[string]ProfileInfo {
+	if len(profiles) == 0 {
+		return profiles
+	}
+	kept := make(map[string]ProfileInfo, len(mints))
+	for _, m := range mints {
+		if m.OperatorPubkey == "" {
+			continue
+		}
+		if p, ok := profiles[m.OperatorPubkey]; ok {
+			kept[m.OperatorPubkey] = p
+		}
+	}
+	return kept
 }
 
 func (h *Handler) buildDiscoverMint(
