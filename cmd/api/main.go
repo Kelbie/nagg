@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/vertex-lab/nagg/internal/appview"
+	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/cache"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
@@ -270,6 +271,12 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}
+	if cfg.Auditor.Enabled && cfg.Auditor.URL != "" {
+		auditorClient := auditor.NewHTTPClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
+		appviewOpts = append(appviewOpts, appview.WithAuditor(auditorClient))
+		slog.Info("mint auditor enabled", "url", cfg.Auditor.URL, "limit", cfg.Auditor.Limit)
+	}
+	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage))
 	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}

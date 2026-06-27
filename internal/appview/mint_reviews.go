@@ -55,11 +55,6 @@ type MintReviewsResponse struct {
 	Profiles map[string]ProfileInfo `json:"profiles"`
 }
 
-// DiscoverMintsResponse matches the nagg-ts DiscoverMintsResponseSchema.
-type DiscoverMintsResponse struct {
-	Mints []MintAggregate `json:"mints"`
-}
-
 func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET /nostr/mint/reviews only", http.StatusMethodNotAllowed)
@@ -121,60 +116,6 @@ func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 		Reviews:  deduped,
 		Profiles: profiles,
 	})
-}
-
-func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET /nostr/mint/discover only", http.StatusMethodNotAllowed)
-		return
-	}
-	limit := intParam(r, "limit", 200)
-	events, err := h.store.QueryEvents(r.Context(), chstore.EventQueryInput{
-		Kinds: []int{mintReviewKind},
-		Tags:  []chstore.TagFilter{{Key: "k", Value: cashuMintK}},
-		Limit: uint64(limit),
-	})
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-
-	byMint := map[string][]MintReview{}
-	display := map[string]string{}
-	for _, event := range events {
-		review, ok := mintReviewFromEvent(event)
-		if !ok {
-			continue
-		}
-		key := normalizeMintURL(review.MintURL)
-		byMint[key] = append(byMint[key], review)
-		if _, seen := display[key]; !seen {
-			display[key] = review.MintURL
-		}
-	}
-
-	mints := make([]MintAggregate, 0, len(byMint))
-	for key, reviews := range byMint {
-		deduped := dedupeMintReviewsByReviewer(reviews)
-		mints = append(mints, MintAggregate{
-			MintURL:      display[key],
-			AverageScore: averageMintScore(deduped),
-			ReviewCount:  len(deduped),
-		})
-	}
-	// Best-attested first: most reviews, then highest average, then url for a
-	// stable order (map iteration is random).
-	sort.Slice(mints, func(i, j int) bool {
-		if mints[i].ReviewCount != mints[j].ReviewCount {
-			return mints[i].ReviewCount > mints[j].ReviewCount
-		}
-		if scoreOrZero(mints[i].AverageScore) != scoreOrZero(mints[j].AverageScore) {
-			return scoreOrZero(mints[i].AverageScore) > scoreOrZero(mints[j].AverageScore)
-		}
-		return mints[i].MintURL < mints[j].MintURL
-	})
-
-	writeJSON(w, DiscoverMintsResponse{Mints: mints})
 }
 
 // --- parsing / aggregation (mirrors nagg-ts facade/mint-reviews.ts) ---------

@@ -16,6 +16,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/cache"
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -70,6 +71,9 @@ type Handler struct {
 	cacheTTL                  time.Duration
 	cacheStaleFor             time.Duration
 	ranker                    RankedFeedProvider
+	auditor                   AuditorClient
+	appLatestVersion          string
+	appUpdateMessage          string
 	// querySlots bounds how many CH-heavy requests execute concurrently (cache
 	// misses only). The shared ClickHouse degrades sharply past a handful of
 	// concurrent heavy queries, so excess requests wait here and succeed a little
@@ -169,6 +173,31 @@ func WithRankedFeed(provider RankedFeedProvider) Option {
 	}
 }
 
+// AuditorClient supplies the upstream cashu mint auditor data (mint list, state,
+// operation counts, NUT-06 info) that /nostr/mint/discover merges with nagg's
+// Nostr review + social data. Satisfied by *auditor.HTTPClient.
+type AuditorClient interface {
+	Mints(context.Context) ([]auditor.Mint, error)
+}
+
+// WithAppVersion backs POST /app/latest-version, letting the app's update check
+// read through nagg. An empty version advertises "no update".
+func WithAppVersion(version, message string) Option {
+	return func(h *Handler) {
+		h.appLatestVersion = version
+		h.appUpdateMessage = message
+	}
+}
+
+// WithAuditor wires the cashu mint auditor client. Without it,
+// /nostr/mint/discover degrades to Nostr-only discovery (reviews + operator
+// social, no audit state / supported-unit data).
+func WithAuditor(client AuditorClient) Option {
+	return func(h *Handler) {
+		h.auditor = client
+	}
+}
+
 func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 	return func(h *Handler) {
 		h.userBackfiller = backfiller
@@ -256,6 +285,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/profile", h.profile, false},
 		{"/nostr/search", h.search, false},
 		{"/nostr/recommended", h.recommended, false},
+		{"/app/latest-version", h.latestVersion, false},
 	}
 	for _, route := range routes {
 		next := route.handler

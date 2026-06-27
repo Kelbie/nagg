@@ -27,6 +27,8 @@ type Config struct {
 	Viewer     ViewerConfig
 	Enrich     EnrichConfig
 	Cache      CacheConfig
+	Auditor    AuditorConfig
+	AppVersion AppVersionConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -55,6 +57,24 @@ type RollupConfig struct {
 	MaxTargets    int
 	MinActorScore float64
 	Version       string
+}
+
+// AppVersionConfig backs POST /app/latest-version so the Sovran app's update
+// check reads through nagg instead of api.sovran.money. LatestVersion empty
+// means "no update advertised" (the client treats an empty/older-or-equal
+// version as up to date).
+type AppVersionConfig struct {
+	LatestVersion string
+	UpdateMessage string
+}
+
+// AuditorConfig configures the upstream cashu mint auditor client that powers
+// /nostr/mint/discover. URL empty (or Enabled false) leaves discovery
+// Nostr-only (reviews + operator social, no audit state / supported units).
+type AuditorConfig struct {
+	URL     string
+	Enabled bool
+	Limit   int
 }
 
 type APIConfig struct {
@@ -172,6 +192,15 @@ func Load() (Config, error) {
 			RankMinFollowers:    parseInt(env("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "500")),
 			SyncBatch:           parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
 			SyncThrottle:        parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
+		},
+		Auditor: AuditorConfig{
+			URL:     env("NAGG_AUDITOR_URL", "https://api.audit.8333.space"),
+			Enabled: parseBool(env("NAGG_AUDITOR_ENABLED", "true")),
+			Limit:   parseInt(env("NAGG_AUDITOR_LIMIT", "200")),
+		},
+		AppVersion: AppVersionConfig{
+			LatestVersion: os.Getenv("NAGG_APP_LATEST_VERSION"),
+			UpdateMessage: os.Getenv("NAGG_APP_UPDATE_MESSAGE"),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,
