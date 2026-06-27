@@ -2,8 +2,10 @@ package appview
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -147,17 +149,7 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		mints = append(mints, row)
 	}
 
-	// Best-attested first: most reviews, then highest average, then url (stable;
-	// map iteration is random).
-	sort.Slice(mints, func(i, j int) bool {
-		if mints[i].ReviewCount != mints[j].ReviewCount {
-			return mints[i].ReviewCount > mints[j].ReviewCount
-		}
-		if scoreOrZero(mints[i].AverageScore) != scoreOrZero(mints[j].AverageScore) {
-			return scoreOrZero(mints[i].AverageScore) > scoreOrZero(mints[j].AverageScore)
-		}
-		return mints[i].MintURL < mints[j].MintURL
-	})
+	sortDiscoverMints(mints)
 	if mintsLimit > 0 && len(mints) > mintsLimit {
 		mints = mints[:mintsLimit]
 		profiles = pruneProfilesToMints(mints, profiles)
@@ -207,6 +199,73 @@ func (h *Handler) mintReviewAggregates(ctx context.Context, limit int) (map[stri
 		}
 	}
 	return out, nil
+}
+
+// --- ranking ----------------------------------------------------------------
+//
+// Smart sort: green (auditor-passing) mints ALWAYS rank above everything else,
+// then a weighted blend of audit uptime, review score, review count, and
+// operator follower count orders within each tier. Counts/followers are
+// log-scaled so one huge mint can't dominate, and normalized to ~0..1 so the
+// weights are comparable.
+
+const (
+	weightUptime      = 0.40 // audit success %
+	weightReviewScore = 0.30 // average [n/5] review score
+	weightReviewCount = 0.20 // how many reviews/favourites
+	weightFollowers   = 0.10 // operator Nostr reach
+)
+
+// auditUptime is successes / (successes + errors), 0..1. n_errors is a SEPARATE
+// count of failed ops, not a subset of mints/melts, so the denominator includes
+// it. 0 when the mint has no audited operations.
+func auditUptime(m DiscoverMint) float64 {
+	success := m.NMints + m.NMelts
+	total := success + m.NErrors
+	if total <= 0 {
+		return 0
+	}
+	return float64(success) / float64(total)
+}
+
+func isGreenPassing(m DiscoverMint) bool {
+	return m.HasAudit && strings.EqualFold(m.State, "OK")
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func discoverRankScore(m DiscoverMint) float64 {
+	uptime := auditUptime(m)
+	score := scoreOrZero(m.AverageScore) / 5.0
+	// log10(1+n): ~100 reviews → 1.0; ~10k followers → 1.0.
+	reviewCount := clamp01(math.Log10(1+float64(m.ReviewCount)) / 2.0)
+	followers := clamp01(math.Log10(1+float64(m.Followers)) / 4.0)
+	return weightUptime*uptime +
+		weightReviewScore*score +
+		weightReviewCount*reviewCount +
+		weightFollowers*followers
+}
+
+func sortDiscoverMints(mints []DiscoverMint) {
+	sort.Slice(mints, func(i, j int) bool {
+		gi, gj := isGreenPassing(mints[i]), isGreenPassing(mints[j])
+		if gi != gj {
+			return gi // green-passing mints first, always
+		}
+		si, sj := discoverRankScore(mints[i]), discoverRankScore(mints[j])
+		if si != sj {
+			return si > sj
+		}
+		return mints[i].MintURL < mints[j].MintURL // stable tiebreak
+	})
 }
 
 // pruneProfilesToMints drops operator profiles whose mint fell outside the

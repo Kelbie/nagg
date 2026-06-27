@@ -74,6 +74,48 @@ func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 	}
 }
 
+func f(v float64) *float64 { return &v }
+
+func TestSortDiscoverMintsGreenFirstThenWeighted(t *testing.T) {
+	greenStrong := DiscoverMint{
+		MintURL: "https://green-strong", HasAudit: true, State: "OK",
+		NMints: 900, NMelts: 900, NErrors: 10, // ~99% uptime
+		AverageScore: f(4.8), ReviewCount: 40, Followers: 5000,
+	}
+	greenWeak := DiscoverMint{
+		MintURL: "https://green-weak", HasAudit: true, State: "OK",
+		NMints: 5, NMelts: 5, NErrors: 0, // 100% uptime but tiny
+		AverageScore: nil, ReviewCount: 0, Followers: 0,
+	}
+	errorBusy := DiscoverMint{
+		MintURL: "https://error-busy", HasAudit: true, State: "ERROR",
+		NMints: 10, NMelts: 10, NErrors: 500, // error-heavy
+		AverageScore: f(5.0), ReviewCount: 200, Followers: 99999,
+	}
+	noAudit := DiscoverMint{
+		MintURL: "https://no-audit", HasAudit: false,
+		AverageScore: f(4.0), ReviewCount: 10,
+	}
+
+	mints := []DiscoverMint{errorBusy, noAudit, greenWeak, greenStrong}
+	sortDiscoverMints(mints)
+	order := []string{mints[0].MintURL, mints[1].MintURL, mints[2].MintURL, mints[3].MintURL}
+
+	// Both green-passing mints rank above the (busier, higher-scored) non-green
+	// ones — green is always first. greenStrong outranks greenWeak on the blend.
+	want := []string{
+		"https://green-strong",
+		"https://green-weak",
+		"https://error-busy", // higher weighted score than no-audit, but both non-green
+		"https://no-audit",
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("order[%d] = %s, want %s (full: %v)", i, order[i], want[i], order)
+		}
+	}
+}
+
 func TestDiscoverMintsDegradesWithoutAuditor(t *testing.T) {
 	store := mintReviewStore{events: []chstore.EventView{
 		reviewEvent("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "https://m1", "[4/5]", 100),
