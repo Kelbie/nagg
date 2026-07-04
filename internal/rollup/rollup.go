@@ -23,6 +23,7 @@ type Store interface {
 	RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error
 	RecomputeRankFeatures(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
 	RecomputeNotificationsFeed(ctx context.Context, now time.Time) (bool, error)
+	RunRetention(ctx context.Context, dryRun bool) ([]clickhouse.RetentionRunResult, error)
 	LoadRollupState(ctx context.Context, task string) (clickhouse.RollupState, error)
 	SaveRollupState(ctx context.Context, st clickhouse.RollupState) error
 }
@@ -39,6 +40,11 @@ type Config struct {
 	// minute fresh, not 15m). During historical catch-up the loop ticks
 	// near-continuously until the watermark reaches now.
 	NotificationsInterval time.Duration
+	// RetentionInterval paces the declarative retention pass
+	// (clickhouse.RetentionRules). <= 0 disables retention entirely.
+	RetentionInterval time.Duration
+	// RetentionDryRun logs what each rule WOULD delete without deleting.
+	RetentionDryRun bool
 }
 
 type Runner struct {
@@ -88,6 +94,7 @@ func (r *Runner) Run(ctx context.Context) {
 		return
 	}
 	safego.Go("rollup.notifications_feed", func() { r.runNotificationsLoop(ctx) })
+	safego.Go("rollup.retention", func() { r.runRetentionLoop(ctx) })
 	for {
 		if err := r.RunOnce(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -130,6 +137,48 @@ func (r *Runner) runNotificationsLoop(ctx context.Context) {
 			wait = 2 * time.Second
 		}
 		if sleep(ctx, wait) != nil {
+			return
+		}
+	}
+}
+
+// retentionInitialDelay keeps the first retention pass off the boot path so a
+// deploy settles (migrations, catch-up, warm caches) before any deletes are
+// submitted.
+const retentionInitialDelay = 10 * time.Minute
+
+// runRetentionLoop applies the declarative retention rules on a slow cadence,
+// one gate slot per pass so a retention count/delete can never crowd out user
+// reads.
+func (r *Runner) runRetentionLoop(ctx context.Context) {
+	if r.config.RetentionInterval <= 0 {
+		return
+	}
+	if sleep(ctx, retentionInitialDelay) != nil {
+		return
+	}
+	for ctx.Err() == nil {
+		release, err := r.gate.Acquire(ctx)
+		if err != nil {
+			return
+		}
+		results, err := r.store.RunRetention(ctx, r.config.RetentionDryRun)
+		release()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			r.logger.Error("retention run failed", "error", err, "dry_run", r.config.RetentionDryRun)
+		}
+		for _, result := range results {
+			r.logger.Info("retention rule",
+				"rule", result.Rule,
+				"matched_events", result.MatchedEvents,
+				"deleted", result.Deleted,
+				"dry_run", r.config.RetentionDryRun,
+			)
+		}
+		if sleep(ctx, r.config.RetentionInterval) != nil {
 			return
 		}
 	}

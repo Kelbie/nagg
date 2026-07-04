@@ -25,6 +25,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/rollup"
 	"github.com/vertex-lab/nagg/internal/runtimelimits"
 	"github.com/vertex-lab/nagg/internal/safego"
@@ -163,8 +164,19 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 				MinActorScore: cfg.Rollup.MinActorScore,
 				Version:       cfg.Rollup.Version,
 			},
+			RetentionInterval: cfg.Rollup.RetentionInterval,
+			RetentionDryRun:   cfg.Rollup.RetentionDryRun,
 		}, logger).WithGate(gate)
 		go rollupRunner.Run(ctx)
+	}
+
+	// Relevance tracker: records known Sovran viewers (via the appview touch
+	// seam below) and serves the exemption set the ingest post cap consults.
+	// Started regardless of the ingester flag so viewer touches are recorded
+	// even when ingestion runs in a separate process.
+	relevanceTracker := relevance.NewTracker(store, logger)
+	if workerSchemaReady {
+		safego.Go("api.relevance", func() { relevanceTracker.Run(ctx) })
 	}
 
 	if cfg.RunEnricher && workerSchemaReady {
@@ -195,7 +207,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		slog.Error("in-process enricher disabled: schema setup failed")
 	}
 	if cfg.RunIngester && workerSchemaReady {
-		startInProcessIngester(ctx, store, cfg)
+		startInProcessIngester(ctx, store, cfg, relevanceTracker.Exempt)
 	}
 
 	var userFeedBackfiller *appview.RelayUserFeedBackfiller
@@ -273,6 +285,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
+		appview.WithViewerTouch(relevanceTracker.Touch),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor),
 		appview.WithRankedFeed(ranker),
 		appview.WithConcurrencyGate(gate),
@@ -362,7 +375,7 @@ func apiUnavailable(w http.ResponseWriter) {
 	})
 }
 
-func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config) {
+func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config, exempt func(pubkey string) bool) {
 	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
 		slog.Error("in-process ingester disabled: event kind retention failed", "error", err)
 		return
@@ -383,7 +396,7 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 		return
 	}
 
-	pipeline := ingest.New(store, cfg.Ingest)
+	pipeline := ingest.New(store, cfg.Ingest, ingest.WithExemption(exempt))
 	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
 	slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays), "kinds", cfg.Firehose.Kinds)
 	go func() {

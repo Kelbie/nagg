@@ -14,6 +14,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/runtimelimits"
 	"github.com/vertex-lab/nagg/internal/safego"
 )
@@ -63,7 +64,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	pipeline := ingest.New(store, cfg.Ingest)
+	// The exemption set for the post cap is read from ClickHouse (known_viewers
+	// is written by the API process's viewer-touch seam), so the standalone
+	// ingester only needs the refresher, not the touch side.
+	relevanceTracker := relevance.NewTracker(store, logger)
+	safego.Go("ingester.relevance", func() { relevanceTracker.Run(ctx) })
+
+	pipeline := ingest.New(store, cfg.Ingest, ingest.WithExemption(relevanceTracker.Exempt))
 
 	var wg sync.WaitGroup
 	wg.Add(2)

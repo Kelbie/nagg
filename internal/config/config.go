@@ -58,6 +58,12 @@ type RollupConfig struct {
 	MaxTargets    int
 	MinActorScore float64
 	Version       string
+	// RetentionInterval paces the declarative retention rules
+	// (clickhouse.RetentionRules, docs/retention.md). <= 0 disables.
+	RetentionInterval time.Duration
+	// RetentionDryRun logs per-rule matched counts without deleting anything —
+	// the retention rollback lever.
+	RetentionDryRun bool
 }
 
 // AppVersionConfig backs POST /app/latest-version so the Sovran app's update
@@ -187,6 +193,11 @@ func Load() (Config, error) {
 			FlushInterval: parseDuration(env("NAGG_FLUSH_INTERVAL", "5s")),
 			QueueSize:     parseInt(env("NAGG_QUEUE_SIZE", "10000")),
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
+			// Per-author daily firehose cap for posts/reposts from authors NOT
+			// relevant to any Sovran user (see internal/relevance). Measured
+			// 2026-07: 20/day removes ~90% of monthly post volume, all of it
+			// from firehose bridge/bot accounts. 0 disables.
+			PostCapPerDay: parseInt(env("NAGG_POST_CAP_PER_DAY", "20")),
 		},
 		Vertex: VertexConfig{
 			PrivateKey:          os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
@@ -240,11 +251,13 @@ func Load() (Config, error) {
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
 		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", "true")),
 		Rollup: RollupConfig{
-			Interval:      parseDuration(env("NAGG_ROLLUP_INTERVAL", "15m")),
-			RecentWindow:  parseDuration(env("NAGG_ROLLUP_RECENT_WINDOW", "48h")),
-			MaxTargets:    parseInt(env("NAGG_ROLLUP_MAX_TARGETS", "50000")),
-			MinActorScore: parseFloat(env("NAGG_ROLLUP_MIN_ACTOR_SCORE", "0")),
-			Version:       env("NAGG_ROLLUP_THRESHOLD_VERSION", "v1"),
+			Interval:          parseDuration(env("NAGG_ROLLUP_INTERVAL", "15m")),
+			RecentWindow:      parseDuration(env("NAGG_ROLLUP_RECENT_WINDOW", "48h")),
+			MaxTargets:        parseInt(env("NAGG_ROLLUP_MAX_TARGETS", "50000")),
+			MinActorScore:     parseFloat(env("NAGG_ROLLUP_MIN_ACTOR_SCORE", "0")),
+			Version:           env("NAGG_ROLLUP_THRESHOLD_VERSION", "v1"),
+			RetentionInterval: parseDuration(env("NAGG_RETENTION_INTERVAL", "24h")),
+			RetentionDryRun:   parseBool(env("NAGG_RETENTION_DRY_RUN", "false")),
 		},
 	}
 

@@ -77,6 +77,13 @@ type Handler struct {
 	auditor                   AuditorClient
 	appLatestVersion          string
 	appUpdateMessage          string
+	// viewerTouch records "this pubkey is a real Sovran viewer" (relevance
+	// tracking for the ingest post cap). Called ONLY on routes where the
+	// pubkey is semantically the requesting user — notifications, DM
+	// envelopes, thread viewer — never on browsed subjects (profiles, user
+	// feeds), so viewing a bot's profile can't mark the bot as a Sovran user.
+	// Must be non-blocking; nil disables.
+	viewerTouch func(pubkey string)
 	// gate bounds how many CH-heavy requests execute concurrently (cache
 	// misses only). The shared ClickHouse degrades sharply past a handful of
 	// concurrent heavy queries, so excess requests wait here and succeed a little
@@ -198,6 +205,15 @@ func WithAppVersion(version, message string) Option {
 func WithAuditor(client AuditorClient) Option {
 	return func(h *Handler) {
 		h.auditor = client
+	}
+}
+
+// WithViewerTouch wires the known-viewer recording seam (see the viewerTouch
+// field for where it fires). The func must be non-blocking (relevance.Tracker
+// throttles and inserts asynchronously).
+func WithViewerTouch(touch func(pubkey string)) Option {
+	return func(h *Handler) {
+		h.viewerTouch = touch
 	}
 }
 
@@ -1163,6 +1179,7 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 		return input, grouped, fmt.Errorf("notification pubkey: %w", err)
 	}
 	input.Viewer = strings.ToLower(viewer)
+	h.touchViewer(input.Viewer)
 	if tab := strings.ToUpper(strings.TrimSpace(raw.Tab)); tab == "ALL" || tab == "MENTIONS" {
 		input.Tab = tab
 	}
@@ -1236,6 +1253,9 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	if viewer, verr := normalizePubkey(queryViewerParam(r)); verr == nil {
+		h.touchViewer(viewer)
 	}
 	replies := eventsJSON(events)
 	ordering := h.threadOrdering(r.Context(), threadOrderParams{
@@ -1488,6 +1508,7 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	h.touchViewer(viewer)
 	kinds := parseDmKinds(r.URL.Query().Get("kinds"))
 	limit := clampDmLimit(intParam(r, "limit", 50))
 	until := int64(intParam(r, "until", 0))
@@ -2456,6 +2477,13 @@ func normalizePubkey(input string) (string, error) {
 		return value.(string), nil
 	}
 	return "", fmt.Errorf("unsupported pubkey prefix %q", prefix)
+}
+
+// touchViewer records a resolved viewer pubkey via the WithViewerTouch seam.
+func (h *Handler) touchViewer(pubkey string) {
+	if h.viewerTouch != nil && pubkey != "" {
+		h.viewerTouch(pubkey)
+	}
 }
 
 func (h *Handler) viewerPubkeyOr(input string) (string, error) {
