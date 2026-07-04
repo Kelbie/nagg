@@ -13,6 +13,7 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	}
 
 	wantTables := []string{
+		"schema_migrations",
 		"nostr_events",
 		"event_seen_relays",
 		"event_tags",
