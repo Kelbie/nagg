@@ -38,11 +38,15 @@ type MintReview struct {
 }
 
 // MintAggregate is the per-mint summary the client renders. AverageScore is null
-// when no surviving review carried a score.
+// when no surviving review carried a score. FavouriteCount is the subset of
+// deduped reviews posted WITHOUT a score (pure endorsements) — the same field
+// the discover endpoint carries, so the two mint surfaces share one contract
+// and the app never recomputes the scored/favourite split from reviews[].
 type MintAggregate struct {
-	MintURL      string   `json:"mintUrl"`
-	AverageScore *float64 `json:"averageScore"`
-	ReviewCount  int      `json:"reviewCount"`
+	MintURL        string   `json:"mintUrl"`
+	AverageScore   *float64 `json:"averageScore"`
+	ReviewCount    int      `json:"reviewCount"`
+	FavouriteCount int      `json:"favouriteCount"`
 }
 
 // MintReviewsResponse matches the nagg-ts MintReviewsResponseSchema. Profiles
@@ -107,11 +111,18 @@ func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 		profiles = map[string]ProfileInfo{}
 	}
 
+	favourites := 0
+	for _, review := range deduped {
+		if review.Score == nil {
+			favourites++
+		}
+	}
 	writeJSON(w, MintReviewsResponse{
 		Summary: MintAggregate{
-			MintURL:      mintURL,
-			AverageScore: averageMintScore(deduped),
-			ReviewCount:  len(deduped),
+			MintURL:        mintURL,
+			AverageScore:   averageMintScore(deduped),
+			ReviewCount:    len(deduped),
+			FavouriteCount: favourites,
 		},
 		Reviews:  deduped,
 		Profiles: profiles,

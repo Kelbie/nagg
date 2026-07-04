@@ -256,14 +256,20 @@ func (h *Handler) setOptionalBackfillers(backfiller any) {
 	}
 }
 
-func (h *Handler) Register(mux *http.ServeMux) {
-	routes := []struct {
-		path    string
-		handler http.HandlerFunc
-		// heavy routes run multi-query ClickHouse aggregations; only these go
-		// through the concurrency limiter so a burst can't overwhelm CH.
-		heavy bool
-	}{
+type route struct {
+	path    string
+	handler http.HandlerFunc
+	// heavy routes run multi-query ClickHouse aggregations; only these go
+	// through the concurrency limiter so a burst can't overwhelm CH.
+	heavy bool
+}
+
+// routes is the single source of truth for the REST surface. The advertised
+// capabilities manifest (capabilities.AppViewRoutes) must mirror it —
+// TestCapabilitiesRouteParity enforces that, because the manifest had
+// silently drifted to under-report seven live routes.
+func (h *Handler) routes() []route {
+	return []route{
 		{"/nostr/capabilities", h.capabilities, false},
 		{"/nostr/feed", h.feed, true},
 		{"/nostr/feed/user", h.userFeed, true},
@@ -290,7 +296,10 @@ func (h *Handler) Register(mux *http.ServeMux) {
 		{"/nostr/recommended", h.recommended, false},
 		{"/app/latest-version", h.latestVersion, false},
 	}
-	for _, route := range routes {
+}
+
+func (h *Handler) Register(mux *http.ServeMux) {
+	for _, route := range h.routes() {
 		next := route.handler
 		if route.heavy {
 			next = h.limitConcurrency(next)

@@ -49,24 +49,35 @@ var Names = []string{
 	"appview.v1",
 }
 
+// AppViewRoutes is the advertised REST surface. It MUST match the routes
+// appview's Register actually mounts — clients feature-gate on this manifest,
+// and it had silently drifted to under-report seven live routes.
+// appview's TestCapabilitiesRouteParity enforces the match.
 var AppViewRoutes = []string{
 	"/nostr/capabilities",
 	"/nostr/feed",
 	"/nostr/feed/user",
+	"/nostr/feed/ranked",
+	"/nostr/notifications",
 	"/nostr/notes/stats",
 	"/nostr/thread",
 	"/nostr/follows",
 	"/nostr/events",
+	"/nostr/events/query",
 	"/nostr/dm/envelopes",
+	"/nostr/dm/conversation",
+	"/nostr/follow-status",
 	"/nostr/mint/reviews",
 	"/nostr/mint/discover",
 	"/nostr/social-graph",
+	"/nostr/own/profiles",
 	"/nostr/own/",
 	"/nostr/notifications/seen",
 	"/nostr/profiles",
 	"/nostr/profile",
 	"/nostr/search",
 	"/nostr/recommended",
+	"/app/latest-version",
 }
 
 func ServiceInfo() map[string]any {
