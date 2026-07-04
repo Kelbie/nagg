@@ -39,6 +39,7 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"derived_metrics",
 		"enrichment_state",
 		"notification_candidates",
+		"known_viewers",
 	}
 	if len(desired.tables) != len(wantTables) {
 		t.Fatalf("parsed %d tables, want %d: %v", len(desired.tables), len(wantTables), tableNames(desired))

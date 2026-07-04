@@ -19,7 +19,24 @@ type Config struct {
 	FlushInterval time.Duration
 	QueueSize     int
 	VerifyEvents  bool
+	// PostCapPerDay caps how many post/repost events (postCapKinds) a single
+	// NON-exempt author gets ingested per UTC day; the rest are dropped at the
+	// firehose. Measured on prod: ~90% of monthly post volume comes from a
+	// small set of over-cap firehose accounts (bridges/bots), so this is the
+	// main growth stem. 0 disables. Exemption comes from WithExemption; with no
+	// exemption source configured the cap applies to every author.
+	//
+	// The on-demand relay backfills (user feed, threads, DMs) bypass this by
+	// construction — they insert through Store.InsertEvents directly, not
+	// through this firehose pipeline. Demand-driven fetches are definitionally
+	// relevant.
+	PostCapPerDay int
 }
+
+// postCapKinds are the event kinds the per-author daily cap applies to: text
+// notes (1), comments (1111), and reposts (6, 16) — a repost flooder is the
+// same problem as a post flooder. Declarative: edit this list to change scope.
+var postCapKinds = map[int]struct{}{1: {}, 1111: {}, 6: {}, 16: {}}
 
 type Store interface {
 	InsertEvents(context.Context, []clickhouse.EventRecord) error
@@ -30,6 +47,11 @@ type Pipeline struct {
 	cfg   Config
 	batch []clickhouse.EventRecord
 
+	// cap state lives on the single batching goroutine (add/Flush), so it needs
+	// no locking. exempt nil = no exemption source = cap everyone.
+	exempt func(pubkey string) bool
+	cap    postCapCounter
+
 	// verifyOnce/verified: the signature-verification stage is created ONCE per
 	// Pipeline and reused across Run calls — the callers restart Run after
 	// insert-failure bursts, and rebuilding the stage per call would strand the
@@ -38,12 +60,25 @@ type Pipeline struct {
 	verified   <-chan firehose.RelayEvent
 }
 
-func New(store Store, cfg Config) *Pipeline {
-	return &Pipeline{
+// Option customizes a Pipeline beyond the env-derived Config.
+type Option func(*Pipeline)
+
+// WithExemption installs the author-exemption check for the post cap
+// (relevance.Tracker.Exempt: known Sovran viewers + everyone they follow).
+func WithExemption(exempt func(pubkey string) bool) Option {
+	return func(p *Pipeline) { p.exempt = exempt }
+}
+
+func New(store Store, cfg Config, opts ...Option) *Pipeline {
+	p := &Pipeline{
 		store: store,
 		cfg:   cfg,
 		batch: make([]clickhouse.EventRecord, 0, cfg.BatchSize),
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 func (p *Pipeline) Run(ctx context.Context, in <-chan firehose.RelayEvent) error {
@@ -179,6 +214,14 @@ func (p *Pipeline) Flush(ctx context.Context) error {
 	}
 	slog.Info("inserted event batch", "events", len(p.batch), "duration", time.Since(start))
 	p.batch = p.batch[:0]
+	if p.cap.droppedSinceLog > 0 {
+		slog.Info("ingest.capped",
+			"dropped_events", p.cap.droppedSinceLog,
+			"capped_authors_today", p.cap.cappedAuthorsToday,
+			"cap_per_day", p.cfg.PostCapPerDay,
+		)
+		p.cap.droppedSinceLog = 0
+	}
 	return nil
 }
 
@@ -192,6 +235,9 @@ func (p *Pipeline) add(relayEvent firehose.RelayEvent) error {
 		if err := validateShape(event); err != nil {
 			return err
 		}
+	}
+	if p.overPostCap(event) {
+		return errPostCapped
 	}
 
 	p.batch = append(p.batch, clickhouse.EventRecord{
