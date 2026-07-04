@@ -22,52 +22,95 @@ import (
 // once the watermark is close to now (see notificationsFeedReady).
 
 const (
+	// Head cursor: the near-now high-water mark, advanced every tick.
 	notificationsFeedTask = "notifications_feed"
-	// How far back the model reaches on first deploy; matches the table TTL.
+	// Backfill cursor: walks BACKWARD from the first head slice toward the
+	// 30-day history target, one slice per tick.
+	notificationsFeedBackfillTask = "notifications_feed_backfill"
+	// How far back history extends; matches the table TTL.
 	notificationsFeedHistoryWindow = 30 * 24 * time.Hour
 	// Steady-state re-process overlap: late-arriving events for a window and
 	// vertex-score drift converge on rewrite (ReplacingMergeTree by computed_at).
 	notificationsFeedOverlap = 10 * time.Minute
-	// Catch-up slice per tick. Bounds the per-tick join cost against
-	// notification_candidates history.
-	notificationsFeedMaxSlice = 6 * time.Hour
-	// The read path uses the model only when the watermark is at most this far
-	// behind now — otherwise history is still being chewed and the legacy query
-	// serves. This is a BOOTSTRAP condition (self-clearing), not a fallback.
+	// Slice per tick. Kept small on purpose: notification_candidates is sorted
+	// by viewer (created_at windows cannot prune it) and month-old event_tags
+	// granules are cold — the original 6h forward slices ran ~5 MINUTES and
+	// died on the ~300s infra connection ceiling (CH 394 client-cancel).
+	notificationsFeedSlice = time.Hour
+	// The read path flips to the model once the head is at most this far
+	// behind now …
 	notificationsFeedReadyLag = 30 * time.Minute
+	// … AND the backward cursor has covered at least this much history —
+	// enough for virtually all notification page views; deeper history keeps
+	// filling in behind. Bootstrap condition, self-clearing.
+	notificationsFeedReadyHistory = 72 * time.Hour
 )
 
-// RecomputeNotificationsFeed advances the watermark one bounded slice and
-// returns whether the model has caught up to `now`.
+// RecomputeNotificationsFeed keeps the read-model current NEWEST-FIRST: the
+// head slice (recent, warm data — cheap) runs every tick so reads can flip on
+// quickly after a fresh deploy, and one backward history slice follows per
+// tick until the 30-day target is reached. Returns whether both cursors are
+// done for this tick (steady state).
 func (s *Store) RecomputeNotificationsFeed(ctx context.Context, now time.Time) (bool, error) {
-	st, err := s.LoadRollupState(ctx, notificationsFeedTask)
+	head, err := s.LoadRollupState(ctx, notificationsFeedTask)
 	if err != nil {
 		return false, err
 	}
-	from := st.CursorCreatedAt
-	if from.IsZero() {
-		from = now.Add(-notificationsFeedHistoryWindow)
-	} else {
-		from = from.Add(-notificationsFeedOverlap)
-	}
-	to := from.Add(notificationsFeedMaxSlice)
-	caughtUp := !to.Before(now)
-	if caughtUp {
-		to = now
-	}
 
-	if err := s.execRollup(ctx, "recompute notifications feed", buildNotificationsFeedSQL(from, to, now)); err != nil {
+	// Head slice: [last head − overlap, now). On the very first run cover one
+	// slice back from now; history is the backfill walker's job.
+	headFrom := head.CursorCreatedAt.Add(-notificationsFeedOverlap)
+	firstRun := head.CursorCreatedAt.IsZero()
+	if firstRun {
+		headFrom = now.Add(-notificationsFeedSlice)
+	}
+	if err := s.execRollup(ctx, "recompute notifications feed head", buildNotificationsFeedSQL(headFrom, now, now)); err != nil {
 		return false, err
 	}
 	if err := s.SaveRollupState(ctx, RollupState{
 		Task:            notificationsFeedTask,
-		CursorCreatedAt: to,
+		CursorCreatedAt: now,
 		LastRunAt:       now,
-		Processed:       st.Processed + 1,
+		Processed:       head.Processed + 1,
 	}); err != nil {
 		return false, err
 	}
-	return caughtUp, nil
+
+	// Backward history slice.
+	backfill, err := s.LoadRollupState(ctx, notificationsFeedBackfillTask)
+	if err != nil {
+		return false, err
+	}
+	edge := backfill.CursorCreatedAt
+	if edge.IsZero() {
+		if !firstRun {
+			// Pre-two-cursor deployments have a head but no backfill cursor;
+			// resume history from the oldest slice the head design covered.
+			edge = head.CursorCreatedAt
+		} else {
+			edge = headFrom
+		}
+	}
+	target := now.Add(-notificationsFeedHistoryWindow)
+	if !edge.After(target) {
+		return true, nil // history complete — steady state
+	}
+	sliceFrom := edge.Add(-notificationsFeedSlice)
+	if sliceFrom.Before(target) {
+		sliceFrom = target
+	}
+	if err := s.execRollup(ctx, "recompute notifications feed history", buildNotificationsFeedSQL(sliceFrom, edge, now)); err != nil {
+		return false, err
+	}
+	if err := s.SaveRollupState(ctx, RollupState{
+		Task:            notificationsFeedBackfillTask,
+		CursorCreatedAt: sliceFrom,
+		LastRunAt:       now,
+		Processed:       backfill.Processed + 1,
+	}); err != nil {
+		return false, err
+	}
+	return !sliceFrom.After(target), nil
 }
 
 // buildNotificationsFeedSQL denormalizes the candidate window [from, to) into
@@ -161,11 +204,17 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 		LEFT JOIN referenced_events AS rp ON rp.id = rm.direct_parent_id
 		LEFT JOIN event_ref_authors AS ra ON ra.event_id = n.event_id AND ra.ref_author = n.viewer
 		LEFT JOIN actor_scores AS sc ON sc.pubkey = n.actor_pubkey
+		-- max_execution_time 240 (below the rollup default of 600): the
+		-- nagg<->ClickHouse connection is killed by infrastructure at ~300s,
+		-- so a statement allowed to run longer dies as a client-cancel
+		-- (CH 394) AFTER doing all its work. Fail fast and clean instead.
+		SETTINGS max_execution_time = 240
 	`, from.Unix(), to.Unix(), computedAt.Unix())
 }
 
-// notificationsFeedReady reports whether the read-model watermark is close
-// enough to now to serve reads. Cached briefly so the hot path doesn't query
+// notificationsFeedReady reports whether the read-model can serve reads: the
+// head watermark is fresh AND the backward history walker has covered the
+// window users actually page. Cached briefly so the hot path doesn't query
 // rollup_state per request.
 func (s *Store) notificationsFeedReady(ctx context.Context) bool {
 	s.feedReadyMu.Lock()
@@ -173,9 +222,13 @@ func (s *Store) notificationsFeedReady(ctx context.Context) bool {
 	if time.Since(s.feedReadyCheckedAt) < 30*time.Second {
 		return s.feedReady
 	}
-	st, err := s.LoadRollupState(ctx, notificationsFeedTask)
-	ready := err == nil && !st.CursorCreatedAt.IsZero() &&
-		time.Since(st.CursorCreatedAt) < notificationsFeedReadyLag
+	head, headErr := s.LoadRollupState(ctx, notificationsFeedTask)
+	backfill, backErr := s.LoadRollupState(ctx, notificationsFeedBackfillTask)
+	ready := headErr == nil && backErr == nil &&
+		!head.CursorCreatedAt.IsZero() &&
+		time.Since(head.CursorCreatedAt) < notificationsFeedReadyLag &&
+		!backfill.CursorCreatedAt.IsZero() &&
+		time.Since(backfill.CursorCreatedAt) >= notificationsFeedReadyHistory
 	s.feedReady = ready
 	s.feedReadyCheckedAt = time.Now()
 	return ready
