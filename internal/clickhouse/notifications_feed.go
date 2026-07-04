@@ -27,8 +27,10 @@ const (
 	// Backfill cursor: walks BACKWARD from the first head slice toward the
 	// 30-day history target, one slice per tick.
 	notificationsFeedBackfillTask = "notifications_feed_backfill"
-	// How far back history extends; matches the table TTL.
-	notificationsFeedHistoryWindow = 30 * 24 * time.Hour
+	// How far back history extends; matches the table TTL. 14 days: paging
+	// deeper is rare, and history size is what blew the disk in the first
+	// (denormalized) shape.
+	notificationsFeedHistoryWindow = 14 * 24 * time.Hour
 	// Steady-state re-process overlap: late-arriving events for a window and
 	// vertex-score drift converge on rewrite (ReplacingMergeTree by computed_at).
 	notificationsFeedOverlap = 10 * time.Minute
@@ -119,7 +121,7 @@ func (s *Store) RecomputeNotificationsFeed(ctx context.Context, now time.Time) (
 func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 	return fmt.Sprintf(`
 		INSERT INTO notifications_feed
-			(viewer, created_at, event_id, reason, actor_pubkey, event_pubkey, event_kind, event_created_at, content, tags_json, sig, event_last_seen_at, is_reply, direct_parent_author, replies_viewer_thread, actor_score, computed_at)
+			(viewer, created_at, event_id, reason, actor_pubkey, event_pubkey, event_kind, event_created_at, is_reply, direct_parent_author, replies_viewer_thread, actor_score, computed_at)
 		WITH window_candidates AS (
 			SELECT viewer, event_id, actor_pubkey, created_at, reason
 			FROM notification_candidates
@@ -127,7 +129,10 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 			LIMIT 1 BY viewer, event_id, reason
 		),
 		candidate_events AS (
-			SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+			-- NARROW columns only: event bodies are hydrated by id at read
+			-- time. Storing content/tags_json per (viewer, event) row was the
+			-- disk blow-up (one mention duplicated per p-tagged viewer).
+			SELECT id, pubkey, kind, created_at
 			FROM nostr_events
 			WHERE id IN (SELECT event_id FROM window_candidates)
 			ORDER BY id ASC, last_seen_at DESC
@@ -189,10 +194,6 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 			e.pubkey AS event_pubkey,
 			e.kind AS event_kind,
 			e.created_at AS event_created_at,
-			e.content AS content,
-			e.tags_json AS tags_json,
-			e.sig AS sig,
-			e.last_seen_at AS event_last_seen_at,
 			toUInt8(ifNull(rm.is_reply, 0)) AS is_reply,
 			ifNull(toString(rp.pubkey), '') AS direct_parent_author,
 			toUInt8(notEmpty(toString(ra.ref_author))) AS replies_viewer_thread,
@@ -305,9 +306,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 
 	query := fmt.Sprintf(`
 		SELECT
-			event_id, event_pubkey, event_kind, event_created_at, content,
-			tags_json, sig, event_last_seen_at, reason, actor_score,
-			actor_pubkey, created_at
+			event_id, reason, actor_score, actor_pubkey, created_at
 		FROM (
 			SELECT
 				*,
@@ -318,8 +317,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 			FROM (
 				SELECT
 					viewer, created_at, event_id, reason, actor_pubkey,
-					event_pubkey, event_kind, event_created_at, content,
-					tags_json, sig, event_last_seen_at, is_reply,
+					event_pubkey, event_kind, event_created_at, is_reply,
 					direct_parent_author, replies_viewer_thread, actor_score
 				FROM notifications_feed
 				WHERE viewer = ?%s
@@ -337,33 +335,90 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	out := []NotificationRow{}
+	type pageRow struct {
+		eventID    string
+		reason     string
+		actorScore float64
+		actorPk    string
+		createdAt  time.Time
+	}
+	page := []pageRow{}
+	eventIDs := []string{}
 	for rows.Next() {
-		var row NotificationRow
-		var tagsJSON string
-		var kind uint32
-		if err := rows.Scan(
-			&row.Event.ID,
-			&row.Event.PubKey,
-			&kind,
-			&row.Event.CreatedAt,
-			&row.Event.Content,
-			&tagsJSON,
-			&row.Event.Sig,
-			&row.Event.UpdatedAt,
-			&row.Reason,
-			&row.ActorVertexScore,
-			&row.ActorPubKey,
-			&row.NotificationCreatedAt,
-		); err != nil {
+		var r pageRow
+		if err := rows.Scan(&r.eventID, &r.reason, &r.actorScore, &r.actorPk, &r.createdAt); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		row.Event.Kind = int(kind)
-		_ = json.Unmarshal([]byte(tagsJSON), &row.Event.Tags)
+		page = append(page, r)
+		eventIDs = append(eventIDs, r.eventID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(page) == 0 {
+		return []NotificationRow{}, nil
+	}
+
+	// Hydrate event bodies for JUST this page — one bounded IN-list read. The
+	// model deliberately stores no content/tags: denormalizing bodies per
+	// (viewer, event) row multiplied every mention's content by its p-tag
+	// count and filled the disk.
+	events, err := s.eventsByID(ctx, eventIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]NotificationRow, 0, len(page))
+	for _, r := range page {
+		event, ok := events[r.eventID]
+		if !ok {
+			continue
+		}
+		row := NotificationRow{
+			Event:                 event,
+			Reason:                r.reason,
+			ActorVertexScore:      r.actorScore,
+			ActorPubKey:           r.actorPk,
+			NotificationCreatedAt: r.createdAt,
+		}
 		row.Reason = notificationReasonForEvent(row.Event, row.Reason)
 		out = append(out, row)
+	}
+	return out, nil
+}
+
+// eventsByID fetches full event rows for a bounded id set (page-sized),
+// deduping ReplacingMergeTree versions with LIMIT 1 BY id.
+func (s *Store) eventsByID(ctx context.Context, ids []string) (map[string]EventView, error) {
+	out := make(map[string]EventView, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
+		FROM nostr_events
+		WHERE id IN (?)
+		ORDER BY id ASC, last_seen_at DESC
+		LIMIT 1 BY id
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ev EventView
+		var tagsJSON string
+		var kind uint32
+		if err := rows.Scan(&ev.ID, &ev.PubKey, &kind, &ev.CreatedAt, &ev.Content, &tagsJSON, &ev.Sig, &ev.UpdatedAt); err != nil {
+			return nil, err
+		}
+		ev.Kind = int(kind)
+		_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
+		out[ev.ID] = ev
 	}
 	return out, rows.Err()
 }

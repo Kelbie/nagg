@@ -29,10 +29,6 @@ CREATE TABLE IF NOT EXISTS notifications_feed
     event_pubkey          FixedString(64),
     event_kind            UInt32,
     event_created_at      DateTime,
-    content               String,
-    tags_json             String,
-    sig                   String,
-    event_last_seen_at    DateTime,
     is_reply              UInt8,
     direct_parent_author  String DEFAULT '',
     replies_viewer_thread UInt8,
@@ -41,4 +37,4 @@ CREATE TABLE IF NOT EXISTS notifications_feed
 )
 ENGINE = ReplacingMergeTree(computed_at)
 ORDER BY (viewer, created_at, event_id, reason)
-TTL created_at + INTERVAL 30 DAY;
+TTL created_at + INTERVAL 14 DAY;
