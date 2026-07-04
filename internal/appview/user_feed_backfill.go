@@ -16,6 +16,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/relayquery"
+	"github.com/vertex-lab/nagg/internal/safego"
 )
 
 type UserFeedBackfiller interface {
@@ -654,10 +655,31 @@ func (b *RelayUserFeedBackfiller) insertCollected(ctx context.Context, message s
 	return nil
 }
 
+// attemptsPruneThreshold bounds the cooldown map. Keys are per-pubkey /
+// per-event attempt markers; before the prune the map only ever grew — a slow
+// unbounded leak on the long-lived API process (the companion `jobs` map
+// already self-cleans). Pruning is opportunistic on the mutating paths, so the
+// steady-state cost is a length check.
+const attemptsPruneThreshold = 50_000
+
+// pruneAttemptsLocked drops expired cooldown entries once the map is big
+// enough to matter. Caller must hold b.mu.
+func (b *RelayUserFeedBackfiller) pruneAttemptsLocked(now time.Time) {
+	if len(b.attempts) < attemptsPruneThreshold {
+		return
+	}
+	for key, last := range b.attempts {
+		if now.Sub(last) >= b.cfg.Cooldown {
+			delete(b.attempts, key)
+		}
+	}
+}
+
 func (b *RelayUserFeedBackfiller) shouldAttempt(key string) bool {
 	now := time.Now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneAttemptsLocked(now)
 	if last, ok := b.attempts[key]; ok && now.Sub(last) < b.cfg.Cooldown {
 		return false
 	}
@@ -670,6 +692,7 @@ func (b *RelayUserFeedBackfiller) attemptValues(prefix string, values []string) 
 	out := make([]string, 0, len(values))
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneAttemptsLocked(now)
 	for _, value := range values {
 		key := prefix + ":" + value
 		if last, ok := b.attempts[key]; ok && now.Sub(last) < b.cfg.Cooldown {
@@ -703,6 +726,7 @@ func (b *RelayUserFeedBackfiller) scheduleJob(ctx context.Context, key string, w
 	b.mu.Unlock()
 
 	go func() {
+		defer safego.Recover("appview.user_feed_backfill")
 		job.err = work(context.WithoutCancel(ctx))
 		close(job.done)
 

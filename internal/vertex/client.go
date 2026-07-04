@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"math"
 	"sort"
 	"strconv"
@@ -254,6 +255,7 @@ func runDVM[T any](
 	}
 
 	go func() {
+		defer safego.Recover("vertex.sync")
 		publishCtx, publishCancel := context.WithTimeout(ctx, 7*time.Second)
 		defer publishCancel()
 		_ = relay.Publish(publishCtx, request)

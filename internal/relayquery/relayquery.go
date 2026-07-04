@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -54,6 +55,7 @@ func (c Client) Query(ctx context.Context, filter map[string]any, timeout time.D
 	for _, relay := range relays {
 		relay := relay
 		go func() {
+			defer safego.Recover("relayquery.fanout")
 			events, err := c.queryRelay(qctx, relay, subID, filter)
 			results <- relayResult{relay: relay, events: events, err: err}
 		}()

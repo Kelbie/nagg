@@ -8,14 +8,18 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/runtimelimits"
+	"github.com/vertex-lab/nagg/internal/safego"
 )
 
 func main() {
+	runtimelimits.Apply()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -64,15 +68,34 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
+		defer safego.Recover("ingester.worker")
 		defer wg.Done()
 		client.Run(ctx, events)
 		close(events)
 	}()
 	go func() {
+		defer safego.Recover("ingester.worker")
 		defer wg.Done()
-		if err := pipeline.Run(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error("ingestion stopped with error", "error", err)
-			stop()
+		// Restart consumption in-process instead of exiting on the first
+		// insert-failure burst: exiting hands control to Railway's restart
+		// policy, which re-pays boot (connect + migrate check) and — on a
+		// still-degraded ClickHouse — becomes a restart loop. A nil return
+		// means the firehose closed the channel.
+		backoff := time.Second
+		for {
+			err := pipeline.Run(ctx, events)
+			if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.Error("ingestion stopped with error; restarting", "error", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 		}
 	}()
 

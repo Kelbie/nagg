@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"io"
 	"net/http"
 	"strings"
@@ -192,6 +193,7 @@ func serveSWR(
 		// expired entry and an explicit refresh, so neither blocks the caller.
 		writeResponse(w, http.StatusOK, "application/json", cachedBody, "stale")
 		go func() {
+			defer safego.Recover("cache.revalidate")
 			_, _, _ = group.Do("revalidate:"+key, func() (any, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), revalidateTimeout)
 				defer cancel()

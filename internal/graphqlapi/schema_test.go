@@ -464,10 +464,10 @@ func TestFeatureWeightsFromTerms_BailsOnUnrecognized(t *testing.T) {
 		"unknown engagement":   {{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "bookmarks"}, Transform: "LOG1P"}},
 		"non-log1p engagement": {{Kind: weightedRankTermReferences, References: gated, Metric: genericMetric{Name: "likes"}, Transform: "IDENTITY"}},
 		// Ungated engagement (counts ALL engagers, e.g. trending) has no real_* column.
-		"ungated engagement":   {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Transform: "LOG1P"}},
-		"non-vertex pubkey":    {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "other"}}},
-		"non-zero fallback":    {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", Fallback: 0.1}}},
-		"non-quality derived":  {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
+		"ungated engagement":  {{Kind: weightedRankTermReferences, Metric: genericMetric{Name: "likes"}, Transform: "LOG1P"}},
+		"non-vertex pubkey":   {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "other"}}},
+		"non-zero fallback":   {{Kind: weightedRankTermPubkeyScore, PubkeyScore: pubkeyScoreRankTerm{Source: "vertex", Fallback: 0.1}}},
+		"non-quality derived": {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
 	}
 	for name, terms := range cases {
 		if _, _, _, ok := featureWeightsFromTerms(terms); ok {

@@ -149,9 +149,12 @@ func Load() (Config, error) {
 			// runaway guard: an over-budget query is rejected by ClickHouse with a
 			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed
 			// request) instead of consuming the whole instance and cgroup-OOMing the
-			// container (the source of the 502/restart flaps). 0 = unset (no per-query
-			// cap); set once the real per-query footprint is measured.
-			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "0")),
+			// container (the source of the 502/restart flaps). The footprint is now
+			// measured: the worst legitimate read (pre-fix contact-list lookups)
+			// peaked at 7.31 GiB and its replacement runs in single-digit MiB, so
+			// 4 GiB is far above every sanctioned query while still shielding the
+			// instance. 0 = explicitly uncapped.
+			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "4294967296")),
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),

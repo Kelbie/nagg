@@ -14,9 +14,12 @@ import (
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/enrich"
+	"github.com/vertex-lab/nagg/internal/runtimelimits"
+	"github.com/vertex-lab/nagg/internal/safego"
 )
 
 func main() {
+	runtimelimits.Apply()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -89,6 +92,7 @@ func startHealthServer(logger *slog.Logger) *http.Server {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
+		defer safego.Recover("enricher.worker")
 		logger.Info("enricher health server listening", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("enricher health server stopped with error", "error", err)

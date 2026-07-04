@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
@@ -50,6 +51,7 @@ func (c *Client) Run(ctx context.Context, out chan<- RelayEvent) {
 		relay := relay
 		wg.Add(1)
 		go func() {
+			defer safego.Recover("firehose.relay")
 			defer wg.Done()
 			c.runRelay(ctx, relay, out)
 		}()

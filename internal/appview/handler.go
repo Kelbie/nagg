@@ -20,6 +20,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/cache"
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -2156,12 +2157,14 @@ func (h *Handler) tryBackfillEnrichment(ctx context.Context, ids []string, pubke
 	if h.engagementBackfiller != nil && len(ids) > 0 {
 		tasks++
 		go func() {
+			defer safego.Recover("appview.backfill")
 			results <- result{completed: h.tryBackfillEngagement(ctx, ids)}
 		}()
 	}
 	if h.profileBackfiller != nil && len(pubkeys) > 0 {
 		tasks++
 		go func() {
+			defer safego.Recover("appview.backfill")
 			results <- result{completed: h.tryBackfillProfiles(ctx, pubkeys)}
 		}()
 	}
@@ -2183,12 +2186,14 @@ func (h *Handler) tryBackfillProfileSummary(ctx context.Context, pubkey string) 
 	if h.profileBackfiller != nil {
 		tasks++
 		go func() {
+			defer safego.Recover("appview.backfill")
 			results <- result{completed: h.tryBackfillProfiles(ctx, []string{pubkey})}
 		}()
 	}
 	if h.followBackfiller != nil {
 		tasks++
 		go func() {
+			defer safego.Recover("appview.backfill")
 			results <- result{completed: h.tryBackfillFollows(ctx, pubkey)}
 		}()
 	}

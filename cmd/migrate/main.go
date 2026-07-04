@@ -11,9 +11,11 @@ import (
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
+	"github.com/vertex-lab/nagg/internal/runtimelimits"
 )
 
 func main() {
+	runtimelimits.Apply()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 

@@ -10,12 +10,12 @@ import (
 )
 
 type mockStore struct {
-	calls       []string
-	failOn      string
-	savedState  *clickhouse.RollupState
-	gotSince    time.Time
-	gotLimit    int
-	gotThVer    string
+	calls      []string
+	failOn     string
+	savedState *clickhouse.RollupState
+	gotSince   time.Time
+	gotLimit   int
+	gotThVer   string
 }
 
 func (m *mockStore) record(name string) error {

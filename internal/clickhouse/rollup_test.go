@@ -82,15 +82,15 @@ func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing
 		"INSERT INTO note_engagement_real",
 		// explicit column list (real_actors is ALTER-appended / physically last)
 		"(event_id, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, threshold_version, computed_at)",
-		"sc >= 0.42",                          // threshold gate
-		"et.pubkey IN (scored)",               // only scored actors
+		"sc >= 0.42",            // threshold gate
+		"et.pubkey IN (scored)", // only scored actors
 		"uniqExactIf(et.pubkey, et.pubkey != a2.author)", // self-exclusion
-		"'v3' AS threshold_version",           // stamped version
+		"'v3' AS threshold_version",                      // stamped version
 		"toDateTime(1700009999) AS computed_at",
-		"note_reply_edges",                    // real replies via edge authors
-		"note_zaps",                           // real zaps
-		"AS real_actors",                      // combined distinct-engager count
-		"uniqExact(actor)",                    // actors = distinct engagers across types
+		"note_reply_edges", // real replies via edge authors
+		"note_zaps",        // real zaps
+		"AS real_actors",   // combined distinct-engager count
+		"uniqExact(actor)", // actors = distinct engagers across types
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("engagement-real SQL missing %q", want)
@@ -103,10 +103,10 @@ func TestBuildUserStatsSQL_FollowerFanInAndPosts(t *testing.T) {
 	for _, want := range []string{
 		"INSERT INTO user_stats",
 		"length(u.contacts) AS following",
-		"arrayJoin(contacts)",            // follower fan-in
-		"user_contacts_latest FINAL",     // latest list only (fixes the bug)
+		"arrayJoin(contacts)",        // follower fan-in
+		"user_contacts_latest FINAL", // latest list only (fixes the bug)
 		"uniqMerge(posts)",
-		"WHERE follow IN (touched)",       // bounded emission
+		"WHERE follow IN (touched)", // bounded emission
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("user-stats SQL missing %q", want)
@@ -121,11 +121,11 @@ func TestBuildRankFeaturesSQL_AssemblesRawAndReal(t *testing.T) {
 		// explicit column list maps by name (real_actors is physically last)
 		"real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)",
 		"uniqMerge(likes)",
-		"note_direct_reply_counts",                  // direct replies, not any-e-tag
+		"note_direct_reply_counts", // direct replies, not any-e-tag
 		"uniqMerge(quotes)",
 		"sumMerge(sats)",
-		"note_engagement_real",                      // real columns
-		"argMax(score, fetched_at) AS score",        // author vertex score
+		"note_engagement_real",               // real columns
+		"argMax(score, fetched_at) AS score", // author vertex score
 		"metric = 'contribution_quality'",
 		"'v1' AS threshold_version",
 	} {
