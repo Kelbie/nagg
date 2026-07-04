@@ -216,26 +216,45 @@ func (p MaxAgeWithoutEngagement) deletePredicate(kinds []int, idColumn string) s
 }
 
 type RetentionRunResult struct {
-	Rule          string
-	MatchedEvents uint64
-	Deleted       bool
+	Rule        string
+	Table       string
+	Partition   string
+	MatchedRows uint64
+	Deleted     bool
 }
 
-// retentionMaxPendingMutations skips a run while earlier delete mutations are
-// still chewing — resubmitting identical deletes would only pile mutations up.
-const retentionMaxPendingMutations = 4
+// ErrRetentionBusy: a previous delete mutation is still executing, so this
+// pass did nothing. Field-learned the hard way (2026-07-04): a single
+// multi-part mutation on this capacity-limited instance fans out across the
+// whole background pool and starves user reads with error 439 — so retention
+// runs AT MOST ONE partition-scoped mutation at a time, and never overlaps an
+// in-flight one.
+var ErrRetentionBusy = errors.New("retention mutation still pending")
 
-// RunRetention evaluates every RetentionRule: counts matching events (always —
-// that count is the run's log line), then submits the lightweight DELETEs for
-// event_tags and nostr_events unless dryRun. Rule failures don't stop later
-// rules; they are joined into the returned error.
+// retentionTargets: each rule deletes from nostr_events and cascades to
+// event_tags (which carries kind/created_at/event_id for exactly this reason).
+// Both partition by toYYYYMM(created_at).
+var retentionTargets = []struct {
+	table    string
+	idColumn string
+}{
+	{table: "nostr_events", idColumn: "id"},
+	{table: "event_tags", idColumn: "event_id"},
+}
+
+// RunRetention advances retention by ONE bounded step: it finds the first
+// (rule, table, partition) with matching rows and submits a single
+// partition-scoped lightweight DELETE for it, returning immediately (the
+// mutation executes in the background). The caller re-ticks; the
+// ErrRetentionBusy guard serializes mutations across ticks. dryRun instead
+// reports every rule's matches without deleting anything.
 func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunResult, error) {
 	pending, err := s.pendingRetentionMutations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("check pending mutations: %w", err)
 	}
-	if pending > retentionMaxPendingMutations {
-		return nil, fmt.Errorf("skipping retention run: %d mutations still pending on nostr_events/event_tags", pending)
+	if pending > 0 {
+		return nil, fmt.Errorf("%w (%d pending)", ErrRetentionBusy, pending)
 	}
 
 	// Bounded like every other background job on this capacity-limited
@@ -251,30 +270,63 @@ func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunRe
 	var results []RetentionRunResult
 	var errs []error
 	for _, rule := range RetentionRules {
-		eventsPredicate := rule.Policy.deletePredicate(rule.Kinds, "id")
-		var matched uint64
-		if err := s.conn.QueryRow(qctx, "SELECT count() FROM nostr_events WHERE "+eventsPredicate).Scan(&matched); err != nil {
-			errs = append(errs, fmt.Errorf("retention rule %q count: %w", rule.Name, err))
-			continue
-		}
-		result := RetentionRunResult{Rule: rule.Name, MatchedEvents: matched}
-		if matched > 0 && !dryRun {
-			tagsPredicate := rule.Policy.deletePredicate(rule.Kinds, "event_id")
-			if err := s.conn.Exec(qctx, "DELETE FROM event_tags WHERE "+tagsPredicate); err != nil {
-				errs = append(errs, fmt.Errorf("retention rule %q delete event_tags: %w", rule.Name, err))
+		for _, target := range retentionTargets {
+			predicate := rule.Policy.deletePredicate(rule.Kinds, target.idColumn)
+			partition, matched, err := s.firstRetentionMatch(qctx, target.table, predicate)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("retention rule %q count %s: %w", rule.Name, target.table, err))
+				continue
+			}
+			if matched == 0 {
+				continue
+			}
+			result := RetentionRunResult{
+				Rule:        rule.Name,
+				Table:       target.table,
+				Partition:   partition,
+				MatchedRows: matched,
+			}
+			if dryRun {
 				results = append(results, result)
 				continue
 			}
-			if err := s.conn.Exec(qctx, "DELETE FROM nostr_events WHERE "+eventsPredicate); err != nil {
-				errs = append(errs, fmt.Errorf("retention rule %q delete nostr_events: %w", rule.Name, err))
-				results = append(results, result)
-				continue
+			stmt := fmt.Sprintf("DELETE FROM %s IN PARTITION %s WHERE %s", target.table, partition, predicate)
+			if err := s.conn.Exec(qctx, stmt); err != nil {
+				return results, errors.Join(append(errs, fmt.Errorf("retention rule %q delete %s partition %s: %w", rule.Name, target.table, partition, err))...)
 			}
 			result.Deleted = true
+			results = append(results, result)
+			// One mutation per pass — see ErrRetentionBusy.
+			return results, errors.Join(errs...)
 		}
-		results = append(results, result)
 	}
 	return results, errors.Join(errs...)
+}
+
+// firstRetentionMatch returns the oldest partition with rows matching the
+// predicate, and its match count. Oldest-first clears the many small historic
+// partitions quickly and leaves the current jumbo partition for last.
+func (s *Store) firstRetentionMatch(ctx context.Context, table, predicate string) (string, uint64, error) {
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
+		SELECT toString(toYYYYMM(created_at)) AS partition, count() AS matched
+		FROM %s
+		WHERE %s
+		GROUP BY partition
+		ORDER BY partition ASC
+		LIMIT 1
+	`, table, predicate))
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+	var partition string
+	var matched uint64
+	if rows.Next() {
+		if err := rows.Scan(&partition, &matched); err != nil {
+			return "", 0, err
+		}
+	}
+	return partition, matched, rows.Err()
 }
 
 func (s *Store) pendingRetentionMutations(ctx context.Context) (uint64, error) {

@@ -72,10 +72,16 @@ Execution (`Store.RunRetention`, scheduled by the rollup runner):
 - **Lightweight `DELETE FROM`**, submitted async (`lightweight_deletes_sync=0`):
   rows mask immediately as the mutation runs; disk space reclaims through
   background merges. No part rewrite at submit time — safe on a near-full disk.
-- Runs every `NAGG_RETENTION_INTERVAL` (default 24h), first pass 10 minutes
-  after boot, one `chgate` slot per pass.
-- Skips a pass while >4 mutations are still pending on the two tables.
-- Every pass logs one `retention rule` line per rule with the matched count.
+- **At most ONE partition-scoped mutation per pass**, and never while another
+  is still executing (`ErrRetentionBusy`). Field lesson 2026-07-04: two
+  table-wide mutations fanned out across the whole background pool and starved
+  user reads (error 439) until the fat one was `KILL MUTATION`ed. Oldest
+  partition first, so the many small historic partitions clear quickly.
+- Pacing: re-ticks every 5 minutes while there is work in flight or queued;
+  `NAGG_RETENTION_INTERVAL` (default 24h) is the idle cadence once everything
+  has converged. First pass 10 minutes after boot; one `chgate` slot per pass.
+- Every pass logs a `retention rule` line (rule, table, partition, matched
+  rows) for what it acted on.
 
 Gift wraps (kind 1059) are deliberately **not** filtered or pruned — product
 decision 2026-07: keep the whole DM firehose so a new user's history is served
@@ -86,7 +92,7 @@ without a relay round-trip.
 | Env | Default | Meaning |
 | --- | --- | --- |
 | `NAGG_POST_CAP_PER_DAY` | `20` | Daily post/repost cap for non-exempt authors; `0` disables. |
-| `NAGG_RETENTION_INTERVAL` | `24h` | Retention cadence; `0` disables retention. |
+| `NAGG_RETENTION_INTERVAL` | `24h` | Idle retention cadence (busy re-tick is fixed at 5m); `0` disables retention. |
 | `NAGG_RETENTION_DRY_RUN` | `false` | Log per-rule matched counts without deleting. |
 
 ## Adding a rule
