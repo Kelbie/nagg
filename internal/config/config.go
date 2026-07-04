@@ -156,6 +156,9 @@ func Load() (Config, error) {
 			// 4 GiB is far above every sanctioned query while still shielding the
 			// instance. 0 = explicitly uncapped.
 			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "4294967296")),
+			// Emergency escape hatch for the notifications read-model rollout;
+			// remove once the model has served production for a while.
+			NotificationsLegacyRead: parseBool(env("NAGG_NOTIFICATIONS_LEGACY_READ", "false")),
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),

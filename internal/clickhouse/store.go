@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
@@ -75,10 +76,21 @@ type Config struct {
 	// MaxQueryMemoryBytes caps per-read ClickHouse memory via the max_memory_usage
 	// setting. 0 leaves it unset (server default). See config.APIConfig docs.
 	MaxQueryMemoryBytes int64
+	// NotificationsLegacyRead forces the legacy live-join notifications query
+	// even when the notifications_feed read-model is caught up. Emergency
+	// escape hatch for the first read-model deploys — remove once the model
+	// has served production for a while.
+	NotificationsLegacyRead bool
 }
 
 type Store struct {
 	conn ch.Conn
+	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
+	notificationsLegacyRead bool
+	// Cached notifications_feed readiness (see notificationsFeedReady).
+	feedReadyMu        sync.Mutex
+	feedReady          bool
+	feedReadyCheckedAt time.Time
 }
 
 const clickHouseStartupProbeTimeout = 2 * time.Second
@@ -229,7 +241,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.MaxQueryMemoryBytes > 0 {
 		readSettings = ch.Settings{"max_memory_usage": cfg.MaxQueryMemoryBytes}
 	}
-	return &Store{conn: retryConn{Conn: conn, readSettings: readSettings}}, nil
+	return &Store{
+		conn:                    retryConn{Conn: conn, readSettings: readSettings},
+		notificationsLegacyRead: cfg.NotificationsLegacyRead,
+	}, nil
 }
 
 type openRetryConfig struct {
@@ -557,7 +572,6 @@ func (s *Store) Backfill(ctx context.Context) error {
 	statements := []string{
 		"TRUNCATE TABLE IF EXISTS note_like_counts",
 		"TRUNCATE TABLE IF EXISTS note_repost_counts",
-		"TRUNCATE TABLE IF EXISTS note_reply_counts",
 		"TRUNCATE TABLE IF EXISTS note_zaps",
 		"TRUNCATE TABLE IF EXISTS note_zap_totals",
 		"TRUNCATE TABLE IF EXISTS profiles_latest",
@@ -571,11 +585,6 @@ func (s *Store) Backfill(ctx context.Context) error {
 		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS reposts
 		 FROM event_tags
 		 WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
-		 GROUP BY target_event_id`,
-		`INSERT INTO note_reply_counts
-		 SELECT tag_value AS target_event_id, uniqState(event_id) AS replies
-		 FROM event_tags
-		 WHERE kind = 1 AND tag_key = 'e' AND length(tag_value) = 64
 		 GROUP BY target_event_id`,
 		`INSERT INTO profiles_latest
 		 SELECT

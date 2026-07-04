@@ -40,6 +40,9 @@ func (m *mockStore) RecomputeUserStats(_ context.Context, _ time.Time, _ int, _ 
 func (m *mockStore) RecomputeRankFeatures(_ context.Context, _ time.Time, _ int, _ clickhouse.Thresholds, _ time.Time) error {
 	return m.record("rank_features")
 }
+func (m *mockStore) RecomputeNotificationsFeed(_ context.Context, _ time.Time) (bool, error) {
+	return true, m.record("notifications_feed")
+}
 func (m *mockStore) LoadRollupState(_ context.Context, task string) (clickhouse.RollupState, error) {
 	return clickhouse.RollupState{Task: task}, nil
 }

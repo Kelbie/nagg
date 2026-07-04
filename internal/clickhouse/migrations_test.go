@@ -41,7 +41,6 @@ func TestMigrations_FilenamesAreNNNPrefixed(t *testing.T) {
 // event_tags rows), and deleting a ledger row deliberately re-runs a file — so
 // an INSERT into any non-convergent table would double-apply.
 var idempotentInsertTargets = map[string]struct{}{
-	"note_reply_counts":        {},
 	"note_like_counts":         {},
 	"note_repost_counts":       {},
 	"note_quote_counts":        {},
@@ -49,6 +48,7 @@ var idempotentInsertTargets = map[string]struct{}{
 	"note_reply_edges":         {},
 	"user_contacts_latest":     {},
 	"user_post_counts":         {},
+	"user_stats":               {},
 }
 
 // allowedStmtPrefixes are the re-runnable DDL shapes migrations may use. Every

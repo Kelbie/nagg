@@ -782,11 +782,16 @@ func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[st
 		out[pubkey] = counts
 	}
 
+	// Followers come from the rollup-maintained user_stats table (015 backfilled
+	// it to full coverage). The previous read — uniqExact over the ENTIRE global
+	// kind-3 p-tag history in event_tags — was both wrong (counted every pubkey
+	// that EVER followed, ignoring NIP-02 replaceability) and one of the heavy
+	// per-request aggregations on a 2B-row table.
 	rows, err := s.conn.Query(ctx, `
-		SELECT tag_value, uniqExact(pubkey)
-		FROM event_tags
-		WHERE kind = 3 AND tag_key = 'p' AND tag_value IN (?)
-		GROUP BY tag_value
+		SELECT pubkey, argMax(followers, computed_at)
+		FROM user_stats
+		WHERE pubkey IN (?)
+		GROUP BY pubkey
 	`, pubkeys)
 	if err != nil {
 		return nil, err
@@ -1218,6 +1223,14 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	replyScope := strings.ToUpper(strings.TrimSpace(input.ReplyScope))
 	if replyScope == "" {
 		replyScope = "THREAD"
+	}
+
+	// Prefer the denormalized read-model once its watermark has caught up —
+	// a keyed range scan instead of the FINAL-join + tag-scan query below.
+	// While the model backfills after a fresh deploy the legacy query serves
+	// (a bootstrap condition, not a fallback: it self-clears within minutes).
+	if !s.notificationsLegacyRead && s.notificationsFeedReady(ctx) {
+		return s.notificationsFromFeed(ctx, input, tab, policy, replyScope)
 	}
 
 	// Bound how many recent candidates we hydrate before the heavy FINAL joins

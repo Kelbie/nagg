@@ -12,6 +12,7 @@ import (
 
 	"github.com/vertex-lab/nagg/internal/chgate"
 	"github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/safego"
 )
 
 // Store is the subset of the ClickHouse store the rollup needs. Defined as an
@@ -21,6 +22,7 @@ type Store interface {
 	RecomputeEngagementReal(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
 	RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error
 	RecomputeRankFeatures(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
+	RecomputeNotificationsFeed(ctx context.Context, now time.Time) (bool, error)
 	LoadRollupState(ctx context.Context, task string) (clickhouse.RollupState, error)
 	SaveRollupState(ctx context.Context, st clickhouse.RollupState) error
 }
@@ -32,6 +34,11 @@ type Config struct {
 	RecentWindow time.Duration
 	MaxTargets   int
 	Thresholds   clickhouse.Thresholds
+	// NotificationsInterval paces the notifications_feed incremental tick —
+	// much faster than the main rollup (notifications must be seconds-to-a-
+	// minute fresh, not 15m). During historical catch-up the loop ticks
+	// near-continuously until the watermark reaches now.
+	NotificationsInterval time.Duration
 }
 
 type Runner struct {
@@ -67,6 +74,9 @@ func NewRunner(store Store, cfg Config, logger *slog.Logger) *Runner {
 	if cfg.Thresholds.Version == "" {
 		cfg.Thresholds.Version = "v1"
 	}
+	if cfg.NotificationsInterval <= 0 {
+		cfg.NotificationsInterval = time.Minute
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -77,6 +87,7 @@ func (r *Runner) Run(ctx context.Context) {
 	if r == nil || r.store == nil {
 		return
 	}
+	safego.Go("rollup.notifications_feed", func() { r.runNotificationsLoop(ctx) })
 	for {
 		if err := r.RunOnce(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -85,6 +96,40 @@ func (r *Runner) Run(ctx context.Context) {
 			r.logger.Error("rollup failed", "error", err)
 		}
 		if err := sleep(ctx, r.config.Interval); err != nil {
+			return
+		}
+	}
+}
+
+// runNotificationsLoop maintains the notifications_feed read-model: fast
+// incremental ticks in steady state, near-continuous slices while the
+// historical catch-up is still behind. Each slice holds one gate slot so the
+// catch-up can never crowd out user reads.
+func (r *Runner) runNotificationsLoop(ctx context.Context) {
+	for ctx.Err() == nil {
+		release, err := r.gate.Acquire(ctx)
+		if err != nil {
+			return
+		}
+		caughtUp, err := r.store.RecomputeNotificationsFeed(ctx, r.now())
+		release()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			r.logger.Error("notifications feed rollup failed", "error", err)
+			if sleep(ctx, r.config.NotificationsInterval) != nil {
+				return
+			}
+			continue
+		}
+		wait := r.config.NotificationsInterval
+		if !caughtUp {
+			// Historical catch-up: keep chewing with just enough pause to let
+			// queued user reads take the gate first.
+			wait = 2 * time.Second
+		}
+		if sleep(ctx, wait) != nil {
 			return
 		}
 	}
