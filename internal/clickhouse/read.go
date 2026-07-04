@@ -203,24 +203,63 @@ func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string
 		limitPerPubKey = 1
 	}
 
+	// Two-step read. nostr_events is sorted (kind, created_at, pubkey, id), so a
+	// per-pubkey latest lookup cannot use the primary key past `kind` — the old
+	// single-query form dragged content/tags_json for the WHOLE kind slice
+	// through FINAL + sort, costing 6-7.3 GiB per lookup on kind 3 (the standing
+	// ClickHouse OOM trigger; see system.query_log exception history). Resolving
+	// ids first touches only narrow sort columns; the full rows are then fetched
+	// for just those ids. DISTINCT dedupes unmerged ReplacingMergeTree versions
+	// (same id ⇒ same pubkey/created_at), replacing FINAL.
 	where, args := eventWhere("e", nil, pubkeys, kinds, nil)
-	query := fmt.Sprintf(`
-		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
-		FROM nostr_events AS e FINAL
-		%s
-		ORDER BY e.pubkey ASC, e.created_at DESC, e.id DESC
-		LIMIT %d BY e.pubkey
+	idQuery := fmt.Sprintf(`
+		SELECT id FROM (
+			SELECT DISTINCT e.id AS id, e.pubkey AS pubkey, e.created_at AS created_at
+			FROM nostr_events AS e
+			%s
+		)
+		ORDER BY pubkey ASC, created_at DESC, id DESC
+		LIMIT %d BY pubkey
 	`, where, limitPerPubKey)
-	rows, err := s.conn.Query(ctx, query, args...)
+	idRows, err := s.conn.Query(ctx, idQuery, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	ids := make([]string, 0, len(pubkeys))
+	for idRows.Next() {
+		var id string
+		if err := idRows.Scan(&id); err != nil {
+			idRows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := idRows.Err(); err != nil {
+		idRows.Close()
+		return nil, err
+	}
+	idRows.Close()
 
 	out := make(map[string][]EventView, len(pubkeys))
 	for _, pubkey := range pubkeys {
 		out[pubkey] = nil
 	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.conn.Query(ctx, `
+		SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
+		FROM nostr_events AS e
+		WHERE e.id IN (?)
+		ORDER BY e.pubkey ASC, e.created_at DESC, e.id DESC, e.last_seen_at DESC
+		LIMIT 1 BY e.id
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
 	for rows.Next() {
 		var tagsJSON string
 		var ev EventView
@@ -231,6 +270,42 @@ func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string
 		ev.Kind = int(kind)
 		_ = json.Unmarshal([]byte(tagsJSON), &ev.Tags)
 		out[ev.PubKey] = append(out[ev.PubKey], ev)
+	}
+	return out, rows.Err()
+}
+
+// LatestContacts returns each pubkey's latest kind-3 contact set (p-tag values)
+// from the ingest-maintained user_contacts_latest table. Follow-graph reads must
+// use this instead of QueryLatestEventsByPubKeys(kind=3): contact lists are the
+// largest events on the network, and pulling them through the raw events table
+// was the 7 GiB-per-lookup query that OOMed ClickHouse.
+func (s *Store) LatestContacts(ctx context.Context, pubkeys []string) (map[string]map[string]struct{}, error) {
+	pubkeys = uniqueStrings(pubkeys)
+	out := make(map[string]map[string]struct{}, len(pubkeys))
+	if len(pubkeys) == 0 {
+		return out, nil
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT pubkey, argMax(contacts, created_at)
+		FROM user_contacts_latest
+		WHERE pubkey IN (?)
+		GROUP BY pubkey
+	`, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pubkey string
+		var contacts []string
+		if err := rows.Scan(&pubkey, &contacts); err != nil {
+			return nil, err
+		}
+		set := make(map[string]struct{}, len(contacts))
+		for _, contact := range contacts {
+			set[contact] = struct{}{}
+		}
+		out[pubkey] = set
 	}
 	return out, rows.Err()
 }
@@ -697,21 +772,13 @@ func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[st
 	if len(pubkeys) == 0 {
 		return out, nil
 	}
-	latest, err := s.QueryLatestEventsByPubKeys(ctx, pubkeys, []int{3}, 1)
+	contacts, err := s.LatestContacts(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
 	for _, pubkey := range pubkeys {
-		seenFollows := map[string]struct{}{}
-		for _, event := range latest[pubkey] {
-			for _, tag := range event.Tags {
-				if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
-					seenFollows[tag[1]] = struct{}{}
-				}
-			}
-		}
 		counts := out[pubkey]
-		counts.Follows = uint64(len(seenFollows))
+		counts.Follows = uint64(len(contacts[pubkey]))
 		out[pubkey] = counts
 	}
 
@@ -759,40 +826,20 @@ func (s *Store) FollowEdges(ctx context.Context, viewer string, candidates []str
 		return out, nil
 	}
 
-	// viewer -> candidate, from the viewer's latest kind-3 p-tags.
-	viewerLatest, err := s.QueryLatestEventsByPubKeys(ctx, []string{viewer}, []int{3}, 1)
+	// Both directions from the ingest-maintained latest contact lists — one
+	// batched read covers the viewer and every candidate.
+	contacts, err := s.LatestContacts(ctx, append([]string{viewer}, candidates...))
 	if err != nil {
 		return nil, err
 	}
-	viewerFollows := map[string]struct{}{}
-	for _, event := range viewerLatest[viewer] {
-		for _, tag := range event.Tags {
-			if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
-				viewerFollows[tag[1]] = struct{}{}
-			}
-		}
-	}
-
-	// candidate -> viewer, from each candidate's latest kind-3 p-tags.
-	candidateLatest, err := s.QueryLatestEventsByPubKeys(ctx, candidates, []int{3}, 1)
-	if err != nil {
-		return nil, err
-	}
+	viewerFollows := contacts[viewer]
 	for _, candidate := range candidates {
 		edge := out[candidate]
 		if _, ok := viewerFollows[candidate]; ok {
 			edge.Following = true
 		}
-		for _, event := range candidateLatest[candidate] {
-			for _, tag := range event.Tags {
-				if len(tag) >= 2 && tag[0] == "p" && tag[1] == viewer {
-					edge.FollowsYou = true
-					break
-				}
-			}
-			if edge.FollowsYou {
-				break
-			}
+		if _, ok := contacts[candidate][viewer]; ok {
+			edge.FollowsYou = true
 		}
 		out[candidate] = edge
 	}
