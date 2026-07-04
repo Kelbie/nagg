@@ -7,6 +7,7 @@ package rollup
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -147,9 +148,17 @@ func (r *Runner) runNotificationsLoop(ctx context.Context) {
 // submitted.
 const retentionInitialDelay = 10 * time.Minute
 
-// runRetentionLoop applies the declarative retention rules on a slow cadence,
-// one gate slot per pass so a retention count/delete can never crowd out user
-// reads.
+// retentionBusyInterval is the re-tick cadence while retention has work in
+// flight or queued: after submitting a mutation (there is probably another
+// partition waiting) and while a mutation is still executing. The idle cadence
+// — everything converged, nothing matched — is Config.RetentionInterval.
+const retentionBusyInterval = 5 * time.Minute
+
+// runRetentionLoop applies the declarative retention rules, one gate slot per
+// pass so a retention count/delete can never crowd out user reads. Each pass
+// submits AT MOST one partition-scoped mutation (see Store.RunRetention) —
+// concurrent multi-part mutations starve this instance's thread pool and take
+// user reads down with error 439.
 func (r *Runner) runRetentionLoop(ctx context.Context) {
 	if r.config.RetentionInterval <= 0 {
 		return
@@ -164,21 +173,34 @@ func (r *Runner) runRetentionLoop(ctx context.Context) {
 		}
 		results, err := r.store.RunRetention(ctx, r.config.RetentionDryRun)
 		release()
-		if err != nil {
+
+		wait := r.config.RetentionInterval
+		switch {
+		case errors.Is(err, clickhouse.ErrRetentionBusy):
+			r.logger.Info("retention waiting on in-flight mutation")
+			wait = retentionBusyInterval
+		case err != nil:
 			if ctx.Err() != nil {
 				return
 			}
 			r.logger.Error("retention run failed", "error", err, "dry_run", r.config.RetentionDryRun)
+			wait = retentionBusyInterval
 		}
 		for _, result := range results {
 			r.logger.Info("retention rule",
 				"rule", result.Rule,
-				"matched_events", result.MatchedEvents,
+				"table", result.Table,
+				"partition", result.Partition,
+				"matched_rows", result.MatchedRows,
 				"deleted", result.Deleted,
 				"dry_run", r.config.RetentionDryRun,
 			)
+			if result.Deleted {
+				// A mutation went out; more partitions likely remain.
+				wait = retentionBusyInterval
+			}
 		}
-		if sleep(ctx, r.config.RetentionInterval) != nil {
+		if sleep(ctx, wait) != nil {
 			return
 		}
 	}
