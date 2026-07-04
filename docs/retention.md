@@ -72,16 +72,25 @@ Execution (`Store.RunRetention`, scheduled by the rollup runner):
 - **Lightweight `DELETE FROM`**, submitted async (`lightweight_deletes_sync=0`):
   rows mask immediately as the mutation runs; disk space reclaims through
   background merges. No part rewrite at submit time — safe on a near-full disk.
-- **At most ONE partition-scoped mutation per pass**, and never while another
-  is still executing (`ErrRetentionBusy`). Field lesson 2026-07-04: two
-  table-wide mutations fanned out across the whole background pool and starved
-  user reads (error 439) until the fat one was `KILL MUTATION`ed. Oldest
-  partition first, so the many small historic partitions clear quickly.
+- **At most ONE mutation per pass**, and never while another is still
+  executing (`ErrRetentionBusy`). Field lesson 2026-07-04: two table-wide
+  mutations running concurrently fanned out across the whole background pool
+  and starved user reads (error 439) until the fat one was `KILL MUTATION`ed;
+  a single serialized mutation ran with reads healthy throughout. (Partition
+  scoping is NOT used — `DELETE ... IN PARTITION` did not restrict the rewrite
+  on this ClickHouse version.)
+- **Disk-headroom guard** (`ErrRetentionNoHeadroom`): a mutation reserves up
+  to the table's largest part size while rewriting; submitting without
+  headroom wedges it in a reserve-fail retry loop (observed: "Cannot reserve
+  17.89 GiB" retrying forever). Retention waits for merges to free space.
+- **Minimum batch** (`retentionMinMatchedRows` = 50k): a full-table mutation
+  costs the same for 5k rows as for 2M, so rules wait until enough garbage
+  accrues instead of churning parts all day.
 - Pacing: re-ticks every 5 minutes while there is work in flight or queued;
   `NAGG_RETENTION_INTERVAL` (default 24h) is the idle cadence once everything
   has converged. First pass 10 minutes after boot; one `chgate` slot per pass.
-- Every pass logs a `retention rule` line (rule, table, partition, matched
-  rows) for what it acted on.
+- Every pass logs a `retention rule` line (rule, table, matched rows) for what
+  it acted on.
 
 Gift wraps (kind 1059) are deliberately **not** filtered or pruned — product
 decision 2026-07: keep the whole DM firehose so a new user's history is served

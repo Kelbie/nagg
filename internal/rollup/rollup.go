@@ -179,6 +179,10 @@ func (r *Runner) runRetentionLoop(ctx context.Context) {
 		case errors.Is(err, clickhouse.ErrRetentionBusy):
 			r.logger.Info("retention waiting on in-flight mutation")
 			wait = retentionBusyInterval
+		case errors.Is(err, clickhouse.ErrRetentionNoHeadroom):
+			// Background merges free space over time; retry on the busy cadence.
+			r.logger.Info("retention waiting for disk headroom", "detail", err.Error())
+			wait = retentionBusyInterval
 		case err != nil:
 			if ctx.Err() != nil {
 				return
@@ -190,13 +194,12 @@ func (r *Runner) runRetentionLoop(ctx context.Context) {
 			r.logger.Info("retention rule",
 				"rule", result.Rule,
 				"table", result.Table,
-				"partition", result.Partition,
 				"matched_rows", result.MatchedRows,
 				"deleted", result.Deleted,
 				"dry_run", r.config.RetentionDryRun,
 			)
 			if result.Deleted {
-				// A mutation went out; more partitions likely remain.
+				// A mutation went out; more work likely remains.
 				wait = retentionBusyInterval
 			}
 		}
