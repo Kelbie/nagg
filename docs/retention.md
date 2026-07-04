@@ -63,8 +63,12 @@ Mechanics worth knowing:
 | Param-replaceable | 30078, 38000 | latest per (author, d-tag) | Same, keyed per d-tag. Measured: 98.7% of kind-30078 superseded (~4 GiB). |
 | Unengaged old posts | 1, 1111 | posts younger than 1 year OR with any like/repost/quote/zap/direct-reply ever | Nobody reads year-old posts nobody engaged with. Small today (index is young), load-bearing as the index ages. |
 
-Each rule deletes from `nostr_events` and cascades the same predicate to
-`event_tags`. Engagement is read from the aggregate tables
+Rules delete from `nostr_events` only. `event_tags` is deliberately left
+alone: its superseded-event rows measured a mere ~0.5 GiB (46.7M of 2.05B
+rows), and an event_tags mutation — even running alone — saturates the
+instance and takes user reads down (observed twice on 2026-07-04). Orphaned
+tag rows are inert; every reader is either materialized-aggregate-based or
+bounded to recent time windows. Engagement is read from the aggregate tables
 (`note_like_counts` etc.), which are never pruned — so deleting an engaging
 event later never "un-engages" its target.
 

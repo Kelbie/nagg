@@ -113,7 +113,8 @@ func eventKindRetentionMutations(allowed []int) []string {
 // Declarative retention
 //
 // RetentionRules is the single, top-to-bottom-readable statement of what this
-// app-view keeps in nostr_events (and, in cascade, event_tags). Everything
+// app-view keeps in nostr_events (see retentionTargets for why event_tags is
+// left alone). Everything
 // deleted here is either superseded (replaceable events — only the latest
 // version is ever read) or stale-and-unengaged, and all of it is recoverable
 // from relays via the on-demand backfills. Plain-language docs and the
@@ -230,15 +231,21 @@ type RetentionRunResult struct {
 // in-flight one.
 var ErrRetentionBusy = errors.New("retention mutation still pending")
 
-// retentionTargets: each rule deletes from nostr_events and cascades to
-// event_tags (which carries kind/created_at/event_id for exactly this reason).
-// Both partition by toYYYYMM(created_at).
+// retentionTargets: rules delete from nostr_events ONLY.
+//
+// event_tags is deliberately NOT cascaded. Measured live (2026-07-04): the
+// rule-1 cascade matched 46.7M of event_tags' 2.05B rows — roughly half a GiB
+// compressed — and the mutation, even running alone, saturated the instance
+// (per-part NOT IN evaluation over hundreds of millions of rows) and took
+// user reads down until it was KILLed. Orphaned tag rows for deleted events
+// are inert: every aggregate that reads event_tags is either already
+// materialized or bounded to recent created_at windows. A sub-GiB reclaim is
+// never worth a read outage.
 var retentionTargets = []struct {
 	table    string
 	idColumn string
 }{
 	{table: "nostr_events", idColumn: "id"},
-	{table: "event_tags", idColumn: "event_id"},
 }
 
 // retentionMinMatchedRows: don't spend a full-table mutation on a trickle.
