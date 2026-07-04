@@ -112,7 +112,12 @@ func verifyStage(ctx context.Context, in <-chan firehose.RelayEvent, workers int
 			defer safego.Recover("ingest.verify")
 			defer wg.Done()
 			for relayEvent := range in {
-				if err := verifyEvent(relayEvent.Event); err != nil {
+				// Per-EVENT recovery: a panic inside signature verification
+				// (malformed relay data) must poison only that event. If it
+				// killed the worker, the pool would drain one panic at a time
+				// until out closed and Run returned nil — which the restart
+				// loops treat as terminal, silently wedging ingestion.
+				if err := verifyEventSafe(relayEvent.Event); err != nil {
 					slog.Debug("event rejected", "relay", relayEvent.Relay, "error", err)
 					continue
 				}
@@ -130,6 +135,17 @@ func verifyStage(ctx context.Context, in <-chan firehose.RelayEvent, workers int
 		close(out)
 	}()
 	return out
+}
+
+// verifyEventSafe converts a verification panic into an error so one poisoned
+// event can never take a verify worker down.
+func verifyEventSafe(event *nostr.Event) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("verification panicked: %v", r)
+		}
+	}()
+	return verifyEvent(event)
 }
 
 func verifyEvent(event *nostr.Event) error {

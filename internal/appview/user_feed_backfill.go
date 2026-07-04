@@ -727,14 +727,24 @@ func (b *RelayUserFeedBackfiller) scheduleJob(ctx context.Context, key string, w
 
 	go func() {
 		defer safego.Recover("appview.user_feed_backfill")
+		// Cleanup is DEFERRED so a panic inside work() cannot skip it: an
+		// unclosed done channel + a stale jobs entry would wedge this key
+		// forever (every later request would wait on the dead job until its
+		// timeout and never schedule replacement work).
+		defer func() {
+			if r := recover(); r != nil {
+				job.err = fmt.Errorf("backfill job panicked: %v", r)
+				// Re-panic so safego.Recover logs it with the stack.
+				defer panic(r)
+			}
+			close(job.done)
+			b.mu.Lock()
+			if b.jobs[key] == job {
+				delete(b.jobs, key)
+			}
+			b.mu.Unlock()
+		}()
 		job.err = work(context.WithoutCancel(ctx))
-		close(job.done)
-
-		b.mu.Lock()
-		if b.jobs[key] == job {
-			delete(b.jobs, key)
-		}
-		b.mu.Unlock()
 	}()
 	return job
 }
