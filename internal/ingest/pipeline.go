@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/firehose"
+	"github.com/vertex-lab/nagg/internal/safego"
 )
 
 type Config struct {
@@ -26,6 +29,13 @@ type Pipeline struct {
 	store Store
 	cfg   Config
 	batch []clickhouse.EventRecord
+
+	// verifyOnce/verified: the signature-verification stage is created ONCE per
+	// Pipeline and reused across Run calls — the callers restart Run after
+	// insert-failure bursts, and rebuilding the stage per call would strand the
+	// old workers on the shared input channel, silently swallowing events.
+	verifyOnce sync.Once
+	verified   <-chan firehose.RelayEvent
 }
 
 func New(store Store, cfg Config) *Pipeline {
@@ -37,6 +47,19 @@ func New(store Store, cfg Config) *Pipeline {
 }
 
 func (p *Pipeline) Run(ctx context.Context, in <-chan firehose.RelayEvent) error {
+	// Signature verification is secp256k1 work per event; done inline on this
+	// single consumer goroutine it was the ingest bottleneck — and when inserts
+	// slowed, the combination stalled the channel, backpressured the firehose
+	// off its relays, and triggered the reconnect replay storm. A small worker
+	// pool keeps verification off the batching goroutine.
+	source := in
+	if p.cfg.VerifyEvents {
+		p.verifyOnce.Do(func() {
+			p.verified = verifyStage(ctx, in, verifyWorkerCount())
+		})
+		source = p.verified
+	}
+
 	ticker := time.NewTicker(p.cfg.FlushInterval)
 	defer ticker.Stop()
 
@@ -48,7 +71,7 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan firehose.RelayEvent) error
 			if err := p.Flush(ctx); err != nil {
 				return err
 			}
-		case relayEvent, ok := <-in:
+		case relayEvent, ok := <-source:
 			if !ok {
 				return p.Flush(ctx)
 			}
@@ -63,6 +86,70 @@ func (p *Pipeline) Run(ctx context.Context, in <-chan firehose.RelayEvent) error
 			}
 		}
 	}
+}
+
+func verifyWorkerCount() int {
+	workers := runtime.GOMAXPROCS(0) - 1
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 4 {
+		workers = 4
+	}
+	return workers
+}
+
+// verifyStage fans events across `workers` goroutines that drop shape-invalid
+// and signature-invalid events, forwarding the rest. Event order is not
+// preserved — inserts have no ordering dependency (dedup is by id downstream).
+// The output channel closes when the input closes and all workers drain.
+func verifyStage(ctx context.Context, in <-chan firehose.RelayEvent, workers int) <-chan firehose.RelayEvent {
+	out := make(chan firehose.RelayEvent, workers*2)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer safego.Recover("ingest.verify")
+			defer wg.Done()
+			for relayEvent := range in {
+				if err := verifyEvent(relayEvent.Event); err != nil {
+					slog.Debug("event rejected", "relay", relayEvent.Relay, "error", err)
+					continue
+				}
+				select {
+				case out <- relayEvent:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer safego.Recover("ingest.verify_close")
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+func verifyEvent(event *nostr.Event) error {
+	if event == nil {
+		return fmt.Errorf("nil event")
+	}
+	if err := validateShape(event); err != nil {
+		return err
+	}
+	if !event.CheckID() {
+		return fmt.Errorf("invalid id")
+	}
+	ok, err := event.CheckSignature()
+	if err != nil {
+		return fmt.Errorf("signature check failed: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("invalid signature")
+	}
+	return nil
 }
 
 func (p *Pipeline) Flush(ctx context.Context) error {
@@ -84,19 +171,10 @@ func (p *Pipeline) add(relayEvent firehose.RelayEvent) error {
 	if event == nil {
 		return fmt.Errorf("nil event")
 	}
-	if err := validateShape(event); err != nil {
-		return err
-	}
-	if p.cfg.VerifyEvents {
-		if !event.CheckID() {
-			return fmt.Errorf("invalid id")
-		}
-		ok, err := event.CheckSignature()
-		if err != nil {
-			return fmt.Errorf("signature check failed: %w", err)
-		}
-		if !ok {
-			return fmt.Errorf("invalid signature")
+	if !p.cfg.VerifyEvents {
+		// The verify stage already shape-checked when enabled.
+		if err := validateShape(event); err != nil {
+			return err
 		}
 	}
 

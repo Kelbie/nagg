@@ -19,6 +19,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/cache"
 	"github.com/vertex-lab/nagg/internal/capabilities"
+	"github.com/vertex-lab/nagg/internal/chgate"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -76,11 +77,13 @@ type Handler struct {
 	auditor                   AuditorClient
 	appLatestVersion          string
 	appUpdateMessage          string
-	// querySlots bounds how many CH-heavy requests execute concurrently (cache
+	// gate bounds how many CH-heavy requests execute concurrently (cache
 	// misses only). The shared ClickHouse degrades sharply past a handful of
 	// concurrent heavy queries, so excess requests wait here and succeed a little
-	// slower instead of stampeding CH and failing. nil = unlimited.
-	querySlots chan struct{}
+	// slower instead of stampeding CH and failing. This is the PROCESS-WIDE
+	// chgate shared with GraphQL and the background workers, not a REST-only
+	// semaphore. nil = unlimited.
+	gate *chgate.Gate
 }
 
 type VertexClient interface {
@@ -159,13 +162,11 @@ func WithRateLimit(limit int, window time.Duration) Option {
 // WithRankedFeed wires the shared ranked-feed ranking pipeline so the REST
 // /nostr/feed/ranked route can serve the same ranking the GraphQL rankedEvents
 // resolver produces. Without it, the route responds 503.
-// WithMaxConcurrentRequests bounds concurrent CH-heavy requests (cache misses).
-// n <= 0 leaves it unlimited.
-func WithMaxConcurrentRequests(n int) Option {
+// WithConcurrencyGate installs the process-wide heavy-query gate (shared with
+// GraphQL and background workers). nil leaves the handler ungated.
+func WithConcurrencyGate(gate *chgate.Gate) Option {
 	return func(h *Handler) {
-		if n > 0 {
-			h.querySlots = make(chan struct{}, n)
-		}
+		h.gate = gate
 	}
 }
 
@@ -301,24 +302,13 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	}
 }
 
-// limitConcurrency gates a handler on the querySlots semaphore so only N CH-heavy
-// requests run at once; the rest wait (bounded by the request context) rather
-// than piling onto an already-saturated ClickHouse. It wraps the raw handler
-// INSIDE the response cache, so cache hits never wait. Returns 503 (retryable)
-// if the client's context expires while queued.
+// limitConcurrency gates a handler on the process-wide chgate so only N
+// CH-heavy requests run at once; the rest wait (bounded by the request
+// context) rather than piling onto an already-saturated ClickHouse. It wraps
+// the raw handler INSIDE the response cache, so cache hits never wait.
+// Returns 503 (retryable) if the client's context expires while queued.
 func (h *Handler) limitConcurrency(next http.HandlerFunc) http.HandlerFunc {
-	if h.querySlots == nil {
-		return next
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case h.querySlots <- struct{}{}:
-			defer func() { <-h.querySlots }()
-			next(w, r)
-		case <-r.Context().Done():
-			http.Error(w, "server busy, retry shortly", http.StatusServiceUnavailable)
-		}
-	}
+	return h.gate.Middleware(next)
 }
 
 func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {

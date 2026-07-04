@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/vertex-lab/nagg/internal/chgate"
 	"github.com/vertex-lab/nagg/internal/clickhouse"
 )
 
@@ -38,6 +39,19 @@ type Runner struct {
 	config Config
 	logger *slog.Logger
 	now    func() time.Time
+	// gate is the process-wide heavy-ClickHouse gate. The rollup's periodic
+	// multi-way aggregations previously ran ungated alongside user reads on
+	// the same capacity-limited instance; each tick now holds one slot so a
+	// rollup can't stack on top of a full request burst. nil = ungated.
+	gate *chgate.Gate
+}
+
+// WithGate installs the shared heavy-query gate (see chgate).
+func (r *Runner) WithGate(gate *chgate.Gate) *Runner {
+	if r != nil {
+		r.gate = gate
+	}
+	return r
 }
 
 func NewRunner(store Store, cfg Config, logger *slog.Logger) *Runner {
@@ -80,6 +94,12 @@ func (r *Runner) Run(ctx context.Context) {
 // real-reply count and rank features), then real engagement, then user stats, then
 // rank features. A stage error aborts the tick so the next tick retries cleanly.
 func (r *Runner) RunOnce(ctx context.Context) error {
+	release, err := r.gate.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	now := r.now()
 	since := now.Add(-r.config.RecentWindow)
 	limit := r.config.MaxTargets

@@ -62,12 +62,27 @@ func (c *Client) Run(ctx context.Context, out chan<- RelayEvent) {
 
 func (c *Client) runRelay(ctx context.Context, relay string, out chan<- RelayEvent) {
 	retries := 0
+	// highWater tracks the newest created_at consumed FROM THIS RELAY so a
+	// reconnect resumes where the subscription left off instead of replaying
+	// the whole NAGG_SINCE window (24h). The replay was a positive-feedback
+	// storm: slow ClickHouse → insert backpressure → socket stalls → relay
+	// drops us → reconnect re-requests 24h → even more insert load.
+	var highWater time.Time
 	for ctx.Err() == nil {
-		err := c.consumeRelay(ctx, relay, out)
+		started := time.Now()
+		hw, err := c.consumeRelay(ctx, relay, out, highWater)
+		if hw.After(highWater) {
+			highWater = hw
+		}
 		if ctx.Err() != nil {
 			return
 		}
 
+		// A connection that held for a while was healthy — reset the backoff
+		// so a relay that drops hourly doesn't creep to the max delay forever.
+		if time.Since(started) > time.Minute {
+			retries = 0
+		}
 		delay := backoff(c.cfg.RelayRetry, retries)
 		retries++
 		slog.Warn("relay disconnected; retrying", "relay", relay, "delay", delay, "error", err)
@@ -79,13 +94,13 @@ func (c *Client) runRelay(ctx context.Context, relay string, out chan<- RelayEve
 	}
 }
 
-func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- RelayEvent) error {
+func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- RelayEvent, highWater time.Time) (time.Time, error) {
 	u, err := url.Parse(relay)
 	if err != nil {
-		return err
+		return highWater, err
 	}
 	if u.Scheme != "wss" && u.Scheme != "ws" {
-		return fmt.Errorf("relay URL must use ws or wss: %s", relay)
+		return highWater, fmt.Errorf("relay URL must use ws or wss: %s", relay)
 	}
 
 	dialer := websocket.Dialer{
@@ -94,16 +109,16 @@ func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- Rela
 	}
 	conn, _, err := dialer.DialContext(ctx, relay, nil)
 	if err != nil {
-		return err
+		return highWater, err
 	}
 	defer conn.Close()
 	if c.cfg.ReadLimit > 0 {
 		conn.SetReadLimit(c.cfg.ReadLimit)
 	}
 
-	req := []any{"REQ", c.cfg.SubID, c.filter()}
+	req := []any{"REQ", c.cfg.SubID, c.filter(highWater)}
 	if err := conn.WriteJSON(req); err != nil {
-		return fmt.Errorf("send REQ: %w", err)
+		return highWater, fmt.Errorf("send REQ: %w", err)
 	}
 	slog.Info("relay subscription opened", "relay", relay, "kinds", c.cfg.Kinds)
 
@@ -111,13 +126,13 @@ func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- Rela
 		select {
 		case <-ctx.Done():
 			_ = conn.WriteJSON([]any{"CLOSE", c.cfg.SubID})
-			return ctx.Err()
+			return highWater, ctx.Err()
 		default:
 		}
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			return err
+			return highWater, err
 		}
 
 		event, ok, err := parseEventMessage(data)
@@ -128,6 +143,11 @@ func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- Rela
 		if !ok {
 			continue
 		}
+		if t := event.CreatedAt.Time(); t.After(highWater) && !t.After(time.Now().Add(10*time.Minute)) {
+			// Ignore far-future timestamps so one bogus event can't push the
+			// watermark past reality and blind the subscription.
+			highWater = t
+		}
 		if c.seen.Contains(event.ID) {
 			continue
 		}
@@ -135,19 +155,28 @@ func (c *Client) consumeRelay(ctx context.Context, relay string, out chan<- Rela
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return highWater, ctx.Err()
 		case out <- RelayEvent{Relay: relay, Event: event}:
 		}
 	}
 }
 
-func (c *Client) filter() map[string]any {
+func (c *Client) filter(highWater time.Time) map[string]any {
 	filter := make(map[string]any, 2)
 	if len(c.cfg.Kinds) > 0 {
 		filter["kinds"] = c.cfg.Kinds
 	}
 	if c.cfg.Since != nil {
-		filter["since"] = time.Now().Add(-*c.cfg.Since).Unix()
+		since := time.Now().Add(-*c.cfg.Since)
+		// Reconnects resume from this relay's high-water mark (minus a 5m
+		// overlap for out-of-order delivery) instead of re-requesting the
+		// whole window; the seen-cache absorbs the overlap.
+		if !highWater.IsZero() {
+			if resume := highWater.Add(-5 * time.Minute); resume.After(since) {
+				since = resume
+			}
+		}
+		filter["since"] = since.Unix()
 	}
 	return filter
 }

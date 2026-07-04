@@ -15,6 +15,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/relayquery"
 )
 
 type Config struct {
@@ -158,22 +159,19 @@ func Load() (Config, error) {
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
-			// Default 2, matching the measured concurrency ceiling of the shared
-			// ~30 GB Railway ClickHouse: a single heavy app-view read (e.g. an
-			// engaged account's notifications, ~7 s, multiple GB) is so memory-hungry
-			// that only two run at once before ClickHouse sheds the rest with a fast
-			// 5xx. An app launch fires feed + notifications + search + profiles
-			// concurrently, so an over-high cap (the previous 24) never engaged —
-			// ClickHouse rejected first, the client saw nagg fail, and fell back. At
-			// 2 the excess queues on the semaphore (bounded by the request context)
-			// and succeeds slower instead of 5xx-ing. This is a low-traffic ceiling:
-			// raise it via env only after the per-query cost drops (the materialized
-			// notifications read-model — see docs/notifications-performance.md §9) or
-			// the ClickHouse instance is scaled / its workers split out.
-			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "2")),
+			// Slots on the PROCESS-WIDE heavy-query gate (chgate): heavy REST,
+			// GraphQL, and the rollup all share it. The old ceiling of 2 matched a
+			// world where a single read could eat multiple GiB (an engaged account's
+			// notifications; the 7 GiB contact-list lookups); with those reads fixed
+			// and every query capped at 4 GiB, the worst sanctioned read is tens of
+			// MiB and 4 concurrent queries fit comfortably. Excess queues on the gate
+			// (bounded by the request context) and succeeds slower instead of 5xx-ing.
+			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "4")),
 		},
 		Firehose: firehose.Config{
-			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
+			// Sanitized: the prod env value has been observed with hard line-wraps
+			// INSIDE urls ("wss://relay.h\n  odl.ar"), which dial-fail forever.
+			Relays:        relayquery.SanitizeRelays(splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social"))),
 			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
