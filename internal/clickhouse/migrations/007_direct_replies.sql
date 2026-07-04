@@ -37,17 +37,6 @@ ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (parent_id, child_id);
 
--- Direct-reply COUNT per parent. uniqState over distinct child ids makes repeated
--- backfills / rollup recomputes idempotent (set union), matching the existing
--- engagement count tables.
-CREATE TABLE IF NOT EXISTS note_direct_reply_counts
-(
-    target_event_id FixedString(64),
-    replies AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY target_event_id;
-
 -- Backfill edges over all history. Per child, pick the NIP-10 direct parent:
 --   reply marker  >  unmarked last 'e' (max tag_index)  >  root marker.
 -- For kind 1111 (NIP-22) comments markers are typically absent, so the unmarked
@@ -93,17 +82,7 @@ WHERE parent_id != ''
   AND length(parent_id) = 64
   AND NOT has(quote_targets, parent_id);
 
--- Build the direct-reply counts from the authoritative edge table.
-INSERT INTO note_direct_reply_counts
-SELECT
-    parent_id AS target_event_id,
-    uniqState(child_id) AS replies
-FROM note_reply_edges
-GROUP BY parent_id;
-
--- The legacy any-e-tag aggregate (note_reply_counts / mv_note_reply_counts,
--- formerly declared in 002 + 005) is superseded by note_direct_reply_counts;
--- mergeCount reads the direct table (read.go). RETIRED: the direct-reply path
--- validated on devnagg, so the legacy CREATEs were removed from 002 and 005
--- was deleted — the declarative schema reconciler drops the undeclared
--- table + view on the next migrate.
+-- The direct-reply COUNT aggregate lives in the rules registry as the
+-- periodic relationship k1_1111_e_reply (agg_k1_1111_e_reply); the rollup
+-- rebuilds it from these edges. The legacy note_reply_counts /
+-- note_direct_reply_counts tables are undeclared and reconciled away.

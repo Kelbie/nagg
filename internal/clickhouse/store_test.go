@@ -3,9 +3,6 @@ package clickhouse
 import (
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/nbd-wtf/go-nostr"
 )
 
 func TestEstimateStoredBytes(t *testing.T) {
@@ -23,46 +20,6 @@ func TestEstimateStoredBytes(t *testing.T) {
 	for name, tc := range tests {
 		if got := estimateStoredBytes(tc.count, tc.totalBytes, tc.totalRows); got != tc.want {
 			t.Fatalf("%s estimate = %d, want %d", name, got, tc.want)
-		}
-	}
-}
-
-func TestExtractNoteZapUsesZapRequestAmount(t *testing.T) {
-	targetID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	event := &nostr.Event{
-		ID:     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-		PubKey: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-		Kind:   9735,
-		Tags: nostr.Tags{
-			{"e", targetID},
-			{"description", `{"tags":[["amount","123000"],["e","dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"]]}`},
-			{"bolt11", "lnbc999u1test"},
-		},
-	}
-
-	zap, ok := extractNoteZap(event, time.Unix(1, 0))
-	if !ok {
-		t.Fatal("expected zap")
-	}
-	if zap.TargetEventID != targetID {
-		t.Fatalf("target = %s", zap.TargetEventID)
-	}
-	if zap.Sats != 123 {
-		t.Fatalf("sats = %d", zap.Sats)
-	}
-}
-
-func TestSatsFromBolt11HRP(t *testing.T) {
-	tests := map[string]uint64{
-		"lnbc11test":      100_000_000,
-		"lnbc2500u1test":  250_000,
-		"lnbc20m1test":    2_000_000,
-		"lnbc1000n1test":  100,
-		"lnbc10000p1test": 1,
-	}
-	for invoice, want := range tests {
-		if got := satsFromBolt11(invoice); got != want {
-			t.Fatalf("%s sats = %d, want %d", invoice, got, want)
 		}
 	}
 }

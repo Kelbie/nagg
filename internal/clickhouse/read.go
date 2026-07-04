@@ -340,16 +340,16 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 			ifNull(er.re, 0) AS real_replies,
 			ifNull(er.rz, 0) AS real_zap_sats
 		FROM (
-			SELECT target_event_id AS id FROM note_like_counts WHERE target_event_id IN (?)
-			UNION DISTINCT SELECT target_event_id FROM note_repost_counts WHERE target_event_id IN (?)
-			UNION DISTINCT SELECT target_event_id FROM note_direct_reply_counts WHERE target_event_id IN (?)
-			UNION DISTINCT SELECT target_event_id FROM note_zap_totals WHERE target_event_id IN (?)
+			SELECT target AS id FROM agg_k7_e WHERE target IN (?)
+			UNION DISTINCT SELECT target FROM agg_k6_16_e WHERE target IN (?)
+			UNION DISTINCT SELECT target FROM agg_k1_1111_e_reply WHERE target IN (?)
+			UNION DISTINCT SELECT target FROM agg_k9735_e WHERE target IN (?)
 			UNION DISTINCT SELECT event_id FROM note_engagement_real WHERE event_id IN (?)
 		) ids
-		LEFT JOIN (SELECT target_event_id, uniqMerge(likes) AS c FROM note_like_counts WHERE target_event_id IN (?) GROUP BY target_event_id) l ON l.target_event_id = ids.id
-		LEFT JOIN (SELECT target_event_id, uniqMerge(reposts) AS c FROM note_repost_counts WHERE target_event_id IN (?) GROUP BY target_event_id) rp ON rp.target_event_id = ids.id
-		LEFT JOIN (SELECT target_event_id, uniqMerge(replies) AS c FROM note_direct_reply_counts WHERE target_event_id IN (?) GROUP BY target_event_id) dr ON dr.target_event_id = ids.id
-		LEFT JOIN (SELECT target_event_id, sumMerge(sats) AS s FROM note_zap_totals WHERE target_event_id IN (?) GROUP BY target_event_id) z ON z.target_event_id = ids.id
+		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k7_e WHERE target IN (?) GROUP BY target) l ON l.target = ids.id
+		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k6_16_e WHERE target IN (?) GROUP BY target) rp ON rp.target = ids.id
+		LEFT JOIN (SELECT target, uniqMerge(sources) AS c FROM agg_k1_1111_e_reply WHERE target IN (?) GROUP BY target) dr ON dr.target = ids.id
+		LEFT JOIN (SELECT target, sumMerge(value_total) AS s FROM agg_k9735_e WHERE target IN (?) GROUP BY target) z ON z.target = ids.id
 		LEFT JOIN (
 			SELECT event_id,
 				argMax(real_likes, computed_at) AS rl,
@@ -563,10 +563,10 @@ type directReplySort struct {
 }
 
 var directReplySorts = map[string]directReplySort{
-	"likes":   {"note_like_counts", "likes", "uniqMerge"},
-	"reposts": {"note_repost_counts", "reposts", "uniqMerge"},
-	"replies": {"note_direct_reply_counts", "replies", "uniqMerge"},
-	"zaps":    {"note_zap_totals", "sats", "sumMerge"},
+	"likes":   {"agg_k7_e", "actors", "uniqMerge"},
+	"reposts": {"agg_k6_16_e", "actors", "uniqMerge"},
+	"replies": {"agg_k1_1111_e_reply", "sources", "uniqMerge"},
+	"zaps":    {"agg_k9735_e", "value_total", "sumMerge"},
 }
 
 // RankedDirectReplySupported reports whether a sort key has a precomputed ranking
@@ -725,13 +725,13 @@ func (s *Store) FollowedReplies(ctx context.Context, viewerPubkey string, parent
 				bitShiftLeft(toUInt64(ifNull(lc.likes, 0)), 32) + toUInt64(toUnixTimestamp(e.created_at)) AS sort_key
 			FROM note_reply_edges e
 			LEFT JOIN (
-				SELECT target_event_id, uniqMerge(likes) AS likes
-				FROM note_like_counts
-				WHERE target_event_id IN (
+				SELECT target, uniqMerge(actors) AS likes
+				FROM agg_k7_e
+				WHERE target IN (
 					SELECT child_id FROM note_reply_edges WHERE parent_id IN (?)
 				)
-				GROUP BY target_event_id
-			) lc ON e.child_id = lc.target_event_id
+				GROUP BY target
+			) lc ON e.child_id = lc.target
 			WHERE e.parent_id IN (?)
 			  AND e.child_pubkey IN (
 				SELECT arrayJoin(contacts) FROM user_contacts_latest FINAL WHERE pubkey = ?

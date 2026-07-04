@@ -19,8 +19,9 @@ fan_in AS (
     GROUP BY pubkey
 ),
 post_counts AS (
-    SELECT pubkey, toUInt64(uniqMerge(posts)) AS posts
-    FROM user_post_counts
+    SELECT pubkey, toUInt64(uniq(id)) AS posts
+    FROM nostr_events
+    WHERE kind IN (1, 1111)
     GROUP BY pubkey
 ),
 population AS (

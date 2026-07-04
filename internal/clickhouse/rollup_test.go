@@ -46,8 +46,8 @@ func TestBuildDirectReplyCountsSQL_IdempotentUnion(t *testing.T) {
 	if !strings.Contains(sql, "uniqState(child_id)") {
 		t.Error("direct reply counts must use uniqState(child_id) for idempotent union")
 	}
-	if !strings.Contains(sql, "INSERT INTO note_direct_reply_counts") {
-		t.Error("must insert into note_direct_reply_counts")
+	if !strings.Contains(sql, "INSERT INTO agg_k1_1111_e_reply") {
+		t.Error("must insert into agg_k1_1111_e_reply")
 	}
 }
 
@@ -57,7 +57,7 @@ func TestTargetIDsSubquery_RecencyOrderedEngagedOnly(t *testing.T) {
 		"max(engaged_at) AS engaged_at", // engagement recency
 		"ORDER BY engaged_at DESC",      // freshest engaged notes first
 		"LIMIT 50000",                   // bounded
-		"note_zaps",                     // zapped notes
+		"event_refs",                    // zapped notes (rule = 'k9735_e')
 		"tag_key = 'e'",                 // reaction/repost/reply/quote targets
 	} {
 		if !strings.Contains(sql, want) {
@@ -88,7 +88,7 @@ func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing
 		"'v3' AS threshold_version",                      // stamped version
 		"toDateTime(1700009999) AS computed_at",
 		"note_reply_edges", // real replies via edge authors
-		"note_zaps",        // real zaps
+		"event_refs",       // real zaps
 		"AS real_actors",   // combined distinct-engager count
 		"uniqExact(actor)", // actors = distinct engagers across types
 	} {
@@ -105,7 +105,7 @@ func TestBuildUserStatsSQL_FollowerFanInAndPosts(t *testing.T) {
 		"length(u.contacts) AS following",
 		"arrayJoin(contacts)",        // follower fan-in
 		"user_contacts_latest FINAL", // latest list only (fixes the bug)
-		"uniqMerge(posts)",
+		"uniqMerge(sources)",
 		"WHERE follow IN (touched)", // bounded emission
 	} {
 		if !strings.Contains(sql, want) {
@@ -120,10 +120,10 @@ func TestBuildRankFeaturesSQL_AssemblesRawAndReal(t *testing.T) {
 		"INSERT INTO note_rank_features",
 		// explicit column list maps by name (real_actors is physically last)
 		"real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)",
-		"uniqMerge(likes)",
-		"note_direct_reply_counts", // direct replies, not any-e-tag
-		"uniqMerge(quotes)",
-		"sumMerge(sats)",
+		"uniqMerge(actors)",
+		"agg_k1_1111_e_reply", // direct replies, not any-e-tag
+		"uniqMerge(sources)",
+		"sumMerge(value_total)",
 		"note_engagement_real",               // real columns
 		"argMax(score, fetched_at) AS score", // author vertex score
 		"metric = 'contribution_quality'",

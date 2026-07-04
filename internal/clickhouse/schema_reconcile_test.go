@@ -4,33 +4,35 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/vertex-lab/nagg/internal/rules"
 )
 
 func TestParseDesiredSchema_RealMigrations(t *testing.T) {
-	desired, err := parseDesiredSchema(embeddedMigrations())
+	// Static SQL + registry-generated DDL together form the desired schema —
+	// the same composition reconcileSchema uses.
+	reg, err := rules.Default(20)
+	if err != nil {
+		t.Fatalf("rules.Default: %v", err)
+	}
+	desired, err := parseDesiredSchema(append(embeddedMigrations(), reg.GeneratedDDL()...))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
 
 	wantTables := []string{
+		// static SQL
 		"schema_migrations",
 		"notifications_feed",
 		"nostr_events",
 		"event_seen_relays",
 		"event_tags",
-		"note_like_counts",
-		"note_repost_counts",
 		"note_reply_edges",
-		"note_direct_reply_counts",
-		"note_quote_counts",
 		"note_engagement_real",
 		"rollup_state",
 		"user_contacts_latest",
-		"user_post_counts",
 		"user_stats",
 		"note_rank_features",
-		"note_zaps",
-		"note_zap_totals",
 		"profiles_latest",
 		"vertex_profile_cache",
 		"vertex_scores",
@@ -40,6 +42,14 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"enrichment_state",
 		"notification_candidates",
 		"known_viewers",
+		// registry-generated
+		"event_refs",
+		"agg_k7_e",
+		"agg_k6_16_e",
+		"agg_k1_q",
+		"agg_k9735_e",
+		"agg_k1_1111_e_reply",
+		"agg_k1_1111_author",
 	}
 	if len(desired.tables) != len(wantTables) {
 		t.Fatalf("parsed %d tables, want %d: %v", len(desired.tables), len(wantTables), tableNames(desired))
@@ -51,14 +61,16 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	}
 
 	wantViews := []string{
-		"mv_note_like_counts",
-		"mv_note_repost_counts",
-		"mv_note_quote_counts",
-		"mv_note_zap_totals",
+		// static SQL
 		"mv_profiles_latest",
 		"mv_notification_candidates",
 		"mv_user_contacts_latest",
-		"mv_user_post_counts",
+		// registry-generated (periodic k1_1111_e_reply has no view)
+		"mv_agg_k7_e",
+		"mv_agg_k6_16_e",
+		"mv_agg_k1_q",
+		"mv_agg_k9735_e",
+		"mv_agg_k1_1111_author",
 	}
 	if len(desired.views) != len(wantViews) {
 		t.Fatalf("parsed %d views, want %d: %v", len(desired.views), len(wantViews), viewNames(desired))
@@ -89,20 +101,21 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		t.Errorf("first_seen_at definition lost its DEFAULT: %q", def)
 	}
 
-	// Paren-nested AggregateFunction type must be kept whole in the definition.
-	likeCols := desired.tables["note_like_counts"]
-	likesDef, ok := likeCols["likes"]
+	// Paren-nested AggregateFunction type must be kept whole in the definition
+	// (generated DDL exercises the same parser paths as static SQL).
+	actorCols := desired.tables["agg_k7_e"]
+	actorsDef, ok := actorCols["actors"]
 	if !ok {
-		t.Fatalf("note_like_counts is missing the 'likes' column: %v", colNames(likeCols))
+		t.Fatalf("agg_k7_e is missing the 'actors' column: %v", colNames(actorCols))
 	}
-	if !strings.Contains(likesDef, "AggregateFunction(uniq, FixedString(64))") {
-		t.Errorf("likes column lost its nested type; got definition %q", likesDef)
+	if !strings.Contains(actorsDef, "AggregateFunction(uniq, FixedString(64))") {
+		t.Errorf("actors column lost its nested type; got definition %q", actorsDef)
 	}
 
 	// AggregateFunction(sum, UInt64) must also survive (multiple AggregateFunctions in one table).
-	zapTotals := desired.tables["note_zap_totals"]
-	if def := zapTotals["sats"]; !strings.Contains(def, "AggregateFunction(sum, UInt64)") {
-		t.Errorf("note_zap_totals.sats lost its nested type; got %q", def)
+	zapAgg := desired.tables["agg_k9735_e"]
+	if def := zapAgg["value_total"]; !strings.Contains(def, "AggregateFunction(sum, UInt64)") {
+		t.Errorf("agg_k9735_e.value_total lost its nested type; got %q", def)
 	}
 
 	// Array(String) and a default string literal must survive.
@@ -292,16 +305,15 @@ func TestSchemaReconcileMode_Default(t *testing.T) {
 // the migration must DROP the old view first so the change applies on existing
 // deployments (CREATE ... IF NOT EXISTS alone is a no-op there). It must also
 // backfill historical replies.
-// TestDirectRepliesMigration_DeclaresEdgeAndCountTables guards the NIP-10/22
-// direct-reply rebuild: migration 007 must declare the edge and direct-count
-// tables, derive the parent with the reply > unmarked-last > root coalesce, and
-// exclude quotes. It must also be wired into the apply order.
-func TestDirectRepliesMigration_DeclaresEdgeAndCountTables(t *testing.T) {
+// TestDirectRepliesMigration_DeclaresEdgeTable guards the NIP-10/22
+// direct-reply edge rebuild: migration 007 must declare the edge table and
+// derive the parent with the reply > unmarked-last > root coalesce, excluding
+// quotes. The direct-reply COUNT aggregate moved to the rules registry
+// (agg_k1_1111_e_reply) and must NOT be declared here anymore.
+func TestDirectRepliesMigration_DeclaresEdgeTable(t *testing.T) {
 	sql := mustReadMigration("007_direct_replies.sql")
 	for _, want := range []string{
 		"CREATE TABLE IF NOT EXISTS note_reply_edges",
-		"CREATE TABLE IF NOT EXISTS note_direct_reply_counts",
-		"uniqState(child_id)",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply')",
 		"argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = '')",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root')",
@@ -317,10 +329,11 @@ func TestDirectRepliesMigration_DeclaresEdgeAndCountTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
-	for _, tbl := range []string{"note_reply_edges", "note_direct_reply_counts"} {
-		if _, ok := desired.tables[tbl]; !ok {
-			t.Errorf("expected table %q declared by 007", tbl)
-		}
+	if _, ok := desired.tables["note_reply_edges"]; !ok {
+		t.Error("expected table note_reply_edges declared by 007")
+	}
+	if _, ok := desired.tables["note_direct_reply_counts"]; ok {
+		t.Error("note_direct_reply_counts must no longer be declared by static SQL")
 	}
 
 	if !migrationFilePresent("007_direct_replies.sql") {

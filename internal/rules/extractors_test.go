@@ -71,7 +71,7 @@ func TestSatsFromBolt11(t *testing.T) {
 		invoice string
 		want    uint64
 	}{
-		{"lnbc1pjqqqqq", 0},           // no amount
+		{"lnbc1pjqqqqq", 0},            // no amount
 		{"lnbc21m1pjqqqqq", 2_100_000}, // 21 milli-BTC
 		{"lnbc210u1pjqqqqq", 21_000},   // 210 micro-BTC
 		{"lnbc210n1pjqqqqq", 21},       // 210 nano-BTC

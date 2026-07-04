@@ -5,72 +5,109 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
+
+	"github.com/vertex-lab/nagg/internal/rules"
 )
 
-// errPostCapped marks an event dropped by the per-author daily post cap. It is
+// errCapped marks an event dropped by a per-author ingest cap rule. It is
 // counted into the periodic summary (Flush) rather than logged per event.
-var errPostCapped = errors.New("author over daily post cap")
+var errCapped = errors.New("author over ingest cap")
 
-// postCapCounterMaxEntries bounds the per-author counter map. Overflow FAILS
-// OPEN: authors beyond the bound are not counted (so never capped) until the
-// day rolls over — never drop events because bookkeeping ran out of room.
-// Sized ~3× the busiest observed day (~60k distinct non-exempt authors).
-const postCapCounterMaxEntries = 200_000
+// capCounterMaxEntries bounds each rule's per-author counter map. Overflow
+// FAILS OPEN: authors beyond the bound are not counted (so never capped) until
+// the window rolls over — never drop events because bookkeeping ran out of
+// room. Sized ~3× the busiest observed day (~60k distinct non-exempt authors).
+const capCounterMaxEntries = 200_000
 
-// postCapCounter tracks accepted capped-kind events per (author, UTC day). The
-// day is the INGESTION day (wall clock), not the event's author-claimed
-// created_at, so backdated timestamps can't dodge the cap. All access is from
-// the single batching goroutine — no locking.
-type postCapCounter struct {
-	day    string
+// capCounter tracks accepted events per (author, window bucket) for one cap
+// rule. The bucket is derived from the INGESTION time (wall clock), not the
+// event's author-claimed created_at, so backdated timestamps can't dodge the
+// cap. All access is from the single batching goroutine — no locking.
+//
+// Window == 0 declares a lifetime cap; the in-process counter approximates it
+// (it resets on restart) — a durable lifetime counter is a follow-up, so
+// lifetime rules currently under-enforce rather than over-drop.
+type capCounter struct {
+	rule   rules.Cap
+	bucket string
 	counts map[string]int
 
 	// summary-log state: events dropped since the last summary, and how many
-	// distinct authors hit the cap today.
-	droppedSinceLog    uint64
-	cappedAuthorsToday int
-
-	// now is a test seam; nil means time.Now.
-	now func() time.Time
+	// distinct authors hit the cap in the current bucket.
+	droppedSinceLog     uint64
+	cappedAuthorsBucket int
 }
 
-// overPostCap reports whether this event must be dropped, and does the
-// counting for events it lets through.
-func (p *Pipeline) overPostCap(event *nostr.Event) bool {
-	limit := p.cfg.PostCapPerDay
-	if limit <= 0 || event == nil {
-		return false
+func newCapCounters(caps []rules.Cap) []*capCounter {
+	out := make([]*capCounter, 0, len(caps))
+	for _, c := range caps {
+		if c.Max <= 0 {
+			continue
+		}
+		out = append(out, &capCounter{rule: c})
 	}
-	if _, capped := postCapKinds[event.Kind]; !capped {
-		return false
-	}
-	if p.exempt != nil && p.exempt(event.PubKey) {
-		return false
-	}
+	return out
+}
 
-	nowFn := p.cap.now
+// bucketKey identifies the rule's current window. Duration-window rules
+// bucket by truncated wall clock (a 24h window is the UTC day, matching the
+// previous per-day semantics); lifetime rules share one process-lived bucket.
+func (c *capCounter) bucketKey(now time.Time) string {
+	if c.rule.Window <= 0 {
+		return "lifetime"
+	}
+	return now.UTC().Truncate(c.rule.Window).Format(time.RFC3339)
+}
+
+// overCap reports whether this event must be dropped by any declared cap
+// rule, and does the counting for events it lets through.
+func (p *Pipeline) overCap(event *nostr.Event) bool {
+	if event == nil || len(p.caps) == 0 {
+		return false
+	}
+	nowFn := p.capNow
 	if nowFn == nil {
 		nowFn = time.Now
 	}
-	day := nowFn().UTC().Format("2006-01-02")
-	if p.cap.day != day {
-		p.cap.day = day
-		p.cap.counts = make(map[string]int, 4096)
-		p.cap.cappedAuthorsToday = 0
-	}
+	now := nowFn()
 
-	count, tracked := p.cap.counts[event.PubKey]
-	if count >= limit {
-		p.cap.droppedSinceLog++
-		return true
+	for _, c := range p.caps {
+		if !kindIn(c.rule.Kinds, event.Kind) {
+			continue
+		}
+		if c.rule.ExemptKnownViewers && p.exempt != nil && p.exempt(event.PubKey) {
+			continue
+		}
+
+		bucket := c.bucketKey(now)
+		if c.bucket != bucket {
+			c.bucket = bucket
+			c.counts = make(map[string]int, 4096)
+			c.cappedAuthorsBucket = 0
+		}
+
+		count, tracked := c.counts[event.PubKey]
+		if count >= c.rule.Max {
+			c.droppedSinceLog++
+			return true
+		}
+		if !tracked && len(c.counts) >= capCounterMaxEntries {
+			// Fail open past the bound (see capCounterMaxEntries).
+			continue
+		}
+		c.counts[event.PubKey] = count + 1
+		if count+1 == c.rule.Max {
+			c.cappedAuthorsBucket++
+		}
 	}
-	if !tracked && len(p.cap.counts) >= postCapCounterMaxEntries {
-		// Fail open past the bound (see postCapCounterMaxEntries).
-		return false
-	}
-	p.cap.counts[event.PubKey] = count + 1
-	if count+1 == limit {
-		p.cap.cappedAuthorsToday++
+	return false
+}
+
+func kindIn(kinds []int, kind int) bool {
+	for _, k := range kinds {
+		if k == kind {
+			return true
+		}
 	}
 	return false
 }

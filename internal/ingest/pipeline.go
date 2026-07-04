@@ -11,6 +11,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/firehose"
+	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/safego"
 )
 
@@ -19,24 +20,20 @@ type Config struct {
 	FlushInterval time.Duration
 	QueueSize     int
 	VerifyEvents  bool
-	// PostCapPerDay caps how many post/repost events (postCapKinds) a single
-	// NON-exempt author gets ingested per UTC day; the rest are dropped at the
-	// firehose. Measured on prod: ~90% of monthly post volume comes from a
-	// small set of over-cap firehose accounts (bridges/bots), so this is the
-	// main growth stem. 0 disables. Exemption comes from WithExemption; with no
-	// exemption source configured the cap applies to every author.
+	// Caps are the declarative per-author ingest cap rules (rules.Cap): each
+	// caps how many events of its kinds a NON-exempt author gets ingested per
+	// window; the rest are dropped at the firehose. Measured on prod: ~90% of
+	// monthly post volume came from a small set of over-cap firehose accounts
+	// (bridges/bots), so this is the main growth stem. Empty disables capping.
+	// Exemption comes from WithExemption; with no exemption source configured
+	// a rule's cap applies to every author.
 	//
 	// The on-demand relay backfills (user feed, threads, DMs) bypass this by
 	// construction — they insert through Store.InsertEvents directly, not
 	// through this firehose pipeline. Demand-driven fetches are definitionally
 	// relevant.
-	PostCapPerDay int
+	Caps []rules.Cap
 }
-
-// postCapKinds are the event kinds the per-author daily cap applies to: text
-// notes (1), comments (1111), and reposts (6, 16) — a repost flooder is the
-// same problem as a post flooder. Declarative: edit this list to change scope.
-var postCapKinds = map[int]struct{}{1: {}, 1111: {}, 6: {}, 16: {}}
 
 type Store interface {
 	InsertEvents(context.Context, []clickhouse.EventRecord) error
@@ -50,7 +47,9 @@ type Pipeline struct {
 	// cap state lives on the single batching goroutine (add/Flush), so it needs
 	// no locking. exempt nil = no exemption source = cap everyone.
 	exempt func(pubkey string) bool
-	cap    postCapCounter
+	caps   []*capCounter
+	// capNow is a test seam; nil means time.Now.
+	capNow func() time.Time
 
 	// verifyOnce/verified: the signature-verification stage is created ONCE per
 	// Pipeline and reused across Run calls — the callers restart Run after
@@ -74,6 +73,7 @@ func New(store Store, cfg Config, opts ...Option) *Pipeline {
 		store: store,
 		cfg:   cfg,
 		batch: make([]clickhouse.EventRecord, 0, cfg.BatchSize),
+		caps:  newCapCounters(cfg.Caps),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -214,13 +214,18 @@ func (p *Pipeline) Flush(ctx context.Context) error {
 	}
 	slog.Info("inserted event batch", "events", len(p.batch), "duration", time.Since(start))
 	p.batch = p.batch[:0]
-	if p.cap.droppedSinceLog > 0 {
+	for _, c := range p.caps {
+		if c.droppedSinceLog == 0 {
+			continue
+		}
 		slog.Info("ingest.capped",
-			"dropped_events", p.cap.droppedSinceLog,
-			"capped_authors_today", p.cap.cappedAuthorsToday,
-			"cap_per_day", p.cfg.PostCapPerDay,
+			"rule", c.rule.Name,
+			"dropped_events", c.droppedSinceLog,
+			"capped_authors_bucket", c.cappedAuthorsBucket,
+			"cap_max", c.rule.Max,
+			"cap_window", c.rule.Window.String(),
 		)
-		p.cap.droppedSinceLog = 0
+		c.droppedSinceLog = 0
 	}
 	return nil
 }
@@ -236,8 +241,8 @@ func (p *Pipeline) add(relayEvent firehose.RelayEvent) error {
 			return err
 		}
 	}
-	if p.overPostCap(event) {
-		return errPostCapped
+	if p.overCap(event) {
+		return errCapped
 	}
 
 	p.batch = append(p.batch, clickhouse.EventRecord{

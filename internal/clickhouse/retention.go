@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 )
@@ -112,9 +111,9 @@ func eventKindRetentionMutations(allowed []int) []string {
 // ---------------------------------------------------------------------------
 // Declarative retention
 //
-// RetentionRules is the single, top-to-bottom-readable statement of what this
-// app-view keeps in nostr_events (see retentionTargets for why event_tags is
-// left alone). Everything
+// The registry's Lifetime rules are the single, top-to-bottom-readable
+// statement of what this app-view keeps in nostr_events (see retentionTargets
+// for why event_tags is left alone). Everything
 // deleted here is either superseded (replaceable events — only the latest
 // version is ever read) or stale-and-unengaged, and all of it is recoverable
 // from relays via the on-demand backfills. Plain-language docs and the
@@ -126,95 +125,15 @@ func eventKindRetentionMutations(allowed []int) []string {
 // never at risk.
 // ---------------------------------------------------------------------------
 
-// RetentionRules — edit this list to change what is pruned.
-var RetentionRules = []RetentionRule{
-	{
-		// Replaceable events (NIP-01): relays and every reader keep only the
-		// newest event per author; the older versions are pure dead weight.
-		// Measured on prod 2026-07: 80–92% of stored kind-0/3/10050 rows were
-		// superseded (~13 GiB, dominated by kind-3 contact lists).
-		Name:   "replaceable: keep only the latest event per author",
-		Kinds:  []int{0, 3, 10050, 10051},
-		Policy: KeepLatestPerAuthor{},
-	},
-	{
-		// Parameterized-replaceable events: same, but versioned per (author,
-		// d-tag). Measured: 98.7% of kind-30078 rows were superseded (~4 GiB).
-		Name:   "param-replaceable: keep only the latest event per (author, d-tag)",
-		Kinds:  []int{30078, 38000},
-		Policy: KeepLatestPerAuthorDTag{},
-	},
-	{
-		// Old posts nobody engaged with. "Engaged" = any like, repost, quote,
-		// zap, or direct reply ever recorded (the aggregate tables outlive the
-		// engaging events themselves, so pruning a reply never un-engages its
-		// parent).
-		Name:   "posts: drop after 1 year without any engagement",
-		Kinds:  []int{1, 1111},
-		Policy: MaxAgeWithoutEngagement{Age: 365 * 24 * time.Hour},
-	},
-}
-
-type RetentionRule struct {
-	Name   string
-	Kinds  []int
-	Policy RetentionPolicy
-}
-
-// RetentionPolicy renders the WHERE predicate selecting rows to DELETE.
-// idColumn abstracts the event-id column name: "id" on nostr_events,
-// "event_id" on the event_tags cascade (which carries kind + created_at too).
-type RetentionPolicy interface {
-	deletePredicate(kinds []int, idColumn string) string
-}
-
-// KeepLatestPerAuthor deletes every event whose (kind, author) has a newer
-// version. Ties on created_at keep one arbitrary winner — the same semantics
-// relays apply to replaceable events.
-type KeepLatestPerAuthor struct{}
-
-func (KeepLatestPerAuthor) deletePredicate(kinds []int, idColumn string) string {
-	return fmt.Sprintf(`kind IN (%s) AND %s NOT IN (
-		SELECT argMax(id, created_at)
-		FROM nostr_events
-		WHERE kind IN (%s)
-		GROUP BY kind, pubkey
-	)`, ints(kinds), idColumn, ints(kinds))
-}
-
-// KeepLatestPerAuthorDTag is KeepLatestPerAuthor keyed by (kind, author,
-// d-tag) for parameterized-replaceable kinds. Events without a d tag group
-// together under the empty key, which is exactly NIP-01's treatment ("d" absent
-// = empty d).
-type KeepLatestPerAuthorDTag struct{}
-
-func (KeepLatestPerAuthorDTag) deletePredicate(kinds []int, idColumn string) string {
-	return fmt.Sprintf(`kind IN (%s) AND %s NOT IN (
-		SELECT argMax(id, created_at)
-		FROM nostr_events
-		WHERE kind IN (%s)
-		GROUP BY kind, pubkey,
-			arrayFirst(t -> length(t) >= 2 AND t[1] = 'd', JSONExtract(tags_json, 'Array(Array(String))'))
-	)`, ints(kinds), idColumn, ints(kinds))
-}
-
-// MaxAgeWithoutEngagement deletes events older than Age with zero recorded
-// engagement. The engagement tables are AggregatingMergeTree state that is
-// never pruned, so this reads them as a permanent ledger.
-type MaxAgeWithoutEngagement struct {
-	Age time.Duration
-}
-
-func (p MaxAgeWithoutEngagement) deletePredicate(kinds []int, idColumn string) string {
-	days := int(p.Age.Hours() / 24)
-	return fmt.Sprintf(`kind IN (%s) AND created_at < now() - INTERVAL %d DAY AND %s NOT IN (
-		SELECT target_event_id FROM note_like_counts
-		UNION ALL SELECT target_event_id FROM note_repost_counts
-		UNION ALL SELECT target_event_id FROM note_quote_counts
-		UNION ALL SELECT target_event_id FROM note_zap_totals
-		UNION ALL SELECT target_event_id FROM note_direct_reply_counts
-	)`, ints(kinds), days, idColumn)
-}
+// The lifetime rules themselves live in the rules registry
+// (internal/rules): kind-neutral Lifetime declarations whose policies render
+// the delete predicates. Measured context behind the production defaults
+// (rules.Default) as of prod 2026-07: 80-92% of stored kind-0/3/10050 rows
+// were superseded (~13 GiB, dominated by kind-3 contact lists); 98.7% of
+// kind-30078 rows were superseded (~4 GiB). The unreferenced-expiry rule's
+// protection ledger reads the declared relationships' aggregate tables, which
+// are AggregatingMergeTree state that is never pruned — so pruning a
+// referencing event never un-references its target.
 
 type RetentionRunResult struct {
 	Rule        string
@@ -294,9 +213,9 @@ func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunRe
 
 	var results []RetentionRunResult
 	var errs []error
-	for _, rule := range RetentionRules {
+	for _, rule := range s.rules.Lifetimes() {
 		for _, target := range retentionTargets {
-			predicate := rule.Policy.deletePredicate(rule.Kinds, target.idColumn)
+			predicate := rule.Policy.DeletePredicate(rule.Kinds, target.idColumn)
 			var matched uint64
 			if err := s.conn.QueryRow(qctx, fmt.Sprintf("SELECT count() FROM %s WHERE %s", target.table, predicate)).Scan(&matched); err != nil {
 				errs = append(errs, fmt.Errorf("retention rule %q count %s: %w", rule.Name, target.table, err))

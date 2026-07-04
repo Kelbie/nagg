@@ -1,6 +1,9 @@
 package rules
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Default declares nagg's production rule set. Semantics intentionally match
 // the previous hand-written aggregates one-to-one so the generic layer can be
@@ -16,7 +19,8 @@ import "time"
 //	k1_1111_author  ← user_post_counts (unique events created per pubkey)
 //
 // capMax is the per-window event cap for the ingest cap rule (the
-// NAGG_POST_CAP_PER_DAY config value, default 20).
+// NAGG_POST_CAP_PER_DAY config value, default 20); capMax <= 0 omits the cap
+// rule entirely, matching the old "0 disables" semantics.
 func Default(capMax int) (*Registry, error) {
 	relationships := []Relationship{
 		{
@@ -104,8 +108,9 @@ func Default(capMax int) (*Registry, error) {
 		},
 	}
 
-	caps := []Cap{
-		{
+	var caps []Cap
+	if capMax > 0 {
+		caps = append(caps, Cap{
 			// A non-exempt pubkey may ingest at most capMax events of these
 			// kinds per 24h window (known viewers and their follows exempt).
 			Name:               "k1_1111_6_16_daily",
@@ -113,8 +118,19 @@ func Default(capMax int) (*Registry, error) {
 			Max:                capMax,
 			Window:             24 * time.Hour,
 			ExemptKnownViewers: true,
-		},
+		})
 	}
 
 	return New(relationships, lifetimes, caps)
+}
+
+// MustDefault is Default for wiring paths without an error channel (config
+// construction): the default rule set is compile-time data validated by unit
+// tests, so a failure is a programming error worth crashing on.
+func MustDefault(capMax int) *Registry {
+	r, err := Default(capMax)
+	if err != nil {
+		panic(fmt.Sprintf("rules: invalid default rule set: %v", err))
+	}
+	return r
 }

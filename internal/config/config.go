@@ -16,6 +16,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/relayquery"
+	"github.com/vertex-lab/nagg/internal/rules"
 )
 
 type Config struct {
@@ -144,6 +145,13 @@ type OnDemandConfig struct {
 
 func Load() (Config, error) {
 	onDemandUserFeed := parseBool(env("NAGG_ON_DEMAND_USER_FEED", "true"))
+
+	// The declarative rule registry (internal/rules) drives the generated
+	// aggregate schema, the ingest event_refs fan-out, retention, and the
+	// per-author ingest caps. NAGG_POST_CAP_PER_DAY parameterizes the default
+	// cap rule; 0 disables capping.
+	ruleRegistry := rules.MustDefault(parseInt(env("NAGG_POST_CAP_PER_DAY", "20")))
+
 	cfg := Config{
 		ClickHouse: chstore.Config{
 			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
@@ -152,6 +160,7 @@ func Load() (Config, error) {
 			Password:     os.Getenv("NAGG_CLICKHOUSE_PASSWORD"),
 			MaxOpenConns: parseInt(env("NAGG_CLICKHOUSE_MAX_OPEN_CONNS", "30")),
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
+			Rules:        ruleRegistry,
 			// Per-query memory ceiling (bytes) applied to every app-view read, as a
 			// runaway guard: an over-budget query is rejected by ClickHouse with a
 			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed
@@ -193,11 +202,11 @@ func Load() (Config, error) {
 			FlushInterval: parseDuration(env("NAGG_FLUSH_INTERVAL", "5s")),
 			QueueSize:     parseInt(env("NAGG_QUEUE_SIZE", "10000")),
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
-			// Per-author daily firehose cap for posts/reposts from authors NOT
-			// relevant to any Sovran user (see internal/relevance). Measured
-			// 2026-07: 20/day removes ~90% of monthly post volume, all of it
-			// from firehose bridge/bot accounts. 0 disables.
-			PostCapPerDay: parseInt(env("NAGG_POST_CAP_PER_DAY", "20")),
+			// Declarative per-author firehose caps for authors NOT relevant
+			// to any Sovran user (see internal/relevance). Measured 2026-07:
+			// 20/day removes ~90% of monthly post volume, all of it from
+			// firehose bridge/bot accounts.
+			Caps: ruleRegistry.Caps(),
 		},
 		Vertex: VertexConfig{
 			PrivateKey:          os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),

@@ -19,6 +19,8 @@ import (
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/nbd-wtf/go-nostr"
+
+	"github.com/vertex-lab/nagg/internal/rules"
 )
 
 // migrationsFS holds every migrations/NNN_*.sql file, compiled into the binary.
@@ -81,10 +83,17 @@ type Config struct {
 	// escape hatch for the first read-model deploys — remove once the model
 	// has served production for a while.
 	NotificationsLegacyRead bool
+	// Rules is the declarative rule registry driving the generated aggregate
+	// schema, the ingest event_refs fan-out, retention, and read specs. Nil
+	// falls back to rules.Default with the standard cap, so existing callers
+	// and tests keep working without wiring.
+	Rules *rules.Registry
 }
 
 type Store struct {
 	conn ch.Conn
+	// rules mirrors Config.Rules (defaulted when nil).
+	rules *rules.Registry
 	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
 	notificationsLegacyRead bool
 	// Cached notifications_feed readiness (see notificationsFeedReady).
@@ -92,6 +101,9 @@ type Store struct {
 	feedReady          bool
 	feedReadyCheckedAt time.Time
 }
+
+// Rules returns the store's rule registry.
+func (s *Store) Rules() *rules.Registry { return s.rules }
 
 const clickHouseStartupProbeTimeout = 2 * time.Second
 
@@ -241,8 +253,16 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.MaxQueryMemoryBytes > 0 {
 		readSettings = ch.Settings{"max_memory_usage": cfg.MaxQueryMemoryBytes}
 	}
+	reg := cfg.Rules
+	if reg == nil {
+		reg, err = rules.Default(20)
+		if err != nil {
+			return nil, fmt.Errorf("default rules: %w", err)
+		}
+	}
 	return &Store{
 		conn:                    retryConn{Conn: conn, readSettings: readSettings},
+		rules:                   reg,
 		notificationsLegacyRead: cfg.NotificationsLegacyRead,
 	}, nil
 }
@@ -534,11 +554,68 @@ func (s *Store) Migrate(ctx context.Context) error {
 		slog.Info("migration applied", "name", name, "duration", time.Since(start))
 	}
 
+	// Rule-derived schema: every declared relationship owns an aggregate
+	// table (and, for the ingest tier, the materialized view feeding it),
+	// generated from the registry rather than hand-written SQL. Tables that
+	// did not exist before this pass get a one-shot historical backfill so a
+	// newly declared rule immediately covers data that predates it — the
+	// "prototype the count, then declare it" flow.
+	if err := s.applyGeneratedSchema(migCtx); err != nil {
+		return fmt.Errorf("generated schema failed: %w", err)
+	}
+
 	// The CREATEs above ensure declared tables/views exist; the reconciler then
-	// strips anything the embedded SQL no longer declares and evolves columns,
-	// making the SQL files the single declarative source of truth.
+	// strips anything the embedded SQL + rule registry no longer declare and
+	// evolves columns, making the declarations the single source of truth.
 	if err := s.reconcileSchema(ctx, schemaReconcileMode()); err != nil {
 		return fmt.Errorf("schema reconcile failed: %w", err)
+	}
+	return nil
+}
+
+// applyGeneratedSchema creates the registry-derived tables and views, then
+// backfills any aggregate table created for the first time. Backfills run
+// against empty tables only, so uniq states stay exact and sum states are
+// never double-counted.
+func (s *Store) applyGeneratedSchema(ctx context.Context) error {
+	existing, err := s.readActualTables(ctx)
+	if err != nil {
+		return fmt.Errorf("read existing tables: %w", err)
+	}
+
+	for _, stmt := range s.rules.GeneratedDDL() {
+		if err := s.conn.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("generated DDL failed: %w\nstatement:\n%s", err, stmt)
+		}
+	}
+
+	_, refsExisted := existing["event_refs"]
+	needRefsReplay := false
+	for _, rel := range s.rules.Relationships() {
+		table := rules.TableName(rel.Name)
+		if _, ok := existing[table]; ok {
+			continue
+		}
+		if sql, ok := rules.BackfillSQL(rel); ok {
+			start := time.Now()
+			if err := s.conn.Exec(ctx, sql); err != nil {
+				return fmt.Errorf("backfill %s: %w", rel.Name, err)
+			}
+			slog.Info("rule backfilled", "rule", rel.Name, "duration", time.Since(start))
+			continue
+		}
+		if rel.Ref.Extractor != "" && rel.Refresh == rules.RefreshIngest {
+			needRefsReplay = true
+		}
+	}
+
+	// Extractor-based history must be replayed through Go: the sources are
+	// raw events, not tag rows. One pass repopulates event_refs; the
+	// materialized views fire per inserted row and fill the new aggregates.
+	if needRefsReplay || (!refsExisted && len(s.rules.IngestExtractorRules()) > 0) {
+		if err := s.replayEventRefs(ctx); err != nil {
+			return fmt.Errorf("replay event_refs: %w", err)
+		}
 	}
 	return nil
 }
@@ -569,23 +646,21 @@ func (s *Store) recordMigration(ctx context.Context, name string) error {
 }
 
 func (s *Store) Backfill(ctx context.Context) error {
-	statements := []string{
-		"TRUNCATE TABLE IF EXISTS note_like_counts",
-		"TRUNCATE TABLE IF EXISTS note_repost_counts",
-		"TRUNCATE TABLE IF EXISTS note_zaps",
-		"TRUNCATE TABLE IF EXISTS note_zap_totals",
+	// Rebuild every rule-derived aggregate from raw history: truncate so the
+	// uniq/sum states are exact, then re-run each rule's backfill SELECT.
+	// Extractor-based rules are rebuilt by replayEventRefs below.
+	statements := []string{"TRUNCATE TABLE IF EXISTS event_refs"}
+	for _, rel := range s.rules.Relationships() {
+		statements = append(statements, "TRUNCATE TABLE IF EXISTS "+rules.TableName(rel.Name))
+	}
+	for _, rel := range s.rules.Relationships() {
+		if sql, ok := rules.BackfillSQL(rel); ok {
+			statements = append(statements, sql)
+		}
+	}
+	statements = append(statements,
 		"TRUNCATE TABLE IF EXISTS profiles_latest",
 		"TRUNCATE TABLE IF EXISTS notification_candidates",
-		`INSERT INTO note_like_counts
-		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS likes
-		 FROM event_tags
-		 WHERE kind = 7 AND tag_key = 'e' AND length(tag_value) = 64
-		 GROUP BY target_event_id`,
-		`INSERT INTO note_repost_counts
-		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS reposts
-		 FROM event_tags
-		 WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
-		 GROUP BY target_event_id`,
 		`INSERT INTO profiles_latest
 		 SELECT
 		   pubkey,
@@ -623,24 +698,46 @@ func (s *Store) Backfill(ctx context.Context) error {
 		   AND length(tag_value) = 64
 		   AND kind IN (1, 3, 6, 7, 16, 9735)
 		   AND pubkey != tag_value`,
-	}
+	)
 	for _, stmt := range statements {
 		if err := s.conn.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("backfill failed: %w", err)
 		}
 	}
-	if err := s.backfillZaps(ctx); err != nil {
-		return fmt.Errorf("backfill zaps failed: %w", err)
+	if err := s.replayEventRefs(ctx); err != nil {
+		return fmt.Errorf("backfill event refs failed: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) backfillZaps(ctx context.Context) error {
-	rows, err := s.conn.Query(ctx, `
+// replayEventRefs re-derives event_refs rows from raw history for every
+// ingest-tier extractor rule: one pass over the rules' source kinds, each
+// event run through its extractor. The materialized views feeding the
+// aggregate tables fire per inserted row, so this also (re)fills those
+// aggregates — callers must ensure the destination aggregates are empty or
+// freshly created, or sums would double-count.
+func (s *Store) replayEventRefs(ctx context.Context) error {
+	extractorRules := s.rules.IngestExtractorRules()
+	if len(extractorRules) == 0 {
+		return nil
+	}
+	kindSet := map[int]struct{}{}
+	for _, rel := range extractorRules {
+		for _, k := range rel.Kinds {
+			kindSet[k] = struct{}{}
+		}
+	}
+	kinds := make([]string, 0, len(kindSet))
+	for k := range kindSet {
+		kinds = append(kinds, strconv.Itoa(k))
+	}
+	sort.Strings(kinds)
+
+	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
 		FROM nostr_events FINAL
-		WHERE kind = 9735
-	`)
+		WHERE kind IN (%s)
+	`, strings.Join(kinds, ", ")))
 	if err != nil {
 		return err
 	}
@@ -654,26 +751,31 @@ func (s *Store) backfillZaps(ctx context.Context) error {
 		return nil
 	}
 
-	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO note_zaps")
+	batch, err := s.prepareInsertBatch(ctx, "INSERT INTO event_refs")
 	if err != nil {
 		return err
 	}
 	defer closeUnsentBatch(batch)
 	appended := false
-	for _, event := range events {
-		zap, ok := extractNoteZap(eventViewToNostrEvent(event), event.CreatedAt)
-		if !ok {
-			continue
-		}
-		appended = true
-		if err := batch.Append(
-			zap.ReceiptID,
-			zap.TargetEventID,
-			zap.PubKey,
-			zap.CreatedAt,
-			zap.Sats,
-		); err != nil {
-			return err
+	for _, view := range events {
+		event := eventViewToNostrEvent(view)
+		for _, rel := range extractorRules {
+			if !kindIn(rel.Kinds, event.Kind) {
+				continue
+			}
+			for _, ref := range rules.Extractor(rel.Ref.Extractor)(event) {
+				appended = true
+				if err := batch.Append(
+					rel.Name,
+					event.ID,
+					event.PubKey,
+					view.CreatedAt,
+					ref.Target,
+					ref.Value,
+				); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if appended {
@@ -702,12 +804,17 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 		return err
 	}
 	defer closeUnsentBatch(tagsBatch)
-	zapsBatch, err := s.prepareInsertBatch(ctx, "INSERT INTO note_zaps")
-	if err != nil {
-		return err
+
+	extractorRules := s.rules.IngestExtractorRules()
+	var refsBatch chdriver.Batch
+	if len(extractorRules) > 0 {
+		refsBatch, err = s.prepareInsertBatch(ctx, "INSERT INTO event_refs")
+		if err != nil {
+			return err
+		}
+		defer closeUnsentBatch(refsBatch)
 	}
-	defer closeUnsentBatch(zapsBatch)
-	zapsAppended := false
+	refsAppended := false
 
 	for _, record := range records {
 		event := record.Event
@@ -754,16 +861,22 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 			}
 		}
 
-		if zap, ok := extractNoteZap(event, createdAt); ok {
-			zapsAppended = true
-			if err := zapsBatch.Append(
-				zap.ReceiptID,
-				zap.TargetEventID,
-				zap.PubKey,
-				zap.CreatedAt,
-				zap.Sats,
-			); err != nil {
-				return err
+		for _, rel := range extractorRules {
+			if !kindIn(rel.Kinds, event.Kind) {
+				continue
+			}
+			for _, ref := range rules.Extractor(rel.Ref.Extractor)(event) {
+				refsAppended = true
+				if err := refsBatch.Append(
+					rel.Name,
+					event.ID,
+					event.PubKey,
+					createdAt,
+					ref.Target,
+					ref.Value,
+				); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -777,12 +890,21 @@ func (s *Store) InsertEvents(ctx context.Context, records []EventRecord) error {
 	if err := tagsBatch.Send(); err != nil {
 		return err
 	}
-	if zapsAppended {
-		if err := zapsBatch.Send(); err != nil {
+	if refsAppended {
+		if err := refsBatch.Send(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func kindIn(kinds []int, kind int) bool {
+	for _, k := range kinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func flattenTag(tag nostr.Tag) (string, string, []string) {
@@ -801,14 +923,6 @@ func flattenTag(tag nostr.Tag) (string, string, []string) {
 	return key, value, extra
 }
 
-type noteZap struct {
-	ReceiptID     string
-	TargetEventID string
-	PubKey        string
-	CreatedAt     time.Time
-	Sats          uint64
-}
-
 func eventViewToNostrEvent(event EventView) *nostr.Event {
 	tags := make(nostr.Tags, 0, len(event.Tags))
 	for _, tag := range event.Tags {
@@ -823,139 +937,4 @@ func eventViewToNostrEvent(event EventView) *nostr.Event {
 		Content:   event.Content,
 		Sig:       event.Sig,
 	}
-}
-
-func extractNoteZap(event *nostr.Event, createdAt time.Time) (noteZap, bool) {
-	if event.Kind != 9735 {
-		return noteZap{}, false
-	}
-	targetID := firstHexNostrTag(event.Tags, "e")
-	description := firstNostrTag(event.Tags, "description")
-	if targetID == "" && description != "" {
-		targetID = targetIDFromZapRequest(description)
-	}
-	if targetID == "" {
-		return noteZap{}, false
-	}
-
-	msats := amountMSatsFromZapRequest(description)
-	var sats uint64
-	if msats > 0 {
-		sats = msats / 1000
-	} else if bolt11 := firstNostrTag(event.Tags, "bolt11"); bolt11 != "" {
-		sats = satsFromBolt11(bolt11)
-	}
-
-	return noteZap{
-		ReceiptID:     event.ID,
-		TargetEventID: targetID,
-		PubKey:        event.PubKey,
-		CreatedAt:     createdAt,
-		Sats:          sats,
-	}, true
-}
-
-func targetIDFromZapRequest(raw string) string {
-	var req struct {
-		Tags [][]string `json:"tags"`
-	}
-	if err := json.Unmarshal([]byte(raw), &req); err != nil {
-		return ""
-	}
-	return firstHexTag(req.Tags, "e")
-}
-
-func amountMSatsFromZapRequest(raw string) uint64 {
-	var req struct {
-		Tags [][]string `json:"tags"`
-	}
-	if err := json.Unmarshal([]byte(raw), &req); err != nil {
-		return 0
-	}
-	value := firstTag(req.Tags, "amount")
-	if value == "" {
-		return 0
-	}
-	n, err := strconv.ParseUint(value, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
-func satsFromBolt11(invoice string) uint64 {
-	invoice = strings.ToLower(strings.TrimSpace(invoice))
-	if !strings.HasPrefix(invoice, "lnbc") {
-		return 0
-	}
-	sep := strings.LastIndexByte(invoice, '1')
-	if sep <= len("lnbc") {
-		return 0
-	}
-	amount := invoice[len("lnbc"):sep]
-	if amount == "" {
-		return 0
-	}
-
-	unit := byte(0)
-	last := amount[len(amount)-1]
-	if last < '0' || last > '9' {
-		unit = last
-		amount = amount[:len(amount)-1]
-	}
-	n, err := strconv.ParseUint(amount, 10, 64)
-	if err != nil {
-		return 0
-	}
-
-	switch unit {
-	case 0:
-		return n * 100_000_000
-	case 'm':
-		return n * 100_000
-	case 'u':
-		return n * 100
-	case 'n':
-		return n / 10
-	case 'p':
-		return n / 10_000
-	default:
-		return 0
-	}
-}
-
-func firstHexTag(tags [][]string, key string) string {
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == key && len(tag[1]) == 64 {
-			return tag[1]
-		}
-	}
-	return ""
-}
-
-func firstTag(tags [][]string, key string) string {
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == key {
-			return tag[1]
-		}
-	}
-	return ""
-}
-
-func firstHexNostrTag(tags nostr.Tags, key string) string {
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == key && len(tag[1]) == 64 {
-			return tag[1]
-		}
-	}
-	return ""
-}
-
-func firstNostrTag(tags nostr.Tags, key string) string {
-	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == key {
-			return tag[1]
-		}
-	}
-	return ""
 }

@@ -33,26 +33,6 @@ SELECT
 FROM nostr_events
 WHERE kind = 3;
 
--- Post counts per author (kind 1 + 1111). uniqState(id) survives ReplacingMergeTree
--- re-inserts of a re-seen event, and is incremental — a pure materialized view.
-CREATE TABLE IF NOT EXISTS user_post_counts
-(
-    pubkey FixedString(64),
-    posts AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY pubkey;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_user_post_counts
-TO user_post_counts
-AS
-SELECT
-    pubkey,
-    uniqState(id) AS posts
-FROM nostr_events
-WHERE kind IN (1, 1111)
-GROUP BY pubkey;
-
 -- Denormalized per-user stats read by the API. following = length of the latest
 -- contact list; followers = fan-in (how many users' LATEST list contains you) —
 -- too heavy for a row-trigger MV, so the rollup job computes followers for touched
@@ -81,10 +61,3 @@ SELECT
 FROM nostr_events
 WHERE kind = 3;
 
-INSERT INTO user_post_counts
-SELECT
-    pubkey,
-    uniqState(id) AS posts
-FROM nostr_events
-WHERE kind IN (1, 1111)
-GROUP BY pubkey;

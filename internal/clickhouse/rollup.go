@@ -167,7 +167,7 @@ func targetIDsSubquery(since time.Time, limit int) string {
 				WHERE tag_key = 'e' AND length(tag_value) = 64
 				  AND created_at >= toDateTime(%d) AND kind IN (1, 6, 7, 16, 1111)
 				UNION ALL
-				SELECT target_event_id AS event_id, created_at AS engaged_at FROM note_zaps
+				SELECT target AS event_id, created_at AS engaged_at FROM event_refs WHERE rule = 'k9735_e'
 				WHERE created_at >= toDateTime(%d)
 			)
 			GROUP BY event_id
@@ -220,8 +220,8 @@ func buildReplyEdgesSQL(since time.Time, limit int) string {
 func buildDirectReplyCountsSQL(since time.Time, limit int) string {
 	children := recentChildrenSubquery(since, limit)
 	return fmt.Sprintf(`
-		INSERT INTO note_direct_reply_counts
-		SELECT parent_id AS target_event_id, uniqState(child_id) AS replies
+		INSERT INTO agg_k1_1111_e_reply
+		SELECT parent_id AS target, uniqState(child_id) AS sources
 		FROM note_reply_edges
 		WHERE child_id IN (%s)
 		GROUP BY parent_id`, children)
@@ -295,11 +295,11 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 			GROUP BY event_id
 		) q ON q.event_id = a.event_id
 		LEFT JOIN (
-			SELECT z.target_event_id AS event_id,
+			SELECT z.target AS event_id,
 			       uniqExact(z.pubkey) AS cnt,
-			       sum(z.sats) AS sats
-			FROM note_zaps z
-			WHERE z.target_event_id IN (target_ids) AND z.pubkey IN (scored)
+			       sum(z.value) AS sats
+			FROM event_refs z
+			WHERE z.rule = 'k9735_e' AND z.target IN (target_ids) AND z.pubkey IN (scored)
 			GROUP BY event_id
 		) z ON z.event_id = a.event_id
 		LEFT JOIN (
@@ -321,9 +321,9 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 				FROM note_reply_edges e INNER JOIN authors a2 ON a2.event_id = e.parent_id
 				WHERE e.child_pubkey IN (scored) AND e.child_pubkey != a2.author
 				UNION ALL
-				SELECT zz.target_event_id AS event_id, zz.pubkey AS actor
-				FROM note_zaps zz INNER JOIN authors a2 ON a2.event_id = zz.target_event_id
-				WHERE zz.pubkey IN (scored) AND zz.pubkey != a2.author
+				SELECT zz.target AS event_id, zz.pubkey AS actor
+				FROM event_refs zz INNER JOIN authors a2 ON a2.event_id = zz.target
+				WHERE zz.rule = 'k9735_e' AND zz.pubkey IN (scored) AND zz.pubkey != a2.author
 			)
 			GROUP BY event_id
 		) act ON act.event_id = a.event_id`,
@@ -374,10 +374,10 @@ func buildUserStatsSQL(since time.Time, limit int, computedAt time.Time) string 
 			GROUP BY follow
 		) f ON f.pubkey = u.pubkey
 		LEFT JOIN (
-			SELECT pubkey, uniqMerge(posts) AS posts
-			FROM user_post_counts
-			WHERE pubkey IN (touched)
-			GROUP BY pubkey
+			SELECT target AS pubkey, uniqMerge(sources) AS posts
+			FROM agg_k1_1111_author
+			WHERE target IN (touched)
+			GROUP BY target
 		) p ON p.pubkey = u.pubkey`, touched, computedAt.Unix())
 }
 
@@ -422,11 +422,11 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 			'%s' AS threshold_version,
 			toDateTime(%d) AS computed_at
 		FROM (SELECT id, pubkey, kind, created_at FROM nostr_events FINAL WHERE id IN (target_ids)) n
-		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(likes) AS v FROM note_like_counts WHERE target_event_id IN (target_ids) GROUP BY id) lk ON lk.id = n.id
-		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(reposts) AS v FROM note_repost_counts WHERE target_event_id IN (target_ids) GROUP BY id) rp ON rp.id = n.id
-		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(replies) AS v FROM note_direct_reply_counts WHERE target_event_id IN (target_ids) GROUP BY id) re ON re.id = n.id
-		LEFT JOIN (SELECT target_event_id AS id, uniqMerge(quotes) AS v FROM note_quote_counts WHERE target_event_id IN (target_ids) GROUP BY id) qt ON qt.id = n.id
-		LEFT JOIN (SELECT target_event_id AS id, sumMerge(sats) AS sats, uniqMerge(zaps) AS zaps FROM note_zap_totals WHERE target_event_id IN (target_ids) GROUP BY id) zt ON zt.id = n.id
+		LEFT JOIN (SELECT target AS id, uniqMerge(actors) AS v FROM agg_k7_e WHERE target IN (target_ids) GROUP BY id) lk ON lk.id = n.id
+		LEFT JOIN (SELECT target AS id, uniqMerge(actors) AS v FROM agg_k6_16_e WHERE target IN (target_ids) GROUP BY id) rp ON rp.id = n.id
+		LEFT JOIN (SELECT target AS id, uniqMerge(sources) AS v FROM agg_k1_1111_e_reply WHERE target IN (target_ids) GROUP BY id) re ON re.id = n.id
+		LEFT JOIN (SELECT target AS id, uniqMerge(sources) AS v FROM agg_k1_q WHERE target IN (target_ids) GROUP BY id) qt ON qt.id = n.id
+		LEFT JOIN (SELECT target AS id, sumMerge(value_total) AS sats, uniqMerge(sources) AS zaps FROM agg_k9735_e WHERE target IN (target_ids) GROUP BY id) zt ON zt.id = n.id
 		LEFT JOIN (SELECT event_id AS id, argMax(real_likes, computed_at) AS real_likes, argMax(real_reposts, computed_at) AS real_reposts, argMax(real_replies, computed_at) AS real_replies, argMax(real_quotes, computed_at) AS real_quotes, argMax(real_zaps, computed_at) AS real_zaps, argMax(real_zap_sats, computed_at) AS real_zap_sats, argMax(real_actors, computed_at) AS real_actors FROM note_engagement_real WHERE event_id IN (target_ids) GROUP BY id) er ON er.id = n.id
 		LEFT JOIN (SELECT pubkey, argMax(score, fetched_at) AS score, argMax(followers, fetched_at) AS followers FROM vertex_scores WHERE source = 'vertex' GROUP BY pubkey) vs ON vs.pubkey = n.pubkey
 		LEFT JOIN (SELECT event_id AS id, argMax(value, computed_at) AS value FROM derived_metrics WHERE metric = 'contribution_quality' AND event_id IN (target_ids) GROUP BY id) dm ON dm.id = n.id`,

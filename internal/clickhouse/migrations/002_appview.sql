@@ -1,74 +1,10 @@
-CREATE TABLE IF NOT EXISTS note_like_counts
-(
-    target_event_id FixedString(64),
-    likes AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY target_event_id;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_note_like_counts
-TO note_like_counts
-AS
-SELECT
-    tag_value AS target_event_id,
-    uniqState(pubkey) AS likes
-FROM event_tags
-WHERE kind = 7 AND tag_key = 'e' AND length(tag_value) = 64
-GROUP BY target_event_id;
-
-CREATE TABLE IF NOT EXISTS note_repost_counts
-(
-    target_event_id FixedString(64),
-    reposts AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY target_event_id;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_note_repost_counts
-TO note_repost_counts
-AS
-SELECT
-    tag_value AS target_event_id,
-    uniqState(pubkey) AS reposts
-FROM event_tags
-WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
-GROUP BY target_event_id;
-
--- (note_reply_counts / mv_note_reply_counts used to live here: an any-e-tag
--- reply aggregate that over-counted grandchildren. Superseded by
--- note_direct_reply_counts (007); their CREATEs were removed so the schema
--- reconciler retires them — see 007's trailer.)
-
-CREATE TABLE IF NOT EXISTS note_zaps
-(
-    zap_receipt_id FixedString(64),
-    target_event_id FixedString(64),
-    pubkey FixedString(64),
-    created_at DateTime,
-    sats UInt64
-)
-ENGINE = ReplacingMergeTree
-PARTITION BY toYYYYMM(created_at)
-ORDER BY (target_event_id, zap_receipt_id);
-
-CREATE TABLE IF NOT EXISTS note_zap_totals
-(
-    target_event_id FixedString(64),
-    sats AggregateFunction(sum, UInt64),
-    zaps AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY target_event_id;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_note_zap_totals
-TO note_zap_totals
-AS
-SELECT
-    target_event_id,
-    sumState(sats) AS sats,
-    uniqState(zap_receipt_id) AS zaps
-FROM note_zaps
-GROUP BY target_event_id;
+-- The engagement aggregates that used to open this file (note_like_counts,
+-- note_repost_counts, note_zaps, note_zap_totals and their MVs, plus the
+-- legacy note_reply_counts) are RETIRED: kind-to-kind aggregations are now
+-- declared in the rules registry (internal/rules), which generates the
+-- agg_<rule> tables, their materialized views, and the event_refs landing
+-- table at migrate time. The schema reconciler drops the undeclared legacy
+-- tables on deploy.
 
 CREATE TABLE IF NOT EXISTS profiles_latest
 (
