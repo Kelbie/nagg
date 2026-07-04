@@ -35,11 +35,12 @@ func TestMigrations_FilenamesAreNNNPrefixed(t *testing.T) {
 
 // idempotentInsertTargets are tables whose engine makes a repeated INSERT
 // converge instead of double-count — AggregatingMergeTree (uniqState/*State) or
-// ReplacingMergeTree keyed on the inserted id. Migrations re-run on every deploy
-// (there is no applied-versions ledger, by design — the backfills must keep
-// converging with the live MVs), so an INSERT into any other table double-applies.
+// ReplacingMergeTree keyed on the inserted id. The schema_migrations ledger
+// normally skips applied files, but idempotency is STILL mandatory: the ledger
+// is a fast-path (the every-deploy full re-run stopped scaling at billions of
+// event_tags rows), and deleting a ledger row deliberately re-runs a file — so
+// an INSERT into any non-convergent table would double-apply.
 var idempotentInsertTargets = map[string]struct{}{
-	"note_reply_counts":        {},
 	"note_like_counts":         {},
 	"note_repost_counts":       {},
 	"note_quote_counts":        {},
@@ -47,6 +48,7 @@ var idempotentInsertTargets = map[string]struct{}{
 	"note_reply_edges":         {},
 	"user_contacts_latest":     {},
 	"user_post_counts":         {},
+	"user_stats":               {},
 }
 
 // allowedStmtPrefixes are the re-runnable DDL shapes migrations may use. Every
@@ -119,4 +121,20 @@ func hasAnyStmtPrefix(s string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// TestMigrations_LedgerFileExists guards the Migrate() bootstrap contract: the
+// ledger's own migration must exist, sort FIRST (Migrate applies it before
+// reading the ledger), and create the schema_migrations table.
+func TestMigrations_LedgerFileExists(t *testing.T) {
+	names := migrationNames()
+	if len(names) == 0 {
+		t.Fatal("no embedded migrations discovered")
+	}
+	if names[0] != migrationsLedgerFile {
+		t.Fatalf("first migration must be the ledger (%s); got %s", migrationsLedgerFile, names[0])
+	}
+	if !strings.Contains(mustReadMigration(migrationsLedgerFile), "CREATE TABLE IF NOT EXISTS schema_migrations") {
+		t.Errorf("%s must create the schema_migrations table", migrationsLedgerFile)
+	}
 }

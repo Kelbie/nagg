@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -54,6 +56,7 @@ func (c Client) Query(ctx context.Context, filter map[string]any, timeout time.D
 	for _, relay := range relays {
 		relay := relay
 		go func() {
+			defer safego.Recover("relayquery.fanout")
 			events, err := c.queryRelay(qctx, relay, subID, filter)
 			results <- relayResult{relay: relay, events: events, err: err}
 		}()
@@ -231,11 +234,26 @@ func validateEvent(event *nostr.Event) error {
 }
 
 func uniqueRelays(relays []string) []string {
+	return SanitizeRelays(relays)
+}
+
+// SanitizeRelays normalizes and validates relay URLs, dropping anything that
+// cannot be dialed. Relay lists arrive from hostile-ish sources — env vars
+// pasted with hard line-wraps (the prod NAGG_RELAYS contained
+// "wss://relay.h\n  odl.ar", dial-failing on every query) and relay hints in
+// untrusted events — so interior whitespace is REMOVED (rejoining wrapped
+// URLs) and the result must parse as ws:// or wss://.
+func SanitizeRelays(relays []string) []string {
 	out := make([]string, 0, len(relays))
 	seen := map[string]struct{}{}
 	for _, relay := range relays {
-		relay = strings.TrimSpace(relay)
+		relay = strings.Join(strings.Fields(relay), "")
 		if relay == "" {
+			continue
+		}
+		parsed, err := url.Parse(relay)
+		if err != nil || (parsed.Scheme != "ws" && parsed.Scheme != "wss") || parsed.Host == "" {
+			slog.Warn("dropping invalid relay url", "relay", relay)
 			continue
 		}
 		if _, ok := seen[relay]; ok {

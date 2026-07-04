@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
@@ -75,10 +76,21 @@ type Config struct {
 	// MaxQueryMemoryBytes caps per-read ClickHouse memory via the max_memory_usage
 	// setting. 0 leaves it unset (server default). See config.APIConfig docs.
 	MaxQueryMemoryBytes int64
+	// NotificationsLegacyRead forces the legacy live-join notifications query
+	// even when the notifications_feed read-model is caught up. Emergency
+	// escape hatch for the first read-model deploys — remove once the model
+	// has served production for a while.
+	NotificationsLegacyRead bool
 }
 
 type Store struct {
 	conn ch.Conn
+	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
+	notificationsLegacyRead bool
+	// Cached notifications_feed readiness (see notificationsFeedReady).
+	feedReadyMu        sync.Mutex
+	feedReady          bool
+	feedReadyCheckedAt time.Time
 }
 
 const clickHouseStartupProbeTimeout = 2 * time.Second
@@ -229,7 +241,10 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	if cfg.MaxQueryMemoryBytes > 0 {
 		readSettings = ch.Settings{"max_memory_usage": cfg.MaxQueryMemoryBytes}
 	}
-	return &Store{conn: retryConn{Conn: conn, readSettings: readSettings}}, nil
+	return &Store{
+		conn:                    retryConn{Conn: conn, readSettings: readSettings},
+		notificationsLegacyRead: cfg.NotificationsLegacyRead,
+	}, nil
 }
 
 type openRetryConfig struct {
@@ -465,6 +480,11 @@ func closeUnsentBatch(batch chdriver.Batch) {
 	}
 }
 
+// migrationsLedgerFile is the migration that creates the schema_migrations
+// ledger itself. It is applied unconditionally (idempotent CREATE) so the
+// ledger exists before we try to read it.
+const migrationsLedgerFile = "000_schema_migrations.sql"
+
 func (s *Store) Migrate(ctx context.Context) error {
 	// Run migrations — and especially the historical backfill INSERT…SELECTs — with
 	// a low thread budget. Managed ClickHouse defaults max_threads to auto(N) (e.g.
@@ -479,13 +499,41 @@ func (s *Store) Migrate(ctx context.Context) error {
 		// let background merges apply it so the migrate stays a metadata change.
 		"materialize_ttl_after_modify": 0,
 	}))
-	for _, migration := range embeddedMigrations() {
-		for _, stmt := range splitSQLStatements(migration) {
-			if err := s.conn.Exec(migCtx, stmt); err != nil {
-				return fmt.Errorf("migration failed: %w", err)
-			}
+
+	// Bootstrap the ledger first — its own migration is idempotent and cheap.
+	for _, stmt := range splitSQLStatements(mustReadMigration(migrationsLedgerFile)) {
+		if err := s.conn.Exec(migCtx, stmt); err != nil {
+			return fmt.Errorf("migration ledger bootstrap failed: %w", err)
 		}
 	}
+	applied, err := s.appliedMigrations(ctx)
+	if err != nil {
+		return fmt.Errorf("read schema_migrations ledger: %w", err)
+	}
+
+	// Apply only unrecorded migrations. Historically every file re-ran on every
+	// deploy "so the backfills keep converging with the live MVs" — that design
+	// stopped scaling once the backfill sources crossed billions of rows (a
+	// full event_tags re-aggregation per deploy, twice). Statement idempotency
+	// is still mandatory (migrations_test.go): the ledger is the fast-path, not
+	// the safety net, and deleting a row from schema_migrations deliberately
+	// re-runs that file.
+	for _, name := range migrationNames() {
+		if _, done := applied[name]; done {
+			continue
+		}
+		start := time.Now()
+		for _, stmt := range splitSQLStatements(mustReadMigration(name)) {
+			if err := s.conn.Exec(migCtx, stmt); err != nil {
+				return fmt.Errorf("migration %s failed: %w", name, err)
+			}
+		}
+		if err := s.recordMigration(ctx, name); err != nil {
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		slog.Info("migration applied", "name", name, "duration", time.Since(start))
+	}
+
 	// The CREATEs above ensure declared tables/views exist; the reconciler then
 	// strips anything the embedded SQL no longer declares and evolves columns,
 	// making the SQL files the single declarative source of truth.
@@ -495,11 +543,35 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// appliedMigrations returns the set of migration filenames recorded in the
+// schema_migrations ledger.
+func (s *Store) appliedMigrations(ctx context.Context) (map[string]struct{}, error) {
+	rows, err := s.conn.Query(ctx, "SELECT DISTINCT name FROM schema_migrations")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	applied := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		applied[name] = struct{}{}
+	}
+	return applied, rows.Err()
+}
+
+// recordMigration marks a migration file as applied. ReplacingMergeTree keyed
+// on name makes repeat records converge instead of duplicating.
+func (s *Store) recordMigration(ctx context.Context, name string) error {
+	return s.conn.Exec(ctx, "INSERT INTO schema_migrations (name) VALUES (?)", name)
+}
+
 func (s *Store) Backfill(ctx context.Context) error {
 	statements := []string{
 		"TRUNCATE TABLE IF EXISTS note_like_counts",
 		"TRUNCATE TABLE IF EXISTS note_repost_counts",
-		"TRUNCATE TABLE IF EXISTS note_reply_counts",
 		"TRUNCATE TABLE IF EXISTS note_zaps",
 		"TRUNCATE TABLE IF EXISTS note_zap_totals",
 		"TRUNCATE TABLE IF EXISTS profiles_latest",
@@ -513,11 +585,6 @@ func (s *Store) Backfill(ctx context.Context) error {
 		 SELECT tag_value AS target_event_id, uniqState(pubkey) AS reposts
 		 FROM event_tags
 		 WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
-		 GROUP BY target_event_id`,
-		`INSERT INTO note_reply_counts
-		 SELECT tag_value AS target_event_id, uniqState(event_id) AS replies
-		 FROM event_tags
-		 WHERE kind = 1 AND tag_key = 'e' AND length(tag_value) = 64
 		 GROUP BY target_event_id`,
 		`INSERT INTO profiles_latest
 		 SELECT

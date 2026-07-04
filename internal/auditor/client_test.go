@@ -2,6 +2,7 @@ package auditor
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -88,5 +89,40 @@ func TestMintsCachesAndServesStaleOnError(t *testing.T) {
 	mints, err := c.Mints(ctx)
 	if err != nil || len(mints) != 2 {
 		t.Fatalf("stale serve failed: err=%v len=%d", err, len(mints))
+	}
+}
+
+// TestParseMints_NutsPassthroughAndUnitUnion pins the capability contract: the
+// full NUT-06 `nuts` map rides through VERBATIM (the app derives features from
+// it without a nagg release), and supportedUnits is the NUT-04 ∪ NUT-05 union
+// (melt-only units used to be dropped).
+func TestParseMints_NutsPassthroughAndUnitUnion(t *testing.T) {
+	const body = `[
+	  {"url":"https://mint.cap","name":"","state":"OK",
+	   "info":"{\"name\":\"Cap Mint\",\"nuts\":{\"4\":{\"methods\":[{\"method\":\"bolt11\",\"unit\":\"sat\"}]},\"5\":{\"methods\":[{\"method\":\"bolt11\",\"unit\":\"usd\"}]},\"7\":{\"supported\":true},\"10\":{\"supported\":true},\"17\":{\"supported\":[{\"method\":\"bolt11\",\"unit\":\"sat\",\"commands\":[\"bolt11_mint_quote\"]}]}}}"}
+	]`
+	mints, err := parseMints([]byte(body))
+	if err != nil {
+		t.Fatalf("parseMints: %v", err)
+	}
+	if len(mints) != 1 {
+		t.Fatalf("got %d mints, want 1", len(mints))
+	}
+	m := mints[0]
+	// Union: sat from NUT-04, usd only from NUT-05.
+	if len(m.Units) != 2 || m.Units[0] != "sat" || m.Units[1] != "usd" {
+		t.Errorf("units = %v, want [sat usd] (NUT-04 ∪ NUT-05)", m.Units)
+	}
+	if len(m.Nuts) == 0 {
+		t.Fatal("nuts raw map missing")
+	}
+	var nuts map[string]json.RawMessage
+	if err := json.Unmarshal(m.Nuts, &nuts); err != nil {
+		t.Fatalf("nuts is not a JSON object: %v", err)
+	}
+	for _, key := range []string{"4", "5", "7", "10", "17"} {
+		if _, ok := nuts[key]; !ok {
+			t.Errorf("nuts[%q] missing — the map must pass through verbatim", key)
+		}
 	}
 }

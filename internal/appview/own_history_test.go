@@ -63,7 +63,7 @@ func TestOwnHistoryLikesByAuthor(t *testing.T) {
 
 func TestOwnHistoryAuthoredVsRepliesSplit(t *testing.T) {
 	events := []chstore.EventView{
-		ownEvent("authored", 1, 200, [][]string{}),               // no #e → authored
+		ownEvent("authored", 1, 200, [][]string{}),                // no #e → authored
 		ownEvent("reply", 1, 100, [][]string{{"e", "some-note"}}), // #e → reply
 	}
 	authoredStore := &ownHistoryStore{events: events}

@@ -32,11 +32,11 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.UserFeedWait != 3*time.Second {
 		t.Fatalf("on-demand user-feed wait = %s, want 3s so cold profiles block briefly for backfill", cfg.OnDemand.UserFeedWait)
 	}
-	if cfg.API.MaxConcurrentRequests != 2 {
-		t.Fatalf("max concurrent requests = %d, want 2 (the measured shared-ClickHouse ceiling) so a burst queues instead of being shed as 5xx", cfg.API.MaxConcurrentRequests)
+	if cfg.API.MaxConcurrentRequests != 4 {
+		t.Fatalf("max concurrent requests = %d, want 4 — the process-wide chgate ceiling sized for post-fix per-query footprints (tens of MiB, hard-capped at 4 GiB); a burst queues instead of being shed as 5xx", cfg.API.MaxConcurrentRequests)
 	}
-	if cfg.ClickHouse.MaxQueryMemoryBytes != 0 {
-		t.Fatalf("max query memory = %d, want 0 (per-query cap unset by default)", cfg.ClickHouse.MaxQueryMemoryBytes)
+	if cfg.ClickHouse.MaxQueryMemoryBytes != 4<<30 {
+		t.Fatalf("max query memory = %d, want 4 GiB — the measured worst legitimate read is single-digit MiB, and an uncapped runaway query cgroup-OOMs the whole ClickHouse instance (the historical 502/restart flap)", cfg.ClickHouse.MaxQueryMemoryBytes)
 	}
 	if cfg.ClickHouse.MaxOpenConns != 30 || cfg.ClickHouse.MaxIdleConns != 10 {
 		t.Fatalf("clickhouse pool = open %d idle %d", cfg.ClickHouse.MaxOpenConns, cfg.ClickHouse.MaxIdleConns)

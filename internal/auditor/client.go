@@ -31,6 +31,14 @@ type Mint struct {
 	IconURL         string
 	Description     string
 	OperatorContact string
+	// Nuts is the mint's NUT-06 `nuts` capability map, VERBATIM (raw JSON
+	// object, e.g. {"4":{...},"7":{"supported":true},...}). The auditor
+	// already delivers the full GetInfoResponse; earlier revisions parsed only
+	// a sliver and threw the capability data away, forcing the app to fetch
+	// every mint's /v1/info itself to learn supported features. Passed through
+	// untyped by design: the app decides which NUTs it cares about without a
+	// nagg release. nil when the auditor had no info for the mint.
+	Nuts json.RawMessage
 }
 
 // Client fetches the auditor's mint list. Implementations cache internally.
@@ -183,6 +191,7 @@ func parseMints(body []byte) ([]Mint, error) {
 			mint.IconURL = info.IconURL
 			mint.Description = info.Description
 			mint.OperatorContact = info.nostrContact()
+			mint.Nuts = info.Nuts
 			if mint.Name == "" {
 				mint.Name = info.Name
 			}
@@ -192,19 +201,30 @@ func parseMints(body []byte) ([]Mint, error) {
 	return out, nil
 }
 
-// nut06Info is the subset of NUT-06 GetInfoResponse discovery needs.
+// nut06Info is the subset of NUT-06 GetInfoResponse discovery needs. Nuts is
+// kept raw AND selectively decoded: raw rides through to the discover response
+// verbatim; the typed view only serves supportedUnits derivation.
 type nut06Info struct {
 	Name        string          `json:"name"`
 	IconURL     string          `json:"icon_url"`
 	Description string          `json:"description"`
 	Contact     json.RawMessage `json:"contact"`
-	Nuts        struct {
-		Four struct {
-			Methods []struct {
-				Unit string `json:"unit"`
-			} `json:"methods"`
-		} `json:"4"`
-	} `json:"nuts"`
+	Nuts        json.RawMessage `json:"nuts"`
+}
+
+// nutsMethods is the typed sliver of the nuts map used for unit derivation:
+// NUT-04 (mint) and NUT-05 (melt) payment methods.
+type nutsMethods struct {
+	Four struct {
+		Methods []struct {
+			Unit string `json:"unit"`
+		} `json:"methods"`
+	} `json:"4"`
+	Five struct {
+		Methods []struct {
+			Unit string `json:"unit"`
+		} `json:"methods"`
+	} `json:"5"`
 }
 
 func parseInfo(encoded string) *nut06Info {
@@ -219,19 +239,32 @@ func parseInfo(encoded string) *nut06Info {
 	return &info
 }
 
+// units returns the UNION of NUT-04 (mint) and NUT-05 (melt) method units.
+// The previous NUT-04-only derivation under-reported mints that only melt a
+// given unit.
 func (n *nut06Info) units() []string {
+	var methods nutsMethods
+	if len(n.Nuts) > 0 {
+		_ = json.Unmarshal(n.Nuts, &methods)
+	}
 	seen := map[string]struct{}{}
 	var units []string
-	for _, m := range n.Nuts.Four.Methods {
-		u := strings.ToLower(strings.TrimSpace(m.Unit))
+	add := func(unit string) {
+		u := strings.ToLower(strings.TrimSpace(unit))
 		if u == "" {
-			continue
+			return
 		}
 		if _, ok := seen[u]; ok {
-			continue
+			return
 		}
 		seen[u] = struct{}{}
 		units = append(units, u)
+	}
+	for _, m := range methods.Four.Methods {
+		add(m.Unit)
+	}
+	for _, m := range methods.Five.Methods {
+		add(m.Unit)
 	}
 	sort.Strings(units)
 	return units

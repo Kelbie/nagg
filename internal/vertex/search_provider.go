@@ -3,6 +3,7 @@ package vertex
 import (
 	"context"
 	"fmt"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"log/slog"
 	"time"
 
@@ -71,6 +72,7 @@ func (p *SearchProvider) refreshAsync(args SearchArgs) {
 		return
 	}
 	go func() {
+		defer safego.Recover("vertex.search_refresh")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if _, err := p.refresh(ctx, args); err != nil {

@@ -2,6 +2,7 @@ package appview
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"net/http"
 	"sort"
@@ -19,11 +20,20 @@ import (
 // instead of the per-mint review + operator-profile N+1 fan-outs layered on a
 // direct api.sovran.money auditor call.
 type DiscoverMint struct {
-	MintURL        string   `json:"mintUrl"`
-	Name           string   `json:"name,omitempty"`
-	IconURL        string   `json:"iconUrl,omitempty"`
-	Description    string   `json:"description,omitempty"`
+	MintURL     string `json:"mintUrl"`
+	Name        string `json:"name,omitempty"`
+	IconURL     string `json:"iconUrl,omitempty"`
+	Description string `json:"description,omitempty"`
+	// SupportedUnits is the union of NUT-04 (mint) and NUT-05 (melt) method
+	// units — a distilled convenience for list filters.
 	SupportedUnits []string `json:"supportedUnits,omitempty"`
+	// Nuts is the mint's NUT-06 `nuts` capability map passed through VERBATIM
+	// (raw JSON object: {"4":{...},"7":{"supported":true},"17":{...},…}).
+	// Deliberately untyped: the app reads whichever NUT entries it cares about
+	// (payment methods, state check, P2PK, websockets, …) without a nagg
+	// release, and previously had to fetch every mint's /v1/info itself to
+	// learn any of this. Absent when the auditor had no info for the mint.
+	Nuts json.RawMessage `json:"nuts,omitempty"`
 
 	// Nostr reviews (NIP-87 kind-38000). AverageScore is null when no surviving
 	// review carried a [n/5]. ReviewCount is the deduped review total (one latest
@@ -301,6 +311,7 @@ func buildDiscoverMint(
 		row.IconURL = audit.IconURL
 		row.Description = audit.Description
 		row.SupportedUnits = audit.Units
+		row.Nuts = audit.Nuts
 		row.HasAudit = true
 		row.State = audit.State
 		row.NMints = audit.NMints

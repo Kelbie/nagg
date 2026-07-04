@@ -15,6 +15,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/relayquery"
 )
 
 type Config struct {
@@ -149,28 +150,31 @@ func Load() (Config, error) {
 			// runaway guard: an over-budget query is rejected by ClickHouse with a
 			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed
 			// request) instead of consuming the whole instance and cgroup-OOMing the
-			// container (the source of the 502/restart flaps). 0 = unset (no per-query
-			// cap); set once the real per-query footprint is measured.
-			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "0")),
+			// container (the source of the 502/restart flaps). The footprint is now
+			// measured: the worst legitimate read (pre-fix contact-list lookups)
+			// peaked at 7.31 GiB and its replacement runs in single-digit MiB, so
+			// 4 GiB is far above every sanctioned query while still shielding the
+			// instance. 0 = explicitly uncapped.
+			MaxQueryMemoryBytes: parseInt64(env("NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES", "4294967296")),
+			// Emergency escape hatch for the notifications read-model rollout;
+			// remove once the model has served production for a while.
+			NotificationsLegacyRead: parseBool(env("NAGG_NOTIFICATIONS_LEGACY_READ", "false")),
 		},
 		API: APIConfig{
 			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
-			// Default 2, matching the measured concurrency ceiling of the shared
-			// ~30 GB Railway ClickHouse: a single heavy app-view read (e.g. an
-			// engaged account's notifications, ~7 s, multiple GB) is so memory-hungry
-			// that only two run at once before ClickHouse sheds the rest with a fast
-			// 5xx. An app launch fires feed + notifications + search + profiles
-			// concurrently, so an over-high cap (the previous 24) never engaged —
-			// ClickHouse rejected first, the client saw nagg fail, and fell back. At
-			// 2 the excess queues on the semaphore (bounded by the request context)
-			// and succeeds slower instead of 5xx-ing. This is a low-traffic ceiling:
-			// raise it via env only after the per-query cost drops (the materialized
-			// notifications read-model — see docs/notifications-performance.md §9) or
-			// the ClickHouse instance is scaled / its workers split out.
-			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "2")),
+			// Slots on the PROCESS-WIDE heavy-query gate (chgate): heavy REST,
+			// GraphQL, and the rollup all share it. The old ceiling of 2 matched a
+			// world where a single read could eat multiple GiB (an engaged account's
+			// notifications; the 7 GiB contact-list lookups); with those reads fixed
+			// and every query capped at 4 GiB, the worst sanctioned read is tens of
+			// MiB and 4 concurrent queries fit comfortably. Excess queues on the gate
+			// (bounded by the request context) and succeeds slower instead of 5xx-ing.
+			MaxConcurrentRequests: parseInt(env("NAGG_MAX_CONCURRENT_REQUESTS", "4")),
 		},
 		Firehose: firehose.Config{
-			Relays:        splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social")),
+			// Sanitized: the prod env value has been observed with hard line-wraps
+			// INSIDE urls ("wss://relay.h\n  odl.ar"), which dial-fail forever.
+			Relays:        relayquery.SanitizeRelays(splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social"))),
 			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000")),
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),

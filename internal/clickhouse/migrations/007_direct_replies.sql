@@ -101,8 +101,9 @@ SELECT
 FROM note_reply_edges
 GROUP BY parent_id;
 
--- The legacy any-e-tag aggregate (note_reply_counts / mv_note_reply_counts from
--- 002 + 005) is superseded by note_direct_reply_counts; mergeCount now reads the
--- direct table (read.go). The legacy table is left in place to retire cleanly in
--- a follow-up once the direct-reply path is validated on devnagg — dropping it
--- here would fight 002/005, which recreate it on every migrate.
+-- The legacy any-e-tag aggregate (note_reply_counts / mv_note_reply_counts,
+-- formerly declared in 002 + 005) is superseded by note_direct_reply_counts;
+-- mergeCount reads the direct table (read.go). RETIRED: the direct-reply path
+-- validated on devnagg, so the legacy CREATEs were removed from 002 and 005
+-- was deleted — the declarative schema reconciler drops the undeclared
+-- table + view on the next migrate.

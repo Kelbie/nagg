@@ -13,12 +13,13 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	}
 
 	wantTables := []string{
+		"schema_migrations",
+		"notifications_feed",
 		"nostr_events",
 		"event_seen_relays",
 		"event_tags",
 		"note_like_counts",
 		"note_repost_counts",
-		"note_reply_counts",
 		"note_reply_edges",
 		"note_direct_reply_counts",
 		"note_quote_counts",
@@ -51,7 +52,6 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	wantViews := []string{
 		"mv_note_like_counts",
 		"mv_note_repost_counts",
-		"mv_note_reply_counts",
 		"mv_note_quote_counts",
 		"mv_note_zap_totals",
 		"mv_profiles_latest",
@@ -291,23 +291,6 @@ func TestSchemaReconcileMode_Default(t *testing.T) {
 // the migration must DROP the old view first so the change applies on existing
 // deployments (CREATE ... IF NOT EXISTS alone is a no-op there). It must also
 // backfill historical replies.
-func TestReplyParityMigration_IncludesKind1111(t *testing.T) {
-	sql := mustReadMigration("005_reply_parity.sql")
-	if !strings.Contains(sql, "DROP VIEW IF EXISTS mv_note_reply_counts") {
-		t.Error("reply-parity migration must DROP the old reply MV before recreating it")
-	}
-	if !strings.Contains(sql, "kind IN (1, 1111)") {
-		t.Error("reply-parity migration must aggregate kinds (1, 1111)")
-	}
-	if !strings.Contains(sql, "INSERT INTO note_reply_counts") {
-		t.Error("reply-parity migration must backfill historical replies")
-	}
-	// The file must be discovered by the embed glob, or it never runs.
-	if !migrationFilePresent("005_reply_parity.sql") {
-		t.Error("005_reply_parity.sql is not discovered by embeddedMigrations()")
-	}
-}
-
 // TestDirectRepliesMigration_DeclaresEdgeAndCountTables guards the NIP-10/22
 // direct-reply rebuild: migration 007 must declare the edge and direct-count
 // tables, derive the parent with the reply > unmarked-last > root coalesce, and

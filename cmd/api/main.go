@@ -18,6 +18,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/appview"
 	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/cache"
+	"github.com/vertex-lab/nagg/internal/chgate"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/config"
 	"github.com/vertex-lab/nagg/internal/enrich"
@@ -25,12 +26,15 @@ import (
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/rollup"
+	"github.com/vertex-lab/nagg/internal/runtimelimits"
+	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 const apiInitializationRetryDelay = 10 * time.Second
 
 func main() {
+	runtimelimits.Apply()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
@@ -56,6 +60,7 @@ func main() {
 	}
 
 	go func() {
+		defer safego.Recover("api.worker")
 		slog.Info("graphql api listening", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("graphql api failed", "error", err)
@@ -103,6 +108,12 @@ func initializeAPI(ctx context.Context, cfg config.Config, logger *slog.Logger, 
 }
 
 func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
+	// One process-wide gate for every heavy ClickHouse path. Previously only
+	// heavy REST routes were semaphored — GraphQL (its own mux) and background
+	// workers (rollup) piled onto CH past the measured concurrency ceiling,
+	// producing the shed/5xx/reset behavior the semaphore existed to prevent.
+	gate := chgate.New(cfg.API.MaxConcurrentRequests)
+
 	var vertexClient *vertex.Client
 	if cfg.Vertex.PrivateKey != "" {
 		client, err := vertex.New(vertex.Config{
@@ -152,7 +163,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 				MinActorScore: cfg.Rollup.MinActorScore,
 				Version:       cfg.Rollup.Version,
 			},
-		}, logger)
+		}, logger).WithGate(gate)
 		go rollupRunner.Run(ctx)
 	}
 
@@ -169,6 +180,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			}, logger)
 			slog.Info("in-process enricher starting", "tasks", enrich.NormalizeTasks(cfg.Enrich.Tasks))
 			go func() {
+				defer safego.Recover("api.worker")
 				if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 					slog.Error("enricher stopped with error", "error", err)
 				}
@@ -248,8 +260,10 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout),
 		graphqlapi.WithRelayHydrationMaxJobs(cfg.OnDemand.GraphQLMaxJobsPerRequest),
 	)
-	mux.HandleFunc("/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
-	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gqlHandler, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
+	// Gate INSIDE the response cache so cache hits never queue.
+	gatedGQL := gate.Middleware(gqlHandler)
+	mux.HandleFunc("/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
+	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
 	// Reuse the GraphQL schema options so the REST ranked-feed route runs the
 	// exact same ranking pipeline (scoring + on-demand hydration) as the
@@ -261,7 +275,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor),
 		appview.WithRankedFeed(ranker),
-		appview.WithMaxConcurrentRequests(cfg.API.MaxConcurrentRequests),
+		appview.WithConcurrencyGate(gate),
 	}
 	// Route REST profile search through the same cache-backed provider as GraphQL.
 	// Injected unconditionally: with no Vertex key the provider returns
@@ -278,6 +292,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		// Warm the auditor cache in the background so the first /nostr/mint/discover
 		// request doesn't pay the cold upstream fetch.
 		go func() {
+			defer safego.Recover("api.worker")
 			warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			if _, err := auditorClient.Mints(warmCtx); err != nil {
@@ -372,12 +387,34 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
 	slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays), "kinds", cfg.Firehose.Kinds)
 	go func() {
+		defer safego.Recover("api.worker")
 		firehoseClient.Run(ctx, events)
 		close(events)
 	}()
 	go func() {
-		if err := pipeline.Run(ctx, events); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error("ingestion stopped with error", "error", err)
+		defer safego.Recover("api.ingest_pipeline")
+		// The pipeline must outlive failure bursts: a returned error (e.g. CH
+		// inserts failing past their retries while the database restarts)
+		// previously ended this goroutine SILENTLY — ingestion stopped while
+		// the API kept serving, and the firehose eventually blocked on the
+		// full channel (observed as a lone "ingestion stopped with error" at
+		// the end of a session's logs). Resume consuming with backoff until
+		// shutdown; a nil return means the firehose closed the channel.
+		backoff := time.Second
+		for {
+			err := pipeline.Run(ctx, events)
+			if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			slog.Error("ingestion stopped with error; restarting", "error", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 		}
 	}()
 }

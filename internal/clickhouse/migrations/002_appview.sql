@@ -34,23 +34,10 @@ FROM event_tags
 WHERE kind IN (6, 16) AND tag_key = 'e' AND length(tag_value) = 64
 GROUP BY target_event_id;
 
-CREATE TABLE IF NOT EXISTS note_reply_counts
-(
-    target_event_id FixedString(64),
-    replies AggregateFunction(uniq, FixedString(64))
-)
-ENGINE = AggregatingMergeTree
-ORDER BY target_event_id;
-
-CREATE MATERIALIZED VIEW IF NOT EXISTS mv_note_reply_counts
-TO note_reply_counts
-AS
-SELECT
-    tag_value AS target_event_id,
-    uniqState(event_id) AS replies
-FROM event_tags
-WHERE kind = 1 AND tag_key = 'e' AND length(tag_value) = 64
-GROUP BY target_event_id;
+-- (note_reply_counts / mv_note_reply_counts used to live here: an any-e-tag
+-- reply aggregate that over-counted grandchildren. Superseded by
+-- note_direct_reply_counts (007); their CREATEs were removed so the schema
+-- reconciler retires them — see 007's trailer.)
 
 CREATE TABLE IF NOT EXISTS note_zaps
 (
