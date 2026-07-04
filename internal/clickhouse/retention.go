@@ -218,7 +218,6 @@ func (p MaxAgeWithoutEngagement) deletePredicate(kinds []int, idColumn string) s
 type RetentionRunResult struct {
 	Rule        string
 	Table       string
-	Partition   string
 	MatchedRows uint64
 	Deleted     bool
 }
@@ -242,12 +241,31 @@ var retentionTargets = []struct {
 	{table: "event_tags", idColumn: "event_id"},
 }
 
+// retentionMinMatchedRows: don't spend a full-table mutation on a trickle.
+// Superseded replaceable versions accumulate continuously from the firehose;
+// mutating for a few thousand rows would churn the table's parts all day.
+const retentionMinMatchedRows = 50_000
+
+// ErrRetentionNoHeadroom: the disk can't fit a mutation of the table's
+// largest part right now. A ClickHouse mutation reserves up to the full part
+// size while rewriting it; submitting without headroom wedges the mutation in
+// a reserve-fail retry loop (observed live: "Cannot reserve 17.89 GiB" against
+// a 24 GiB-free disk, retrying forever and blocking retention). Space frees up
+// as background merges compact already-masked rows — the next pass retries.
+var ErrRetentionNoHeadroom = errors.New("not enough disk headroom for a retention mutation")
+
 // RunRetention advances retention by ONE bounded step: it finds the first
-// (rule, table, partition) with matching rows and submits a single
-// partition-scoped lightweight DELETE for it, returning immediately (the
-// mutation executes in the background). The caller re-ticks; the
-// ErrRetentionBusy guard serializes mutations across ticks. dryRun instead
-// reports every rule's matches without deleting anything.
+// (rule, table) with enough matching rows and submits a single lightweight
+// DELETE for it, returning immediately (the mutation executes in the
+// background). The caller re-ticks; the ErrRetentionBusy guard serializes
+// mutations across ticks — NEVER run two at once, one multi-part mutation can
+// occupy this instance's whole background pool. dryRun instead reports every
+// rule's matches without deleting anything.
+//
+// NOTE deletes are deliberately table-wide, not partition-scoped: lightweight
+// DELETE ... IN PARTITION does not restrict the rewrite on this ClickHouse
+// version (observed live: an IN PARTITION 202512 delete rewrote 202606 parts),
+// so partition scoping only adds a false sense of boundedness.
 func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunResult, error) {
 	pending, err := s.pendingRetentionMutations(ctx)
 	if err != nil {
@@ -272,27 +290,29 @@ func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunRe
 	for _, rule := range RetentionRules {
 		for _, target := range retentionTargets {
 			predicate := rule.Policy.deletePredicate(rule.Kinds, target.idColumn)
-			partition, matched, err := s.firstRetentionMatch(qctx, target.table, predicate)
-			if err != nil {
+			var matched uint64
+			if err := s.conn.QueryRow(qctx, fmt.Sprintf("SELECT count() FROM %s WHERE %s", target.table, predicate)).Scan(&matched); err != nil {
 				errs = append(errs, fmt.Errorf("retention rule %q count %s: %w", rule.Name, target.table, err))
 				continue
 			}
-			if matched == 0 {
+			if matched < retentionMinMatchedRows {
 				continue
 			}
 			result := RetentionRunResult{
 				Rule:        rule.Name,
 				Table:       target.table,
-				Partition:   partition,
 				MatchedRows: matched,
 			}
 			if dryRun {
 				results = append(results, result)
 				continue
 			}
-			stmt := fmt.Sprintf("DELETE FROM %s IN PARTITION %s WHERE %s", target.table, partition, predicate)
+			if err := s.checkRetentionHeadroom(qctx, target.table); err != nil {
+				return results, errors.Join(append(errs, err)...)
+			}
+			stmt := fmt.Sprintf("DELETE FROM %s WHERE %s", target.table, predicate)
 			if err := s.conn.Exec(qctx, stmt); err != nil {
-				return results, errors.Join(append(errs, fmt.Errorf("retention rule %q delete %s partition %s: %w", rule.Name, target.table, partition, err))...)
+				return results, errors.Join(append(errs, fmt.Errorf("retention rule %q delete %s: %w", rule.Name, target.table, err))...)
 			}
 			result.Deleted = true
 			results = append(results, result)
@@ -303,30 +323,23 @@ func (s *Store) RunRetention(ctx context.Context, dryRun bool) ([]RetentionRunRe
 	return results, errors.Join(errs...)
 }
 
-// firstRetentionMatch returns the oldest partition with rows matching the
-// predicate, and its match count. Oldest-first clears the many small historic
-// partitions quickly and leaves the current jumbo partition for last.
-func (s *Store) firstRetentionMatch(ctx context.Context, table, predicate string) (string, uint64, error) {
-	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
-		SELECT toString(toYYYYMM(created_at)) AS partition, count() AS matched
-		FROM %s
-		WHERE %s
-		GROUP BY partition
-		ORDER BY partition ASC
-		LIMIT 1
-	`, table, predicate))
+// checkRetentionHeadroom refuses to submit a mutation unless the disk can hold
+// a rewrite of the table's largest active part with 25% margin.
+func (s *Store) checkRetentionHeadroom(ctx context.Context, table string) error {
+	var largestPart, freeSpace uint64
+	err := s.conn.QueryRow(ctx, `
+		SELECT
+			(SELECT max(bytes_on_disk) FROM system.parts WHERE active AND database = currentDatabase() AND table = ?),
+			(SELECT min(free_space) FROM system.disks)
+	`, table).Scan(&largestPart, &freeSpace)
 	if err != nil {
-		return "", 0, err
+		return fmt.Errorf("check disk headroom: %w", err)
 	}
-	defer rows.Close()
-	var partition string
-	var matched uint64
-	if rows.Next() {
-		if err := rows.Scan(&partition, &matched); err != nil {
-			return "", 0, err
-		}
+	need := largestPart + largestPart/4
+	if freeSpace < need {
+		return fmt.Errorf("%w: table %s largest part %d bytes needs %d, disk has %d free", ErrRetentionNoHeadroom, table, largestPart, need, freeSpace)
 	}
-	return partition, matched, rows.Err()
+	return nil
 }
 
 func (s *Store) pendingRetentionMutations(ctx context.Context) (uint64, error) {
