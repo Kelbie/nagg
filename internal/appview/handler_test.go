@@ -38,10 +38,6 @@ func (s fakeStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chst
 	return nil, nil
 }
 
-func (s fakeStore) NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error) {
-	return map[string]chstore.NoteStats{}, nil
-}
-
 func (s fakeStore) EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error) {
 	return map[string]map[string]map[string]uint64{}, nil
 }
@@ -204,11 +200,20 @@ func (s *sequencedThreadStore) DescendantEvents(context.Context, string, int) (*
 	return &s.root, s.threads[idx], nil
 }
 
+// testCounts is the fixture shape for per-event counts; tests express the
+// values in familiar terms and noteStatsAsAggregates maps them to rule names.
+type testCounts struct {
+	LikeCount   uint64
+	RepostCount uint64
+	ReplyCount  uint64
+	SatsZapped  uint64
+}
+
 type appViewHydrationStore struct {
 	fakeStore
 	feed        []chstore.EventView
 	events      map[string]chstore.EventView
-	stats       map[string]chstore.NoteStats
+	stats       map[string]testCounts
 	noteStatIDs []string
 }
 
@@ -226,15 +231,6 @@ func (s *appViewHydrationStore) QueryEvents(_ context.Context, input chstore.Eve
 	return out, nil
 }
 
-func (s *appViewHydrationStore) NoteStats(_ context.Context, ids []string) (map[string]chstore.NoteStats, error) {
-	s.noteStatIDs = append([]string(nil), ids...)
-	out := make(map[string]chstore.NoteStats, len(ids))
-	for _, id := range ids {
-		out[id] = s.stats[id]
-	}
-	return out, nil
-}
-
 func (s *appViewHydrationStore) EventAggregates(_ context.Context, ids []string) (map[string]map[string]map[string]uint64, error) {
 	s.noteStatIDs = append([]string(nil), ids...)
 	out := make(map[string]map[string]map[string]uint64, len(ids))
@@ -248,7 +244,7 @@ func (s *appViewHydrationStore) EventAggregates(_ context.Context, ids []string)
 
 // noteStatsAsAggregates maps the legacy fixture counts onto the declared rule
 // vocabulary, omitting zeros exactly like the real EventAggregates read.
-func noteStatsAsAggregates(st chstore.NoteStats) map[string]map[string]uint64 {
+func noteStatsAsAggregates(st testCounts) map[string]map[string]uint64 {
 	out := map[string]map[string]uint64{}
 	put := func(rule, metric string, v uint64) {
 		if v == 0 {
@@ -981,7 +977,7 @@ func TestFeedHydratesRootAndQuotedEvents(t *testing.T) {
 		},
 		feed:   []chstore.EventView{reply},
 		events: map[string]chstore.EventView{rootID: root, quoteID: quote},
-		stats: map[string]chstore.NoteStats{
+		stats: map[string]testCounts{
 			rootID:  {LikeCount: 2, RepostCount: 3, ReplyCount: 4, SatsZapped: 5},
 			replyID: {LikeCount: 6, RepostCount: 7, ReplyCount: 8, SatsZapped: 9},
 			quoteID: {LikeCount: 10, RepostCount: 11, ReplyCount: 12, SatsZapped: 13},
@@ -1068,7 +1064,7 @@ func TestFeedKeepsRootIDWhenRootUnavailable(t *testing.T) {
 		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feed:      []chstore.EventView{reply},
 		events:    map[string]chstore.EventView{},
-		stats:     map[string]chstore.NoteStats{replyID: {LikeCount: 1}},
+		stats:     map[string]testCounts{replyID: {LikeCount: 1}},
 	}
 	handler := New(store, WithNIP05Validation(false))
 
@@ -1144,7 +1140,7 @@ func TestFeedResolvesUpstreamRootFromParentReply(t *testing.T) {
 		},
 		feed:   []chstore.EventView{reply},
 		events: map[string]chstore.EventView{rootID: root, parentID: parent},
-		stats: map[string]chstore.NoteStats{
+		stats: map[string]testCounts{
 			rootID:  {LikeCount: 2, RepostCount: 3, ReplyCount: 4, SatsZapped: 5},
 			replyID: {LikeCount: 6, RepostCount: 7, ReplyCount: 8, SatsZapped: 9},
 		},
@@ -1228,7 +1224,7 @@ func TestFeedHydratesRepostOriginalRoot(t *testing.T) {
 		},
 		feed:   []chstore.EventView{repost},
 		events: map[string]chstore.EventView{rootID: root, originalID: original},
-		stats: map[string]chstore.NoteStats{
+		stats: map[string]testCounts{
 			rootID:     {LikeCount: 2, RepostCount: 3, ReplyCount: 4, SatsZapped: 5},
 			originalID: {LikeCount: 6, RepostCount: 7, ReplyCount: 8, SatsZapped: 9},
 		},
@@ -1859,7 +1855,7 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 			},
 		},
 		events: map[string]chstore.EventView{},
-		stats: map[string]chstore.NoteStats{
+		stats: map[string]testCounts{
 			firstID:  {LikeCount: 1},
 			secondID: {LikeCount: 2},
 		},
@@ -1982,7 +1978,7 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 				},
 			},
 			events: map[string]chstore.EventView{},
-			stats:  map[string]chstore.NoteStats{eventID: {LikeCount: 3}},
+			stats:  map[string]testCounts{eventID: {LikeCount: 3}},
 		},
 		rows: []chstore.ViewerFeedRow{{
 			Event:            event,
@@ -2046,7 +2042,7 @@ func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
-			stats:     map[string]chstore.NoteStats{},
+			stats:     map[string]testCounts{},
 		},
 	}
 	handler := New(store, WithViewerPubkey(testPubkey), WithNIP05Validation(false))
@@ -2077,7 +2073,7 @@ func TestNotificationsAcceptsFollowsPolicy(t *testing.T) {
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
-			stats:     map[string]chstore.NoteStats{},
+			stats:     map[string]testCounts{},
 		},
 	}
 	handler := New(store, WithNIP05Validation(false))
@@ -2097,7 +2093,7 @@ func TestNotificationsRequiresViewer(t *testing.T) {
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
-			stats:     map[string]chstore.NoteStats{},
+			stats:     map[string]testCounts{},
 		},
 	}
 	handler := New(store, WithNIP05Validation(false))
@@ -2142,7 +2138,7 @@ func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) 
 				counts: chstore.PubkeyStats{Followers: 100},
 			},
 			events: map[string]chstore.EventView{target: {ID: target, PubKey: testPubkey, Kind: 1, Content: "my post"}},
-			stats:  map[string]chstore.NoteStats{},
+			stats:  map[string]testCounts{},
 		},
 		rows: rows,
 	}
@@ -2223,7 +2219,7 @@ func TestNotificationsGroupedFalseReturnsRawSingles(t *testing.T) {
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
-			stats:     map[string]chstore.NoteStats{},
+			stats:     map[string]testCounts{},
 		},
 		rows: rows,
 	}

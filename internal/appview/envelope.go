@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 )
@@ -207,21 +205,6 @@ func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventVi
 		cursor = &c
 	}
 	return h.assembleEnvelope(ctx, order, orderBy, referenced, cursor)
-}
-
-// parseFeedCursor decodes the feed continuation token ("<until>|<offset>").
-// A missing or malformed cursor means the first page.
-func parseFeedCursor(raw string) (until int64, offset uint64) {
-	parts := strings.SplitN(strings.TrimSpace(raw), "|", 2)
-	if len(parts) != 2 {
-		return 0, 0
-	}
-	u, err1 := strconv.ParseInt(parts[0], 10, 64)
-	o, err2 := strconv.ParseUint(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		return 0, 0
-	}
-	return u, o
 }
 
 func (h *Handler) writeFeedEnvelope(w http.ResponseWriter, r *http.Request, events []chstore.EventView, orderBy string) {

@@ -111,20 +111,6 @@ type ReferenceAggregateMetric struct {
 	DistinctField string
 }
 
-type NoteStats struct {
-	LikeCount   uint64 `json:"likeCount"`
-	RepostCount uint64 `json:"repostCount"`
-	ReplyCount  uint64 `json:"replyCount"`
-	SatsZapped  uint64 `json:"satsZapped"`
-	// Vertex-real counts: distinct engagers whose saved Vertex score clears the
-	// rollup threshold (bot-resistant). Sourced from gated_ref_counts; zero
-	// until the rollup has computed a row for the event.
-	RealLikeCount   uint64 `json:"realLikeCount"`
-	RealRepostCount uint64 `json:"realRepostCount"`
-	RealReplyCount  uint64 `json:"realReplyCount"`
-	RealSatsZapped  uint64 `json:"realSatsZapped"`
-}
-
 type PubkeyStats struct {
 	Follows   uint64 `json:"follows"`
 	Followers uint64 `json:"followers"`
@@ -309,70 +295,6 @@ func (s *Store) LatestK3Refs(ctx context.Context, pubkeys []string) (map[string]
 			set[contact] = struct{}{}
 		}
 		out[pubkey] = set
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteStats, error) {
-	ids = uniqueStrings(ids)
-	out := make(map[string]NoteStats, len(ids))
-	for _, id := range ids {
-		out[id] = NoteStats{}
-	}
-	if len(ids) == 0 {
-		return out, nil
-	}
-
-	// ONE query on ONE connection. The earlier errgroup opened five concurrent
-	// native connections, which the capacity-limited ClickHouse resets under load
-	// (the cause of the feed noteStats break + the REST /nostr/feed/ranked 500s).
-	// LEFT JOIN every precomputed count onto the engaged-id set (UNION of the
-	// per-table keys) so the whole page's stats come back in a single round-trip.
-	// Direct (NIP-10/22) replies come from note_direct_reply_counts; real_* are the
-	// vertex-real counts (argMax over computed_at collapses the ReplacingMergeTree
-	// + threshold rows). Ids with no engagement anywhere stay pre-filled at zero.
-	query := `
-		SELECT
-			ids.id,
-			ifNull(l.c, 0)  AS likes,
-			ifNull(rp.c, 0) AS reposts,
-			ifNull(dr.c, 0) AS replies,
-			ifNull(z.s, 0)  AS zap_sats,
-			ifNull(er.rl, 0) AS gated_k7_e_actors,
-			ifNull(er.rr, 0) AS gated_k6_16_e_actors,
-			ifNull(er.re, 0) AS gated_k1_1111_e_reply_sources,
-			ifNull(er.rz, 0) AS gated_k9735_e_value_total
-		FROM (
-			SELECT target AS id FROM agg_k7_e WHERE target IN (?)
-			UNION DISTINCT SELECT target FROM agg_k6_16_e WHERE target IN (?)
-			UNION DISTINCT SELECT target FROM agg_k1_1111_e_reply WHERE target IN (?)
-			UNION DISTINCT SELECT target FROM agg_k9735_e WHERE target IN (?)
-			UNION DISTINCT SELECT event_id FROM gated_ref_counts WHERE event_id IN (?)
-		) ids
-		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k7_e WHERE target IN (?) GROUP BY target) l ON l.target = ids.id
-		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k6_16_e WHERE target IN (?) GROUP BY target) rp ON rp.target = ids.id
-		LEFT JOIN (SELECT target, uniqMerge(sources) AS c FROM agg_k1_1111_e_reply WHERE target IN (?) GROUP BY target) dr ON dr.target = ids.id
-		LEFT JOIN (SELECT target, sumMerge(value_total) AS s FROM agg_k9735_e WHERE target IN (?) GROUP BY target) z ON z.target = ids.id
-		LEFT JOIN (
-			SELECT event_id,
-				argMax(k7_e_actors, computed_at) AS rl,
-				argMax(k6_16_e_actors, computed_at) AS rr,
-				argMax(k1_1111_e_reply_sources, computed_at) AS re,
-				argMax(k9735_e_value_total, computed_at) AS rz
-			FROM gated_ref_counts WHERE event_id IN (?) GROUP BY event_id
-		) er ON er.event_id = ids.id`
-	rows, err := s.conn.Query(ctx, query, ids, ids, ids, ids, ids, ids, ids, ids, ids, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var st NoteStats
-		if err := rows.Scan(&id, &st.LikeCount, &st.RepostCount, &st.ReplyCount, &st.SatsZapped, &st.RealLikeCount, &st.RealRepostCount, &st.RealReplyCount, &st.RealSatsZapped); err != nil {
-			return nil, err
-		}
-		out[id] = st
 	}
 	return out, rows.Err()
 }

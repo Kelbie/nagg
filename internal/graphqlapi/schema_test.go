@@ -52,7 +52,6 @@ type fakeStore struct {
 	rankedDirectReplyCalls      []rankedDirectReplyCall
 	authoredReplyChains         map[string][]string
 	authoredReplyChainCalls     []authoredReplyChainCall
-	noteStatsRows               map[string]chstore.NoteStats
 	noteStatsInputs             [][]string
 	followedReplyRows           map[string]string
 	followedReplyViewer         string
@@ -393,15 +392,6 @@ func (s *fakeStore) RankedRefSources(_ context.Context, parentID, sort string, l
 func (s *fakeStore) AuthoredRefChain(_ context.Context, rootID, author string, maxDepth int) ([]string, error) {
 	s.authoredReplyChainCalls = append(s.authoredReplyChainCalls, authoredReplyChainCall{rootID: rootID, author: author, maxDepth: maxDepth})
 	return s.authoredReplyChains[rootID], nil
-}
-
-func (s *fakeStore) NoteStats(_ context.Context, ids []string) (map[string]chstore.NoteStats, error) {
-	s.noteStatsInputs = append(s.noteStatsInputs, ids)
-	out := make(map[string]chstore.NoteStats, len(ids))
-	for _, id := range ids {
-		out[id] = s.noteStatsRows[id]
-	}
-	return out, nil
 }
 
 func (s *fakeStore) FollowedRefs(_ context.Context, viewer string, parentIDs []string) (map[string]string, error) {

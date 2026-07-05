@@ -35,15 +35,6 @@ func (c *scoreProviderClient) ProfileRefresh(context.Context, string) (ProfileRe
 	return c.profile, c.err
 }
 
-type scoreProviderCounter struct {
-	followers uint64
-	err       error
-}
-
-func (c scoreProviderCounter) FollowerCount(context.Context, string) (uint64, error) {
-	return c.followers, c.err
-}
-
 func TestScoreProviderSkipsBelowFollowerThreshold(t *testing.T) {
 	store := &scoreProviderStore{}
 	client := &scoreProviderClient{}
@@ -67,12 +58,12 @@ func TestScoreProviderRefreshesAndSavesAtThreshold(t *testing.T) {
 	client := &scoreProviderClient{profile: ProfileResult{PubKey: scoreProviderTestPubkey, Score: &score}}
 	provider := NewScoreProvider(store, client, 500)
 
-	got, ok, err := provider.AuthorScoreWithFollowers(context.Background(), scoreProviderTestPubkey, 500)
+	profile, fromCache, err := provider.AuthorProfileWithFollowers(context.Background(), scoreProviderTestPubkey, 500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || got != score {
-		t.Fatalf("score = %v ok=%v, want %v true", got, ok, score)
+	if fromCache || profile.Score == nil || *profile.Score != score {
+		t.Fatalf("profile = %+v fromCache=%v, want fresh score %v", profile, fromCache, score)
 	}
 	if client.calls != 1 || len(store.saved) != 1 {
 		t.Fatalf("client calls=%d saved=%d, want refresh and save", client.calls, len(store.saved))
@@ -94,24 +85,5 @@ func TestScoreProviderFallsBackToCacheWhenRefreshFails(t *testing.T) {
 	}
 	if !fromCache || profile.Score == nil || *profile.Score != score {
 		t.Fatalf("profile = %+v fromCache=%v, want cached score", profile, fromCache)
-	}
-}
-
-func TestScoreProviderAuthorScoreUsesFollowerCounter(t *testing.T) {
-	score := 73.0
-	store := &scoreProviderStore{cached: ProfileResult{PubKey: scoreProviderTestPubkey, Score: &score}, cacheOK: true}
-	provider := NewScoreProvider(
-		store,
-		nil,
-		500,
-		WithFollowerCounter(scoreProviderCounter{followers: 500}),
-	)
-
-	got, ok, err := provider.AuthorScore(context.Background(), scoreProviderTestPubkey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok || got != score {
-		t.Fatalf("score = %v ok=%v, want %v true", got, ok, score)
 	}
 }

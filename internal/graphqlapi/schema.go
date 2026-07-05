@@ -45,7 +45,6 @@ type Store interface {
 	RefSourceIDs(context.Context, string) ([]string, error)
 	RankedRefSources(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error)
 	AuthoredRefChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error)
-	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
 	FollowedRefs(context.Context, string, []string) (map[string]string, error)
 }
 
@@ -2401,13 +2400,6 @@ func shuffleJitter(id string, shuffle shuffleSpec) float64 {
 	return (float64(h.Sum64()) / maxUint64AsFloat) * shuffle.Strength
 }
 
-func rankTagValues(predicate graphTagPredicate, candidateIDs []string) []string {
-	if predicate.Value != "" || len(predicate.Values) > 0 {
-		return predicate.Values
-	}
-	return candidateIDs
-}
-
 func graphTagPredicates(v any) []graphTagPredicate {
 	values := anyList(v)
 	out := make([]graphTagPredicate, 0, len(values))
@@ -2773,17 +2765,6 @@ func (r *resolver) hydrateRelayEventQuery(ctx context.Context, input chstore.Eve
 		return false
 	}
 	return true
-}
-
-func relayQueryWithTagValues(input chstore.EventQueryInput, key string, values []string) chstore.EventQueryInput {
-	out := input
-	key = strings.TrimSpace(key)
-	values = uniqueStrings(values)
-	if key == "" || len(values) == 0 {
-		return out
-	}
-	out.Tags = append(append([]chstore.TagFilter(nil), input.Tags...), chstore.TagFilter{Key: key, Values: values})
-	return out
 }
 
 func (r *resolver) parseEventQueryInput(ctx context.Context, raw map[string]any) (chstore.EventQueryInput, error) {
@@ -3207,14 +3188,6 @@ func intList(v any) []int {
 	return out
 }
 
-func anyIntList(values []int) []any {
-	out := make([]any, 0, len(values))
-	for _, value := range values {
-		out = append(out, value)
-	}
-	return out
-}
-
 func anyList(v any) []any {
 	switch values := v.(type) {
 	case []any:
@@ -3426,10 +3399,6 @@ func newNotificationConnection(store Store, rows []chstore.ViewerFeedRow, pubkey
 	return notificationConnectionSource{rows: rows, nodes: nodes}
 }
 
-func newEventConnectionCaches(store Store, grouped map[string][]chstore.EventView) eventConnectionCaches {
-	return newEventConnectionCachesWithPubkeyScoreMinFollowers(store, grouped, defaultPubkeyScoreMinFollowers)
-}
-
 func newEventConnectionCachesWithPubkeyScoreMinFollowers(store Store, grouped map[string][]chstore.EventView, pubkeyScoreMinFollowers uint64) eventConnectionCaches {
 	events := uniqueGroupedEvents(grouped)
 	return eventConnectionCaches{
@@ -3466,10 +3435,6 @@ func wrapEvents(events []chstore.EventView, relations *pubkeyRelationCache, even
 		out = append(out, wrapEvent(event, relations, eventRelations))
 	}
 	return out
-}
-
-func newEventRelationCache(store Store, events []chstore.EventView) *eventRelationCache {
-	return newEventRelationCacheWithPubkeyScoreMinFollowers(store, events, defaultPubkeyScoreMinFollowers)
 }
 
 func newEventRelationCacheWithPubkeyScoreMinFollowers(store Store, events []chstore.EventView, pubkeyScoreMinFollowers uint64) *eventRelationCache {
@@ -3601,83 +3566,6 @@ func (c *eventRelationCache) queryEventsByIDs(ctx context.Context, r *resolver, 
 	return out, nil
 }
 
-func (c *eventRelationCache) parseEventQueryInput(ctx context.Context, raw map[string]any) (chstore.EventQueryInput, error) {
-	input, err := parseEventQueryInput(raw)
-	if err != nil {
-		return input, err
-	}
-	sources := pubkeySources(raw["pubkeysFrom"])
-	if len(sources) == 0 {
-		return input, nil
-	}
-	derived, err := c.resolvePubkeySources(ctx, sources)
-	if err != nil {
-		return input, err
-	}
-	input.PubKeys = uniqueStrings(append(input.PubKeys, derived...))
-	if len(input.PubKeys) == 0 {
-		input.Empty = true
-	}
-	return input, nil
-}
-
-func (c *eventRelationCache) resolvePubkeySources(ctx context.Context, sources []pubkeySource) ([]string, error) {
-	var out []string
-	for _, source := range sources {
-		if source.latestEventTags == nil {
-			continue
-		}
-		values, err := c.resolveLatestEventTagPubkeys(ctx, *source.latestEventTags)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, values...)
-	}
-	return uniqueStrings(out), nil
-}
-
-func (c *eventRelationCache) candidatePubkeyBoosts(ctx context.Context, raw any) ([]candidatePubkeyBoost, error) {
-	return candidatePubkeyBoosts(ctx, raw, c.resolvePubkeySources)
-}
-
-func (c *eventRelationCache) resolveLatestEventTagPubkeys(ctx context.Context, source latestEventTagPubkeySource) ([]string, error) {
-	normalized, err := normalizeLatestEventTagPubkeySource(source)
-	if err != nil {
-		return nil, err
-	}
-	key := "latestEventTags:" + latestEventTagPubkeySourceSignature(normalized)
-
-	c.mu.Lock()
-	cached, ok := c.latestEventTags[key]
-	c.mu.Unlock()
-	if !ok {
-		value, err, _ := c.group.Do(key, func() (any, error) {
-			c.mu.Lock()
-			if existing, exists := c.latestEventTags[key]; exists {
-				c.mu.Unlock()
-				return existing, nil
-			}
-			c.mu.Unlock()
-
-			events, err := c.store.QueryLatestEventsByPubKeys(ctx, []string{normalized.PubKey}, normalized.Kinds, uint64(normalized.Limit))
-			if err != nil {
-				return nil, err
-			}
-			values := latestEventTagPubkeyValues(events[normalized.PubKey], normalized)
-
-			c.mu.Lock()
-			c.latestEventTags[key] = values
-			c.mu.Unlock()
-			return values, nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		cached, _ = value.([]string)
-	}
-	return append([]string(nil), cached...), nil
-}
-
 func newPubkeyRelationCache(store Store, events []chstore.EventView) *pubkeyRelationCache {
 	pubkeys := make([]string, 0, len(events))
 	seen := map[string]struct{}{}
@@ -3760,47 +3648,6 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func mapKeys(values map[string]struct{}) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		if value != "" {
-			out = append(out, value)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func graphInputSignature(value any) string {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprintf("%#v", value)
-	}
-	return string(encoded)
-}
-
-func latestEventTagPubkeySourceSignature(source latestEventTagPubkeySource) string {
-	return strings.Join([]string{
-		source.PubKey,
-		kindSignature(source.Kinds),
-		graphTagPredicateSignature(source.Tag),
-		strconv.Itoa(source.Limit),
-		strconv.Itoa(source.MaxValues),
-	}, "|")
-}
-
-func graphTagPredicateSignature(predicate graphTagPredicate) string {
-	return strings.Join([]string{
-		predicate.Key,
-		predicate.Value,
-		strings.Join(uniqueStrings(predicate.Values), ","),
-		predicate.Marker,
-		strings.Join(uniqueStrings(predicate.Markers), ","),
-		strings.Join(uniqueStrings(predicate.ExcludeMarkers), ","),
-		strconv.Itoa(predicate.Index),
-	}, "\x00")
-}
-
 func eventViewMapLen(values map[string][]chstore.EventView) int {
 	var total int
 	for _, events := range values {
@@ -3818,41 +3665,6 @@ func kindSignature(values []int) string {
 		parts = append(parts, fmt.Sprintf("%d", value))
 	}
 	return strings.Join(parts, ",")
-}
-
-func takeUnvisited(visited map[string]struct{}, ids []string, max int) []string {
-	out := make([]string, 0, min(len(ids), max))
-	for _, id := range ids {
-		if _, ok := visited[id]; ok {
-			continue
-		}
-		visited[id] = struct{}{}
-		out = append(out, id)
-		if len(out) >= max {
-			break
-		}
-	}
-	return out
-}
-
-func keys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for key := range m {
-		if key != "" {
-			out = append(out, key)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func chunks(values []string, size int) [][]string {
-	var out [][]string
-	for start := 0; start < len(values); start += size {
-		end := min(start+size, len(values))
-		out = append(out, values[start:end])
-	}
-	return out
 }
 
 func validateHex64(value string) error {

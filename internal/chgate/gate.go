@@ -39,21 +39,6 @@ func (g *Gate) Acquire(ctx context.Context) (func(), error) {
 	}
 }
 
-// TryAcquire grabs a slot without waiting; ok=false means the gate is
-// saturated. For opportunistic background work that should be SKIPPED under
-// load rather than queued behind user requests.
-func (g *Gate) TryAcquire() (func(), bool) {
-	if g == nil {
-		return func() {}, true
-	}
-	select {
-	case g.slots <- struct{}{}:
-		return func() { <-g.slots }, true
-	default:
-		return nil, false
-	}
-}
-
 // Middleware gates an HTTP handler: queued requests wait bounded by their own
 // context and get a retryable 503 if it expires first. Wrap INSIDE any
 // response cache so cache hits never wait.

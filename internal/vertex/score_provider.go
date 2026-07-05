@@ -2,12 +2,9 @@ package vertex
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 )
-
-var ErrFollowerCounterUnavailable = errors.New("vertex follower counter unavailable")
 
 type ScoreProfileStore interface {
 	CachedVertexProfile(context.Context, string) (ProfileResult, bool, error)
@@ -18,33 +15,14 @@ type ScoreProfileClient interface {
 	ProfileRefresh(context.Context, string) (ProfileResult, error)
 }
 
-type FollowerCounter interface {
-	FollowerCount(context.Context, string) (uint64, error)
-}
-
 type ScoreProvider struct {
 	store        ScoreProfileStore
 	client       ScoreProfileClient
-	counter      FollowerCounter
 	minFollowers uint64
 	logger       *slog.Logger
 }
 
 type ScoreProviderOption func(*ScoreProvider)
-
-func WithFollowerCounter(counter FollowerCounter) ScoreProviderOption {
-	return func(p *ScoreProvider) {
-		p.counter = counter
-	}
-}
-
-func WithScoreProviderLogger(logger *slog.Logger) ScoreProviderOption {
-	return func(p *ScoreProvider) {
-		if logger != nil {
-			p.logger = logger
-		}
-	}
-}
 
 func NewScoreProvider(
 	store ScoreProfileStore,
@@ -62,28 +40,6 @@ func NewScoreProvider(
 		opt(p)
 	}
 	return p
-}
-
-func (p *ScoreProvider) AuthorScore(ctx context.Context, pubkey string) (float64, bool, error) {
-	if p.counter == nil {
-		return 0, false, ErrFollowerCounterUnavailable
-	}
-	followers, err := p.counter.FollowerCount(ctx, pubkey)
-	if err != nil {
-		return 0, false, err
-	}
-	return p.AuthorScoreWithFollowers(ctx, pubkey, followers)
-}
-
-func (p *ScoreProvider) AuthorScoreWithFollowers(ctx context.Context, pubkey string, followers uint64) (float64, bool, error) {
-	profile, _, err := p.AuthorProfileWithFollowers(ctx, pubkey, followers)
-	if err != nil {
-		return 0, false, err
-	}
-	if profile.Score == nil {
-		return 0, false, nil
-	}
-	return *profile.Score, true, nil
 }
 
 func (p *ScoreProvider) AuthorProfileWithFollowers(

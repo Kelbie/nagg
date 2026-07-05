@@ -213,27 +213,9 @@ The `nagg-graphql` skill (in `.claude/skills/nagg-graphql/`) turns plain-languag
 - "What are the top event kinds on the relay?"
 - "Which events got the most reactions?"
 
-## Backfill One Thread
+## Thread Exploration Tools (retired)
 
-Fetch a root event from configured Nostr relays, recursively crawl associated `e`-tagged events, and backfill kind-0 profiles for all discovered pubkeys:
-
-```sh
-NAGG_CLICKHOUSE_ADDR=127.0.0.1:9000 \
-NAGG_THREAD_RELAY=wss://relay.damus.io \
-NAGG_THREAD_EXTRA_RELAYS=wss://nos.lol,wss://relay.nostr.band \
-go run ./cmd/thread-crawler nevent1...
-```
-
-Then demonstrate that GraphQL can resolve a display-ready thread summary using only raw events plus same-`pubkey` lookups for kind `0` metadata:
-
-```sh
-NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \
-go run ./cmd/thread-demo <root-event-id>
-```
-
-For a cleaner text UI that renders the thread tree with usernames, profile image URLs, comment counts, and like counts, use:
-
-```sh
-NAGG_GRAPHQL_ENDPOINT=http://127.0.0.1:8080/graphql \
-go run ./cmd/thread-cli <root-event-id>
-```
+The v1 exploration tools (`thread-crawler`, `thread-demo`, `thread-cli`) are
+gone: on-demand thread backfill now happens inside the app-view — `GET
+/nostr/thread?id=<hex>` fetches missing events from relays automatically and
+serves the ranked tree in the generic envelope.
