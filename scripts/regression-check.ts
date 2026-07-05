@@ -546,7 +546,8 @@ const checks: Check[] = [
     ["/nostr/recommended"],
     () => call(`/nostr/recommended?source=${fixtures.recommended.source}&limit=${fixtures.recommended.limit}`),
     (t, r) => {
-      checkEnvelope(t, r.body, { resolveOrder: false });
+      // Pubkey-centric route: aggregates are keyed by pubkey rules.
+      checkEnvelope(t, r.body, { resolveOrder: false, pubkeyKeyedAggregates: true });
       t.ok(Array.isArray(r.body.pubkeys), "pubkeys missing");
     },
     { vertexDependent: true },
@@ -559,7 +560,7 @@ const checks: Check[] = [
     ["/nostr/follow-status"],
     () => call(`/nostr/follow-status?viewer=${V.followStatusViewer}&candidates=${V.followStatusCandidates.join(",")}`),
     (t, r) => {
-      checkEnvelope(t, r.body);
+      checkEnvelope(t, r.body, { pubkeyKeyedAggregates: true });
       const edges = r.body.edges ?? {};
       t.ok(Object.keys(edges).length === V.followStatusCandidates.length, `edges has ${Object.keys(edges).length} keys, want ${V.followStatusCandidates.length}`);
       for (const pk of V.followStatusCandidates) {
