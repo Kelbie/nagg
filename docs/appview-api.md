@@ -1,206 +1,182 @@
-# nagg app-view API
+# nagg app-view API (v2)
 
 The app-view is nagg's REST surface: precomputed, aggregated Nostr reads served
 over HTTP/JSON. It is the **only** transport `sovran-app` uses (via the
 `@sovranbitcoin/nagg-ts` client) — there is no client-side GraphQL. nagg's
-GraphQL endpoint still exists server-side (the REST handlers reuse its
-resolver/store internals) but is not consumed by clients.
+GraphQL endpoint exists server-side as the prototyping surface over the same
+rule registry, but is not consumed by clients.
+
+**v2 is terminology-agnostic.** The server speaks Nostr primitives — events,
+kinds, tags, pubkeys — and declared aggregation rules. It never says post,
+like, repost, reply, zap, or mention. Clients reconstruct concepts: a repost is
+a kind-6/16 event whose `e` reference is embedded alongside; a profile is a
+kind-0 event; counts are whatever aggregation rules the registry declares
+(see `docs/rules-registry.md`). `appViewVersion` in `/nostr/capabilities` is
+`"v2"`; the capability token is `appview.v2`.
 
 Every route is mounted at both `/nostr/*` and `/v1/nostr/*` (identical handler,
 cache, and middleware). Heavy routes run multi-query ClickHouse aggregations and
 pass through a concurrency limiter; light routes do not. All responses are JSON.
 
-## 1. Endpoint inventory + sovran-app usage
+## 1. The envelope
 
-| Method | Path | Heavy | Used by sovran-app | nagg-ts binding / call site |
-|---|---|---|---|---|
-| GET | `/nostr/capabilities` | no | yes | service-info / capability probe |
-| GET,POST | `/nostr/feed` | yes | yes | `followsFeedAppView` — following-recent, following-replies, posts-by-pubkeys (recent) |
-| GET | `/nostr/feed/user` | yes | yes | `userFeedAppView` — profile feed (`getUserFeed`) |
-| POST | `/nostr/feed/ranked` | yes | yes | `rankedFeedAppView` — For-You, following-popular, posts-by-pubkeys (popular) |
-| GET,POST | `/nostr/notifications` | yes | yes | `notificationsAppView` — `getNotifications` |
-| GET | `/nostr/notifications/seen` | no | yes | notifications read-marker |
-| POST | `/nostr/notes/stats` | no | yes | `noteStatsAppView` — engagement counts by id |
-| GET | `/nostr/thread` | yes | yes | `threadAppView` — `getThread` (sorts: `new` / `ranked` / `relevant`) |
-| GET | `/nostr/follows` | no | yes | follow counts |
-| GET | `/nostr/follow-status` | no | yes | `followStatusAppView` — batch viewer↔candidate relationship |
-| GET | `/nostr/events` | no | yes | `eventsAppView` — enrich/quoted events by id |
-| POST | `/nostr/events/query` | yes | yes | `eventsQueryAppView` — Whitenoise group msgs/invites, wallpaper catalog |
-| GET,POST | `/nostr/dm/envelopes` | yes | yes | `dmEnvelopesAppView` — DM/contacts inbox |
-| GET,POST | `/nostr/dm/conversation` | yes | yes | `dmConversationAppView` — scoped DM conversation |
-| GET | `/nostr/own/profiles` | no | yes | `ownProfilesAppView` — own accounts + follow counts |
-| GET | `/nostr/own/{type}` | yes | yes | own action history (authored/replies/likes/reposts/bookmarks/follows/mutes/relays) |
-| GET | `/nostr/profiles` | no | yes | `profilesAppView` — batch profile info by pubkey |
-| GET | `/nostr/profile` | no | yes | single profile summary (score + counts + top followers) |
-| GET | `/nostr/social-graph` | yes | yes | contacts + relays + mutes bundle |
-| GET | `/nostr/search` | no | yes | `profileSearchAppView` — profile search (cached Vertex pagerank via the shared `SearchProvider`, falls back to the local ClickHouse index) |
-| GET | `/nostr/recommended` | no | yes | recommended profiles |
-| GET | `/nostr/mint/reviews` | yes | yes | NIP-87 cashu mint reviews |
-| GET | `/nostr/mint/discover` | yes | yes | cashu mint discovery |
-
-> Two reads are intentionally **not** served by nagg and fall through to other
-> tiers (Primal / relays): batch kind-0 `Profiles` enrichment beyond what
-> `/nostr/profiles` covers, and `ProfileStats`. The reputation score
-> (`/nostr/profile`-adjacent score API) and NIP-11 relay metadata are separate
-> services, not app-view endpoints.
-
-## 2. Shared concepts
-
-**Enrichment side-maps.** Feed/thread/notification responses carry the events
-plus three keyed side-maps so the client never issues follow-up fetches:
-`metrics` (event id → `NoteStats`), `profiles` (pubkey → `ProfileInfo`),
-`quoted` (event id → full quoted `FeedEvent`).
-
-**Ordering manifest.** `ordering` is the server-authoritative render order. The
-client renders strictly by `ordering.elements`; `ordering.orderBy` carries the
-semantic the ids alone don't:
-
-- `rank` — algorithmic order; the client must **not** prepend live items above
-  the fold.
-- `created_at` — chronological; live items may prepend.
-
-**Pagination.** Feeds use `paginationUntil` (oldest `created_at`) +
-`paginationOffset`. List shapes (DM, notifications) use a `pageInfo` connection
-cursor (`hasNextPage`, `endCursor` = `<RFC3339Nano>|<id>` of the oldest row).
-
-## 3. Response structures
-
-### FeedEvent
+Every route returns ONE shape (route-specific extensions ride alongside, §4):
 
 ```jsonc
 {
-  "id": "<64-hex>", "kind": 1, "pubkey": "<64-hex>",
-  "content": "…", "tags": [["e","…"],["p","…"]], "created_at": 1710000000
+  "order":   ["<event-id>", "…"],        // server-authoritative render order
+  "orderBy": "created_at",               // or "rank"
+  "events":  [Event],                    // everything the response references
+  "aggregates": {                        // target → rule → metric → value
+    "<event-id>": { "k7_e": { "actors": 3 }, "k9735_e": { "value_total": 21, "sources": 1 } }
+  },
+  "cursor":  "…"                         // opaque pagination token; absent on last/only page
 }
 ```
 
-Raw-event connections (`/nostr/events/query`, `/nostr/dm/*`) instead use the
-ClickHouse `EventView` JSON: `{id, pubkey, kind, createdAt (RFC3339), content,
-tags, sig, updatedAt}` (the client schema accepts either `created_at` epoch or
-`createdAt` string).
+- **`order`** — anchor event ids in render order. For kind-6/16 entries the
+  anchor is the **referenced (original) event's id**, so multiple reposts of
+  one event collapse to one stable anchor. `orderBy: "rank"` means the client
+  must not prepend live items above the fold; `"created_at"` means it may.
+- **`events`** — raw Nostr shape (`{id, kind, pubkey, content, tags,
+  created_at}`), deduplicated by id. Includes the ordered items **plus all
+  hydration**: repost originals, resolved roots, quoted (`q`-tag) events, and
+  each author's latest kind-0 profile event. Hydration is just more events —
+  there are no side-maps. Parse profile fields from the kind-0 `content` JSON.
+- **`aggregates`** — declared rule values keyed by target (event id, or pubkey
+  on profile routes). **Zero values are omitted entirely**: a missing rule or
+  metric means 0. Rule vocabulary in §2.
+- **`cursor`** — echo it back to continue. Feeds encode
+  `"<oldest created_at unix>|<page length>"` (pass the components back as the
+  `until`/`offset` request params); list routes (DM, events/query, own
+  history, notifications) encode `"<RFC3339Nano>|<id>"` of the oldest row.
 
-### NoteStats (metrics map value)
+## 2. Aggregation rule names
+
+The values clients render come from the rule registry. Event-keyed:
+
+| Rule.metric | Meaning |
+| --- | --- |
+| `k7_e.actors` | unique pubkeys that published a kind-7 referencing the event |
+| `k6_16_e.actors` | unique pubkeys that published a kind-6/16 referencing it |
+| `k1_q.sources` | unique kind-1 events `q`-referencing it |
+| `k1_1111_e_reply.sources` | unique direct NIP-10/22 replies (periodic tier — minutes-stale) |
+| `k9735_e.value_total` | sats total across kind-9735 receipts referencing it |
+| `k9735_e.sources` | unique kind-9735 receipts referencing it |
+| `vertex_k7_e.actors`, `vertex_k6_16_e.actors`, `vertex_k1_q.sources`, `vertex_k1_1111_e_reply.sources`, `vertex_k9735_e.sources`, `vertex_k9735_e.value_total` | the same signals counted only from Vertex-score-gated engagers (spam-resistant); computed by the rollup, zero until it has run for the event |
+| `vertex_actors.actors` | distinct score-gated engagers across all reference types |
+
+Pubkey-keyed (profile-family routes):
+
+| Rule.metric | Meaning |
+| --- | --- |
+| `k3_p_latest.actors` | followers — latest kind-3 lists containing the pubkey |
+| `k3_author_latest.sources` | following — size of the pubkey's own latest kind-3 |
+| `k1_1111_author.sources` | events of kind 1/1111 the pubkey created |
+
+## 3. Endpoint inventory
+
+| Method | Path | Heavy | Response |
+| --- | --- | --- | --- |
+| GET | `/nostr/capabilities` | no | service info; `appViewVersion: "v2"` |
+| GET,POST | `/nostr/feed` | yes | envelope |
+| GET | `/nostr/feed/user` | yes | envelope |
+| POST | `/nostr/feed/ranked` | yes | envelope (`orderBy: "rank"`) |
+| GET,POST | `/nostr/notifications` | yes | envelope + `entries` + `hasNext` (§4) |
+| GET | `/nostr/notifications/seen` | no | envelope holding the viewer's kind-30078 read-marker event; client parses `seenUntil` from its content |
+| POST | `/nostr/events/aggregates` | no | envelope, aggregates only (`order`/`events` empty). Body `{"ids": ["<id>", …]}`, ≤ 100. **Replaces `/nostr/notes/stats`.** |
+| GET | `/nostr/thread` | yes | envelope; `order[0]` is the root id, the rest is the server-ranked reply order |
+| GET | `/nostr/follows` | no | envelope; pubkey-keyed aggregates |
+| GET | `/nostr/events` | no | envelope; `order` = requested ids that resolved |
+| POST | `/nostr/events/query` | yes | envelope (bare when the queried kinds include 1059 — §5) |
+| GET,POST | `/nostr/dm/envelopes` | yes | bare envelope (§5) |
+| GET,POST | `/nostr/dm/conversation` | yes | bare envelope (§5) |
+| GET | `/nostr/follow-status` | no | envelope + `edges` (§4) |
+| GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) |
+| GET | `/nostr/mint/discover` | yes | **not an envelope** |
+| GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags |
+| GET | `/nostr/own/profiles` | no | envelope: kind-0 events + pubkey-keyed aggregates |
+| GET | `/nostr/own/{type}` | yes | envelope of the viewer's own action history |
+| GET | `/nostr/profiles` | no | envelope: kind-0 events for the requested pubkeys |
+| GET | `/nostr/profile` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
+| GET | `/nostr/search` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
+| GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) |
+| GET | `/app/latest-version` | no | static app-version payload |
+
+Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
+thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
+Thread `sort` accepts `new` (default), `ranked`, `relevant` — `ranked` orders
+by the declared `k7_e.actors` aggregation.
+
+## 4. Route extensions
+
+**Notifications** — envelope plus:
 
 ```jsonc
 {
-  "likeCount": 0, "repostCount": 0, "replyCount": 0, "satsZapped": 0,
-  "realLikeCount": 0, "realRepostCount": 0, "realReplyCount": 0, "realSatsZapped": 0
-}
-```
-
-`real*` counts engagement only from Vertex-scored distinct engagers (spam-resistant).
-
-### ProfileInfo (profiles map value)
-
-```jsonc
-{ "name": "…", "picture": "…" }
-```
-
-### OrderingManifest
-
-```jsonc
-{ "orderBy": "rank" | "created_at", "elements": ["<id>", "…"] }
-```
-
-### FeedResponse — `/nostr/feed`, `/nostr/feed/user`, `/nostr/feed/ranked`
-
-```jsonc
-{
-  "items": [
-    { "type": "note",   "event": FeedEvent, "rootEvent": FeedEvent?, "rootEventId": "…"? },
-    { "type": "repost", "repostEvent": FeedEvent, "originalEvent": FeedEvent?, "originalEventId": "…" }
+  "entries": [
+    { "id": "<event-id>", "kind": 7, "actor": "<pubkey>", "target": "<event-id>",
+      "total": 12, "totalCapped": false,
+      "actors": [{ "pubkey": "…", "eventId": "…", "createdAt": 1710000000, "actorVertexScore": 42.0 }] }
   ],
-  "ordering": OrderingManifest,
-  "metrics":  { "<id>": NoteStats },
-  "profiles": { "<pubkey>": ProfileInfo },
-  "quoted":   { "<id>": FeedEvent },
-  "paginationUntil": 1710000000,
-  "paginationOffset": 30
+  "hasNext": true
 }
 ```
 
-### ThreadResponse — `/nostr/thread`
+`id` is the representative (newest) triggering event; it is also the `order`
+anchor and is embedded in `events`, as is the target event. **No reason
+strings** — the kind carries the semantics: 3 = a contact list now references
+you; 6/16 = a repost of your event; 7 = a reaction to it; 9735 = a zap receipt
+for it; 1 = a kind-1 references you or your event, and the client derives
+which by reading the embedded event's tags (`q` tag naming your event →
+quote; `e` tag whose target is your event → reply; otherwise mention).
+Entries without `total` are singles; grouped entries collapse many
+same-kind/same-target events (grouping semantics and the conservative
+`hasNext` hint are unchanged — see `docs/notifications-flow.md`).
 
-A flat list of descendant events under `root`; the client builds structure from
-`events` and renders the reply order from `ordering`.
+**Follow-status** — envelope plus directional reference edges (no verb labels;
+mutual = `out && in`):
+
+```jsonc
+{ "edges": { "<candidate-pubkey>": { "out": true, "in": false } } }
+```
+
+**Profile / search / recommended** — envelope plus:
 
 ```jsonc
 {
-  "root": FeedEvent,
-  "events": [FeedEvent],          // all descendants
-  "ordering": OrderingManifest,    // reply render order
-  "metrics":  { "<id>": NoteStats },
-  "profiles": { "<pubkey>": ProfileInfo },
-  "quoted":   { "<id>": FeedEvent }
+  "pubkeys": ["<pubkey>", "…"],       // complete ranked list, including pubkeys
+                                       // with no locally indexed kind-0 (order can
+                                       // only anchor locally known profile events)
+  "providers": {                       // provider-namespaced non-count data
+    "<pubkey>": {
+      "vertex": { "rank": 1, "score": 87.2, "nodes": 210433, "references": ["<pubkey>", "…"] },
+      "nip05":  { "valid": true },
+      "nagg":   { "firstEventAt": 1710000000 }
+    }
+  },
+  "fromCache": false
 }
 ```
 
-Query params: `id` (required), `limit` (fetch cap, default 1000), `sort`
-(`new` default | `ranked` | `relevant`), `viewer` (required for `relevant`),
-`offset`, `replyLimit` (page size; 0 = all), `candidateLimit`, `rankedLimit`.
+Provider payloads are float/context-shaped data from named providers (the DVM
+plugin seam, `internal/dvm`); counts stay in `aggregates`.
 
-- `new` — descendant order as stored (backward-compatible default).
-- `ranked` — direct replies by engagement (`likes`).
-- `relevant` — viewer-specific merge, computed server-side from precomputed
-  store primitives: **author self-reply chain → one followed-tail reply →
-  ranked direct replies → remaining replies**, deduped, source excluded.
+## 5. DM privacy: bare envelopes
 
-### EnrichmentResponse — `/nostr/events`, `/nostr/profiles`
+`/nostr/dm/envelopes`, `/nostr/dm/conversation`, and any `/nostr/events/query`
+whose kinds include 1059 return the envelope with **empty aggregates and no
+profile hydration**. Gift-wrap authors are ephemeral pubkeys; enriching them
+would be meaningless at best and correlating at worst. nagg never decrypts —
+the client decrypts and buckets by counterparty. `/nostr/dm/conversation`
+takes an optional `counterparty`: kind-4 is scoped to the pair; kind-1059
+returns the full viewer inbox (nagg cannot see inside the wraps).
 
-```jsonc
-{ "metrics": { "<id>": NoteStats }, "profiles": { "<pubkey>": ProfileInfo }, "quoted": { "<id>": FeedEvent } }
-```
-
-### Event connection — `/nostr/events/query`, `/nostr/dm/envelopes`, `/nostr/dm/conversation`
-
-Wrapped under a transport-specific key (`events` / `dmEnvelopes` /
-`dmConversation`) so the body byte-matches the canonical client shape:
-
-```jsonc
-{ "events": { "nodes": [EventView], "pageInfo": { "hasNextPage": false, "endCursor": "…|…" } } }
-```
-
-`POST /nostr/events/query` body (constrained filter; at least one of
-`ids`/`authors`/`kinds`/`tags` required, `limit` ≤ 500):
-
-```jsonc
-{ "kinds": [1063], "authors": ["<hex>"], "tags": [{"key":"e","values":["<id>"]}],
-  "since": 0, "until": 0, "limit": 100 }
-```
-
-`/nostr/dm/conversation` adds an optional `counterparty`: NIP-04 (kind 4) is
-scoped to the pair; gift wraps (kind 1059) return the full viewer inbox (nagg
-can't see inside them). nagg never decrypts — the client does.
-
-### FollowStatusResponse — `/nostr/follow-status`
-
-Params: `viewer`, `candidates` (csv, ≤ 500).
-
-```jsonc
-{ "followStatus": [
-  { "pubkey": "<hex>", "following": true, "followsYou": false,
-    "mutual": false, "relationship": "following" }   // following | follows_you | mutual | none
-] }
-```
-
-### OwnProfilesResponse — `/nostr/own/profiles`
-
-Params: `pubkeys` (csv, ≤ 10). Metadata + follow counts for the viewer's own
-accounts.
-
-```jsonc
-{ "ownProfiles": [
-  { "pubkey": "<hex>", "name": "…", "displayName": "…", "picture": "…",
-    "about": "…", "nip05": "…", "lud16": "…", "banner": "…", "website": "…",
-    "followers": 0, "follows": 0, "createdAt": 1710000000 }
-] }
-```
-
-### On-demand relay backfill
+## 6. On-demand relay backfill
 
 Most read endpoints trigger a bounded, non-blocking relay backfill on a cache
-miss / incomplete result (feed, feed/user, thread, notes/stats, events, follows,
-dm, profiles, profile, social-graph, search), so a cold author/thread is
-populated from relays and served. Backfill failures are logged and the response
-proceeds with whatever is available. `feed/ranked` (precomputed) and the
-mint/events-query paths do not backfill.
+miss / incomplete result (feed, feed/user, thread, events/aggregates, events,
+follows, dm, profiles, profile, social-graph, search), so a cold author or
+thread is populated from relays and served. Backfill failures are logged and
+the response proceeds with whatever is available. `feed/ranked` (precomputed)
+and the mint/events-query paths do not backfill.

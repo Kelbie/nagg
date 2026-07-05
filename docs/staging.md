@@ -81,7 +81,7 @@ redeploys automatically. Until then, deploy with the `down`/`up` flow above.
 ## Audit harness — `scripts/parity-check.ts`
 
 Full prod-vs-staging audit of every REST app-view sovran-app uses (feed,
-feed/user, notifications, dm/envelopes, profile, notes/stats, thread). For each
+feed/user, notifications, dm/envelopes, profile, events/aggregates, thread). For each
 it checks three things:
 
 1. **Data parity** — compares the set of event ids (or stat keys) prod vs devnagg

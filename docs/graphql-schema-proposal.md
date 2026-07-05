@@ -1,6 +1,20 @@
 # GraphQL Schema Proposal: Generic Nostr Analytics Layer
 
-**Status:** Revised — generic-first read layer for nagg  
+**Status:** REALIZED (2026-07-05) — the rules registry (`internal/rules`,
+`docs/rules-registry.md`) now enforces this proposal mechanically. GraphQL and
+the REST app-view are two thin surfaces over one registry. The typed
+domain-vocabulary surface that had drifted back in after this proposal
+(`noteStats { likes, reposts, zapSats }`, `aggregateReferencedBy`,
+`rankedReferencedBy`, `selectedReferences`, the `authoredReplyChain` wrapper)
+was pruned — none of it had consumers; nagg-ts is pure REST. Rank metric
+names are now registry rule names (`k7_e.actors`, `k6_16_e.actors`,
+`k1_q.sources`, `k1_1111_e_reply.sources`, `k9735_e.value_total`, plus the
+cross-rule `actors` signal). Remaining TODOs from this document: cursor-based
+pagination (`after: Cursor`) and a real `pageInfo.hasNextPage` (still
+hardcoded `false`); `Hex64`/`Cursor` remain plain strings with runtime
+validation.
+
+**Original status:** Revised — generic-first read layer for nagg  
 **Date:** 2026-05-30  
 **Context:** This replaces the earlier typed social-stats proposal. The previous shape baked in app-level concepts such as `likes`, `thread`, `participants`, `followers`, and `zaps`. Those are useful interpretations, but they should be client-side query recipes over Nostr primitives, not server-side schema concepts.
 
