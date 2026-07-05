@@ -103,3 +103,36 @@ func TestRankFeaturesReadMatchesDeclaredColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestSyncCandidatesReadMatchesDeclaredColumns — third rename-missed-read
+// (the vertex score sync's candidate query still said `contacts` after
+// latest_k3's column became `refs`, silently killing every score refresh).
+// Pin the projection's declared columns and the query's references.
+func TestSyncCandidatesReadMatchesDeclaredColumns(t *testing.T) {
+	reg, err := rules.Default(20)
+	if err != nil {
+		t.Fatalf("rules.Default: %v", err)
+	}
+	desired, err := parseDesiredSchema(append(embeddedMigrations(), reg.GeneratedDDL()...))
+	if err != nil {
+		t.Fatalf("parseDesiredSchema: %v", err)
+	}
+	cols, ok := desired.tables["latest_k3"]
+	if !ok {
+		t.Fatalf("latest_k3 not declared")
+	}
+	if _, ok := cols["refs"]; !ok {
+		t.Errorf("latest_k3 missing declared column refs")
+	}
+	if _, ok := cols["contacts"]; ok {
+		t.Errorf("latest_k3 still declares retired column contacts")
+	}
+	for _, q := range []string{recentAuthorsBySyncGateQuery} {
+		if strings.Contains(q, "contacts") {
+			t.Errorf("sync candidate query references retired column contacts:\n%s", q)
+		}
+		if !strings.Contains(q, "arrayJoin(refs)") {
+			t.Errorf("sync candidate query must read latest_k3.refs:\n%s", q)
+		}
+	}
+}

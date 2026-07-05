@@ -917,14 +917,7 @@ func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error
 	return counts[pubkey].Followers, nil
 }
 
-func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, staleAfter time.Duration, limit int) ([]string, error) {
-	if staleAfter <= 0 {
-		staleAfter = 7 * 24 * time.Hour
-	}
-	if limit <= 0 {
-		limit = 200
-	}
-	rows, err := s.conn.Query(ctx, `
+const recentAuthorsBySyncGateQuery = `
 		SELECT recent.pubkey
 		FROM
 		(
@@ -941,7 +934,7 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 			-- credits on over-qualified authors. latest_k3 is MV-fed +
 			-- backfilled, so this needs no rollup bootstrap.
 			SELECT follow AS pubkey, count() AS followers
-			FROM (SELECT arrayJoin(contacts) AS follow FROM latest_k3 FINAL)
+			FROM (SELECT arrayJoin(refs) AS follow FROM latest_k3 FINAL)
 			GROUP BY follow
 			HAVING followers >= ?
 		) AS follower_counts ON follower_counts.pubkey = recent.pubkey
@@ -955,7 +948,16 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 		WHERE ifNull(scores.fetched_at, toDateTime(0)) < now() - INTERVAL ? SECOND
 		ORDER BY recent.last_event_at DESC
 		LIMIT ?
-	`, minFollowers, int64(staleAfter/time.Second), limit)
+	`
+
+func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, staleAfter time.Duration, limit int) ([]string, error) {
+	if staleAfter <= 0 {
+		staleAfter = 7 * 24 * time.Hour
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.conn.Query(ctx, recentAuthorsBySyncGateQuery, minFollowers, int64(staleAfter/time.Second), limit)
 	if err != nil {
 		return nil, err
 	}
