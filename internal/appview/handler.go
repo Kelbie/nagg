@@ -1125,9 +1125,10 @@ type threadOrderParams struct {
 }
 
 const (
-	// threadRankedSort is the engagement metric the ranked/relevant reply order
-	// uses for its ranked tier (matches the feed's primary signal).
-	threadRankedSort        = "likes"
+	// threadRankedSort is the declared aggregation ("rule.metric") the
+	// ranked/relevant reply order uses for its ranked tier: unique kind-7
+	// referencing actors, the feed's primary signal.
+	threadRankedSort        = "k7_e.actors"
 	threadCandidateDefault  = 200
 	threadRankedTierDefault = 50
 	threadAuthorChainDepth  = 8

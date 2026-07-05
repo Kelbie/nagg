@@ -685,37 +685,28 @@ func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, 
 	return out, rows.Err()
 }
 
-// directReplySort maps a thread reply sort to the precomputed count table that
-// ranks it. The table/column/merge are fixed (never request input), so they are
-// safe to format into SQL; the parent id is always a bind param.
-type directReplySort struct {
-	table  string
-	column string
-	merge  string
-}
-
-var directReplySorts = map[string]directReplySort{
-	"likes":   {"agg_k7_e", "actors", "uniqMerge"},
-	"reposts": {"agg_k6_16_e", "actors", "uniqMerge"},
-	"replies": {"agg_k1_1111_e_reply", "sources", "uniqMerge"},
-	"zaps":    {"agg_k9735_e", "value_total", "sumMerge"},
-}
-
-// RankedDirectReplySupported reports whether a sort key has a precomputed ranking
-// path (so the GraphQL resolver can decide to skip the live aggregation).
-func RankedDirectReplySupported(sort string) bool {
-	if sort == "" || sort == "new" {
-		return true
+// refRankSpec resolves a "rule.metric" sort key (e.g. "k7_e.actors",
+// "k9735_e.value_total") to the declared relationship's read spec. Only
+// event-target rules rank replies; anything else — including the recency
+// keys "new" and "" — reports ok == false.
+func (s *Store) refRankSpec(sort string) (rules.ReadSpec, bool) {
+	rule, metric, ok := strings.Cut(sort, ".")
+	if !ok {
+		return rules.ReadSpec{}, false
 	}
-	_, ok := directReplySorts[sort]
-	return ok
+	rel := s.rules.Relationship(rule)
+	if rel == nil || rel.Ref.Target != rules.TargetEventID {
+		return rules.ReadSpec{}, false
+	}
+	return s.rules.ReadSpec(rule, metric)
 }
 
-// RankedDirectReplyIDs returns the DIRECT (NIP-10/22) replies to parentID ordered
-// by a PRECOMPUTED engagement count (likes/reposts/replies/zaps) or by recency
-// ("new"/""). It reads only precomputed tables — note_reply_edges for the reply
-// set + the matching note_*_counts table for the sort — so the thread reply list
-// ranks without a live aggregation. A LEFT JOIN keeps replies with zero engagement
+// RankedDirectReplyIDs returns the DIRECT (NIP-10/22) replies to parentID
+// ordered by a declared aggregation ("rule.metric" sort keys such as
+// "k7_e.actors" or "k9735_e.value_total") or by recency ("new"/""). It reads
+// only precomputed tables — note_reply_edges for the reply set + the rule's
+// aggregate table for the sort — so the thread reply list ranks without a
+// live aggregation. A LEFT JOIN keeps replies with zero engagement
 // (recency tiebreak), so the full reply set is returned, ranked.
 func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error) {
 	if len(parentID) != 64 {
@@ -728,7 +719,7 @@ func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string,
 		offset = 0
 	}
 
-	spec, ranked := directReplySorts[sort]
+	spec, ranked := s.refRankSpec(sort)
 	var query string
 	var args []any
 	if !ranked {
@@ -749,13 +740,13 @@ func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string,
 				FROM note_reply_edges WHERE parent_id = ? GROUP BY child_id
 			) e
 			LEFT JOIN (
-				SELECT target_event_id, %s(%s) AS c
+				SELECT target, %s(%s) AS c
 				FROM %s
-				WHERE target_event_id IN (SELECT child_id FROM note_reply_edges WHERE parent_id = ?)
-				GROUP BY target_event_id
-			) m ON m.target_event_id = e.child_id
+				WHERE target IN (SELECT child_id FROM note_reply_edges WHERE parent_id = ?)
+				GROUP BY target
+			) m ON m.target = e.child_id
 			ORDER BY ifNull(m.c, 0) DESC, e.created_at DESC, e.child_id DESC
-			LIMIT ? OFFSET ?`, spec.merge, spec.column, spec.table)
+			LIMIT ? OFFSET ?`, spec.MergeFunc, spec.Column, spec.Table)
 		args = []any{parentID, parentID, limit, offset}
 	}
 
