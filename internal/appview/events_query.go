@@ -29,19 +29,6 @@ type EventTagFilter struct {
 	Values []string `json:"values"`
 }
 
-// EventsConnection is the raw-event connection envelope shared by the
-// filtered-query shapes, matching the canonical NaggEventConnection.
-type EventsConnection struct {
-	Nodes    []chstore.EventView `json:"nodes"`
-	PageInfo PageInfo            `json:"pageInfo"`
-}
-
-// EventsQueryResponse wraps the connection under `events` to match the canonical
-// NaggWhitenoiseEventsData / NaggPostsRecentData shapes.
-type EventsQueryResponse struct {
-	Events EventsConnection `json:"events"`
-}
-
 const eventsQueryMaxLimit = 500
 
 // eventsQuery serves a constrained, filtered event query: it backs the niche
@@ -72,10 +59,25 @@ func (h *Handler) eventsQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("appview.events.query", "kinds", req.Kinds, "authors", len(req.Authors), "limit", int(input.Limit), "results", len(events))
-	writeJSON(w, EventsQueryResponse{Events: EventsConnection{
-		Nodes:    events,
-		PageInfo: PageInfo{HasNextPage: len(events) >= int(input.Limit), EndCursor: eventEndCursor(events)},
-	}})
+	order := make([]string, 0, len(events))
+	for _, event := range events {
+		order = append(order, event.ID)
+	}
+	cursor := eventEndCursor(events)
+	// PRIVACY: queries touching gift wraps (kind 1059) are served bare — no
+	// profile hydration or aggregates for ephemeral wrap authors.
+	for _, kind := range req.Kinds {
+		if kind == 1059 {
+			writeJSON(w, inlineEnvelope(order, orderByCreatedAt, events, cursor))
+			return
+		}
+	}
+	envelope, err := h.assembleEnvelope(r.Context(), order, orderByCreatedAt, events, cursor)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, envelope)
 }
 
 // toQueryInput normalizes and bounds the request into a store query, returning

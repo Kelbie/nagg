@@ -1,7 +1,6 @@
 package appview
 
 import (
-	"encoding/json"
 	"net/http"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -18,11 +17,6 @@ import (
 // SeenNotificationsDTag is the NIP-78 `d` tag identifying the notifications
 // seen-up-to marker. Stable so every device reads/writes the same event.
 const SeenNotificationsDTag = "sovran/notifications/seen"
-
-// SeenStateResponse matches the nagg-ts SeenState contract.
-type SeenStateResponse struct {
-	SeenUntil int64 `json:"seenUntil"`
-}
 
 func (h *Handler) notificationsSeen(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -45,25 +39,15 @@ func (h *Handler) notificationsSeen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Latest wins (replaceable addressable event). 0 means "never marked seen".
+	// Latest wins (replaceable addressable event); the client parses the
+	// marker's content (seenUntil) itself — the server just returns the
+	// event. An empty envelope means "never marked seen".
 	latest := latestEventByKind(events)[kindAppData]
-	writeJSON(w, SeenStateResponse{SeenUntil: parseSeenUntil(latest)})
+	if latest == nil {
+		writeJSON(w, inlineEnvelope(nil, orderByCreatedAt, nil, nil))
+		return
+	}
+	writeJSON(w, inlineEnvelope([]string{latest.ID}, orderByCreatedAt, []chstore.EventView{*latest}, nil))
 }
 
 const kindAppData = 30078
-
-func parseSeenUntil(event *chstore.EventView) int64 {
-	if event == nil {
-		return 0
-	}
-	var payload struct {
-		SeenUntil int64 `json:"seenUntil"`
-	}
-	if err := json.Unmarshal([]byte(event.Content), &payload); err != nil {
-		return 0
-	}
-	if payload.SeenUntil < 0 {
-		return 0
-	}
-	return payload.SeenUntil
-}

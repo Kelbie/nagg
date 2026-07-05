@@ -21,22 +21,6 @@ const (
 	kindMuteList  = 10000
 )
 
-// RelayListEntry is one NIP-65 relay with its read/write direction.
-type RelayListEntry struct {
-	URL   string `json:"url"`
-	Read  bool   `json:"read"`
-	Write bool   `json:"write"`
-}
-
-// SocialGraphResponse matches the nagg-ts SocialGraphResponseSchema.
-type SocialGraphResponse struct {
-	Pubkey   string                 `json:"pubkey"`
-	Follows  []string               `json:"follows"`
-	Profiles map[string]ProfileInfo `json:"profiles"`
-	Relays   []RelayListEntry       `json:"relays"`
-	Mutes    []string               `json:"mutes"`
-}
-
 func (h *Handler) socialGraph(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET /nostr/social-graph only", http.StatusMethodNotAllowed)
@@ -57,24 +41,25 @@ func (h *Handler) socialGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The lists ARE events: the latest kind-3 (references), kind-10002
+	// (NIP-65 relays), and kind-10000 (mutes) go in the envelope and the
+	// client reads their tags; the referenced pubkeys' kind-0 profile events
+	// ride along so cold start needs no per-profile fan-out.
 	latest := latestEventByKind(events)
-	follows := pTagValues(latest[kindContacts])
-	mutes := pTagValues(latest[kindMuteList])
-	relays := parseRelayList(latest[kindRelayList])
-
-	profiles, err := h.profileInfos(r.Context(), follows)
-	if err != nil {
+	order := make([]string, 0, 3)
+	referenced := make([]chstore.EventView, 0, 3)
+	for _, kind := range []int{kindContacts, kindRelayList, kindMuteList} {
+		if event := latest[kind]; event != nil {
+			order = append(order, event.ID)
+			referenced = append(referenced, *event)
+		}
+	}
+	envelope := inlineEnvelope(order, orderByCreatedAt, referenced, nil)
+	if err := h.appendProfileEventsTo(r.Context(), &envelope, pTagValues(latest[kindContacts])); err != nil {
 		writeError(w, err)
 		return
 	}
-
-	writeJSON(w, SocialGraphResponse{
-		Pubkey:   pubkey,
-		Follows:  follows,
-		Profiles: profiles,
-		Relays:   relays,
-		Mutes:    mutes,
-	})
+	writeJSON(w, envelope)
 }
 
 // latestEventByKind keeps the newest event per kind (replaceable events: the
@@ -101,29 +86,6 @@ func pTagValues(event *chstore.EventView) []string {
 		if len(tag) >= 2 && tag[0] == "p" && tag[1] != "" {
 			out = append(out, tag[1])
 		}
-	}
-	return out
-}
-
-func parseRelayList(event *chstore.EventView) []RelayListEntry {
-	if event == nil {
-		return []RelayListEntry{}
-	}
-	out := []RelayListEntry{}
-	for _, tag := range event.Tags {
-		if len(tag) < 2 || tag[0] != "r" || tag[1] == "" {
-			continue
-		}
-		marker := ""
-		if len(tag) >= 3 {
-			marker = tag[2]
-		}
-		// NIP-65: no marker → read+write; "read"/"write" → that direction only.
-		out = append(out, RelayListEntry{
-			URL:   tag[1],
-			Read:  marker != "write",
-			Write: marker != "read",
-		})
 	}
 	return out
 }

@@ -16,12 +16,6 @@ import (
 // (authors=[me], kinds per type) — no migration. A by-author materialized view
 // is a paging-performance optimization, not a correctness prerequisite.
 
-// OwnHistoryResponse matches the nagg-ts OwnHistoryResponseSchema.
-type OwnHistoryResponse struct {
-	Events          []FeedEvent `json:"events"`
-	PaginationUntil int64       `json:"paginationUntil"`
-}
-
 // ownActionKinds maps an action type to the Nostr kinds that back it. The bool
 // reports whether the type is recognized. zaps-sent is intentionally absent: a
 // zap RECEIPT (9735) is authored by the LNURL service, not the sender, so it
@@ -96,10 +90,16 @@ func (h *Handler) ownHistory(w http.ResponseWriter, r *http.Request) {
 	// boundaries — acceptable for a lazy own-history scroll-back.
 	events = filterOwnByActionType(events, actionType)
 
-	writeJSON(w, OwnHistoryResponse{
-		Events:          eventsJSON(events),
-		PaginationUntil: oldestCreatedAt(events),
-	})
+	order := make([]string, 0, len(events))
+	for _, event := range events {
+		order = append(order, event.ID)
+	}
+	envelope, err := h.assembleEnvelope(r.Context(), order, orderByCreatedAt, events, eventEndCursor(events))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, envelope)
 }
 
 func ownActionTypeFromPath(path string) string {
@@ -132,15 +132,4 @@ func hasETag(tags [][]string) bool {
 		}
 	}
 	return false
-}
-
-func oldestCreatedAt(events []chstore.EventView) int64 {
-	var oldest int64
-	for _, event := range events {
-		ts := event.CreatedAt.Unix()
-		if oldest == 0 || ts < oldest {
-			oldest = ts
-		}
-	}
-	return oldest
 }

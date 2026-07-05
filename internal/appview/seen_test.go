@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,10 +43,13 @@ func TestNotificationsSeenReturnsLatestTimestamp(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp SeenStateResponse
+	var resp Envelope
 	_ = json.NewDecoder(rec.Body).Decode(&resp)
-	if resp.SeenUntil != 2000 {
-		t.Fatalf("seenUntil = %d, want 2000 (latest)", resp.SeenUntil)
+	if len(resp.Events) != 1 {
+		t.Fatalf("events = %+v, want the latest marker event", resp.Events)
+	}
+	if !strings.Contains(resp.Events[0].Content, "2000") {
+		t.Fatalf("marker content = %q, want the latest (2000) marker", resp.Events[0].Content)
 	}
 }
 
@@ -55,9 +59,9 @@ func TestNotificationsSeenDefaultsToZero(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/nostr/notifications/seen?viewer="+testPubkey, nil)
 	handler.notificationsSeen(rec, req)
 
-	var resp SeenStateResponse
+	var resp Envelope
 	_ = json.NewDecoder(rec.Body).Decode(&resp)
-	if resp.SeenUntil != 0 {
-		t.Fatalf("seenUntil = %d, want 0 (never marked)", resp.SeenUntil)
+	if len(resp.Events) != 0 || len(resp.Order) != 0 {
+		t.Fatalf("envelope = %+v, want empty (never marked)", resp)
 	}
 }

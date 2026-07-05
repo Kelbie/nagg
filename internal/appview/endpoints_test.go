@@ -46,20 +46,22 @@ func TestFollowStatusDerivesRelationships(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp FollowStatusResponse
+	var resp ReferenceEdgesEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{a: "mutual", b: "following", c: "follows_you", d: "none"}
-	if len(resp.FollowStatus) != 4 {
-		t.Fatalf("rows = %d, want 4", len(resp.FollowStatus))
+	want := map[string]ReferenceEdge{
+		a: {Out: true, In: true},
+		b: {Out: true},
+		c: {In: true},
+		d: {},
 	}
-	for _, row := range resp.FollowStatus {
-		if row.Relationship != want[row.PubKey] {
-			t.Fatalf("relationship[%s] = %q, want %q", row.PubKey[:4], row.Relationship, want[row.PubKey])
-		}
-		if (row.Relationship == "mutual") != row.Mutual {
-			t.Fatalf("mutual flag mismatch for %s", row.PubKey[:4])
+	if len(resp.Edges) != 4 {
+		t.Fatalf("edges = %d, want 4", len(resp.Edges))
+	}
+	for pubkey, edge := range want {
+		if resp.Edges[pubkey] != edge {
+			t.Fatalf("edge[%s] = %+v, want %+v", pubkey[:4], resp.Edges[pubkey], edge)
 		}
 	}
 }
@@ -91,8 +93,12 @@ func (s *ownProfileStore) BatchFollowCounts(_ context.Context, pubkeys []string)
 func TestOwnProfilesReturnsMetadataAndCounts(t *testing.T) {
 	a := hexID("a")
 	store := &ownProfileStore{
-		profileRows: map[string]chstore.ProfileRow{a: {PubKey: a, Name: "alice", Picture: "pic", CreatedAt: time.Unix(1_700_000_000, 0)}},
-		counts:      map[string]chstore.FollowCounts{a: {Follows: 12, Followers: 34}},
+		profileRows: map[string]chstore.ProfileRow{a: {
+			PubKey: a, Name: "alice", Picture: "pic",
+			EventID: hexID("e"), RawJSON: `{"name":"alice","picture":"pic"}`,
+			CreatedAt: time.Unix(1_700_000_000, 0),
+		}},
+		counts: map[string]chstore.FollowCounts{a: {Follows: 12, Followers: 34}},
 	}
 	handler := New(store, WithNIP05Validation(false))
 
@@ -103,16 +109,21 @@ func TestOwnProfilesReturnsMetadataAndCounts(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp OwnProfilesResponse
+	var resp Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.OwnProfiles) != 1 {
-		t.Fatalf("profiles = %d, want 1", len(resp.OwnProfiles))
+	if len(resp.Events) != 1 || resp.Events[0].Kind != 0 || resp.Events[0].PubKey != a {
+		t.Fatalf("events = %+v, want alice's kind-0", resp.Events)
 	}
-	got := resp.OwnProfiles[0]
-	if got.Name != "alice" || got.Follows != 12 || got.Followers != 34 || got.CreatedAt == nil {
-		t.Fatalf("profile = %+v, want alice/12/34 with createdAt", got)
+	if !strings.Contains(resp.Events[0].Content, "alice") {
+		t.Fatalf("profile event content = %q", resp.Events[0].Content)
+	}
+	if len(resp.Order) != 1 || resp.Order[0] != hexID("e") {
+		t.Fatalf("order = %v", resp.Order)
+	}
+	if resp.Aggregates[a]["k3_p_latest"]["actors"] != 34 || resp.Aggregates[a]["k3_author_latest"]["sources"] != 12 {
+		t.Fatalf("aggregates = %+v, want followers 34 / following 12", resp.Aggregates[a])
 	}
 }
 
@@ -154,12 +165,15 @@ func TestEventsQueryReturnsConnection(t *testing.T) {
 	if store.lastInput.Limit != 20 || len(store.lastInput.Kinds) != 1 || store.lastInput.Kinds[0] != 1063 {
 		t.Fatalf("query input = %+v, want kind 1063 limit 20", store.lastInput)
 	}
-	var resp EventsQueryResponse
+	var resp Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Events.Nodes) != 1 {
-		t.Fatalf("nodes = %d, want 1", len(resp.Events.Nodes))
+	if len(resp.Order) != 1 || resp.Order[0] != hexID("a") {
+		t.Fatalf("order = %v, want the result event id", resp.Order)
+	}
+	if len(resp.Events) != 1 || resp.Events[0].ID != hexID("a") {
+		t.Fatalf("events = %+v", resp.Events)
 	}
 }
 

@@ -3,24 +3,22 @@ package appview
 import (
 	"log/slog"
 	"net/http"
-
-	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 )
 
-// FollowStatusRow is the viewer↔candidate relationship, byte-matching the
-// canonical NaggFollowStatusRow the GraphQL followStatus distilled to.
-type FollowStatusRow struct {
-	PubKey       string `json:"pubkey"`
-	Following    bool   `json:"following"`
-	FollowsYou   bool   `json:"followsYou"`
-	Mutual       bool   `json:"mutual"`
-	Relationship string `json:"relationship"`
+// ReferenceEdge reports the viewer↔candidate latest-kind-3 relationship in
+// direction terms: Out = the viewer's latest contact list references the
+// candidate; In = the candidate's latest list references the viewer. "Mutual"
+// is Out && In — a client derivation, not a server label.
+type ReferenceEdge struct {
+	Out bool `json:"out"`
+	In  bool `json:"in"`
 }
 
-// FollowStatusResponse wraps the rows under `followStatus` so the REST body IS
-// the canonical NaggFollowStatusData shape (one parser, both transports).
-type FollowStatusResponse struct {
-	FollowStatus []FollowStatusRow `json:"followStatus"`
+// ReferenceEdgesEnvelope is the follow-status response: the envelope base
+// plus the per-candidate edge map.
+type ReferenceEdgesEnvelope struct {
+	Envelope
+	Edges map[string]ReferenceEdge `json:"edges"`
 }
 
 // followStatus reports, for each candidate, whether the viewer follows them and
@@ -45,56 +43,16 @@ func (h *Handler) followStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	rows := make([]FollowStatusRow, 0, len(candidates))
+	out := make(map[string]ReferenceEdge, len(candidates))
 	for _, candidate := range candidates {
-		rows = append(rows, followStatusRow(candidate, edges[candidate]))
+		edge := edges[candidate]
+		out[candidate] = ReferenceEdge{Out: edge.Following, In: edge.FollowsYou}
 	}
 	slog.Info("appview.follow-status", "viewer", viewer, "candidates", len(candidates))
-	writeJSON(w, FollowStatusResponse{FollowStatus: rows})
-}
-
-// followStatusRow derives the relationship label, matching the GraphQL resolver.
-func followStatusRow(pubkey string, edge chstore.FollowEdge) FollowStatusRow {
-	mutual := edge.Following && edge.FollowsYou
-	relationship := "none"
-	switch {
-	case mutual:
-		relationship = "mutual"
-	case edge.Following:
-		relationship = "following"
-	case edge.FollowsYou:
-		relationship = "follows_you"
-	}
-	return FollowStatusRow{
-		PubKey:       pubkey,
-		Following:    edge.Following,
-		FollowsYou:   edge.FollowsYou,
-		Mutual:       mutual,
-		Relationship: relationship,
-	}
-}
-
-// OwnProfile is metadata plus follow counts for one of the viewer's own
-// accounts, byte-matching the canonical NaggOwnProfile.
-type OwnProfile struct {
-	PubKey      string `json:"pubkey"`
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	Picture     string `json:"picture"`
-	About       string `json:"about"`
-	NIP05       string `json:"nip05"`
-	LUD16       string `json:"lud16"`
-	Banner      string `json:"banner"`
-	Website     string `json:"website"`
-	Followers   int    `json:"followers"`
-	Follows     int    `json:"follows"`
-	CreatedAt   *int64 `json:"createdAt"`
-}
-
-// OwnProfilesResponse wraps the rows under `ownProfiles` to match the canonical
-// NaggOwnProfilesData shape.
-type OwnProfilesResponse struct {
-	OwnProfiles []OwnProfile `json:"ownProfiles"`
+	writeJSON(w, ReferenceEdgesEnvelope{
+		Envelope: inlineEnvelope(nil, orderByCreatedAt, nil, nil),
+		Edges:    out,
+	})
 }
 
 // ownProfiles returns metadata + follower/following counts for a small set of
@@ -112,39 +70,26 @@ func (h *Handler) ownProfiles(w http.ResponseWriter, r *http.Request) {
 		pubkeys = pubkeys[:10]
 	}
 	if len(pubkeys) == 0 {
-		writeJSON(w, OwnProfilesResponse{OwnProfiles: []OwnProfile{}})
+		writeJSON(w, inlineEnvelope(nil, orderByCreatedAt, nil, nil))
 		return
 	}
 	ctx := r.Context()
 	h.tryBackfillProfiles(ctx, pubkeys)
-	profiles, err := h.store.LatestProfiles(ctx, pubkeys)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
 	counts, err := h.store.BatchFollowCounts(ctx, pubkeys)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	out := make([]OwnProfile, 0, len(pubkeys))
-	for _, pubkey := range pubkeys {
-		profile := profiles[pubkey]
-		count := counts[pubkey]
-		out = append(out, OwnProfile{
-			PubKey:      pubkey,
-			Name:        profile.Name,
-			DisplayName: profile.DisplayName,
-			Picture:     profile.Picture,
-			About:       profile.About,
-			NIP05:       profile.NIP05,
-			LUD16:       profile.LUD16,
-			Banner:      profile.Banner,
-			Website:     profile.Website,
-			Followers:   int(count.Followers),
-			Follows:     int(count.Follows),
-			CreatedAt:   unixPtr(profile.CreatedAt),
-		})
+	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
+	if err := h.appendProfileEventsTo(ctx, &envelope, pubkeys); err != nil {
+		writeError(w, err)
+		return
 	}
-	writeJSON(w, OwnProfilesResponse{OwnProfiles: out})
+	for _, event := range envelope.Events {
+		envelope.Order = append(envelope.Order, event.ID)
+	}
+	for _, pubkey := range pubkeys {
+		followAggregates(&envelope, pubkey, counts[pubkey], 0)
+	}
+	writeJSON(w, envelope)
 }

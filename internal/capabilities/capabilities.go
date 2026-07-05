@@ -7,7 +7,7 @@ import (
 
 const (
 	GraphQLSchemaVersion = "2026-06-18"
-	AppViewVersion       = "v1"
+	AppViewVersion       = "v2"
 )
 
 var Names = []string{
@@ -46,7 +46,7 @@ var Names = []string{
 	"graphql.ownProfiles",
 	"appview.dmEnvelopes",
 	"appview.relayHydration",
-	"appview.v1",
+	"appview.v2",
 }
 
 // AppViewRoutes is the advertised REST surface. It MUST match the routes
@@ -59,7 +59,7 @@ var AppViewRoutes = []string{
 	"/nostr/feed/user",
 	"/nostr/feed/ranked",
 	"/nostr/notifications",
-	"/nostr/notes/stats",
+	"/nostr/events/aggregates",
 	"/nostr/thread",
 	"/nostr/follows",
 	"/nostr/events",

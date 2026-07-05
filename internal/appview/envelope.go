@@ -232,3 +232,80 @@ func (h *Handler) writeFeedEnvelope(w http.ResponseWriter, r *http.Request, even
 	}
 	writeJSON(w, response)
 }
+
+// inlineEnvelope builds an Envelope with no hydration and no aggregates — the
+// privacy paths (gift wraps, DMs) use it so ephemeral authors are never
+// enriched, and pubkey-centric routes use it as the base they extend.
+func inlineEnvelope(order []string, orderBy string, events []chstore.EventView, cursor *string) Envelope {
+	feedEvents := make([]FeedEvent, 0, len(events))
+	seen := map[string]struct{}{}
+	for _, event := range events {
+		if _, ok := seen[event.ID]; ok {
+			continue
+		}
+		seen[event.ID] = struct{}{}
+		feedEvents = append(feedEvents, eventJSON(event))
+	}
+	if order == nil {
+		order = []string{}
+	}
+	return Envelope{
+		Order:      order,
+		OrderBy:    orderBy,
+		Events:     feedEvents,
+		Aggregates: map[string]map[string]map[string]uint64{},
+		Cursor:     cursor,
+	}
+}
+
+// appendProfileEventsTo merges the latest kind-0 events for pubkeys into an
+// envelope, deduplicating by event id.
+func (h *Handler) appendProfileEventsTo(ctx context.Context, env *Envelope, pubkeys []string) error {
+	if len(pubkeys) == 0 {
+		return nil
+	}
+	profileEvents, err := h.profileEvents(ctx, pubkeys)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(env.Events))
+	for _, event := range env.Events {
+		seen[event.ID] = struct{}{}
+	}
+	for _, event := range profileEvents {
+		if _, ok := seen[event.ID]; ok {
+			continue
+		}
+		seen[event.ID] = struct{}{}
+		env.Events = append(env.Events, event)
+	}
+	return nil
+}
+
+// setPubkeyAggregate records one pubkey-keyed aggregate value on an envelope,
+// omitting zeros (matching the event-aggregate read's zero omission).
+func setPubkeyAggregate(env *Envelope, pubkey, rule, metric string, value uint64) {
+	if value == 0 || pubkey == "" {
+		return
+	}
+	if env.Aggregates == nil {
+		env.Aggregates = map[string]map[string]map[string]uint64{}
+	}
+	if env.Aggregates[pubkey] == nil {
+		env.Aggregates[pubkey] = map[string]map[string]uint64{}
+	}
+	if env.Aggregates[pubkey][rule] == nil {
+		env.Aggregates[pubkey][rule] = map[string]uint64{}
+	}
+	env.Aggregates[pubkey][rule][metric] = value
+}
+
+// followAggregates records a pubkey's relationship counts under the kind-based
+// rule names: followers = latest kind-3 lists referencing the pubkey
+// (k3_p_latest.actors), following = the pubkey's own latest kind-3 list size
+// (k3_author_latest.sources), created events = k1_1111_author.sources.
+func followAggregates(env *Envelope, pubkey string, counts chstore.FollowCounts, created uint64) {
+	setPubkeyAggregate(env, pubkey, "k3_p_latest", "actors", counts.Followers)
+	setPubkeyAggregate(env, pubkey, "k3_author_latest", "sources", counts.Follows)
+	setPubkeyAggregate(env, pubkey, "k1_1111_author", "sources", created)
+}

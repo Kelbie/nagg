@@ -28,7 +28,6 @@ import (
 type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
-	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
 	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
 	FollowCounts(context.Context, string) (chstore.FollowCounts, error)
@@ -292,7 +291,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/feed/user", h.userFeed, true},
 		{"/nostr/feed/ranked", h.rankedFeed, true},
 		{"/nostr/notifications", h.notifications, true},
-		{"/nostr/notes/stats", h.noteStats, false},
+		{"/nostr/events/aggregates", h.eventAggregates, false},
 		{"/nostr/thread", h.thread, true},
 		{"/nostr/follows", h.follows, false},
 		{"/nostr/events", h.events, false},
@@ -376,21 +375,6 @@ type ProfileInfo struct {
 	Picture string `json:"picture,omitempty"`
 }
 
-type EnrichmentResponse struct {
-	Metrics  map[string]chstore.NoteStats `json:"metrics"`
-	Profiles map[string]ProfileInfo       `json:"profiles"`
-	Quoted   map[string]FeedEvent         `json:"quoted"`
-}
-
-// PageInfo is the connection cursor envelope shared by the list app-view shapes
-// (DM envelopes, notifications). It matches the GraphQL `pageInfo` shape so the
-// nagg-ts client parses both transports with one schema. EndCursor is the
-// `<RFC3339Nano>|<id>` cursor of the last (oldest) row, or null when empty.
-type PageInfo struct {
-	HasNextPage bool    `json:"hasNextPage"`
-	EndCursor   *string `json:"endCursor"`
-}
-
 // eventEndCursor mirrors the GraphQL resolver's cursor format so the REST and
 // GraphQL `pageInfo.endCursor` shapes are identical.
 func eventEndCursor(events []chstore.EventView) *string {
@@ -400,12 +384,6 @@ func eventEndCursor(events []chstore.EventView) *string {
 	last := events[len(events)-1]
 	cursor := last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID
 	return &cursor
-}
-
-type appViewHydration struct {
-	Metrics  map[string]chstore.NoteStats
-	Profiles map[string]ProfileInfo
-	Quoted   map[string]FeedEvent
 }
 
 type resolvedRootEvent struct {
@@ -430,35 +408,31 @@ type ProfileFields struct {
 	LUD06       *string `json:"lud06,omitempty"`
 }
 
-type SearchResult struct {
-	ProfileFields
-	PubKey    string   `json:"pubkey"`
-	Npub      string   `json:"npub"`
-	Rank      *float64 `json:"rank,omitempty"`
-	Score     *float64 `json:"score"`
-	CreatedAt *int64   `json:"created_at,omitempty"`
+// ProvidersEnvelope extends the envelope for pubkey-ranked routes (profile,
+// search, recommended): Pubkeys is the complete ranked pubkey list (Order can
+// only anchor pubkeys whose kind-0 event is locally indexed), and Providers
+// carries provider-namespaced data per pubkey — "vertex" (rank/score/nodes/
+// references), "nip05" (validation), "nagg" (first-indexed timestamps) — kept
+// out of the generic aggregates because it is float/context-shaped provider
+// output, pending the DVM plugin seam.
+type ProvidersEnvelope struct {
+	Envelope
+	Pubkeys   []string                  `json:"pubkeys"`
+	Providers map[string]map[string]any `json:"providers,omitempty"`
+	FromCache bool                      `json:"fromCache,omitempty"`
 }
 
-type TopFollower struct {
-	ProfileFields
-	PubKey string   `json:"pubkey"`
-	Npub   string   `json:"npub"`
-	Rank   float64  `json:"rank"`
-	Score  *float64 `json:"score"`
-}
-
-type ProfileResponse struct {
-	ProfileFields
-	PubKey       string        `json:"pubkey"`
-	Npub         string        `json:"npub"`
-	Rank         float64       `json:"rank"`
-	Score        *float64      `json:"score"`
-	Followers    uint64        `json:"followers"`
-	Follows      uint64        `json:"follows"`
-	CreatedAt    *int64        `json:"created_at"`
-	Nodes        *int          `json:"nodes,omitempty"`
-	TopFollowers []TopFollower `json:"topFollowers"`
-	FromCache    bool          `json:"fromCache"`
+func (p *ProvidersEnvelope) setProvider(pubkey, provider string, payload map[string]any) {
+	if pubkey == "" || len(payload) == 0 {
+		return
+	}
+	if p.Providers == nil {
+		p.Providers = map[string]map[string]any{}
+	}
+	if p.Providers[pubkey] == nil {
+		p.Providers[pubkey] = map[string]any{}
+	}
+	p.Providers[pubkey][provider] = payload
 }
 
 func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
@@ -660,40 +634,33 @@ type NotificationActor struct {
 	ActorVertexScore float64 `json:"actorVertexScore,omitempty"`
 }
 
-// NotificationRowJSON is the REST shape for one notification item. It mirrors the
-// feed's FeedItem convention: a `type` discriminator plus flat omitempty fields
-// and an inline related-event pointer (TargetEvent, like FeedItem.OriginalEvent).
-// A "group" collapses many same-target same-reason notifications (follow /
-// repost / reaction / zap) into one item with a representative Event (the most
-// recent member), a Total count, and up to three sample actors. reply / quote /
-// mention are always "single" so their text stays readable.
-type NotificationRowJSON struct {
-	Type             string              `json:"type"` // "single" | "group"
-	Event            FeedEvent           `json:"event"`
-	Reason           string              `json:"reason"`
-	ActorVertexScore float64             `json:"actorVertexScore"`
-	TargetEventID    string              `json:"targetEventId,omitempty"`
-	TargetEvent      *FeedEvent          `json:"targetEvent,omitempty"`
-	Total            int                 `json:"total,omitempty"`
-	TotalCapped      bool                `json:"totalCapped,omitempty"`
-	SampleActors     []NotificationActor `json:"sampleActors,omitempty"`
+// NotificationEntry is one notification item in kind vocabulary: the
+// triggering event's kind says what happened (3 = a latest contact list now
+// references you; 6/16 = a kind-6/16 references your event; 7 = a kind-7
+// references it; 9735 = a zap receipt references it; 1 = a kind-1 references
+// you or your event — the client reads the embedded event's tags to tell
+// which). A collapsed group carries the newest member as its representative
+// (ID/Kind/Actor), the group Total, and up to three sample Actors; entries
+// with no Total are singles. No reason strings anywhere — kinds only.
+type NotificationEntry struct {
+	ID          string              `json:"id"`
+	Kind        int                 `json:"kind"`
+	Actor       string              `json:"actor,omitempty"`
+	Target      string              `json:"target,omitempty"`
+	Total       int                 `json:"total,omitempty"`
+	TotalCapped bool                `json:"totalCapped,omitempty"`
+	Actors      []NotificationActor `json:"actors,omitempty"`
 }
 
-// NotificationConnection is the notification rows + cursor, matching the GraphQL
-// notifications connection shape ({ nodes, pageInfo }) so one client schema
-// parses both transports (the pageInfo synthesis moves server-side here).
-type NotificationConnection struct {
-	Nodes    []NotificationRowJSON `json:"nodes"`
-	PageInfo PageInfo              `json:"pageInfo"`
-}
-
-// NotificationsResponse mirrors the feed enrichment (Metrics, Profiles, Quoted)
-// so clients can render notification events with the same hydration as the feed.
-type NotificationsResponse struct {
-	Notifications NotificationConnection       `json:"notifications"`
-	Metrics       map[string]chstore.NoteStats `json:"metrics"`
-	Profiles      map[string]ProfileInfo       `json:"profiles"`
-	Quoted        map[string]FeedEvent         `json:"quoted"`
+// NotificationsEnvelope is the notifications route response: the generic
+// envelope (entry order, triggering + target + profile events, aggregates)
+// plus the grouping metadata the client cannot derive from one page, and the
+// conservative has-next hint (grouping collapses pages, so the client drives
+// load-more; see docs/notifications-flow.md).
+type NotificationsEnvelope struct {
+	Envelope
+	Entries []NotificationEntry `json:"entries"`
+	HasNext bool                `json:"hasNext"`
 }
 
 // notifications is the REST counterpart of the GraphQL notifications resolver.
@@ -713,8 +680,8 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		nodes        []NotificationRowJSON
-		hydrationIDs []chstore.EventView
+		entries      []NotificationEntry
+		referenced   []chstore.EventView
 		actorPubkeys []string
 		hasNext      bool
 	)
@@ -771,7 +738,7 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		allRows := make([]chstore.NotificationRow, 0, len(followRows)+len(bodyRows))
 		allRows = append(allRows, followRows...)
 		allRows = append(allRows, bodyRows...)
-		nodes, hydrationIDs, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
+		entries, referenced, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
 	} else {
 		var rows []chstore.NotificationRow
 		err = recordPhase(r.Context(), "db", func() (e error) {
@@ -782,51 +749,48 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 			writeError(w, err)
 			return
 		}
-		nodes = make([]NotificationRowJSON, 0, len(rows))
-		hydrationIDs = make([]chstore.EventView, 0, len(rows))
+		entries = make([]NotificationEntry, 0, len(rows))
+		referenced = make([]chstore.EventView, 0, len(rows))
 		for _, row := range rows {
-			hydrationIDs = append(hydrationIDs, row.Event)
-			nodes = append(nodes, NotificationRowJSON{
-				Type:             "single",
-				Event:            eventJSON(row.Event),
-				Reason:           row.Reason,
-				ActorVertexScore: row.ActorVertexScore,
+			referenced = append(referenced, row.Event)
+			entries = append(entries, NotificationEntry{
+				ID:    row.Event.ID,
+				Kind:  row.Event.Kind,
+				Actor: row.ActorPubKey,
+				Actors: []NotificationActor{{
+					PubKey:           row.ActorPubKey,
+					EventID:          row.Event.ID,
+					CreatedAt:        row.NotificationCreatedAt.Unix(),
+					ActorVertexScore: row.ActorVertexScore,
+				}},
 			})
 		}
 		hasNext = len(rows) >= int(input.Limit)
 	}
 
-	var hydration appViewHydration
-	err = recordPhase(r.Context(), "hydrate", func() (e error) {
-		hydration, e = h.hydrateAppViewEvents(r.Context(), hydrationIDs)
-		return
-	})
+	byID := make(map[string]chstore.EventView, len(referenced))
+	for _, event := range referenced {
+		byID[event.ID] = event
+	}
+	order := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		order = append(order, entry.ID)
+	}
+	envelope, err := h.assembleEnvelope(r.Context(), order, orderByCreatedAt, referenced, notificationEndCursor(entries, byID))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	// Sample actors beyond the representative are not event authors, so hydrate
-	// their profiles explicitly for the avatar cluster.
-	if len(actorPubkeys) > 0 {
-		if profiles, perr := h.profileInfos(r.Context(), actorPubkeys); perr == nil {
-			if hydration.Profiles == nil {
-				hydration.Profiles = make(map[string]ProfileInfo, len(profiles))
-			}
-			for pubkey, profile := range profiles {
-				if _, exists := hydration.Profiles[pubkey]; !exists {
-					hydration.Profiles[pubkey] = profile
-				}
-			}
-		}
+	// Sample actors beyond the representative are not event authors, so embed
+	// their kind-0 profile events explicitly for the avatar cluster.
+	if err := h.appendProfileEventsTo(r.Context(), &envelope, actorPubkeys); err != nil {
+		writeError(w, err)
+		return
 	}
-	writeJSON(w, NotificationsResponse{
-		Notifications: NotificationConnection{
-			Nodes:    nodes,
-			PageInfo: PageInfo{HasNextPage: hasNext, EndCursor: notificationEndCursor(nodes)},
-		},
-		Metrics:  hydration.Metrics,
-		Profiles: hydration.Profiles,
-		Quoted:   hydration.Quoted,
+	writeJSON(w, NotificationsEnvelope{
+		Envelope: envelope,
+		Entries:  entries,
+		HasNext:  hasNext,
 	})
 }
 
@@ -862,11 +826,11 @@ type notificationGroupAcc struct {
 }
 
 // groupNotifications collapses the (newest-first) candidate rows into grouped
-// items, mirroring how the feed envelope collapses reposts. It returns the response
-// nodes, the events to hydrate (representatives + target posts), and whether
-// more items exist past the page. All product semantics live here; the store
-// query stays generic.
-func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow, windowSaturated bool) ([]NotificationRowJSON, []chstore.EventView, []string, bool) {
+// entries, mirroring how the feed envelope collapses kind-6/16 references. It
+// returns the entries, the events to embed (representatives + targets), the
+// sample-actor pubkeys to profile-hydrate, and whether more items exist past
+// the page. All product semantics live here; the store query stays generic.
+func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow, windowSaturated bool) ([]NotificationEntry, []chstore.EventView, []string, bool) {
 	order := make([]string, 0, len(rows))
 	groups := make(map[string]*notificationGroupAcc, len(rows))
 	for _, row := range rows {
@@ -928,70 +892,67 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 		}
 	}
 
-	nodes := make([]NotificationRowJSON, 0, len(order))
-	hydrationEvents := make([]chstore.EventView, 0, len(order)*2)
+	entries := make([]NotificationEntry, 0, len(order))
+	referenced := make([]chstore.EventView, 0, len(order)*2)
 	for _, key := range order {
 		acc := groups[key]
-		node := NotificationRowJSON{
-			Type:             "single",
-			Event:            eventJSON(acc.rep.Event),
-			Reason:           acc.rep.Reason,
-			ActorVertexScore: acc.rep.ActorVertexScore,
+		entry := NotificationEntry{
+			ID:     acc.rep.Event.ID,
+			Kind:   acc.rep.Event.Kind,
+			Actor:  acc.rep.ActorPubKey,
+			Target: acc.targetID,
+			Actors: acc.actors,
 		}
-		hydrationEvents = append(hydrationEvents, acc.rep.Event)
-		if acc.targetID != "" {
-			node.TargetEventID = acc.targetID
-		}
+		referenced = append(referenced, acc.rep.Event)
 		if notificationGroupable(acc.rep.Reason) && acc.total >= 2 {
-			node.Type = "group"
-			node.Total = acc.total
-			node.SampleActors = acc.actors
+			entry.Total = acc.total
 			if acc.rep.Reason == "follow" && followTotal >= 0 {
-				node.Total = followTotal
+				entry.Total = followTotal
 			} else {
-				node.TotalCapped = windowSaturated
+				entry.TotalCapped = windowSaturated
 			}
 		}
-		nodes = append(nodes, node)
+		entries = append(entries, entry)
 	}
 
-	// Hydrate target posts inline (like the feed envelope embeds originals) and
-	// merge sample-actor profiles so avatars resolve.
-	targetIDs := make([]string, 0, len(nodes))
-	actorPubkeys := make([]string, 0, len(nodes)*3)
-	for _, node := range nodes {
-		if node.TargetEventID != "" {
-			targetIDs = append(targetIDs, node.TargetEventID)
+	// Embed target events (like the feed envelope embeds kind-6/16 originals)
+	// and collect sample-actor pubkeys so their profiles resolve.
+	targetIDs := make([]string, 0, len(entries))
+	actorPubkeys := make([]string, 0, len(entries)*3)
+	for _, entry := range entries {
+		if entry.Target != "" {
+			targetIDs = append(targetIDs, entry.Target)
 		}
-		for _, actor := range node.SampleActors {
+		for _, actor := range entry.Actors {
 			actorPubkeys = append(actorPubkeys, actor.PubKey)
 		}
 	}
 	if len(targetIDs) > 0 {
 		if targets, err := h.eventsByID(ctx, targetIDs); err == nil {
-			for i := range nodes {
-				if nodes[i].TargetEventID == "" {
+			for _, entry := range entries {
+				if entry.Target == "" {
 					continue
 				}
-				if target, ok := targets[nodes[i].TargetEventID]; ok {
-					tj := eventJSON(target)
-					nodes[i].TargetEvent = &tj
-					hydrationEvents = append(hydrationEvents, target)
+				if target, ok := targets[entry.Target]; ok {
+					referenced = append(referenced, target)
 				}
 			}
 		}
 	}
-	return nodes, hydrationEvents, actorPubkeys, hasNext
+	return entries, referenced, actorPubkeys, hasNext
 }
 
-// notificationEndCursor mirrors eventEndCursor over the last node's
+// notificationEndCursor mirrors eventEndCursor over the last entry's
 // representative event, keeping the REST and GraphQL cursor formats identical.
-func notificationEndCursor(nodes []NotificationRowJSON) *string {
-	if len(nodes) == 0 {
+func notificationEndCursor(entries []NotificationEntry, byID map[string]chstore.EventView) *string {
+	if len(entries) == 0 {
 		return nil
 	}
-	last := nodes[len(nodes)-1].Event
-	cursor := time.Unix(last.CreatedAt, 0).UTC().Format(time.RFC3339Nano) + "|" + last.ID
+	last, ok := byID[entries[len(entries)-1].ID]
+	if !ok {
+		return nil
+	}
+	cursor := last.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + last.ID
 	return &cursor
 }
 
@@ -1066,9 +1027,9 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.Notificatio
 	return input, grouped, nil
 }
 
-func (h *Handler) noteStats(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) eventAggregates(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "POST /nostr/notes/stats only", http.StatusMethodNotAllowed)
+		http.Error(w, "POST /nostr/events/aggregates only", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
@@ -1315,11 +1276,9 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, map[string]any{
-		"pubkey":    pubkey,
-		"follows":   counts.Follows,
-		"followers": counts.Followers,
-	})
+	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
+	followAggregates(&envelope, pubkey, counts, 0)
+	writeJSON(w, envelope)
 }
 
 func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
@@ -1349,20 +1308,6 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, envelope)
-}
-
-// DmConnection is the REST app-view DM list. It matches the GraphQL dmEnvelopes
-// connection shape ({ nodes, pageInfo }) so the nagg-ts client parses both
-// transports with one schema and no per-transport normalize.
-type DmConnection struct {
-	Nodes    []chstore.EventView `json:"nodes"`
-	PageInfo PageInfo            `json:"pageInfo"`
-}
-
-// DmEnvelopesResponse wraps the connection under `dmEnvelopes` to byte-match the
-// GraphQL `data.dmEnvelopes` shape for the DM/contacts page.
-type DmEnvelopesResponse struct {
-	DmEnvelopes DmConnection `json:"dmEnvelopes"`
 }
 
 // dmEnvelopes is the REST app-view counterpart of the GraphQL dmEnvelopes
@@ -1405,10 +1350,14 @@ func (h *Handler) dmEnvelopes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	merged := mergeDmEnvelopes(limit, authored, received)
-	writeJSON(w, DmEnvelopesResponse{DmEnvelopes: DmConnection{
-		Nodes:    merged,
-		PageInfo: PageInfo{HasNextPage: len(merged) >= limit, EndCursor: eventEndCursor(merged)},
-	}})
+	// PRIVACY: DM envelopes are served bare — no profile hydration, no
+	// aggregates. Gift-wrap authors are ephemeral pubkeys; enriching them
+	// would leak correlation surface for zero rendering value.
+	order := make([]string, 0, len(merged))
+	for _, event := range merged {
+		order = append(order, event.ID)
+	}
+	writeJSON(w, inlineEnvelope(order, orderByCreatedAt, merged, eventEndCursor(merged)))
 }
 
 // parseDmKinds reads a CSV `kinds` param, defaulting to NIP-04 legacy DMs
@@ -1473,16 +1422,15 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(raw) == "" {
 		raw = queryViewerParam(r)
 	}
-	profiles, err := h.profileInfos(r.Context(), normalizePubkeys(csv(raw)))
-	if err != nil {
+	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
+	if err := h.appendProfileEventsTo(r.Context(), &envelope, normalizePubkeys(csv(raw))); err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, EnrichmentResponse{
-		Metrics:  map[string]chstore.NoteStats{},
-		Profiles: profiles,
-		Quoted:   map[string]FeedEvent{},
-	})
+	for _, event := range envelope.Events {
+		envelope.Order = append(envelope.Order, event.ID)
+	}
+	writeJSON(w, envelope)
 }
 
 func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
@@ -1513,27 +1461,55 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	var dvmProfile vertex.ProfileResult
-	var fromCache bool
-	dvmProfile, fromCache = h.vertexProfile(ctx, pubkey, counts.Followers)
-	topFollowers, err := h.enrichTopFollowers(ctx, dvmProfile.TopFollowers)
-	if err != nil {
+	dvmProfile, fromCache := h.vertexProfile(ctx, pubkey, counts.Followers)
+
+	envelope := ProvidersEnvelope{
+		Envelope:  inlineEnvelope(nil, orderByCreatedAt, nil, nil),
+		Pubkeys:   []string{pubkey},
+		FromCache: fromCache,
+	}
+	followerPubkeys := make([]string, 0, len(dvmProfile.TopFollowers))
+	vertexPayload := map[string]any{"rank": dvmProfile.Rank}
+	if dvmProfile.Score != nil {
+		vertexPayload["score"] = *dvmProfile.Score
+	}
+	if dvmProfile.Nodes != nil {
+		vertexPayload["nodes"] = *dvmProfile.Nodes
+	}
+	for _, follower := range dvmProfile.TopFollowers {
+		fp, ok := vertex.NormalizePubkey(follower.PubKey)
+		if !ok {
+			continue
+		}
+		followerPubkeys = append(followerPubkeys, fp)
+		payload := map[string]any{"rank": follower.Rank}
+		if follower.Score != nil {
+			payload["score"] = *follower.Score
+		}
+		envelope.setProvider(fp, "vertex", payload)
+	}
+	if len(followerPubkeys) > 0 {
+		vertexPayload["references"] = followerPubkeys
+	}
+	envelope.setProvider(pubkey, "vertex", vertexPayload)
+	if createdAt != nil {
+		envelope.setProvider(pubkey, "nagg", map[string]any{"firstEventAt": *createdAt})
+	}
+	if fields := h.profileFields(ctx, pubkey, profile); fields.fields.NIP05Valid != nil {
+		envelope.setProvider(pubkey, "nip05", map[string]any{"valid": *fields.fields.NIP05Valid})
+	}
+	followAggregates(&envelope.Envelope, pubkey, counts, 0)
+	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, append([]string{pubkey}, followerPubkeys...)); err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, ProfileResponse{
-		ProfileFields: h.profileFields(ctx, pubkey, profile).fields,
-		PubKey:        pubkey,
-		Npub:          vertex.Npub(pubkey),
-		Rank:          dvmProfile.Rank,
-		Score:         dvmProfile.Score,
-		Followers:     counts.Followers,
-		Follows:       counts.Follows,
-		CreatedAt:     createdAt,
-		Nodes:         dvmProfile.Nodes,
-		TopFollowers:  topFollowers,
-		FromCache:     fromCache,
-	})
+	for _, event := range envelope.Events {
+		if event.PubKey == pubkey {
+			envelope.Order = append(envelope.Order, event.ID)
+			break
+		}
+	}
+	writeJSON(w, envelope)
 }
 
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
@@ -1634,21 +1610,49 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 		"vertex_count", vertexCount, "local_count", len(results)-vertexCount,
 		"from_cache", fromCache)
 
-	enriched, err := h.enrichSearchResults(r.Context(), results)
+	envelope, err := h.rankedPubkeysEnvelope(r.Context(), results, fromCache)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if sortKey == "" {
-		sortKey = "globalPagerank"
+	writeJSON(w, envelope)
+}
+
+// rankedPubkeysEnvelope converts a ranked provider result list into the
+// providers envelope: the complete ranked pubkey list, each pubkey's locally
+// indexed kind-0 event (Order anchors only those), and the provider values.
+func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.SearchResult, fromCache bool) (ProvidersEnvelope, error) {
+	envelope := ProvidersEnvelope{
+		Envelope:  inlineEnvelope(nil, orderByRank, nil, nil),
+		Pubkeys:   make([]string, 0, len(results)),
+		FromCache: fromCache,
 	}
-	writeJSON(w, map[string]any{
-		"query":     query,
-		"limit":     limitClamp(limit, 5),
-		"sort":      sortKey,
-		"results":   enriched,
-		"fromCache": fromCache,
-	})
+	for _, row := range results {
+		envelope.Pubkeys = append(envelope.Pubkeys, row.PubKey)
+		payload := map[string]any{}
+		if row.Rank != nil {
+			payload["rank"] = *row.Rank
+		}
+		if row.Score != nil {
+			payload["score"] = *row.Score
+		}
+		envelope.setProvider(row.PubKey, "vertex", payload)
+	}
+	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
+		return ProvidersEnvelope{}, err
+	}
+	eventByPubkey := make(map[string]string, len(envelope.Events))
+	for _, event := range envelope.Events {
+		if event.Kind == 0 {
+			eventByPubkey[event.PubKey] = event.ID
+		}
+	}
+	for _, pubkey := range envelope.Pubkeys {
+		if id, ok := eventByPubkey[pubkey]; ok {
+			envelope.Order = append(envelope.Order, id)
+		}
+	}
+	return envelope, nil
 }
 
 func (h *Handler) recommended(w http.ResponseWriter, r *http.Request) {
@@ -1675,21 +1679,12 @@ func (h *Handler) recommended(w http.ResponseWriter, r *http.Request) {
 		writeVertexError(w, err)
 		return
 	}
-	enriched, err := h.enrichSearchResults(r.Context(), results)
+	envelope, err := h.rankedPubkeysEnvelope(r.Context(), results, fromCache)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if source == "" {
-		source = "default"
-	}
-	writeJSON(w, map[string]any{
-		"source":    source,
-		"limit":     limitClamp(limit, 5),
-		"sort":      sortKey,
-		"results":   enriched,
-		"fromCache": fromCache,
-	})
+	writeJSON(w, envelope)
 }
 
 func (h *Handler) eventsByID(ctx context.Context, ids []string) (map[string]chstore.EventView, error) {
@@ -1745,45 +1740,6 @@ func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[strin
 		out[pubkey] = ProfileInfo{Name: name, Picture: row.Picture}
 	}
 	return out, nil
-}
-
-func (h *Handler) hydrateAppViewEvents(ctx context.Context, events []chstore.EventView) (appViewHydration, error) {
-	metricIDs := make([]string, 0, len(events))
-	pubkeys := make([]string, 0, len(events))
-	quotedIDs := make([]string, 0)
-	seenMetricIDs := map[string]struct{}{}
-	seenPubkeys := map[string]struct{}{}
-	seenQuotedIDs := map[string]struct{}{}
-
-	for _, event := range events {
-		metricIDs = appendUniqueString(metricIDs, seenMetricIDs, event.ID)
-		pubkeys = appendUniqueString(pubkeys, seenPubkeys, event.PubKey)
-		for _, id := range quotedEventIDs(event) {
-			quotedIDs = appendUniqueString(quotedIDs, seenQuotedIDs, id)
-		}
-	}
-
-	quotedEvents, err := h.eventsByID(ctx, quotedIDs)
-	if err != nil {
-		return appViewHydration{}, err
-	}
-	quoted := make(map[string]FeedEvent, len(quotedEvents))
-	for id, event := range quotedEvents {
-		quoted[id] = eventJSON(event)
-		metricIDs = appendUniqueString(metricIDs, seenMetricIDs, id)
-		pubkeys = appendUniqueString(pubkeys, seenPubkeys, event.PubKey)
-	}
-
-	h.tryBackfillEnrichment(ctx, metricIDs, pubkeys)
-	metrics, err := h.store.NoteStats(ctx, metricIDs)
-	if err != nil {
-		return appViewHydration{}, err
-	}
-	profiles, err := h.profileInfos(ctx, pubkeys)
-	if err != nil {
-		return appViewHydration{}, err
-	}
-	return appViewHydration{Metrics: metrics, Profiles: profiles, Quoted: quoted}, nil
 }
 
 func (h *Handler) rootEvents(ctx context.Context, events []chstore.EventView) (map[string]resolvedRootEvent, error) {
@@ -2131,35 +2087,6 @@ type profileFieldsResult struct {
 	conflict bool
 }
 
-func (h *Handler) enrichSearchResults(ctx context.Context, rows []vertex.SearchResult) ([]SearchResult, error) {
-	pubkeys := make([]string, 0, len(rows))
-	for _, row := range rows {
-		pubkeys = append(pubkeys, row.PubKey)
-	}
-	h.tryBackfillProfiles(ctx, pubkeys)
-	profiles, err := h.store.LatestProfiles(ctx, pubkeys)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]SearchResult, 0, len(rows))
-	for _, row := range rows {
-		fields := h.profileFields(ctx, row.PubKey, profiles[row.PubKey])
-		if fields.conflict {
-			continue
-		}
-		createdAt := unixPtr(profiles[row.PubKey].CreatedAt)
-		out = append(out, SearchResult{
-			ProfileFields: fields.fields,
-			PubKey:        row.PubKey,
-			Npub:          row.Npub,
-			Rank:          row.Rank,
-			Score:         row.Score,
-			CreatedAt:     createdAt,
-		})
-	}
-	return out, nil
-}
-
 func (h *Handler) vertexProfile(ctx context.Context, pubkey string, followers uint64) (vertex.ProfileResult, bool) {
 	provider := vertex.NewScoreProvider(h.store, h.vertex, h.vertexProfileMinFollowers)
 	profile, ok, err := provider.AuthorProfileWithFollowers(ctx, pubkey, followers)
@@ -2179,33 +2106,6 @@ func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, loca
 		return unixPtr(*firstEventAt), nil
 	}
 	return unixPtr(localProfile.CreatedAt), nil
-}
-
-func (h *Handler) enrichTopFollowers(ctx context.Context, followers []vertex.TopFollower) ([]TopFollower, error) {
-	pubkeys := make([]string, 0, len(followers))
-	for _, follower := range followers {
-		pubkeys = append(pubkeys, follower.PubKey)
-	}
-	h.tryBackfillProfiles(ctx, pubkeys)
-	profiles, err := h.store.LatestProfiles(ctx, pubkeys)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]TopFollower, 0, len(followers))
-	for _, follower := range followers {
-		fields := h.profileFields(ctx, follower.PubKey, profiles[follower.PubKey])
-		if fields.conflict {
-			continue
-		}
-		out = append(out, TopFollower{
-			ProfileFields: fields.fields,
-			PubKey:        follower.PubKey,
-			Npub:          follower.Npub,
-			Rank:          follower.Rank,
-			Score:         follower.Score,
-		})
-	}
-	return out, nil
 }
 
 func (h *Handler) profileFields(ctx context.Context, pubkey string, row chstore.ProfileRow) profileFieldsResult {

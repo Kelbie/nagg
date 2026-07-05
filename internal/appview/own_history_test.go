@@ -51,13 +51,13 @@ func TestOwnHistoryLikesByAuthor(t *testing.T) {
 	if len(store.gotInput.Kinds) != 1 || store.gotInput.Kinds[0] != 7 {
 		t.Fatalf("kinds = %+v", store.gotInput.Kinds)
 	}
-	var resp OwnHistoryResponse
+	var resp Envelope
 	_ = json.NewDecoder(rec.Body).Decode(&resp)
-	if len(resp.Events) != 2 {
-		t.Fatalf("events = %d", len(resp.Events))
+	if len(resp.Order) != 2 {
+		t.Fatalf("order = %v", resp.Order)
 	}
-	if resp.PaginationUntil != 100 {
-		t.Fatalf("paginationUntil = %d, want 100 (oldest)", resp.PaginationUntil)
+	if resp.Cursor == nil {
+		t.Fatalf("cursor = nil, want a continuation for a non-empty page")
 	}
 }
 
@@ -76,15 +76,15 @@ func TestOwnHistoryAuthoredVsRepliesSplit(t *testing.T) {
 	New(repliesStore, WithNIP05Validation(false)).ownHistory(recR,
 		httptest.NewRequest(http.MethodGet, "/nostr/own/replies?pubkey="+testPubkey, nil))
 
-	var authored, replies OwnHistoryResponse
+	var authored, replies Envelope
 	_ = json.NewDecoder(recA.Body).Decode(&authored)
 	_ = json.NewDecoder(recR.Body).Decode(&replies)
 
-	if len(authored.Events) != 1 || authored.Events[0].ID != "authored" {
-		t.Fatalf("authored = %+v", authored.Events)
+	if len(authored.Order) != 1 || authored.Order[0] != "authored" {
+		t.Fatalf("authored = %+v", authored.Order)
 	}
-	if len(replies.Events) != 1 || replies.Events[0].ID != "reply" {
-		t.Fatalf("replies = %+v", replies.Events)
+	if len(replies.Order) != 1 || replies.Order[0] != "reply" {
+		t.Fatalf("replies = %+v", replies.Order)
 	}
 }
 

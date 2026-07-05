@@ -31,14 +31,14 @@ const (
 func TestSocialGraphBundlesFollowsProfilesRelaysMutes(t *testing.T) {
 	store := socialGraphStore{
 		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{
-			follow1: {Name: "alice", Picture: "http://x/a.png"},
+			follow1: {Name: "alice", Picture: "http://x/a.png", EventID: "p1", RawJSON: `{"name":"alice"}`},
 		}},
 		events: []chstore.EventView{
-			{Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
+			{ID: "c3", Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
 				Tags: [][]string{{"p", follow1}, {"p", follow2}}},
-			{Kind: 10002, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
+			{ID: "r10002", Kind: 10002, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
 				Tags: [][]string{{"r", "wss://a"}, {"r", "wss://b", "write"}, {"r", "wss://c", "read"}}},
-			{Kind: 10000, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
+			{ID: "m10000", Kind: 10000, PubKey: testPubkey, CreatedAt: time.Unix(200, 0),
 				Tags: [][]string{{"p", muted1}}},
 		},
 	}
@@ -51,34 +51,28 @@ func TestSocialGraphBundlesFollowsProfilesRelaysMutes(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp SocialGraphResponse
+	var resp Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Pubkey != testPubkey {
-		t.Fatalf("pubkey = %s", resp.Pubkey)
+	// The three latest list events are embedded in order; the client derives
+	// references, relays, and mutes from their tags.
+	if len(resp.Order) != 3 || resp.Order[0] != "c3" || resp.Order[1] != "r10002" || resp.Order[2] != "m10000" {
+		t.Fatalf("order = %v", resp.Order)
 	}
-	if len(resp.Follows) != 2 || resp.Follows[0] != follow1 || resp.Follows[1] != follow2 {
-		t.Fatalf("follows = %+v", resp.Follows)
+	byID := map[string]FeedEvent{}
+	for _, event := range resp.Events {
+		byID[event.ID] = event
 	}
-	if resp.Mutes[0] != muted1 {
-		t.Fatalf("mutes = %+v", resp.Mutes)
+	if len(byID["c3"].Tags) != 2 || byID["c3"].Tags[0][1] != follow1 {
+		t.Fatalf("contact list event = %+v", byID["c3"])
 	}
-	if resp.Profiles[follow1].Name != "alice" {
-		t.Fatalf("profiles = %+v (follow1 should be bundled inline)", resp.Profiles)
+	if len(byID["r10002"].Tags) != 3 || len(byID["m10000"].Tags) != 1 {
+		t.Fatalf("relay/mute list events = %+v / %+v", byID["r10002"], byID["m10000"])
 	}
-	want := []RelayListEntry{
-		{URL: "wss://a", Read: true, Write: true},
-		{URL: "wss://b", Read: false, Write: true},
-		{URL: "wss://c", Read: true, Write: false},
-	}
-	if len(resp.Relays) != 3 {
-		t.Fatalf("relays = %+v", resp.Relays)
-	}
-	for i, r := range want {
-		if resp.Relays[i] != r {
-			t.Fatalf("relay[%d] = %+v, want %+v", i, resp.Relays[i], r)
-		}
+	// The referenced pubkeys' kind-0 profile events ride along.
+	if _, ok := byID["p1"]; !ok {
+		t.Fatalf("follow1's kind-0 profile event should be embedded: %v", resp.Events)
 	}
 }
 
@@ -86,8 +80,8 @@ func TestSocialGraphPrefersNewerContactList(t *testing.T) {
 	store := socialGraphStore{
 		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
 		events: []chstore.EventView{
-			{Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(100, 0), Tags: [][]string{{"p", follow1}}},
-			{Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(200, 0), Tags: [][]string{{"p", follow1}, {"p", follow2}}},
+			{ID: "old", Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(100, 0), Tags: [][]string{{"p", follow1}}},
+			{ID: "new", Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(200, 0), Tags: [][]string{{"p", follow1}, {"p", follow2}}},
 		},
 	}
 	handler := New(store, WithNIP05Validation(false))
@@ -96,9 +90,12 @@ func TestSocialGraphPrefersNewerContactList(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/nostr/social-graph?viewer="+testPubkey, nil)
 	handler.socialGraph(rec, req)
 
-	var resp SocialGraphResponse
+	var resp Envelope
 	_ = json.NewDecoder(rec.Body).Decode(&resp)
-	if len(resp.Follows) != 2 {
-		t.Fatalf("follows = %+v, want the created_at:200 list (LWW)", resp.Follows)
+	if len(resp.Order) != 1 || resp.Order[0] != "new" {
+		t.Fatalf("order = %v, want only the created_at:200 list (LWW)", resp.Order)
+	}
+	if len(resp.Events) != 1 || len(resp.Events[0].Tags) != 2 {
+		t.Fatalf("events = %+v, want the newer contact list", resp.Events)
 	}
 }

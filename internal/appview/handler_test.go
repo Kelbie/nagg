@@ -799,18 +799,27 @@ func TestDMEnvelopesReturnsEncryptedContentVerbatim(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response DmEnvelopesResponse
+	var response Envelope
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(response.DmEnvelopes.Nodes) != 1 {
-		t.Fatalf("envelopes = %+v, want exactly one", response.DmEnvelopes.Nodes)
+	if len(response.Events) != 1 {
+		t.Fatalf("events = %+v, want exactly one", response.Events)
 	}
-	if got := response.DmEnvelopes.Nodes[0].Content; got != ciphertext {
+	if got := response.Events[0].Content; got != ciphertext {
 		t.Fatalf("envelope content = %q, want encrypted ciphertext verbatim %q", got, ciphertext)
 	}
-	if response.DmEnvelopes.PageInfo.EndCursor == nil {
-		t.Fatalf("pageInfo.endCursor = nil, want a cursor for a non-empty page")
+	if response.Cursor == nil {
+		t.Fatalf("cursor = nil, want a cursor for a non-empty page")
+	}
+	// PRIVACY: DM responses must never enrich — no aggregates, no profiles.
+	if len(response.Aggregates) != 0 {
+		t.Fatalf("aggregates = %+v, want empty on the DM path", response.Aggregates)
+	}
+	for _, event := range response.Events {
+		if event.Kind == 0 {
+			t.Fatalf("profile hydration leaked into the DM path: %+v", event)
+		}
 	}
 }
 
@@ -1278,6 +1287,7 @@ func TestProfilesEndpointReturnsPictureEvenWhenNameMissing(t *testing.T) {
 					PubKey:  testPubkey,
 					EventID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 					Picture: "https://example.test/avatar.png",
+					RawJSON: `{"picture":"https://example.test/avatar.png"}`,
 				},
 			},
 		},
@@ -1291,13 +1301,15 @@ func TestProfilesEndpointReturnsPictureEvenWhenNameMissing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response EnrichmentResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	profile, ok := response.Profiles[testPubkey]
-	if !ok || profile.Picture != "https://example.test/avatar.png" {
-		t.Fatalf("profiles = %+v", response.Profiles)
+	if len(response.Events) != 1 || response.Events[0].Kind != 0 {
+		t.Fatalf("events = %+v, want one kind-0", response.Events)
+	}
+	if !strings.Contains(response.Events[0].Content, "avatar.png") {
+		t.Fatalf("profile event content = %q", response.Events[0].Content)
 	}
 }
 
@@ -1352,7 +1364,7 @@ func TestProfileSkipsVertexBelowLocalFollowerThreshold(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response ProfileResponse
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
@@ -1362,14 +1374,18 @@ func TestProfileSkipsVertexBelowLocalFollowerThreshold(t *testing.T) {
 	if store.cacheCalls != 0 {
 		t.Fatalf("cache calls = %d, want 0", store.cacheCalls)
 	}
-	if response.Score != nil || response.Rank != 0 || response.FromCache {
-		t.Fatalf("vertex fields leaked into low-follower response: %+v", response)
+	if v := vertexOf(response, testPubkey); v != nil && (v["score"] != nil || v["rank"] != float64(0)) {
+		t.Fatalf("vertex fields leaked into low-follower response: %+v", v)
 	}
-	if response.Followers != 499 || response.Follows != 7 {
-		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	if response.FromCache {
+		t.Fatal("fromCache leaked into low-follower response")
 	}
-	if response.CreatedAt == nil || *response.CreatedAt != firstEventAt.Unix() {
-		t.Fatalf("created_at = %v", response.CreatedAt)
+	followers, follows := followerCounts(response, testPubkey)
+	if followers != 499 || follows != 7 {
+		t.Fatalf("counts = followers %d follows %d", followers, follows)
+	}
+	if got := firstEventAtOf(response, testPubkey); got == nil || *got != firstEventAt.Unix() {
+		t.Fatalf("firstEventAt = %v", got)
 	}
 }
 
@@ -1420,15 +1436,12 @@ func TestProfileRefreshesAndSavesVertexAtFollowerThreshold(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response ProfileResponse
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.PubKey != testPubkey || response.Npub == "" {
-		t.Fatalf("identity fields not set: %+v", response)
-	}
-	if response.Name == nil || *response.Name != "sovran" {
-		t.Fatalf("name = %v", response.Name)
+	if len(response.Pubkeys) != 1 || response.Pubkeys[0] != testPubkey {
+		t.Fatalf("pubkeys = %v", response.Pubkeys)
 	}
 	if refreshCalls != 1 {
 		t.Fatalf("vertex refresh calls = %d, want 1", refreshCalls)
@@ -1439,17 +1452,19 @@ func TestProfileRefreshesAndSavesVertexAtFollowerThreshold(t *testing.T) {
 	if response.FromCache {
 		t.Fatal("fresh vertex response should not be marked from cache")
 	}
-	if response.Followers != 500 || response.Follows != 30 {
-		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	followers, follows := followerCounts(response, testPubkey)
+	if followers != 500 || follows != 30 {
+		t.Fatalf("counts = followers %d follows %d", followers, follows)
 	}
-	if response.Score == nil || *response.Score != score {
-		t.Fatalf("score = %v", response.Score)
+	v := vertexOf(response, testPubkey)
+	if v == nil || v["score"] != score {
+		t.Fatalf("vertex score = %+v", v)
 	}
-	if response.Nodes == nil || *response.Nodes != nodes {
-		t.Fatalf("nodes = %v", response.Nodes)
+	if v["nodes"] != float64(nodes) {
+		t.Fatalf("vertex nodes = %v", v["nodes"])
 	}
-	if response.CreatedAt == nil || *response.CreatedAt != firstEventAt.Unix() {
-		t.Fatalf("created_at = %v", response.CreatedAt)
+	if got := firstEventAtOf(response, testPubkey); got == nil || *got != firstEventAt.Unix() {
+		t.Fatalf("firstEventAt = %v", got)
 	}
 }
 
@@ -1481,12 +1496,12 @@ func TestProfileFallsBackToLocalCreatedAtWhenVertexMissing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response ProfileResponse
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.CreatedAt == nil || *response.CreatedAt != createdAt.Unix() {
-		t.Fatalf("created_at = %v", response.CreatedAt)
+	if got := firstEventAtOf(response, testPubkey); got == nil || *got != createdAt.Unix() {
+		t.Fatalf("firstEventAt = %v", got)
 	}
 }
 
@@ -1528,7 +1543,7 @@ func TestProfileFallsBackToCachedVertexProfileWhenRefreshFails(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response ProfileResponse
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
@@ -1544,11 +1559,12 @@ func TestProfileFallsBackToCachedVertexProfileWhenRefreshFails(t *testing.T) {
 	if !response.FromCache {
 		t.Fatal("expected cached vertex fallback")
 	}
-	if response.Score == nil || *response.Score != score {
-		t.Fatalf("score = %v", response.Score)
+	if v := vertexOf(response, testPubkey); v == nil || v["score"] != score {
+		t.Fatalf("vertex payload = %+v", v)
 	}
-	if response.Followers != 500 || response.Follows != 30 {
-		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	followers, follows := followerCounts(response, testPubkey)
+	if followers != 500 || follows != 30 {
+		t.Fatalf("counts = followers %d follows %d", followers, follows)
 	}
 }
 
@@ -1581,7 +1597,7 @@ func TestProfileReturnsLocalOnlyWhenVertexAndCacheMiss(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response ProfileResponse
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
@@ -1591,11 +1607,12 @@ func TestProfileReturnsLocalOnlyWhenVertexAndCacheMiss(t *testing.T) {
 	if store.cacheCalls != 1 {
 		t.Fatalf("cache calls = %d, want 1", store.cacheCalls)
 	}
-	if response.FromCache || response.Score != nil || response.Rank != 0 {
-		t.Fatalf("expected local-only response, got %+v", response)
+	if v := vertexOf(response, testPubkey); response.FromCache || (v != nil && (v["score"] != nil || v["rank"] != float64(0))) {
+		t.Fatalf("expected local-only response, got fromCache=%v vertex=%+v", response.FromCache, v)
 	}
-	if response.Followers != 500 || response.Follows != 30 {
-		t.Fatalf("counts = followers %d follows %d", response.Followers, response.Follows)
+	followers, follows := followerCounts(response, testPubkey)
+	if followers != 500 || follows != 30 {
+		t.Fatalf("counts = followers %d follows %d", followers, follows)
 	}
 }
 
@@ -1609,6 +1626,8 @@ func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 					PubKey:      testPubkey,
 					DisplayName: "Sovran",
 					Picture:     "https://example.test/avatar.png",
+					EventID:     strings.Repeat("f", 64),
+					RawJSON:     `{"display_name":"Sovran"}`,
 				},
 			},
 		},
@@ -1630,22 +1649,24 @@ func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response struct {
-		Query     string         `json:"query"`
-		Results   []SearchResult `json:"results"`
-		FromCache bool           `json:"fromCache"`
-	}
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if !response.FromCache || response.Query != "sovran" {
-		t.Fatalf("response metadata = %+v", response)
+	if !response.FromCache {
+		t.Fatalf("fromCache = false, want cached vertex path")
 	}
-	if len(response.Results) != 1 {
-		t.Fatalf("results len = %d", len(response.Results))
+	if len(response.Pubkeys) != 1 || response.Pubkeys[0] != testPubkey {
+		t.Fatalf("pubkeys = %v", response.Pubkeys)
 	}
-	if response.Results[0].DisplayName == nil || *response.Results[0].DisplayName != "Sovran" {
-		t.Fatalf("displayName = %v", response.Results[0].DisplayName)
+	if len(response.Events) != 1 || response.Events[0].Kind != 0 || !strings.Contains(response.Events[0].Content, "Sovran") {
+		t.Fatalf("events = %+v, want the local kind-0", response.Events)
+	}
+	if len(response.Order) != 1 || response.Order[0] != strings.Repeat("f", 64) {
+		t.Fatalf("order = %v, want the kind-0 event id", response.Order)
+	}
+	if v := vertexOf(response, testPubkey); v == nil || v["score"] != 42.5 {
+		t.Fatalf("vertex payload = %+v", v)
 	}
 }
 
@@ -1684,25 +1705,18 @@ func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response struct {
-		Query     string         `json:"query"`
-		Results   []SearchResult `json:"results"`
-		FromCache bool           `json:"fromCache"`
-	}
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
 	if response.FromCache {
 		t.Fatalf("fromCache should be false when DVM errored, got %+v", response)
 	}
-	if len(response.Results) != 1 {
-		t.Fatalf("expected 1 local result, got %d", len(response.Results))
+	if len(response.Pubkeys) != 1 || response.Pubkeys[0] != testPubkey {
+		t.Fatalf("pubkeys = %v, want the local result even without a kind-0 event", response.Pubkeys)
 	}
-	if response.Results[0].PubKey != testPubkey {
-		t.Fatalf("pubkey = %s", response.Results[0].PubKey)
-	}
-	if response.Results[0].DisplayName == nil || *response.Results[0].DisplayName != "Sovran" {
-		t.Fatalf("displayName = %v", response.Results[0].DisplayName)
+	if v := vertexOf(response, testPubkey); v == nil || v["rank"] != 7.0 {
+		t.Fatalf("vertex payload = %+v", v)
 	}
 }
 
@@ -1715,8 +1729,8 @@ func TestSearchHonorsProviderOrdering(t *testing.T) {
 	rA, rB := 0.1, 0.9
 	handler := New(
 		fakeStore{profiles: map[string]chstore.ProfileRow{
-			pubA: {PubKey: pubA, DisplayName: "Alice"},
-			pubB: {PubKey: pubB, DisplayName: "Bob"},
+			pubA: {PubKey: pubA, DisplayName: "Alice", EventID: strings.Repeat("a", 64), RawJSON: `{"display_name":"Alice"}`},
+			pubB: {PubKey: pubB, DisplayName: "Bob", EventID: strings.Repeat("b", 64), RawJSON: `{"display_name":"Bob"}`},
 		}},
 		WithProfileSearch(fakeVertex{search: []vertex.SearchResult{
 			{PubKey: pubB, Npub: vertex.Npub(pubB), Rank: &rB},
@@ -1732,17 +1746,16 @@ func TestSearchHonorsProviderOrdering(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response struct {
-		Results []SearchResult `json:"results"`
-	}
+	var response ProvidersEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Results) != 2 {
-		t.Fatalf("results len = %d", len(response.Results))
+	if len(response.Pubkeys) != 2 || response.Pubkeys[0] != pubB || response.Pubkeys[1] != pubA {
+		t.Fatalf("pubkeys = %v want [%s %s]", response.Pubkeys, pubB, pubA)
 	}
-	if response.Results[0].PubKey != pubB || response.Results[1].PubKey != pubA {
-		t.Fatalf("order = %s,%s want %s,%s", response.Results[0].PubKey, response.Results[1].PubKey, pubB, pubA)
+	// Order anchors the kind-0 events in the same provider ranking.
+	if len(response.Order) != 2 || response.Order[0] != strings.Repeat("b", 64) || response.Order[1] != strings.Repeat("a", 64) {
+		t.Fatalf("order = %v", response.Order)
 	}
 }
 
@@ -1770,15 +1783,6 @@ func TestSearchClampsLimitAboveCeiling(t *testing.T) {
 	}
 	if captured.Limit != 100 {
 		t.Fatalf("provider limit = %d, want clamped 100", captured.Limit)
-	}
-	var response struct {
-		Limit int `json:"limit"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-	if response.Limit != 100 {
-		t.Fatalf("echoed limit = %d, want 100", response.Limit)
 	}
 }
 
@@ -2008,25 +2012,32 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 	if store.lastInput.Until != 1_710_000_000 || store.lastInput.Limit != 25 {
 		t.Fatalf("until/limit = %d/%d", store.lastInput.Until, store.lastInput.Limit)
 	}
-	var response NotificationsResponse
+	var response NotificationsEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Notifications.Nodes) != 1 {
-		t.Fatalf("notifications = %+v", response.Notifications)
+	if len(response.Entries) != 1 {
+		t.Fatalf("entries = %+v", response.Entries)
 	}
-	got := response.Notifications.Nodes[0]
-	if got.Event.ID != eventID || got.Reason != "REACTION" || got.ActorVertexScore != 0.42 {
-		t.Fatalf("notification row = %+v", got)
+	got := response.Entries[0]
+	if got.ID != eventID || got.Kind != 7 || got.Actor == "" && len(got.Actors) == 0 {
+		t.Fatalf("entry = %+v", got)
 	}
-	if response.Metrics[eventID].LikeCount != 3 {
-		t.Fatalf("metrics = %+v", response.Metrics)
+	if len(got.Actors) != 1 || got.Actors[0].ActorVertexScore != 0.42 {
+		t.Fatalf("entry actors = %+v", got.Actors)
 	}
-	if response.Profiles[actorPubkey].Name != "Reactor" {
-		t.Fatalf("profiles = %+v", response.Profiles)
+	// No reason strings anywhere in the payload — kinds only.
+	if strings.Contains(rec.Body.String(), "REACTION") || strings.Contains(rec.Body.String(), "reaction") {
+		t.Fatalf("reason string leaked into response: %s", rec.Body.String())
 	}
-	if response.Notifications.PageInfo.EndCursor == nil {
-		t.Fatalf("pageInfo.endCursor = nil, want a cursor for a non-empty page")
+	if response.Aggregates[eventID]["k7_e"]["actors"] != 3 {
+		t.Fatalf("aggregates = %+v", response.Aggregates)
+	}
+	if response.Order[0] != eventID {
+		t.Fatalf("order = %v", response.Order)
+	}
+	if response.Cursor == nil {
+		t.Fatalf("cursor = nil, want a cursor for a non-empty page")
 	}
 }
 
@@ -2125,8 +2136,8 @@ func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) 
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{
 				profiles: map[string]chstore.ProfileRow{
-					hex('1'): {PubKey: hex('1'), DisplayName: "A1"},
-					hex('2'): {PubKey: hex('2'), DisplayName: "A2"},
+					hex('1'): {PubKey: hex('1'), DisplayName: "A1", EventID: hex('7'), RawJSON: `{"display_name":"A1"}`},
+					hex('2'): {PubKey: hex('2'), DisplayName: "A2", EventID: hex('8'), RawJSON: `{"display_name":"A2"}`},
 				},
 				counts: chstore.FollowCounts{Followers: 100},
 			},
@@ -2143,35 +2154,62 @@ func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp NotificationsResponse
+	var resp NotificationsEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	nodes := resp.Notifications.Nodes
-	if len(nodes) != 3 {
-		t.Fatalf("items = %d, want 3 (reaction group, follow group, reply single): %+v", len(nodes), nodes)
+	entries := resp.Entries
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3 (kind-7 group, kind-3 group, kind-1 single): %+v", len(entries), entries)
 	}
-	// node[0]: reaction group on the shared target.
-	if nodes[0].Type != "group" || nodes[0].Reason != "reaction" || nodes[0].Total != 2 {
-		t.Fatalf("reaction group = %+v", nodes[0])
+	// entry[0]: kind-7 group on the shared target.
+	if entries[0].Kind != 7 || entries[0].Total != 2 || entries[0].Target != target {
+		t.Fatalf("kind-7 group = %+v", entries[0])
 	}
-	if len(nodes[0].SampleActors) != 2 || nodes[0].TargetEventID != target || nodes[0].TargetEvent == nil {
-		t.Fatalf("reaction group actors/target = %+v", nodes[0])
+	if len(entries[0].Actors) != 2 {
+		t.Fatalf("kind-7 group actors = %+v", entries[0].Actors)
 	}
-	// node[1]: follow group with the exact follower count from FollowCounts.
-	if nodes[1].Type != "group" || nodes[1].Reason != "follow" || nodes[1].Total != 100 || nodes[1].TotalCapped {
-		t.Fatalf("follow group = %+v", nodes[1])
+	// The target event is embedded in the envelope.
+	targetEmbedded := false
+	for _, event := range resp.Events {
+		if event.ID == target {
+			targetEmbedded = true
+		}
 	}
-	if len(nodes[1].SampleActors) != 3 {
-		t.Fatalf("follow sample actors = %d, want 3", len(nodes[1].SampleActors))
+	if !targetEmbedded {
+		t.Fatalf("target event not embedded: %v", resp.Order)
 	}
-	// node[2]: reply stays single (text must be readable).
-	if nodes[2].Type != "single" || nodes[2].Reason != "reply" {
-		t.Fatalf("reply single = %+v", nodes[2])
+	// entry[1]: kind-3 group with the exact count from FollowCounts.
+	if entries[1].Kind != 3 || entries[1].Total != 100 || entries[1].TotalCapped {
+		t.Fatalf("kind-3 group = %+v", entries[1])
 	}
-	// Sample-actor profiles are hydrated even though their member events collapsed.
-	if resp.Profiles[hex('2')].Name != "A2" {
-		t.Fatalf("sample actor profile missing: %+v", resp.Profiles)
+	if len(entries[1].Actors) != 3 {
+		t.Fatalf("kind-3 sample actors = %d, want 3", len(entries[1].Actors))
+	}
+	// entry[2]: the kind-1 stays single (no Total).
+	if entries[2].Kind != 1 || entries[2].Total != 0 {
+		t.Fatalf("kind-1 single = %+v", entries[2])
+	}
+	// Order anchors the representative ids.
+	if len(resp.Order) != 3 || resp.Order[0] != entries[0].ID {
+		t.Fatalf("order = %v", resp.Order)
+	}
+	// Sample-actor kind-0 profile events are embedded even though their member
+	// events collapsed.
+	actorProfileEmbedded := false
+	for _, event := range resp.Events {
+		if event.Kind == 0 && event.PubKey == hex('2') {
+			actorProfileEmbedded = true
+		}
+	}
+	if !actorProfileEmbedded {
+		t.Fatalf("sample actor profile event missing")
+	}
+	// No reason vocabulary in the payload.
+	for _, word := range []string{"reaction", "follow", "reply"} {
+		if strings.Contains(rec.Body.String(), "\"reason\":") || strings.Contains(rec.Body.String(), "\""+word+"\"") {
+			t.Fatalf("reason string %q leaked into response", word)
+		}
 	}
 }
 
@@ -2196,16 +2234,16 @@ func TestNotificationsGroupedFalseReturnsRawSingles(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp NotificationsResponse
+	var resp NotificationsEnvelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Notifications.Nodes) != 2 {
-		t.Fatalf("grouped=false should return raw rows, got %d", len(resp.Notifications.Nodes))
+	if len(resp.Entries) != 2 {
+		t.Fatalf("grouped=false should return raw rows, got %d", len(resp.Entries))
 	}
-	for _, n := range resp.Notifications.Nodes {
-		if n.Type != "single" || n.Total != 0 || len(n.SampleActors) != 0 {
-			t.Fatalf("grouped=false node must be a raw single: %+v", n)
+	for _, entry := range resp.Entries {
+		if entry.Total != 0 {
+			t.Fatalf("grouped=false entry must be a raw single: %+v", entry)
 		}
 	}
 }
@@ -2235,4 +2273,36 @@ func TestParseDmKindsDefaultsToNip04AndNip17(t *testing.T) {
 			}
 		})
 	}
+}
+
+// vertexOf returns the vertex provider payload for a pubkey, or nil.
+func vertexOf(resp ProvidersEnvelope, pubkey string) map[string]any {
+	if resp.Providers == nil || resp.Providers[pubkey] == nil {
+		return nil
+	}
+	payload, _ := resp.Providers[pubkey]["vertex"].(map[string]any)
+	return payload
+}
+
+// followerCounts reads the follower/following aggregates for a pubkey.
+func followerCounts(resp ProvidersEnvelope, pubkey string) (followers, follows uint64) {
+	return resp.Aggregates[pubkey]["k3_p_latest"]["actors"],
+		resp.Aggregates[pubkey]["k3_author_latest"]["sources"]
+}
+
+// firstEventAtOf reads the nagg provider first-indexed timestamp, or nil.
+func firstEventAtOf(resp ProvidersEnvelope, pubkey string) *int64 {
+	if resp.Providers == nil || resp.Providers[pubkey] == nil {
+		return nil
+	}
+	payload, _ := resp.Providers[pubkey]["nagg"].(map[string]any)
+	if payload == nil {
+		return nil
+	}
+	v, ok := payload["firstEventAt"].(float64)
+	if !ok {
+		return nil
+	}
+	ts := int64(v)
+	return &ts
 }

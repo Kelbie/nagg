@@ -7,12 +7,6 @@ import (
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 )
 
-// DmConversationResponse wraps the connection under `dmConversation` to match
-// the canonical NaggDmConversationData shape.
-type DmConversationResponse struct {
-	DmConversation DmConnection `json:"dmConversation"`
-}
-
 // dmConversation is the REST app-view counterpart of the GraphQL dmConversation
 // resolver: the viewer's DM events optionally scoped to one counterparty. Legacy
 // NIP-04 (kind 4) is scoped to the pair when a counterparty is given; gift wraps
@@ -103,8 +97,10 @@ func (h *Handler) dmConversation(w http.ResponseWriter, r *http.Request) {
 
 	merged := mergeDmEnvelopes(limit, collected)
 	slog.Info("appview.dm.conversation", "viewer", viewer, "scoped", counterparty != "", "results", len(merged))
-	writeJSON(w, DmConversationResponse{DmConversation: DmConnection{
-		Nodes:    merged,
-		PageInfo: PageInfo{HasNextPage: len(merged) >= limit, EndCursor: eventEndCursor(merged)},
-	}})
+	// PRIVACY: served bare, like dmEnvelopes — never enrich DM authors.
+	order := make([]string, 0, len(merged))
+	for _, event := range merged {
+		order = append(order, event.ID)
+	}
+	writeJSON(w, inlineEnvelope(order, orderByCreatedAt, merged, eventEndCursor(merged)))
 }

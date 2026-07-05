@@ -303,7 +303,7 @@ func restCachePolicy(path string, defFresh, defStale time.Duration) (fresh, stal
 		return 300 * time.Second, 30 * time.Minute
 	case strings.HasSuffix(path, "/thread"):
 		return 30 * time.Second, 5 * time.Minute
-	case strings.Contains(path, "/feed"), strings.HasSuffix(path, "/notes/stats"),
+	case strings.Contains(path, "/feed"), strings.HasSuffix(path, "/events/aggregates"),
 		strings.HasSuffix(path, "/events"):
 		return 20 * time.Second, 5 * time.Minute
 	default:

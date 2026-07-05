@@ -79,7 +79,7 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 		t,
 		mux,
 		http.MethodPost,
-		"/nostr/notes/stats",
+		"/nostr/events/aggregates",
 		map[string][]string{"ids": {integrationRootID}},
 		&stats,
 	)

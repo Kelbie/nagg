@@ -730,7 +730,7 @@ func TestServiceInfoExposesCapabilities(t *testing.T) {
 	}
 	data := result.Data.(map[string]any)
 	info := data["serviceInfo"].(map[string]any)
-	if info["graphqlSchemaVersion"] == "" || info["appViewVersion"] != "v1" {
+	if info["graphqlSchemaVersion"] == "" || info["appViewVersion"] != "v2" {
 		t.Fatalf("serviceInfo = %+v", info)
 	}
 	caps := info["capabilities"].([]any)
@@ -753,7 +753,7 @@ func TestHandlerWritesCapabilityHeaders(t *testing.T) {
 	if got := rec.Header().Get("X-Nagg-Capabilities"); !strings.Contains(got, "graphql.rank.pubkeyScoreTerms") {
 		t.Fatalf("capability header = %q", got)
 	}
-	if got := rec.Header().Get("X-Nagg-App-View-Version"); got != "v1" {
+	if got := rec.Header().Get("X-Nagg-App-View-Version"); got != "v2" {
 		t.Fatalf("app view version header = %q", got)
 	}
 }
