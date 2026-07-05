@@ -850,22 +850,65 @@ func (s *Store) BatchPubkeyStats(ctx context.Context, pubkeys []string) (map[str
 	// kind-3 p-tag history in event_tags — was both wrong (counted every pubkey
 	// that EVER followed, ignoring NIP-02 replaceability) and one of the heavy
 	// per-request aggregations on a 2B-row table.
+	found, err := s.readPubkeyStatsInto(ctx, pubkeys, out)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read-through fill: the rollup only covers recently-active authors, so a
+	// cold profile (no events inside the touched window) has no row and would
+	// read as zero inbound refs forever — even with its referencing lists
+	// fully indexed. Compute the missing pubkeys' stats on demand and write
+	// them back, so the next read is a plain row hit.
+	missing := make([]string, 0)
+	for _, pubkey := range pubkeys {
+		if _, ok := found[pubkey]; !ok {
+			missing = append(missing, pubkey)
+		}
+	}
+	if len(missing) > 0 && len(missing) <= pubkeyStatsFillCap {
+		quoted := make([]string, len(missing))
+		for i, pk := range missing {
+			quoted[i] = "'" + pk + "'"
+		}
+		population := "SELECT arrayJoin([" + strings.Join(quoted, ", ") + "]) AS pubkey"
+		if err := s.conn.Exec(ctx, buildPubkeyStatsForSQL(population, time.Now().UTC())); err != nil {
+			// Fill is best-effort: the profile still renders with the live
+			// k3_out count; followers stay zero until a later fill succeeds.
+			return out, nil
+		}
+		if _, err := s.readPubkeyStatsInto(ctx, missing, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// pubkeyStatsFillCap bounds the on-demand fill population per read — profile
+// pages ask for a handful of pubkeys; anything larger waits for the rollup.
+const pubkeyStatsFillCap = 20
+
+// readPubkeyStatsInto reads stored rows into out, returning which pubkeys had
+// a row at all (a stored zero is a real answer; a missing row is not).
+func (s *Store) readPubkeyStatsInto(ctx context.Context, pubkeys []string, out map[string]PubkeyStats) (map[string]struct{}, error) {
 	rows, err := s.conn.Query(ctx, batchPubkeyStatsQuery, pubkeys)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	found := make(map[string]struct{}, len(pubkeys))
 	for rows.Next() {
 		var pubkey string
 		var followers uint64
 		if err := rows.Scan(&pubkey, &followers); err != nil {
 			return nil, err
 		}
+		found[pubkey] = struct{}{}
 		counts := out[pubkey]
 		counts.Followers = followers
 		out[pubkey] = counts
 	}
-	return out, rows.Err()
+	return found, rows.Err()
 }
 
 // FollowEdge describes the directional follow relationship between a viewer and

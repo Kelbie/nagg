@@ -344,7 +344,14 @@ func touchedAuthorsSubquery(since time.Time, limit int) string {
 }
 
 func buildPubkeyStatsSQL(since time.Time, limit int, computedAt time.Time) string {
-	touched := touchedAuthorsSubquery(since, limit)
+	return buildPubkeyStatsForSQL(touchedAuthorsSubquery(since, limit), computedAt)
+}
+
+// buildPubkeyStatsForSQL renders the pubkey_stats INSERT for an arbitrary
+// population clause (the rollup's touched-authors window, or an explicit
+// pubkey list for the read-through fill on cold profiles).
+func buildPubkeyStatsForSQL(population string, computedAt time.Time) string {
+	touched := population
 	// k3_out = size of the pubkey's latest kind-3 reference list; k1_1111_authored
 	// = uniqMerge of the author rule aggregate; k3_in = fan-in over every
 	// pubkey's LATEST kind-3 list. The fan-in scans all latest lists (anyone may
