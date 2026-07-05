@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -370,6 +371,137 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 			return nil, err
 		}
 		out[id] = st
+	}
+	return out, rows.Err()
+}
+
+// aggCol maps one selected column of the aggregates query back to its
+// (rule, metric) identity, in select order.
+type aggCol struct {
+	rule   string
+	metric string
+}
+
+// buildEventAggregatesQuery renders the one-round-trip aggregates read for
+// every event-target rule in the registry plus the vertex-real block, and
+// reports how many `?` bind slots (each an id list) the query carries.
+func buildEventAggregatesQuery(reg *rules.Registry) (string, []aggCol, int) {
+	var (
+		unions  []string
+		joins   []string
+		selects []string
+		cols    []aggCol
+	)
+	eventRules := 0
+	for _, rel := range reg.Relationships() {
+		if rel.Ref.Target != rules.TargetEventID {
+			continue
+		}
+		table := rules.TableName(rel.Name)
+		alias := fmt.Sprintf("a%d", eventRules)
+		eventRules++
+		if len(unions) == 0 {
+			unions = append(unions, fmt.Sprintf("SELECT target AS id FROM %s WHERE target IN (?)", table))
+		} else {
+			unions = append(unions, fmt.Sprintf("UNION DISTINCT SELECT target FROM %s WHERE target IN (?)", table))
+		}
+		var metricSelects []string
+		for _, m := range rel.Metrics {
+			spec, _ := reg.ReadSpec(rel.Name, m.Name)
+			metricSelects = append(metricSelects, fmt.Sprintf("%s(%s) AS %s", spec.MergeFunc, m.Name, m.Name))
+			selects = append(selects, fmt.Sprintf("ifNull(%s.%s, 0)", alias, m.Name))
+			cols = append(cols, aggCol{rule: rel.Name, metric: m.Name})
+		}
+		joins = append(joins, fmt.Sprintf(
+			"LEFT JOIN (SELECT target, %s FROM %s WHERE target IN (?) GROUP BY target) %s ON %s.target = ids.id",
+			strings.Join(metricSelects, ", "), table, alias, alias))
+	}
+	unions = append(unions, "UNION DISTINCT SELECT event_id FROM note_engagement_real WHERE event_id IN (?)")
+	joins = append(joins, `LEFT JOIN (
+			SELECT event_id,
+				argMax(real_likes, computed_at) AS rl,
+				argMax(real_reposts, computed_at) AS rr,
+				argMax(real_replies, computed_at) AS re,
+				argMax(real_quotes, computed_at) AS rq,
+				argMax(real_zaps, computed_at) AS rzn,
+				argMax(real_zap_sats, computed_at) AS rz,
+				argMax(real_actors, computed_at) AS ra
+			FROM note_engagement_real WHERE event_id IN (?) GROUP BY event_id
+		) er ON er.event_id = ids.id`)
+	for _, c := range []struct{ expr, rule, metric string }{
+		{"ifNull(er.rl, 0)", "vertex_k7_e", "actors"},
+		{"ifNull(er.rr, 0)", "vertex_k6_16_e", "actors"},
+		{"ifNull(er.re, 0)", "vertex_k1_1111_e_reply", "sources"},
+		{"ifNull(er.rq, 0)", "vertex_k1_q", "sources"},
+		{"ifNull(er.rzn, 0)", "vertex_k9735_e", "sources"},
+		{"ifNull(er.rz, 0)", "vertex_k9735_e", "value_total"},
+		{"ifNull(er.ra, 0)", "vertex_actors", "actors"},
+	} {
+		selects = append(selects, c.expr)
+		cols = append(cols, aggCol{rule: c.rule, metric: c.metric})
+	}
+
+	query := fmt.Sprintf("SELECT\n\tids.id,\n\t%s\nFROM (\n\t%s\n) ids\n%s",
+		strings.Join(selects, ",\n\t"),
+		strings.Join(unions, "\n\t"),
+		strings.Join(joins, "\n"))
+	return query, cols, len(unions) + len(joins)
+}
+
+// EventAggregates returns, for each requested event id, every declared
+// event-target aggregation's finalized metric values, keyed
+// target -> rule name -> metric name. This is the generic successor of
+// NoteStats: the rule set comes from the registry, so a newly declared
+// relationship shows up in every envelope without a read-path change. The
+// vertex-real threshold-filtered counts (note_engagement_real) are exposed
+// under "vertex_"-prefixed rule names pending the DVM plugin seam.
+//
+// ONE query on ONE connection: LEFT JOIN every aggregate onto the UNION of
+// per-table target keys, so a whole page's aggregates are a single
+// round-trip (see NoteStats for the history behind that constraint). Ids
+// with no aggregates anywhere are simply absent from the result.
+func (s *Store) EventAggregates(ctx context.Context, ids []string) (map[string]map[string]map[string]uint64, error) {
+	ids = uniqueStrings(ids)
+	out := make(map[string]map[string]map[string]uint64, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+
+	query, cols, bindSlots := buildEventAggregatesQuery(s.rules)
+	args := make([]any, 0, bindSlots)
+	for i := 0; i < bindSlots; i++ {
+		args = append(args, ids)
+	}
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		values := make([]uint64, len(cols))
+		dest := make([]any, 0, len(cols)+1)
+		dest = append(dest, &id)
+		for i := range values {
+			dest = append(dest, &values[i])
+		}
+		if err := rows.Scan(dest...); err != nil {
+			return nil, err
+		}
+		byRule := make(map[string]map[string]uint64)
+		for i, c := range cols {
+			if values[i] == 0 {
+				continue
+			}
+			if byRule[c.rule] == nil {
+				byRule[c.rule] = make(map[string]uint64)
+			}
+			byRule[c.rule][c.metric] = values[i]
+		}
+		if len(byRule) > 0 {
+			out[id] = byRule
+		}
 	}
 	return out, rows.Err()
 }

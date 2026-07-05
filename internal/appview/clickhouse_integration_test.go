@@ -55,23 +55,26 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 	mux := http.NewServeMux()
 	New(store, WithNIP05Validation(false), WithRateLimit(1_000, time.Minute)).Register(mux)
 
-	var feed FeedResponse
+	var feed Envelope
 	requestJSON(t, mux, http.MethodGet, "/nostr/feed?pubkeys="+integrationAlice+"&limit=5", nil, &feed)
-	if len(feed.Items) == 0 || feed.Items[0].Type != "note" || feed.Items[0].Event.ID != integrationRootID {
-		t.Fatalf("feed first item = %+v", feed.Items)
+	if len(feed.Order) == 0 || feed.Order[0] != integrationRootID {
+		t.Fatalf("feed order = %v", feed.Order)
 	}
-	assertRootStats(t, feed.Metrics[integrationRootID])
-	if profile := feed.Profiles[integrationAlice]; profile.Name != "Alice" {
-		t.Fatalf("alice profile = %+v", profile)
+	if _, ok := envelopeEvents(feed)[integrationRootID]; !ok {
+		t.Fatalf("feed events missing root: %v", feed.Events)
+	}
+	assertRootAggregates(t, feed.Aggregates[integrationRootID])
+	if profile, ok := envelopeProfile(feed, integrationAlice); !ok || !strings.Contains(profile.Content, "Alice") {
+		t.Fatalf("alice profile event missing: %v", feed.Events)
 	}
 
-	var userFeed FeedResponse
+	var userFeed Envelope
 	requestJSON(t, mux, http.MethodGet, "/nostr/feed/user?pubkey="+integrationAlice+"&limit=5", nil, &userFeed)
-	if len(userFeed.Items) == 0 || userFeed.Items[0].Type != "note" || userFeed.Items[0].Event.ID != integrationRootID {
-		t.Fatalf("user feed first item = %+v", userFeed.Items)
+	if len(userFeed.Order) == 0 || userFeed.Order[0] != integrationRootID {
+		t.Fatalf("user feed order = %v", userFeed.Order)
 	}
 
-	var stats map[string]chstore.NoteStats
+	var stats Envelope
 	requestJSON(
 		t,
 		mux,
@@ -80,7 +83,7 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 		map[string][]string{"ids": {integrationRootID}},
 		&stats,
 	)
-	assertRootStats(t, stats[integrationRootID])
+	assertRootAggregates(t, stats.Aggregates[integrationRootID])
 
 	var follows struct {
 		PubKey    string `json:"pubkey"`
@@ -92,24 +95,24 @@ func TestClickHouseAppViewIntegration(t *testing.T) {
 		t.Fatalf("follows = %+v", follows)
 	}
 
-	var thread struct {
-		Root   FeedEvent   `json:"root"`
-		Events []FeedEvent `json:"events"`
-	}
+	var thread Envelope
 	requestJSON(t, mux, http.MethodGet, "/nostr/thread?id="+integrationRootID+"&limit=100", nil, &thread)
-	if thread.Root.ID != integrationRootID {
-		t.Fatalf("thread root = %+v", thread.Root)
+	if len(thread.Order) == 0 || thread.Order[0] != integrationRootID {
+		t.Fatalf("thread order = %v", thread.Order)
 	}
 	if !containsEvent(thread.Events, integrationReplyID) {
 		t.Fatalf("thread events missing reply: %+v", thread.Events)
 	}
 
-	var enrichment EnrichmentResponse
-	requestJSON(t, mux, http.MethodGet, "/nostr/events?ids="+integrationRootID, nil, &enrichment)
-	if enrichment.Quoted[integrationRootID].ID != integrationRootID {
-		t.Fatalf("quoted root = %+v", enrichment.Quoted)
+	var byID Envelope
+	requestJSON(t, mux, http.MethodGet, "/nostr/events?ids="+integrationRootID, nil, &byID)
+	if len(byID.Order) != 1 || byID.Order[0] != integrationRootID {
+		t.Fatalf("events order = %v", byID.Order)
 	}
-	assertRootStats(t, enrichment.Metrics[integrationRootID])
+	if _, ok := envelopeEvents(byID)[integrationRootID]; !ok {
+		t.Fatalf("events missing root: %v", byID.Events)
+	}
+	assertRootAggregates(t, byID.Aggregates[integrationRootID])
 }
 
 func assertProfileStoreHelpers(t *testing.T, ctx context.Context, store *chstore.Store) {
@@ -243,11 +246,12 @@ func requestJSON(t *testing.T, mux *http.ServeMux, method string, path string, b
 	}
 }
 
-func assertRootStats(t *testing.T, stats chstore.NoteStats) {
+func assertRootAggregates(t *testing.T, agg map[string]map[string]uint64) {
 	t.Helper()
 
-	if stats.LikeCount != 1 || stats.RepostCount != 1 || stats.ReplyCount != 1 || stats.SatsZapped != 123 {
-		t.Fatalf("root stats = %+v", stats)
+	if agg["k7_e"]["actors"] != 1 || agg["k6_16_e"]["actors"] != 1 ||
+		agg["k1_1111_e_reply"]["sources"] != 1 || agg["k9735_e"]["value_total"] != 123 {
+		t.Fatalf("root aggregates = %+v", agg)
 	}
 }
 

@@ -232,16 +232,16 @@ func TestThreadRelevantMergeOrder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp ThreadResponse
+	var resp Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{ar1, ar2, fol, rk1, rk2, nested}
-	if strings.Join(resp.Ordering.Elements, ",") != strings.Join(want, ",") {
-		t.Fatalf("ordering = %v\nwant       %v", resp.Ordering.Elements, want)
+	want := []string{root, ar1, ar2, fol, rk1, rk2, nested}
+	if strings.Join(resp.Order, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v\nwant    %v", resp.Order, want)
 	}
-	if resp.Ordering.OrderBy != orderByRank {
-		t.Fatalf("orderBy = %q, want %q", resp.Ordering.OrderBy, orderByRank)
+	if resp.OrderBy != orderByRank {
+		t.Fatalf("orderBy = %q, want %q", resp.OrderBy, orderByRank)
 	}
 }
 
@@ -259,13 +259,14 @@ func TestThreadDefaultSortUnchanged(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var resp ThreadResponse
+	var resp Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	// Default order is the ThreadEvents reply order (no merge primitives consulted).
-	if strings.Join(resp.Ordering.Elements, ",") != strings.Join([]string{r1, r2}, ",") {
-		t.Fatalf("ordering = %v, want descendant order", resp.Ordering.Elements)
+	// Default order is root then the ThreadEvents reply order (no merge
+	// primitives consulted).
+	if strings.Join(resp.Order, ",") != strings.Join([]string{root, r1, r2}, ",") {
+		t.Fatalf("order = %v, want root + descendant order", resp.Order)
 	}
 }
 

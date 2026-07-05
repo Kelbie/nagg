@@ -29,6 +29,7 @@ type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
+	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
 	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
 	FollowCounts(context.Context, string) (chstore.FollowCounts, error)
 	ProfileFirstEventCreatedAt(context.Context, string) (*time.Time, error)
@@ -375,42 +376,6 @@ type ProfileInfo struct {
 	Picture string `json:"picture,omitempty"`
 }
 
-type FeedItem struct {
-	Type            string     `json:"type"`
-	Event           *FeedEvent `json:"event,omitempty"`
-	RepostEvent     *FeedEvent `json:"repostEvent,omitempty"`
-	OriginalEvent   *FeedEvent `json:"originalEvent,omitempty"`
-	OriginalEventID string     `json:"originalEventId,omitempty"`
-	RootEvent       *FeedEvent `json:"rootEvent,omitempty"`
-	RootEventID     string     `json:"rootEventId,omitempty"`
-}
-
-type FeedResponse struct {
-	Items []FeedItem `json:"items"`
-	// Ordering is the server-authoritative render order + its semantic. The
-	// client renders strictly by Ordering.Elements; Ordering.OrderBy tells it
-	// whether live items may prepend ("created_at") or not ("rank").
-	Ordering         OrderingManifest             `json:"ordering"`
-	Metrics          map[string]chstore.NoteStats `json:"metrics"`
-	Profiles         map[string]ProfileInfo       `json:"profiles"`
-	Quoted           map[string]FeedEvent         `json:"quoted"`
-	PaginationUntil  int64                        `json:"paginationUntil"`
-	PaginationOffset int                          `json:"paginationOffset"`
-}
-
-// ThreadResponse is the flat REST app-view thread shape: a server-ranked flat
-// list of descendant events under `root`, with the same enrichment side maps as
-// the feed. It matches the canonical NaggThread so one client parser serves both
-// transports.
-type ThreadResponse struct {
-	Root     FeedEvent                    `json:"root"`
-	Events   []FeedEvent                  `json:"events"`
-	Ordering OrderingManifest             `json:"ordering"`
-	Metrics  map[string]chstore.NoteStats `json:"metrics"`
-	Profiles map[string]ProfileInfo       `json:"profiles"`
-	Quoted   map[string]FeedEvent         `json:"quoted"`
-}
-
 type EnrichmentResponse struct {
 	Metrics  map[string]chstore.NoteStats `json:"metrics"`
 	Profiles map[string]ProfileInfo       `json:"profiles"`
@@ -522,7 +487,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 
 	authors := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
 	if len(authors) == 0 {
-		h.writeFeedResponse(w, r, nil, orderByCreatedAt)
+		h.writeFeedEnvelope(w, r, nil, orderByCreatedAt)
 		return
 	}
 	var events []chstore.EventView
@@ -543,7 +508,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	h.writeFeedResponse(w, r, events, orderByCreatedAt)
+	h.writeFeedEnvelope(w, r, events, orderByCreatedAt)
 }
 
 func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
@@ -634,7 +599,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 				"before", coldCount, "ms", time.Since(backfillStart).Milliseconds())
 		}
 	}
-	h.writeFeedResponse(w, r, events, orderByCreatedAt)
+	h.writeFeedEnvelope(w, r, events, orderByCreatedAt)
 }
 
 func (h *Handler) shouldBackfillUserFeed(events []chstore.EventView, until int64, limit uint64, offset uint64) bool {
@@ -655,102 +620,6 @@ func (h *Handler) shouldBackfillAuthoredFeed(events []chstore.EventView, authors
 		limit = 30
 	}
 	return len(events) < int(limit)
-}
-
-func (h *Handler) writeFeedResponse(w http.ResponseWriter, r *http.Request, events []chstore.EventView, orderBy string) {
-	response, err := h.feedResponse(r.Context(), events, orderBy)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, response)
-}
-
-func (h *Handler) feedResponse(ctx context.Context, events []chstore.EventView, orderBy string) (FeedResponse, error) {
-	originalIDs := make([]string, 0)
-	for _, event := range events {
-		if event.Kind == 6 || event.Kind == 16 {
-			if id := firstEventTag(event); id != "" {
-				originalIDs = append(originalIDs, id)
-			}
-		}
-	}
-	originals, err := h.eventsByID(ctx, originalIDs)
-	if err != nil {
-		return FeedResponse{}, err
-	}
-
-	rootSources := make([]chstore.EventView, 0, len(events)+len(originals))
-	rootSources = append(rootSources, events...)
-	for _, original := range originals {
-		rootSources = append(rootSources, original)
-	}
-	roots, err := h.rootEvents(ctx, rootSources)
-	if err != nil {
-		return FeedResponse{}, err
-	}
-
-	items := make([]FeedItem, 0, len(events))
-	hydrationEvents := make([]chstore.EventView, 0, len(events)+len(originals)+len(roots))
-	var paginationUntil int64
-
-	for _, event := range events {
-		feedEvent := eventJSON(event)
-		if paginationUntil == 0 || feedEvent.CreatedAt < paginationUntil {
-			paginationUntil = feedEvent.CreatedAt
-		}
-		hydrationEvents = append(hydrationEvents, event)
-
-		if event.Kind == 6 || event.Kind == 16 {
-			originalID := firstEventTag(event)
-			item := FeedItem{Type: "repost", RepostEvent: &feedEvent, OriginalEventID: originalID}
-			if original, ok := originals[originalID]; ok {
-				originalEvent := eventJSON(original)
-				item.OriginalEvent = &originalEvent
-				hydrationEvents = append(hydrationEvents, original)
-				if root, ok := roots[original.ID]; ok {
-					item.RootEventID = root.ID
-					if root.HasEvent {
-						rootEvent := eventJSON(root.Event)
-						item.RootEvent = &rootEvent
-						hydrationEvents = append(hydrationEvents, root.Event)
-					}
-				}
-			}
-			items = append(items, item)
-			continue
-		}
-
-		item := FeedItem{Type: "note", Event: &feedEvent}
-		if root, ok := roots[event.ID]; ok {
-			item.RootEventID = root.ID
-			if root.HasEvent {
-				rootEvent := eventJSON(root.Event)
-				item.RootEvent = &rootEvent
-				hydrationEvents = append(hydrationEvents, root.Event)
-			}
-		}
-		items = append(items, item)
-	}
-
-	var hydration appViewHydration
-	err = recordPhase(ctx, "hydrate", func() (e error) {
-		hydration, e = h.hydrateAppViewEvents(ctx, hydrationEvents)
-		return
-	})
-	if err != nil {
-		return FeedResponse{}, err
-	}
-
-	return FeedResponse{
-		Items:            items,
-		Ordering:         feedItemsOrdering(items, orderBy),
-		Metrics:          hydration.Metrics,
-		Profiles:         hydration.Profiles,
-		Quoted:           hydration.Quoted,
-		PaginationUntil:  paginationUntil,
-		PaginationOffset: len(items),
-	}, nil
 }
 
 // rankedFeed is the REST counterpart of the GraphQL rankedEvents resolver. It
@@ -778,7 +647,7 @@ func (h *Handler) rankedFeed(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	h.writeFeedResponse(w, r, events, orderByRank)
+	h.writeFeedEnvelope(w, r, events, orderByRank)
 }
 
 // NotificationActor is one participant in a grouped notification (a follower /
@@ -993,7 +862,7 @@ type notificationGroupAcc struct {
 }
 
 // groupNotifications collapses the (newest-first) candidate rows into grouped
-// items, mirroring how feedResponse collapses reposts. It returns the response
+// items, mirroring how the feed envelope collapses reposts. It returns the response
 // nodes, the events to hydrate (representatives + target posts), and whether
 // more items exist past the page. All product semantics live here; the store
 // query stays generic.
@@ -1086,7 +955,7 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 		nodes = append(nodes, node)
 	}
 
-	// Hydrate target posts inline (like feedResponse does for OriginalEvent) and
+	// Hydrate target posts inline (like the feed envelope embeds originals) and
 	// merge sample-actor profiles so avatars resolve.
 	targetIDs := make([]string, 0, len(nodes))
 	actorPubkeys := make([]string, 0, len(nodes)*3)
@@ -1215,12 +1084,17 @@ func (h *Handler) noteStats(w http.ResponseWriter, r *http.Request) {
 	}
 	ids := normalizeHexIDs(req.IDs)
 	h.tryBackfillEngagement(r.Context(), ids)
-	stats, err := h.store.NoteStats(r.Context(), ids)
+	aggregates, err := h.store.EventAggregates(r.Context(), ids)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, stats)
+	writeJSON(w, Envelope{
+		Order:      []string{},
+		OrderBy:    orderByCreatedAt,
+		Events:     []FeedEvent{},
+		Aggregates: aggregates,
+	})
 }
 
 func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
@@ -1248,12 +1122,6 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	allEvents := append([]chstore.EventView{*root}, events...)
-	hydration, err := h.hydrateAppViewEvents(r.Context(), allEvents)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
 	if viewer, verr := normalizePubkey(queryViewerParam(r)); verr == nil {
 		h.touchViewer(viewer)
 	}
@@ -1269,14 +1137,17 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		candidateLimit: intParam(r, "candidateLimit", 0),
 		rankedLimit:    intParam(r, "rankedLimit", 0),
 	})
-	writeJSON(w, ThreadResponse{
-		Root:     eventJSON(*root),
-		Events:   replies,
-		Ordering: ordering,
-		Metrics:  hydration.Metrics,
-		Profiles: hydration.Profiles,
-		Quoted:   hydration.Quoted,
-	})
+	// The envelope's order leads with the thread root, then the server-ranked
+	// replies — one shape for feed and thread alike; the client reconstructs
+	// the tree from the events' references.
+	order := append([]string{root.ID}, ordering.Elements...)
+	allEvents := append([]chstore.EventView{*root}, events...)
+	envelope, err := h.assembleEnvelope(r.Context(), order, ordering.OrderBy, allEvents, nil)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, envelope)
 }
 
 // threadOrderParams carries the inputs that decide a thread's reply render order.
@@ -1456,26 +1327,28 @@ func (h *Handler) events(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET /nostr/events only", http.StatusMethodNotAllowed)
 		return
 	}
-	eventsByID, err := h.eventsByID(r.Context(), normalizeHexIDs(csv(r.URL.Query().Get("ids"))))
+	requested := normalizeHexIDs(csv(r.URL.Query().Get("ids")))
+	eventsByID, err := h.eventsByID(r.Context(), requested)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	order := make([]string, 0, len(eventsByID))
 	events := make([]chstore.EventView, 0, len(eventsByID))
-	quoted := make(map[string]FeedEvent, len(eventsByID))
-	for id, event := range eventsByID {
+	for _, id := range requested {
+		event, ok := eventsByID[id]
+		if !ok {
+			continue
+		}
+		order = append(order, id)
 		events = append(events, event)
-		quoted[id] = eventJSON(event)
 	}
-	hydration, err := h.hydrateAppViewEvents(r.Context(), events)
+	envelope, err := h.assembleEnvelope(r.Context(), order, orderByCreatedAt, events, nil)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	for id, event := range hydration.Quoted {
-		quoted[id] = event
-	}
-	writeJSON(w, EnrichmentResponse{Metrics: hydration.Metrics, Profiles: hydration.Profiles, Quoted: quoted})
+	writeJSON(w, envelope)
 }
 
 // DmConnection is the REST app-view DM list. It matches the GraphQL dmEnvelopes

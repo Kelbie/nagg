@@ -42,6 +42,10 @@ func (s fakeStore) NoteStats(context.Context, []string) (map[string]chstore.Note
 	return map[string]chstore.NoteStats{}, nil
 }
 
+func (s fakeStore) EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error) {
+	return map[string]map[string]map[string]uint64{}, nil
+}
+
 func (s fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[string]chstore.ProfileRow, error) {
 	out := make(map[string]chstore.ProfileRow, len(pubkeys))
 	for _, pubkey := range pubkeys {
@@ -229,6 +233,56 @@ func (s *appViewHydrationStore) NoteStats(_ context.Context, ids []string) (map[
 		out[id] = s.stats[id]
 	}
 	return out, nil
+}
+
+func (s *appViewHydrationStore) EventAggregates(_ context.Context, ids []string) (map[string]map[string]map[string]uint64, error) {
+	s.noteStatIDs = append([]string(nil), ids...)
+	out := make(map[string]map[string]map[string]uint64, len(ids))
+	for _, id := range ids {
+		if agg := noteStatsAsAggregates(s.stats[id]); len(agg) > 0 {
+			out[id] = agg
+		}
+	}
+	return out, nil
+}
+
+// noteStatsAsAggregates maps the legacy fixture counts onto the declared rule
+// vocabulary, omitting zeros exactly like the real EventAggregates read.
+func noteStatsAsAggregates(st chstore.NoteStats) map[string]map[string]uint64 {
+	out := map[string]map[string]uint64{}
+	put := func(rule, metric string, v uint64) {
+		if v == 0 {
+			return
+		}
+		if out[rule] == nil {
+			out[rule] = map[string]uint64{}
+		}
+		out[rule][metric] = v
+	}
+	put("k7_e", "actors", st.LikeCount)
+	put("k6_16_e", "actors", st.RepostCount)
+	put("k1_1111_e_reply", "sources", st.ReplyCount)
+	put("k9735_e", "value_total", st.SatsZapped)
+	return out
+}
+
+// envelopeEvents indexes an envelope's embedded events by id.
+func envelopeEvents(env Envelope) map[string]FeedEvent {
+	out := make(map[string]FeedEvent, len(env.Events))
+	for _, event := range env.Events {
+		out[event.ID] = event
+	}
+	return out
+}
+
+// envelopeProfile returns the kind-0 event for a pubkey, if embedded.
+func envelopeProfile(env Envelope, pubkey string) (FeedEvent, bool) {
+	for _, event := range env.Events {
+		if event.Kind == 0 && event.PubKey == pubkey {
+			return event, true
+		}
+	}
+	return FeedEvent{}, false
 }
 
 type fakeUserBackfiller struct {
@@ -513,12 +567,13 @@ func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
 	if store.calls != 2 {
 		t.Fatalf("store calls = %d, want 2", store.calls)
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "hello" {
-		t.Fatalf("items = %+v", response.Items)
+	events := envelopeEvents(response)
+	if len(response.Order) != 1 || events[response.Order[0]].Content != "hello" {
+		t.Fatalf("order = %v events = %v", response.Order, response.Events)
 	}
 }
 
@@ -558,12 +613,12 @@ func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	if store.calls != 1 {
 		t.Fatalf("store calls = %d, want 1", store.calls)
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 0 {
-		t.Fatalf("items = %+v, want stale empty response", response.Items)
+	if len(response.Order) != 0 {
+		t.Fatalf("order = %v, want stale empty response", response.Order)
 	}
 }
 
@@ -605,12 +660,13 @@ func TestUserFeedWaitsThenReturnsBackfilledPosts(t *testing.T) {
 	if store.calls != 2 {
 		t.Fatalf("store calls = %d, want 2 (cold + requery)", store.calls)
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 || response.Items[0].Event == nil || response.Items[0].Event.Content != "backfilled" {
-		t.Fatalf("items = %+v, want the backfilled post", response.Items)
+	events := envelopeEvents(response)
+	if len(response.Order) != 1 || events[response.Order[0]].Content != "backfilled" {
+		t.Fatalf("order = %v events = %v, want the backfilled post", response.Order, response.Events)
 	}
 }
 
@@ -795,12 +851,13 @@ func TestEventsEndpointBackfillsMissingEventsBeforeEnrichment(t *testing.T) {
 	if store.calls != 2 {
 		t.Fatalf("store calls = %d, want 2", store.calls)
 	}
-	var response EnrichmentResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Quoted[eventID].Content != "quoted" {
-		t.Fatalf("quoted = %+v", response.Quoted)
+	events := envelopeEvents(response)
+	if len(response.Order) != 1 || response.Order[0] != eventID || events[eventID].Content != "quoted" {
+		t.Fatalf("order = %v events = %v", response.Order, response.Events)
 	}
 }
 
@@ -853,15 +910,19 @@ func TestThreadBackfillsWhenIndexedRepliesAreShort(t *testing.T) {
 	if store.calls != 2 {
 		t.Fatalf("store calls = %d, want 2", store.calls)
 	}
-	var response struct {
-		Root   FeedEvent   `json:"root"`
-		Events []FeedEvent `json:"events"`
-	}
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Root.ID != rootID || len(response.Events) != 1 || response.Events[0].ID != replyID {
-		t.Fatalf("thread response = %+v", response)
+	if len(response.Order) != 2 || response.Order[0] != rootID || response.Order[1] != replyID {
+		t.Fatalf("order = %v, want [root reply]", response.Order)
+	}
+	events := envelopeEvents(response)
+	if _, ok := events[rootID]; !ok {
+		t.Fatalf("root missing from events: %v", response.Events)
+	}
+	if _, ok := events[replyID]; !ok {
+		t.Fatalf("reply missing from events: %v", response.Events)
 	}
 }
 
@@ -904,9 +965,9 @@ func TestFeedHydratesRootAndQuotedEvents(t *testing.T) {
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
 			profiles: map[string]chstore.ProfileRow{
-				rootPubkey:  {PubKey: rootPubkey, EventID: rootID, DisplayName: "Root Author"},
-				testPubkey:  {PubKey: testPubkey, EventID: replyID, DisplayName: "Reply Author"},
-				quotePubkey: {PubKey: quotePubkey, EventID: quoteID, DisplayName: "Quote Author"},
+				rootPubkey:  {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
+				testPubkey:  {PubKey: testPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Reply Author", RawJSON: `{"display_name":"Reply Author"}`},
+				quotePubkey: {PubKey: quotePubkey, EventID: strings.Repeat("0", 63) + "1", CreatedAt: time.Unix(1_700_000_002, 0), DisplayName: "Quote Author", RawJSON: `{"display_name":"Quote Author"}`},
 			},
 		},
 		feed:   []chstore.EventView{reply},
@@ -930,31 +991,36 @@ func TestFeedHydratesRootAndQuotedEvents(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 {
-		t.Fatalf("items = %+v", response.Items)
+	if len(response.Order) != 1 || response.Order[0] != replyID {
+		t.Fatalf("order = %v", response.Order)
 	}
-	item := response.Items[0]
-	if item.Event == nil || item.Event.ID != replyID {
-		t.Fatalf("event = %+v", item.Event)
+	events := envelopeEvents(response)
+	if _, ok := events[replyID]; !ok {
+		t.Fatalf("reply missing from events: %v", response.Events)
 	}
-	if item.RootEventID != rootID || item.RootEvent == nil || item.RootEvent.ID != rootID {
-		t.Fatalf("root = id %q event %+v", item.RootEventID, item.RootEvent)
+	if _, ok := events[rootID]; !ok {
+		t.Fatalf("resolved root must be embedded: %v", response.Events)
 	}
-	if response.Quoted[quoteID].Content != quote.Content {
-		t.Fatalf("quoted = %+v", response.Quoted)
+	if events[quoteID].Content != quote.Content {
+		t.Fatalf("quoted event missing: %+v", events[quoteID])
 	}
-	if _, ok := response.Quoted[nestedQuoteID]; ok {
-		t.Fatalf("nested quote should not be hydrated: %+v", response.Quoted)
+	if _, ok := events[nestedQuoteID]; ok {
+		t.Fatalf("nested quote should not be hydrated: %v", response.Events)
 	}
-	if response.Metrics[rootID].SatsZapped != 5 || response.Metrics[replyID].LikeCount != 6 || response.Metrics[quoteID].ReplyCount != 12 {
-		t.Fatalf("metrics = %+v", response.Metrics)
+	if response.Aggregates[rootID]["k9735_e"]["value_total"] != 5 ||
+		response.Aggregates[replyID]["k7_e"]["actors"] != 6 ||
+		response.Aggregates[quoteID]["k1_1111_e_reply"]["sources"] != 12 {
+		t.Fatalf("aggregates = %+v", response.Aggregates)
 	}
-	if response.Profiles[rootPubkey].Name != "Root Author" || response.Profiles[quotePubkey].Name != "Quote Author" {
-		t.Fatalf("profiles = %+v", response.Profiles)
+	if profile, ok := envelopeProfile(response, rootPubkey); !ok || !strings.Contains(profile.Content, "Root Author") {
+		t.Fatalf("root author profile event missing: %v", response.Events)
+	}
+	if profile, ok := envelopeProfile(response, quotePubkey); !ok || !strings.Contains(profile.Content, "Quote Author") {
+		t.Fatalf("quote author profile event missing: %v", response.Events)
 	}
 }
 
@@ -1008,19 +1074,21 @@ func TestFeedKeepsRootIDWhenRootUnavailable(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 {
-		t.Fatalf("items = %+v", response.Items)
+	if len(response.Order) != 1 || response.Order[0] != replyID {
+		t.Fatalf("order = %v", response.Order)
 	}
-	item := response.Items[0]
-	if item.RootEventID != rootID {
-		t.Fatalf("root id = %q, want %q", item.RootEventID, rootID)
+	events := envelopeEvents(response)
+	if _, ok := events[replyID]; !ok {
+		t.Fatalf("reply missing from events: %v", response.Events)
 	}
-	if item.RootEvent != nil {
-		t.Fatalf("root event should be unavailable: %+v", item.RootEvent)
+	// The root is unavailable, so it cannot be embedded; the client derives
+	// the pointer from the reply's own root marker tag.
+	if _, ok := events[rootID]; ok {
+		t.Fatalf("unavailable root must not be embedded: %v", response.Events)
 	}
 }
 
@@ -1061,8 +1129,8 @@ func TestFeedResolvesUpstreamRootFromParentReply(t *testing.T) {
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
 			profiles: map[string]chstore.ProfileRow{
-				rootPubkey: {PubKey: rootPubkey, EventID: rootID, DisplayName: "Root Author"},
-				testPubkey: {PubKey: testPubkey, EventID: replyID, DisplayName: "Reply Author"},
+				rootPubkey: {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
+				testPubkey: {PubKey: testPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Reply Author", RawJSON: `{"display_name":"Reply Author"}`},
 			},
 		},
 		feed:   []chstore.EventView{reply},
@@ -1085,22 +1153,25 @@ func TestFeedResolvesUpstreamRootFromParentReply(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 {
-		t.Fatalf("items = %+v", response.Items)
+	if len(response.Order) != 1 || response.Order[0] != replyID {
+		t.Fatalf("order = %v", response.Order)
 	}
-	item := response.Items[0]
-	if item.RootEventID != rootID || item.RootEvent == nil || item.RootEvent.ID != rootID {
-		t.Fatalf("root = id %q event %+v", item.RootEventID, item.RootEvent)
+	events := envelopeEvents(response)
+	if _, ok := events[rootID]; !ok {
+		t.Fatalf("upstream root must be embedded: %v", response.Events)
 	}
-	if _, ok := response.Metrics[parentID]; ok {
-		t.Fatalf("parent should not be hydrated as displayed root: %+v", response.Metrics)
+	if _, ok := events[parentID]; ok {
+		t.Fatalf("intermediate parent should not be embedded as displayed root: %v", response.Events)
 	}
-	if response.Metrics[rootID].SatsZapped != 5 || response.Profiles[rootPubkey].Name != "Root Author" {
-		t.Fatalf("hydration metrics=%+v profiles=%+v", response.Metrics, response.Profiles)
+	if response.Aggregates[rootID]["k9735_e"]["value_total"] != 5 {
+		t.Fatalf("aggregates = %+v", response.Aggregates)
+	}
+	if profile, ok := envelopeProfile(response, rootPubkey); !ok || !strings.Contains(profile.Content, "Root Author") {
+		t.Fatalf("root author profile event missing: %v", response.Events)
 	}
 }
 
@@ -1141,9 +1212,9 @@ func TestFeedHydratesRepostOriginalRoot(t *testing.T) {
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
 			profiles: map[string]chstore.ProfileRow{
-				rootPubkey:     {PubKey: rootPubkey, EventID: rootID, DisplayName: "Root Author"},
-				originalPubkey: {PubKey: originalPubkey, EventID: originalID, DisplayName: "Original Author"},
-				testPubkey:     {PubKey: testPubkey, EventID: repostID, DisplayName: "Reposter"},
+				rootPubkey:     {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
+				originalPubkey: {PubKey: originalPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Original Author", RawJSON: `{"display_name":"Original Author"}`},
+				testPubkey:     {PubKey: testPubkey, EventID: strings.Repeat("0", 63) + "1", CreatedAt: time.Unix(1_700_000_002, 0), DisplayName: "Reposter", RawJSON: `{"display_name":"Reposter"}`},
 			},
 		},
 		feed:   []chstore.EventView{repost},
@@ -1166,22 +1237,27 @@ func TestFeedHydratesRepostOriginalRoot(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 1 {
-		t.Fatalf("items = %+v", response.Items)
+	// A kind-6 entry anchors on the referenced (original) event id.
+	if len(response.Order) != 1 || response.Order[0] != originalID {
+		t.Fatalf("order = %v, want anchored on the original", response.Order)
 	}
-	item := response.Items[0]
-	if item.Type != "repost" || item.OriginalEvent == nil || item.OriginalEvent.ID != originalID {
-		t.Fatalf("repost item = %+v", item)
+	events := envelopeEvents(response)
+	if _, ok := events[repostID]; !ok {
+		t.Fatalf("repost event missing: %v", response.Events)
 	}
-	if item.RootEventID != rootID || item.RootEvent == nil || item.RootEvent.ID != rootID {
-		t.Fatalf("root = id %q event %+v", item.RootEventID, item.RootEvent)
+	if _, ok := events[originalID]; !ok {
+		t.Fatalf("original event missing: %v", response.Events)
 	}
-	if response.Metrics[rootID].SatsZapped != 5 || response.Metrics[originalID].LikeCount != 6 {
-		t.Fatalf("metrics = %+v", response.Metrics)
+	if _, ok := events[rootID]; !ok {
+		t.Fatalf("original's root missing: %v", response.Events)
+	}
+	if response.Aggregates[rootID]["k9735_e"]["value_total"] != 5 ||
+		response.Aggregates[originalID]["k7_e"]["actors"] != 6 {
+		t.Fatalf("aggregates = %+v", response.Aggregates)
 	}
 }
 
@@ -1775,7 +1851,7 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
 			profiles: map[string]chstore.ProfileRow{
-				authorPubkey: {PubKey: authorPubkey, EventID: firstID, DisplayName: "Ranked Author"},
+				authorPubkey: {PubKey: authorPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Ranked Author", RawJSON: `{"display_name":"Ranked Author"}`},
 			},
 		},
 		events: map[string]chstore.EventView{},
@@ -1801,24 +1877,21 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 	if _, ok := ranker.last.(map[string]any); !ok {
 		t.Fatalf("ranker input = %T, want map[string]any (same shape as GraphQL input)", ranker.last)
 	}
-	var response FeedResponse
+	var response Envelope
 	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Items) != 2 {
-		t.Fatalf("items = %+v, want 2", response.Items)
+	if response.OrderBy != orderByRank {
+		t.Fatalf("orderBy = %q, want %q", response.OrderBy, orderByRank)
 	}
-	if response.Items[0].Event == nil || response.Items[0].Event.ID != firstID {
-		t.Fatalf("first item = %+v, want ranked-first id %s", response.Items[0].Event, firstID)
+	if len(response.Order) != 2 || response.Order[0] != firstID || response.Order[1] != secondID {
+		t.Fatalf("order = %v, want ranking preserved [%s %s]", response.Order, firstID, secondID)
 	}
-	if response.Items[1].Event == nil || response.Items[1].Event.ID != secondID {
-		t.Fatalf("second item = %+v, want ranked-second id %s", response.Items[1].Event, secondID)
+	if response.Aggregates[firstID]["k7_e"]["actors"] != 1 || response.Aggregates[secondID]["k7_e"]["actors"] != 2 {
+		t.Fatalf("aggregates = %+v", response.Aggregates)
 	}
-	if response.Metrics[firstID].LikeCount != 1 || response.Metrics[secondID].LikeCount != 2 {
-		t.Fatalf("metrics = %+v", response.Metrics)
-	}
-	if response.Profiles[authorPubkey].Name != "Ranked Author" {
-		t.Fatalf("profiles = %+v", response.Profiles)
+	if profile, ok := envelopeProfile(response, authorPubkey); !ok || !strings.Contains(profile.Content, "Ranked Author") {
+		t.Fatalf("author profile event missing: %v", response.Events)
 	}
 }
 

@@ -18,36 +18,6 @@ type OrderingManifest struct {
 	Elements []string `json:"elements"`
 }
 
-// feedItemsOrdering builds the manifest from feed items in their final order.
-func feedItemsOrdering(items []FeedItem, orderBy string) OrderingManifest {
-	elements := make([]string, 0, len(items))
-	for _, item := range items {
-		if id := feedItemID(item); id != "" {
-			elements = append(elements, id)
-		}
-	}
-	return OrderingManifest{OrderBy: orderBy, Elements: elements}
-}
-
-// feedItemID is the stable render key for an item: the note's id, or a repost's
-// original (anchor) id. Mirrors the nagg-ts feedItemId so the manifest the server
-// emits and the one the client would derive use identical keys.
-func feedItemID(item FeedItem) string {
-	if item.Type == "repost" {
-		if item.OriginalEventID != "" {
-			return item.OriginalEventID
-		}
-		if item.RepostEvent != nil {
-			return item.RepostEvent.ID
-		}
-		return ""
-	}
-	if item.Event != nil {
-		return item.Event.ID
-	}
-	return ""
-}
-
 // eventsOrdering builds the manifest from a flat event list (thread replies).
 func eventsOrdering(events []FeedEvent, orderBy string) OrderingManifest {
 	elements := make([]string, 0, len(events))
