@@ -1144,7 +1144,7 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 	return s.conn.Exec(ctx, `
 		INSERT INTO vertex_scores (source, pubkey, score, rank, followers, nodes, fetched_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, "vertex", pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
+	`, vertex.PluginName, pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
 }
 
 func (s *Store) CachedVertexSearch(ctx context.Context, args vertex.SearchArgs) ([]vertex.SearchResult, time.Time, bool, error) {
@@ -1259,13 +1259,13 @@ func (s *Store) SaveVertexSearch(ctx context.Context, args vertex.SearchArgs, re
 }
 
 func (s *Store) AuthorVertexScores(ctx context.Context, pubkeys []string) (map[string]PubkeyScore, error) {
-	return s.PubkeyScores(ctx, "vertex", pubkeys)
+	return s.PubkeyScores(ctx, vertex.PluginName, pubkeys)
 }
 
 func (s *Store) PubkeyScores(ctx context.Context, source string, pubkeys []string) (map[string]PubkeyScore, error) {
 	source = strings.TrimSpace(strings.ToLower(source))
 	if source == "" {
-		source = "vertex"
+		source = vertex.PluginName
 	}
 	pubkeys = uniqueStrings(pubkeys)
 	out := make(map[string]PubkeyScore, len(pubkeys))

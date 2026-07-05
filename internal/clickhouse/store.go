@@ -20,6 +20,7 @@ import (
 	chdriver "github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/nbd-wtf/go-nostr"
 
+	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/rules"
 )
 
@@ -88,12 +89,17 @@ type Config struct {
 	// falls back to rules.Default with the standard cap, so existing callers
 	// and tests keep working without wiring.
 	Rules *rules.Registry
+	// DVM is the plugin registry whose cache-table DDL is applied and
+	// reconciled alongside the rule-generated schema. Nil means no plugins.
+	DVM *dvm.Registry
 }
 
 type Store struct {
 	conn ch.Conn
 	// rules mirrors Config.Rules (defaulted when nil).
 	rules *rules.Registry
+	// dvm mirrors Config.DVM (empty when nil).
+	dvm *dvm.Registry
 	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
 	notificationsLegacyRead bool
 	// Cached notifications_feed readiness (see notificationsFeedReady).
@@ -260,9 +266,14 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 			return nil, fmt.Errorf("default rules: %w", err)
 		}
 	}
+	plugins := cfg.DVM
+	if plugins == nil {
+		plugins = dvm.Empty()
+	}
 	return &Store{
 		conn:                    retryConn{Conn: conn, readSettings: readSettings},
 		rules:                   reg,
+		dvm:                     plugins,
 		notificationsLegacyRead: cfg.NotificationsLegacyRead,
 	}, nil
 }
@@ -583,7 +594,7 @@ func (s *Store) applyGeneratedSchema(ctx context.Context) error {
 		return fmt.Errorf("read existing tables: %w", err)
 	}
 
-	for _, stmt := range s.rules.GeneratedDDL() {
+	for _, stmt := range s.generatedDDL() {
 		if err := s.conn.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("generated DDL failed: %w\nstatement:\n%s", err, stmt)
 		}
@@ -643,6 +654,14 @@ func (s *Store) appliedMigrations(ctx context.Context) (map[string]struct{}, err
 // on name makes repeat records converge instead of duplicating.
 func (s *Store) recordMigration(ctx context.Context, name string) error {
 	return s.conn.Exec(ctx, "INSERT INTO schema_migrations (name) VALUES (?)", name)
+}
+
+// generatedDDL is every statement derived from declarations rather than
+// static SQL: the rule registry's aggregate tables and views, then the DVM
+// plugins' cache tables. Applied at migrate time and parsed into the schema
+// reconciler's desired set.
+func (s *Store) generatedDDL() []string {
+	return append(s.rules.GeneratedDDL(), s.dvm.CacheDDL()...)
 }
 
 func (s *Store) Backfill(ctx context.Context) error {

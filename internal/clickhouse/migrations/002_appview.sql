@@ -45,11 +45,6 @@ SELECT
 FROM nostr_events
 WHERE kind = 0;
 
-CREATE TABLE IF NOT EXISTS vertex_profile_cache
-(
-    pubkey FixedString(64),
-    fetched_at DateTime,
-    payload String
-)
-ENGINE = ReplacingMergeTree(fetched_at)
-ORDER BY pubkey;
+-- vertex_profile_cache is RETIRED from static SQL: the Vertex DVM plugin
+-- (internal/vertex/plugin.go) declares its own cache tables through the dvm
+-- registry, applied at migrate time alongside the rule-generated schema.

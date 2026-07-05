@@ -20,6 +20,7 @@ import (
 	"github.com/graphql-go/graphql/language/ast"
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/vertex"
 	"golang.org/x/sync/singleflight"
 )
@@ -66,6 +67,17 @@ type resolver struct {
 	profileSearcher         ProfileSearcher
 	pubkeyScoreMinFollowers uint64
 	basePool                *basePoolCache
+	dvm                     *dvm.Registry
+}
+
+// defaultScoreSource is the pubkey-score provider rank terms use when a term
+// names none: the first registered DVM plugin, falling back to the Vertex
+// name so an unwired schema (tests) keeps today's behavior.
+func (r *resolver) defaultScoreSource() string {
+	if r.dvm != nil && len(r.dvm.Names()) > 0 {
+		return r.dvm.Names()[0]
+	}
+	return vertex.PluginName
 }
 
 type ProfileSearcher interface {
@@ -111,6 +123,14 @@ func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 		if b, ok := backfiller.(RelayEventBackfiller); ok {
 			r.relayEventBackfiller = b
 		}
+	}
+}
+
+// WithDVM installs the DVM plugin registry: rank-term score sources resolve
+// against registered plugin names instead of a hardcoded vendor string.
+func WithDVM(reg *dvm.Registry) Option {
+	return func(r *resolver) {
+		r.dvm = reg
 	}
 }
 
@@ -419,7 +439,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	pubkeyScoreFilterInputType := graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "PubkeyScoreFilterInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "vertex"},
+			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: r.defaultScoreSource()},
 			"minFollowers": &graphql.InputObjectFieldConfig{Type: graphql.Int, DefaultValue: 0},
 		},
 	})
@@ -481,7 +501,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	pubkeyScoreRankInputType = graphql.NewInputObject(graphql.InputObjectConfig{
 		Name: "PubkeyScoreRankInput",
 		Fields: graphql.InputObjectConfigFieldMap{
-			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "vertex"},
+			"source":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: r.defaultScoreSource()},
 			"target":       &graphql.InputObjectFieldConfig{Type: graphql.String, DefaultValue: "AUTHOR"},
 			"minFollowers": &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			"fallback":     &graphql.InputObjectFieldConfig{Type: graphql.Float, DefaultValue: 0.0},
@@ -1141,7 +1161,7 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	// finalizeRankedIDs. Falls through to the base-pool/direct path when the feature
 	// table is cold (before the first rollup tick) or the terms are not recognized.
 	if len(input.WeightedTerms) > 0 && featureRankTargetIsGlobal(input.Target) {
-		if weights, halfLife, minFollowers, ok := featureWeightsFromTerms(input.WeightedTerms); ok {
+		if weights, halfLife, minFollowers, ok := featureWeightsFromTerms(input.WeightedTerms, r.defaultScoreSource()); ok {
 			views, served, err := r.rankedEventViewsFromFeatures(ctx, input, weights, halfLife, minFollowers)
 			if err != nil {
 				return nil, err
@@ -1198,7 +1218,7 @@ func featureRankTargetIsGlobal(t chstore.EventQueryInput) bool {
 // LOG1P transform baked into the feature SQL and (b) gate its engagers by a vertex
 // pubkey score — an ungated term (counts ALL engagers, e.g. trending) has no
 // matching feature column and falls back.
-func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, float64, uint64, bool) {
+func featureWeightsFromTerms(terms []weightedRankTerm, scoreSource string) (chstore.FeatureWeights, float64, uint64, bool) {
 	var w chstore.FeatureWeights
 	var halfLife float64
 	var minFollowers uint64
@@ -1211,10 +1231,11 @@ func featureWeightsFromTerms(terms []weightedRankTerm) (chstore.FeatureWeights, 
 	for _, t := range terms {
 		switch t.Kind {
 		case weightedRankTermPubkeyScore:
-			// Only the vertex AUTHOR score with a zero fallback is represented by
-			// author_vertex_score; a non-vertex source, non-AUTHOR target, or
-			// non-zero fallback would score differently here than on the live path.
-			if t.PubkeyScore.Source != "vertex" ||
+			// Only the configured score plugin's AUTHOR score with a zero
+			// fallback is represented by the precomputed author score column; a
+			// foreign source, non-AUTHOR target, or non-zero fallback would
+			// score differently here than on the live path.
+			if t.PubkeyScore.Source != scoreSource ||
 				t.PubkeyScore.Fallback != 0 ||
 				(t.PubkeyScore.Target != "" && t.PubkeyScore.Target != "AUTHOR") {
 				return bail()
@@ -1891,7 +1912,7 @@ func weightedRankTermFrom(
 func pubkeyScoreRankTermFrom(raw map[string]any, defaultMinFollowers uint64) pubkeyScoreRankTerm {
 	source := strings.ToLower(strings.TrimSpace(stringValue(raw["source"])))
 	if source == "" {
-		source = "vertex"
+		source = vertex.PluginName
 	}
 	target := strings.ToUpper(strings.TrimSpace(stringValue(raw["target"])))
 	if target == "" {
@@ -1916,7 +1937,7 @@ func pubkeyScoreFilterFromRaw(raw any) chstore.PubkeyScoreFilter {
 	}
 	source := strings.ToLower(strings.TrimSpace(stringValue(m["source"])))
 	if source == "" {
-		source = "vertex"
+		source = vertex.PluginName
 	}
 	minFollowers := intValue(m["minFollowers"], 0)
 	if minFollowers < 0 {

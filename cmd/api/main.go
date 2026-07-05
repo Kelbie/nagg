@@ -243,9 +243,19 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	searchProvider := vertex.NewSearchProvider(store, searchRefresh, vertex.SearchProviderConfig{
 		MaxAge: 7 * 24 * time.Hour,
 	}, logger)
+	// Attach the runtime capabilities to the Vertex DVM plugin (its static
+	// identity — name, kinds, cache DDL — was registered at config time so
+	// every process derives the same schema).
+	if plugin, ok := cfg.DVM.Plugin(vertex.PluginName).(*vertex.Plugin); ok {
+		plugin.WithSearch(searchProvider)
+		if vertexClient != nil {
+			plugin.WithRecommend(vertexClient)
+		}
+	}
 	schemaOpts := []graphqlapi.Option{
 		graphqlapi.WithPubkeyScoreMinFollowers(cfg.Vertex.RankMinFollowers),
 		graphqlapi.WithProfileSearch(searchProvider),
+		graphqlapi.WithDVM(cfg.DVM),
 	}
 	// Attach on-demand relay hydration to the GraphQL schema (and, via schemaOpts
 	// reuse below, the REST ranked-feed) only when explicitly enabled. This is
@@ -282,6 +292,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	// GraphQL rankedEvents resolver.
 	ranker := graphqlapi.NewRanker(store, schemaOpts...)
 	appviewOpts := []appview.Option{
+		appview.WithDVM(cfg.DVM),
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),

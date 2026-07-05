@@ -312,7 +312,7 @@ func (s *Store) reconcileSchema(ctx context.Context, mode string) error {
 		return nil
 	}
 
-	desired, err := parseDesiredSchema(append(embeddedMigrations(), s.rules.GeneratedDDL()...))
+	desired, err := parseDesiredSchema(append(embeddedMigrations(), s.generatedDDL()...))
 	if err != nil {
 		return fmt.Errorf("schema reconcile: parse desired schema: %w", err)
 	}

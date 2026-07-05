@@ -12,15 +12,20 @@ import (
 	"time"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/rules"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 type Config struct {
 	ClickHouse chstore.Config
+	// DVM is the plugin registry shared by the store (cache-table schema) and
+	// the API wiring (provider attachment, score-source validation).
+	DVM        *dvm.Registry
 	API        APIConfig
 	Firehose   firehose.Config
 	Ingest     ingest.Config
@@ -152,7 +157,13 @@ func Load() (Config, error) {
 	// cap rule; 0 disables capping.
 	ruleRegistry := rules.MustDefault(parseInt(env("NAGG_POST_CAP_PER_DAY", "20")))
 
+	// The DVM plugin registry: static identity (name, kinds, cache DDL) is
+	// declared here so every process — api, ingester, migrate, backfill —
+	// derives the same schema; runtime providers are attached by cmd/api.
+	dvmRegistry := dvm.MustRegistry(vertex.NewPlugin())
+
 	cfg := Config{
+		DVM: dvmRegistry,
 		ClickHouse: chstore.Config{
 			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
 			Database:     env("NAGG_CLICKHOUSE_DATABASE", "default"),
@@ -161,6 +172,7 @@ func Load() (Config, error) {
 			MaxOpenConns: parseInt(env("NAGG_CLICKHOUSE_MAX_OPEN_CONNS", "30")),
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
 			Rules:        ruleRegistry,
+			DVM:          dvmRegistry,
 			// Per-query memory ceiling (bytes) applied to every app-view read, as a
 			// runaway guard: an over-budget query is rejected by ClickHouse with a
 			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed

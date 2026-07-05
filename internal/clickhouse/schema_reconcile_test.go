@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/rules"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 func TestParseDesiredSchema_RealMigrations(t *testing.T) {
@@ -15,7 +16,8 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rules.Default: %v", err)
 	}
-	desired, err := parseDesiredSchema(append(embeddedMigrations(), reg.GeneratedDDL()...))
+	generated := append(reg.GeneratedDDL(), vertex.NewPlugin().CacheDDL()...)
+	desired, err := parseDesiredSchema(append(embeddedMigrations(), generated...))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
@@ -34,15 +36,15 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"user_stats",
 		"note_rank_features",
 		"profiles_latest",
-		"vertex_profile_cache",
-		"vertex_scores",
-		"vertex_search_cache",
 		"derived_tags",
 		"derived_metrics",
 		"enrichment_state",
 		"notification_candidates",
 		"known_viewers",
 		// registry-generated
+		"vertex_scores",
+		"vertex_profile_cache",
+		"vertex_search_cache",
 		"event_refs",
 		"agg_k7_e",
 		"agg_k6_16_e",

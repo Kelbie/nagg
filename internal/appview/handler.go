@@ -21,6 +21,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/capabilities"
 	"github.com/vertex-lab/nagg/internal/chgate"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
@@ -58,6 +59,7 @@ type RankedFeedProvider interface {
 type Handler struct {
 	store                     Store
 	vertex                    VertexClient
+	dvm                       *dvm.Registry
 	profileSearcher           ProfileSearcher
 	userBackfiller            UserFeedBackfiller
 	eventBackfiller           EventBackfiller
@@ -111,6 +113,24 @@ type ProfileSearcher interface {
 type Option func(*Handler)
 
 const defaultVertexProfileMinFollowers uint64 = 500
+
+// WithDVM installs the DVM plugin registry so provider-namespaced envelope
+// payloads are keyed by plugin name instead of a hardcoded vendor string.
+func WithDVM(reg *dvm.Registry) Option {
+	return func(h *Handler) {
+		h.dvm = reg
+	}
+}
+
+// scoreProviderName is the provider namespace for score/graph payloads: the
+// first registered DVM plugin, falling back to the Vertex name when the
+// registry is unwired (tests).
+func (h *Handler) scoreProviderName() string {
+	if h.dvm != nil && len(h.dvm.Names()) > 0 {
+		return h.dvm.Names()[0]
+	}
+	return vertex.PluginName
+}
 
 func WithVertex(client VertexClient) Option {
 	return func(h *Handler) {
@@ -1487,12 +1507,12 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		if follower.Score != nil {
 			payload["score"] = *follower.Score
 		}
-		envelope.setProvider(fp, "vertex", payload)
+		envelope.setProvider(fp, h.scoreProviderName(), payload)
 	}
 	if len(followerPubkeys) > 0 {
 		vertexPayload["references"] = followerPubkeys
 	}
-	envelope.setProvider(pubkey, "vertex", vertexPayload)
+	envelope.setProvider(pubkey, h.scoreProviderName(), vertexPayload)
 	if createdAt != nil {
 		envelope.setProvider(pubkey, "nagg", map[string]any{"firstEventAt": *createdAt})
 	}
@@ -1637,7 +1657,7 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 		if row.Score != nil {
 			payload["score"] = *row.Score
 		}
-		envelope.setProvider(row.PubKey, "vertex", payload)
+		envelope.setProvider(row.PubKey, h.scoreProviderName(), payload)
 	}
 	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
 		return ProvidersEnvelope{}, err

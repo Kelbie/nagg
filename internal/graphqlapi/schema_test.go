@@ -436,7 +436,7 @@ func forYouTerms() []weightedRankTerm {
 }
 
 func TestFeatureWeightsFromTerms_RecognizesForYou(t *testing.T) {
-	w, halfLife, minFollowers, ok := featureWeightsFromTerms(forYouTerms())
+	w, halfLife, minFollowers, ok := featureWeightsFromTerms(forYouTerms(), "vertex")
 	if !ok {
 		t.Fatal("For-You terms must be recognized by the feature mapper")
 	}
@@ -470,7 +470,7 @@ func TestFeatureWeightsFromTerms_BailsOnUnrecognized(t *testing.T) {
 		"non-quality derived": {{Kind: weightedRankTermDerivedMetric, DerivedMetric: "spamminess"}},
 	}
 	for name, terms := range cases {
-		if _, _, _, ok := featureWeightsFromTerms(terms); ok {
+		if _, _, _, ok := featureWeightsFromTerms(terms, "vertex"); ok {
 			t.Errorf("%s: expected ok=false (fall back to live aggregation)", name)
 		}
 	}
