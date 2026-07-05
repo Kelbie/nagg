@@ -50,3 +50,18 @@ func TestBuildNotificationsFeedSQL_TagScanBoundedByCandidateSpan(t *testing.T) {
 		}
 	}
 }
+
+// The page read must overlay LIVE vertex scores over the baked actor_score:
+// history slices never re-run, so a baked-only filter freezes whatever the
+// graph knew at denormalization time and hides actors who score up later.
+func TestNotificationsFromFeedQuery_OverlaysLiveActorScores(t *testing.T) {
+	for _, want := range []string{
+		"if(empty(sc.pubkey), vf.actor_score, sc.score) AS actor_score",
+		"argMax(score, fetched_at) AS score",
+		"ON sc.pubkey = vf.actor_pubkey",
+	} {
+		if !strings.Contains(notificationsFromFeedQueryTemplate, want) {
+			t.Errorf("live-score overlay %q missing from page query", want)
+		}
+	}
+}

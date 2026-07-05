@@ -258,6 +258,59 @@ func (s *Store) notificationsFeedReady(ctx context.Context) bool {
 	return ready
 }
 
+// notificationsFromFeedQueryTemplate is the read-model page query (verbatim
+// except the two %s filter slots), extracted so tests can pin its shape.
+//
+// actor_score is stored on viewer_feed at denormalization time, but the
+// policy filter must see the CURRENT score: baked values freeze whatever the
+// vertex graph knew when the slice ran, and history slices never re-run — on
+// a young graph that filtered actors out forever, no matter how well they
+// scored later. The page's rows (bounded by the inner LIMIT) are therefore
+// overlaid with live vertex_scores; the baked value only serves actors with
+// no live row.
+const notificationsFromFeedQueryTemplate = `
+	SELECT
+		event_id, kind, actor_score, actor_pubkey, created_at
+	FROM (
+		SELECT
+			*,
+			row_number() OVER (
+				PARTITION BY kind, actor_pubkey
+				ORDER BY created_at ASC, event_id ASC
+			) AS actor_kind_rank
+		FROM (
+			SELECT
+				vf.viewer AS viewer, vf.created_at AS created_at,
+				vf.event_id AS event_id, vf.kind AS kind,
+				vf.actor_pubkey AS actor_pubkey, vf.event_pubkey AS event_pubkey,
+				vf.event_kind AS event_kind, vf.event_created_at AS event_created_at,
+				vf.is_ref AS is_ref, vf.target_author AS target_author,
+				vf.in_viewer_tree AS in_viewer_tree,
+				if(empty(sc.pubkey), vf.actor_score, sc.score) AS actor_score
+			FROM (
+				SELECT
+					viewer, created_at, event_id, kind, actor_pubkey,
+					event_pubkey, event_kind, event_created_at, is_ref,
+					target_author, in_viewer_tree, actor_score
+				FROM viewer_feed
+				WHERE viewer = ?%s
+				ORDER BY created_at DESC, event_id DESC, computed_at DESC
+				LIMIT 1 BY event_id, kind
+				LIMIT ?
+			) AS vf
+			LEFT JOIN (
+				SELECT pubkey, argMax(score, fetched_at) AS score
+				FROM vertex_scores
+				WHERE source = 'vertex'
+				GROUP BY pubkey
+			) AS sc ON sc.pubkey = vf.actor_pubkey
+		)
+	)
+	%s
+	ORDER BY created_at DESC, event_id DESC
+	LIMIT ?
+`
+
 // notificationsFromFeed is the read-model query: a keyed range scan over
 // viewer_feed with the same follow-dedupe, reply-scope, and policy
 // semantics as the legacy read — but every predicate hits a stored column.
@@ -327,32 +380,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input ViewerFeedInput
 	args = append(args, outerArgs...)
 	args = append(args, input.Limit)
 
-	query := fmt.Sprintf(`
-		SELECT
-			event_id, kind, actor_score, actor_pubkey, created_at
-		FROM (
-			SELECT
-				*,
-				row_number() OVER (
-					PARTITION BY kind, actor_pubkey
-					ORDER BY created_at ASC, event_id ASC
-				) AS actor_kind_rank
-			FROM (
-				SELECT
-					viewer, created_at, event_id, kind, actor_pubkey,
-					event_pubkey, event_kind, event_created_at, is_ref,
-					target_author, in_viewer_tree, actor_score
-				FROM viewer_feed
-				WHERE viewer = ?%s
-				ORDER BY created_at DESC, event_id DESC, computed_at DESC
-				LIMIT 1 BY event_id, kind
-				LIMIT ?
-			)
-		)
-		%s
-		ORDER BY created_at DESC, event_id DESC
-		LIMIT ?
-	`, filters, outer)
+	query := fmt.Sprintf(notificationsFromFeedQueryTemplate, filters, outer)
 
 	rows, err := s.conn.Query(ctx, query, args...)
 	if err != nil {
