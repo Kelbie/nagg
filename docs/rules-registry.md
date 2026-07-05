@@ -133,6 +133,7 @@ type Plugin interface {
     Kinds() []KindPair   // request/response kinds it speaks
     CacheDDL() []string  // its ClickHouse cache tables — applied at Migrate
                          // and reconciled exactly like rule tables
+    Policy() Policy      // usage rules: cache TTL + inbound-ref gate
     ScoreProvider() any  // nil when unsupported
     SearchProvider() any
     RecommendProvider() any
@@ -146,6 +147,14 @@ plugin rather than static SQL. `config.Load` builds the registry once for
 every process, so no process can reconcile-drop another's cache tables.
 GraphQL's score-source default and the appview `providers` namespace resolve
 through the registry — a future DVM plugs in by adding one entry.
+
+A plugin also declares its usage policy: `Policy{CacheTTL, MinInboundRefs}`.
+`CacheTTL` bounds how long cached provider values are trusted before the
+score sync refetches them; `MinInboundRefs` gates which pubkeys the provider
+is consulted for, measured as latest-list kind-3 inbound refs (`latest_k3`
+fan-in) — the declarative form of the historical >500-followers requirement.
+Vertex declares `7 * 24h` and `500`. The old NAGG_VERTEX_*_MIN_FOLLOWERS env
+vars are gone; change the declaration instead.
 
 ## Deliberately outside the registry
 

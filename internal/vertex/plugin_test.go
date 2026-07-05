@@ -1,6 +1,8 @@
 package vertex
 
 import (
+	"time"
+
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/dvm"
@@ -37,5 +39,16 @@ func TestPluginCapabilitiesNilUntilAttached(t *testing.T) {
 	}
 	if _, err := dvm.NewRegistry(p); err != nil {
 		t.Fatalf("vertex plugin must validate: %v", err)
+	}
+}
+
+func TestPluginPolicy(t *testing.T) {
+	p := NewPlugin()
+	policy := p.Policy()
+	if policy.CacheTTL != 7*24*time.Hour {
+		t.Errorf("CacheTTL = %v, want 7 days", policy.CacheTTL)
+	}
+	if policy.MinInboundRefs != 500 {
+		t.Errorf("MinInboundRefs = %d, want 500", policy.MinInboundRefs)
 	}
 }

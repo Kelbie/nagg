@@ -1,6 +1,10 @@
 package vertex
 
-import "github.com/vertex-lab/nagg/internal/dvm"
+import (
+	"time"
+
+	"github.com/vertex-lab/nagg/internal/dvm"
+)
 
 // PluginName is the provider namespace Vertex data appears under (envelope
 // `providers` keys, rank-term score sources, the vertex_scores source column).
@@ -31,6 +35,18 @@ func (p *Plugin) WithSearch(search *SearchProvider) *Plugin {
 func (p *Plugin) WithRecommend(client *Client) *Plugin {
 	p.recommend = client
 	return p
+}
+
+// Policy: cached values are trusted for 7 days before the sync refetches
+// them (best-effort scores that sharpen as the provider's graph matures),
+// and only pubkeys with at least 500 latest-list inbound refs are worth
+// consulting the provider for — the declarative form of the historical
+// >500-followers requirement.
+func (p *Plugin) Policy() dvm.Policy {
+	return dvm.Policy{
+		CacheTTL:       7 * 24 * time.Hour,
+		MinInboundRefs: 500,
+	}
 }
 
 func (p *Plugin) Name() string { return PluginName }

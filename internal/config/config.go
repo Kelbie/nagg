@@ -111,13 +111,11 @@ type CacheConfig struct {
 }
 
 type VertexConfig struct {
-	PrivateKey          string
-	Relay               string
-	ValidateNIP05       bool
-	ProfileMinFollowers int
-	RankMinFollowers    int
-	SyncBatch           int
-	SyncThrottle        time.Duration
+	PrivateKey    string
+	Relay         string
+	ValidateNIP05 bool
+	SyncBatch     int
+	SyncThrottle  time.Duration
 }
 
 type ViewerConfig struct {
@@ -221,13 +219,11 @@ func Load() (Config, error) {
 			Caps: ruleRegistry.Caps(),
 		},
 		Vertex: VertexConfig{
-			PrivateKey:          os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
-			Relay:               env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
-			ValidateNIP05:       parseBool(env("NAGG_NIP05_VALIDATE", "true")),
-			ProfileMinFollowers: parseInt(env("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "500")),
-			RankMinFollowers:    parseInt(env("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "500")),
-			SyncBatch:           parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
-			SyncThrottle:        parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
+			PrivateKey:    os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
+			Relay:         env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
+			ValidateNIP05: parseBool(env("NAGG_NIP05_VALIDATE", "true")),
+			SyncBatch:     parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
+			SyncThrottle:  parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
 		},
 		Auditor: AuditorConfig{
 			URL:     env("NAGG_AUDITOR_URL", "https://api.audit.8333.space"),
@@ -318,12 +314,6 @@ func (c Config) validate() error {
 		if relayURL.Scheme != "wss" && relayURL.Scheme != "ws" {
 			return errors.New("NAGG_VERTEX_RELAY must use ws or wss")
 		}
-	}
-	if c.Vertex.ProfileMinFollowers < 0 {
-		return errors.New("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS must be non-negative")
-	}
-	if c.Vertex.RankMinFollowers < 0 {
-		return errors.New("NAGG_VERTEX_RANK_MIN_FOLLOWERS must be non-negative")
 	}
 	if c.Vertex.SyncBatch < 1 {
 		return errors.New("NAGG_VERTEX_SYNC_BATCH must be positive")

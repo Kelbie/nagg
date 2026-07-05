@@ -3,6 +3,7 @@ package vertex
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 type syncStore struct {
@@ -10,7 +11,7 @@ type syncStore struct {
 	saved   []ProfileResult
 }
 
-func (s *syncStore) RecentAuthorPubkeysByFollowers(context.Context, uint64, int) ([]string, error) {
+func (s *syncStore) RecentAuthorPubkeysByFollowers(context.Context, uint64, time.Duration, int) ([]string, error) {
 	return s.pubkeys, nil
 }
 

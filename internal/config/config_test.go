@@ -59,12 +59,6 @@ func TestLoadDefaultRelaysExcludeExternalCacheHost(t *testing.T) {
 	if cfg.OnDemand.GraphQLMaxJobsPerRequest != 4 {
 		t.Fatalf("graphql hydration max jobs = %d, want 4", cfg.OnDemand.GraphQLMaxJobsPerRequest)
 	}
-	if cfg.Vertex.ProfileMinFollowers != 500 {
-		t.Fatalf("profile min followers = %d, want 500", cfg.Vertex.ProfileMinFollowers)
-	}
-	if cfg.Vertex.RankMinFollowers != 500 {
-		t.Fatalf("rank min followers = %d, want 500", cfg.Vertex.RankMinFollowers)
-	}
 	if cfg.Vertex.SyncBatch != 200 {
 		t.Fatalf("vertex sync batch = %d, want 200", cfg.Vertex.SyncBatch)
 	}
@@ -147,32 +141,6 @@ func TestLoadClickHouseCapacityKnobOverrides(t *testing.T) {
 	}
 	if cfg.ClickHouse.MaxQueryMemoryBytes != 8_000_000_000 {
 		t.Fatalf("max query memory = %d, want 8000000000 from env override", cfg.ClickHouse.MaxQueryMemoryBytes)
-	}
-}
-
-func TestLoadVertexRankMinFollowersOverride(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "1250")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Vertex.RankMinFollowers != 1250 {
-		t.Fatalf("rank min followers = %d, want 1250", cfg.Vertex.RankMinFollowers)
-	}
-}
-
-func TestLoadRejectsNegativeVertexRankMinFollowers(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_VERTEX_RANK_MIN_FOLLOWERS", "-1")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "NAGG_VERTEX_RANK_MIN_FOLLOWERS") {
-		t.Fatalf("error = %v", err)
 	}
 }
 
@@ -265,32 +233,6 @@ func TestLoadRejectsInvalidViewerPubkey(t *testing.T) {
 		t.Fatal("expected error")
 	}
 	if !strings.Contains(err.Error(), "NAGG_VIEWER_PUBKEY") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestLoadVertexProfileMinFollowersOverride(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "750")
-
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Vertex.ProfileMinFollowers != 750 {
-		t.Fatalf("profile min followers = %d, want 750", cfg.Vertex.ProfileMinFollowers)
-	}
-}
-
-func TestLoadRejectsNegativeVertexProfileMinFollowers(t *testing.T) {
-	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
-	t.Setenv("NAGG_VERTEX_PROFILE_MIN_FOLLOWERS", "-1")
-
-	_, err := Load()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if !strings.Contains(err.Error(), "NAGG_VERTEX_PROFILE_MIN_FOLLOWERS") {
 		t.Fatalf("error = %v", err)
 	}
 }

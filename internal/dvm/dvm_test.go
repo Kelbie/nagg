@@ -14,6 +14,7 @@ type fakePlugin struct {
 func (p fakePlugin) Name() string           { return p.name }
 func (p fakePlugin) Kinds() []KindPair      { return p.kinds }
 func (p fakePlugin) CacheDDL() []string     { return p.ddl }
+func (p fakePlugin) Policy() Policy         { return Policy{} }
 func (p fakePlugin) ScoreProvider() any     { return nil }
 func (p fakePlugin) SearchProvider() any    { return nil }
 func (p fakePlugin) RecommendProvider() any { return nil }

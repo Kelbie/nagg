@@ -16,6 +16,7 @@ package dvm
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // KindPair is one request/response kind pair a plugin speaks (e.g. a 5312
@@ -24,6 +25,23 @@ import (
 type KindPair struct {
 	Request  int
 	Response int
+}
+
+// Policy declares when and how the rest of the stack consults a plugin —
+// the usage rules, declared next to the identity, in the same
+// declare-don't-hand-roll spirit as the rules registry.
+type Policy struct {
+	// CacheTTL is how long the plugin's cached values are trusted before a
+	// refetch: the score sync refreshes pubkeys whose stored values are older
+	// than this. Readers always serve whatever is cached (best-effort — a
+	// young provider dataset improves in place on each TTL cycle).
+	CacheTTL time.Duration
+	// MinInboundRefs gates which pubkeys are worth the provider's time: only
+	// pubkeys whose latest-list inbound reference fan-in (kind-3 p refs, the
+	// latest_k3 projection) reaches this count are synced, rank-gated, or
+	// refreshed through the plugin. The declarative form of the historical
+	// "more than 500 followers" requirement. Zero disables the gate.
+	MinInboundRefs uint64
 }
 
 // Plugin is one DVM integration. Name is the provider namespace clients see
@@ -39,6 +57,9 @@ type Plugin interface {
 	// (IF NOT EXISTS, reapplied every Migrate and included in the schema
 	// reconciler's desired set — dropping a plugin retires its tables).
 	CacheDDL() []string
+	// Policy declares when the stack consults this plugin (cache TTL,
+	// inbound-ref gate). Zero values disable the respective behavior.
+	Policy() Policy
 
 	// ScoreProvider is the pubkey-score source used for rank gating; nil when
 	// the plugin provides no scores.

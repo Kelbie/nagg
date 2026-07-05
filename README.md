@@ -138,11 +138,21 @@ type Plugin interface {
     Kinds() []KindPair   // request/response kinds it speaks
     CacheDDL() []string  // its cache tables — applied and reconciled
                          // exactly like rule tables
+    Policy() Policy      // usage rules: cache TTL + inbound-ref gate
     ScoreProvider() any
     SearchProvider() any
     RecommendProvider() any
 }
 ```
+
+A plugin also declares its **usage policy** — `Policy{CacheTTL,
+MinInboundRefs}`. `CacheTTL` is how long cached provider values are trusted
+before the score sync refetches them (best-effort values that sharpen in
+place as the provider's own dataset matures); `MinInboundRefs` gates which
+pubkeys are worth consulting the provider for, measured as latest-list
+kind-3 inbound refs (the `latest_k3` fan-in) — the declarative form of the
+historical "more than 500 followers" requirement. Vertex declares 7 days
+and 500.
 
 Vertex is the first plugin (kinds 5312/6312, 5313/6313, 5315/6315; cache
 tables `vertex_scores`, `vertex_profile_cache`, `vertex_search_cache`).

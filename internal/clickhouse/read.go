@@ -908,7 +908,10 @@ func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error
 	return counts[pubkey].Followers, nil
 }
 
-func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, limit int) ([]string, error) {
+func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, staleAfter time.Duration, limit int) ([]string, error) {
+	if staleAfter <= 0 {
+		staleAfter = 7 * 24 * time.Hour
+	}
 	if limit <= 0 {
 		limit = 200
 	}
@@ -940,10 +943,10 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 			WHERE source = 'vertex'
 			GROUP BY pubkey
 		) AS scores ON scores.pubkey = recent.pubkey
-		WHERE ifNull(scores.fetched_at, toDateTime(0)) < now() - INTERVAL 6 HOUR
+		WHERE ifNull(scores.fetched_at, toDateTime(0)) < now() - INTERVAL ? SECOND
 		ORDER BY recent.last_event_at DESC
 		LIMIT ?
-	`, minFollowers, limit)
+	`, minFollowers, int64(staleAfter/time.Second), limit)
 	if err != nil {
 		return nil, err
 	}

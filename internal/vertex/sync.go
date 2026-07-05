@@ -7,7 +7,7 @@ import (
 )
 
 type SyncStore interface {
-	RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, limit int) ([]string, error)
+	RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers uint64, staleAfter time.Duration, limit int) ([]string, error)
 	SaveVertexProfile(context.Context, ProfileResult) error
 }
 
@@ -18,7 +18,10 @@ type SyncClient interface {
 type SyncConfig struct {
 	MinFollowers uint64
 	BatchSize    int
-	Interval     time.Duration
+	// StaleAfter is the score cache TTL: pubkeys whose stored values are
+	// older than this get refetched (the plugin policy's CacheTTL).
+	StaleAfter time.Duration
+	Interval   time.Duration
 	// Throttle is the minimum delay between upstream Vertex profile fetches. It
 	// protects the credit-limited upstream API from a burst when a large backlog
 	// of stale/unscored authors accumulates. Zero disables throttling.
@@ -68,7 +71,7 @@ func (s *Syncer) Run(ctx context.Context) {
 }
 
 func (s *Syncer) RunOnce(ctx context.Context) (int, int, error) {
-	pubkeys, err := s.store.RecentAuthorPubkeysByFollowers(ctx, s.config.MinFollowers, s.config.BatchSize)
+	pubkeys, err := s.store.RecentAuthorPubkeysByFollowers(ctx, s.config.MinFollowers, s.config.StaleAfter, s.config.BatchSize)
 	if err != nil {
 		return 0, 0, err
 	}

@@ -109,6 +109,11 @@ func initializeAPI(ctx context.Context, cfg config.Config, logger *slog.Logger, 
 }
 
 func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
+	// The Vertex plugin's declared usage policy: cache TTL + inbound-ref
+	// gate. All consumers (score sync, rank gating, profile refresh) derive
+	// from this single declaration.
+	vertexPolicy := cfg.DVM.Plugin(vertex.PluginName).Policy()
+
 	// One process-wide gate for every heavy ClickHouse path. Previously only
 	// heavy REST routes were semaphored — GraphQL (its own mux) and background
 	// workers (rollup) piled onto CH past the measured concurrency ceiling,
@@ -126,8 +131,9 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		}
 		vertexClient = client
 		vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
-			MinFollowers: uint64(cfg.Vertex.RankMinFollowers),
+			MinFollowers: vertexPolicy.MinInboundRefs,
 			BatchSize:    cfg.Vertex.SyncBatch,
+			StaleAfter:   vertexPolicy.CacheTTL,
 			Throttle:     cfg.Vertex.SyncThrottle,
 		}, logger)
 		go vertexSyncer.Run(ctx)
@@ -253,7 +259,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		}
 	}
 	schemaOpts := []graphqlapi.Option{
-		graphqlapi.WithPubkeyScoreMinFollowers(cfg.Vertex.RankMinFollowers),
+		graphqlapi.WithPubkeyScoreMinFollowers(int(vertexPolicy.MinInboundRefs)),
 		graphqlapi.WithProfileSearch(searchProvider),
 		graphqlapi.WithDVM(cfg.DVM),
 	}
@@ -294,7 +300,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	appviewOpts := []appview.Option{
 		appview.WithDVM(cfg.DVM),
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
-		appview.WithVertexProfileMinFollowers(cfg.Vertex.ProfileMinFollowers),
+		appview.WithVertexProfileMinFollowers(int(vertexPolicy.MinInboundRefs)),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
 		appview.WithViewerTouch(relevanceTracker.Touch),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor),
