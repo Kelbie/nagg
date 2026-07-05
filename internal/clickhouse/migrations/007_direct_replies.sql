@@ -11,7 +11,7 @@
 -- needs ALL of a child's 'e' tags together. But once event_tags is GROUPed BY the
 -- child event_id, every one of that child's 'e' tags is collocated, so the same
 -- argMinIf/argMaxIf logic already used by the notification reply join
--- (read.go: direct_parent_id) yields one edge per child. The rollup job maintains
+-- (read.go: direct_target_id) yields one edge per child. The rollup job maintains
 -- these tables incrementally for recent children; this migration creates them and
 -- backfills history once.
 --
@@ -20,46 +20,46 @@
 -- perturb the declarative schema.
 
 -- One authoritative direct-reply edge per child reply event. ReplacingMergeTree
--- keyed by child_id: re-seeing a child overwrites its (identical) edge row.
--- ORDER BY (parent_id, child_id): a child's direct parent is fixed (event ids are
--- content-addressed, so tags never change), so (parent_id, child_id) is one row
+-- keyed by source_id: re-seeing a child overwrites its (identical) edge row.
+-- ORDER BY (target_id, source_id): a child's direct parent is fixed (event ids are
+-- content-addressed, so tags never change), so (target_id, source_id) is one row
 -- per child and ReplacingMergeTree still dedups re-seen children. Leading with
--- parent_id makes "direct replies to X" an indexed range scan for the thread view.
-CREATE TABLE IF NOT EXISTS note_reply_edges
+-- target_id makes "direct replies to X" an indexed range scan for the thread view.
+CREATE TABLE IF NOT EXISTS ref_edges
 (
-    child_id     FixedString(64),
-    parent_id    FixedString(64),
-    child_pubkey FixedString(64),
+    source_id     FixedString(64),
+    target_id    FixedString(64),
+    source_pubkey FixedString(64),
     kind         UInt32,
     created_at   DateTime
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(created_at)
-ORDER BY (parent_id, child_id);
+ORDER BY (target_id, source_id);
 
 -- Backfill edges over all history. Per child, pick the NIP-10 direct parent:
 --   reply marker  >  unmarked last 'e' (max tag_index)  >  root marker.
 -- For kind 1111 (NIP-22) comments markers are typically absent, so the unmarked
 -- branch selects the lowercase parent 'e' tag. Children whose chosen parent is
 -- only referenced via a 'q' tag (a quote, not a reply) are excluded.
-INSERT INTO note_reply_edges
+INSERT INTO ref_edges
 SELECT
-    child_id,
-    parent_id,
-    child_pubkey,
+    source_id,
+    target_id,
+    source_pubkey,
     kind,
     created_at
 FROM (
     SELECT
-        event_id AS child_id,
-        any(pubkey) AS child_pubkey,
+        event_id AS source_id,
+        any(pubkey) AS source_pubkey,
         any(kind) AS kind,
         any(created_at) AS created_at,
         coalesce(
             nullIf(argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply'), ''),
             nullIf(argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = ''), ''),
             nullIf(argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root'), '')
-        ) AS parent_id,
+        ) AS target_id,
         groupArrayIf(tag_value, tag_key = 'q') AS quote_targets
     FROM (
         SELECT
@@ -78,9 +78,9 @@ FROM (
     )
     GROUP BY event_id
 )
-WHERE parent_id != ''
-  AND length(parent_id) = 64
-  AND NOT has(quote_targets, parent_id);
+WHERE target_id != ''
+  AND length(target_id) = 64
+  AND NOT has(quote_targets, target_id);
 
 -- The direct-reply COUNT aggregate lives in the rules registry as the
 -- periodic relationship k1_1111_e_reply (agg_k1_1111_e_reply); the rollup

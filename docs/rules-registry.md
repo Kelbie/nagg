@@ -74,6 +74,20 @@ parsing the bolt11 invoice).
 
 **Add an extractor only when a real rule needs it — never speculatively.**
 
+## Projections
+
+`Projection{Name, Kinds, Fields}` declares a latest-event-per-author
+extraction: "for each pubkey, keep the newest event of `Kinds`, with these
+columns pulled out of it". The generated table is `latest_<name>`
+(ReplacingMergeTree(created_at) keyed by pubkey, implicit
+pubkey/event_id/created_at columns), fed by a generated MV over
+`nostr_events`, with the same first-creation backfill as relationships. Field
+sources are a closed set, like extractors: `JSONPath` (a
+`JSONExtractString(content, …)` string), `RawContent` (the whole content),
+`TagKey` (the event's 64-hex values of that tag, as an array). The defaults
+declare `latest_k0` (kind-0 metadata fields + raw_json) and `latest_k3`
+(`refs` = p-tag values) — the tables that used to be hand-written SQL.
+
 ## Supersessions
 
 `Supersession{Name, Kinds, PerDTag}` declares that once an author publishes a
@@ -135,11 +149,11 @@ through the registry — a future DVM plugs in by adding one entry.
 
 ## Deliberately outside the registry
 
-- **Rank features** (`note_rank_features`, engagement-real): multi-column,
+- **Rank features** (`rank_features`, engagement-real): multi-column,
   threshold-versioned rank plumbing computed by the rollup — consumed via
   weighted rank terms that *reference* rule names, but not themselves
   kind-to-kind counts.
-- **The notifications feed** (`notifications_feed`): a viewer-indexed read
+- **The notifications feed** (`viewer_feed`): a viewer-indexed read
   model with its own incremental tick (`docs/notifications-flow.md`).
 - **The mint auditor** (`internal/auditor`): a plain cached HTTP client — not
   a DVM, so not a plugin.

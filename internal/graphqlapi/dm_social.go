@@ -172,11 +172,11 @@ func (r *resolver) ownProfiles(ctx context.Context, rawPubkeys any) ([]map[strin
 	if len(pubkeys) == 0 {
 		return []map[string]any{}, nil
 	}
-	profiles, err := r.store.LatestProfiles(ctx, pubkeys)
+	profiles, err := r.store.LatestK0(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
-	counts, err := r.store.BatchFollowCounts(ctx, pubkeys)
+	counts, err := r.store.BatchPubkeyStats(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}

@@ -70,20 +70,20 @@ func TestFollowStatusDerivesRelationships(t *testing.T) {
 
 type ownProfileStore struct {
 	fakeStore
-	profileRows map[string]chstore.ProfileRow
-	counts      map[string]chstore.FollowCounts
+	profileRows map[string]chstore.K0Row
+	counts      map[string]chstore.PubkeyStats
 }
 
-func (s *ownProfileStore) LatestProfiles(_ context.Context, pubkeys []string) (map[string]chstore.ProfileRow, error) {
-	out := make(map[string]chstore.ProfileRow, len(pubkeys))
+func (s *ownProfileStore) LatestK0(_ context.Context, pubkeys []string) (map[string]chstore.K0Row, error) {
+	out := make(map[string]chstore.K0Row, len(pubkeys))
 	for _, p := range pubkeys {
 		out[p] = s.profileRows[p]
 	}
 	return out, nil
 }
 
-func (s *ownProfileStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
-	out := make(map[string]chstore.FollowCounts, len(pubkeys))
+func (s *ownProfileStore) BatchPubkeyStats(_ context.Context, pubkeys []string) (map[string]chstore.PubkeyStats, error) {
+	out := make(map[string]chstore.PubkeyStats, len(pubkeys))
 	for _, p := range pubkeys {
 		out[p] = s.counts[p]
 	}
@@ -93,12 +93,12 @@ func (s *ownProfileStore) BatchFollowCounts(_ context.Context, pubkeys []string)
 func TestOwnProfilesReturnsMetadataAndCounts(t *testing.T) {
 	a := hexID("a")
 	store := &ownProfileStore{
-		profileRows: map[string]chstore.ProfileRow{a: {
+		profileRows: map[string]chstore.K0Row{a: {
 			PubKey: a, Name: "alice", Picture: "pic",
 			EventID: hexID("e"), RawJSON: `{"name":"alice","picture":"pic"}`,
 			CreatedAt: time.Unix(1_700_000_000, 0),
 		}},
-		counts: map[string]chstore.FollowCounts{a: {Follows: 12, Followers: 34}},
+		counts: map[string]chstore.PubkeyStats{a: {Follows: 12, Followers: 34}},
 	}
 	handler := New(store, WithNIP05Validation(false))
 
@@ -189,15 +189,15 @@ type relevantThreadStore struct {
 	allByNew     []string
 }
 
-func (s *relevantThreadStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
+func (s *relevantThreadStore) DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return &s.root, s.replies, nil
 }
 
-func (s *relevantThreadStore) AuthoredReplyChain(context.Context, string, string, int) ([]string, error) {
+func (s *relevantThreadStore) AuthoredRefChain(context.Context, string, string, int) ([]string, error) {
 	return s.authorChain, nil
 }
 
-func (s *relevantThreadStore) FollowedReplies(_ context.Context, _ string, parents []string) (map[string]string, error) {
+func (s *relevantThreadStore) FollowedRefs(_ context.Context, _ string, parents []string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, p := range parents {
 		if id, ok := s.followed[p]; ok {
@@ -207,7 +207,7 @@ func (s *relevantThreadStore) FollowedReplies(_ context.Context, _ string, paren
 	return out, nil
 }
 
-func (s *relevantThreadStore) RankedDirectReplyIDs(_ context.Context, _ string, sort string, _ int, _ int) ([]string, error) {
+func (s *relevantThreadStore) RankedRefSources(_ context.Context, _ string, sort string, _ int, _ int) ([]string, error) {
 	if sort == "new" {
 		return s.allByNew, nil
 	}
@@ -277,7 +277,7 @@ func TestThreadDefaultSortUnchanged(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	// Default order is root then the ThreadEvents reply order (no merge
+	// Default order is root then the DescendantEvents reply order (no merge
 	// primitives consulted).
 	if strings.Join(resp.Order, ",") != strings.Join([]string{root, r1, r2}, ",") {
 		t.Fatalf("order = %v, want root + descendant order", resp.Order)

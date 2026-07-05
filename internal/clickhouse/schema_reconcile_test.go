@@ -25,21 +25,21 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 	wantTables := []string{
 		// static SQL
 		"schema_migrations",
-		"notifications_feed",
+		"viewer_feed",
 		"nostr_events",
 		"event_seen_relays",
 		"event_tags",
-		"note_reply_edges",
-		"note_engagement_real",
+		"ref_edges",
+		"gated_ref_counts",
 		"rollup_state",
-		"user_contacts_latest",
-		"user_stats",
-		"note_rank_features",
-		"profiles_latest",
+		"latest_k3",
+		"pubkey_stats",
+		"rank_features",
+		"latest_k0",
 		"derived_tags",
 		"derived_metrics",
 		"enrichment_state",
-		"notification_candidates",
+		"viewer_refs",
 		"known_viewers",
 		// registry-generated
 		"vertex_scores",
@@ -64,9 +64,9 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 
 	wantViews := []string{
 		// static SQL
-		"mv_profiles_latest",
-		"mv_notification_candidates",
-		"mv_user_contacts_latest",
+		"mv_latest_k0",
+		"mv_viewer_refs",
+		"mv_latest_k3",
 		// registry-generated (periodic k1_1111_e_reply has no view)
 		"mv_agg_k7_e",
 		"mv_agg_k6_16_e",
@@ -144,7 +144,7 @@ func TestComputeReconcilePlan_DropsExtrasAddsMissing(t *testing.T) {
 				"target_event_id": "target_event_id FixedString(64)",
 				"likes":           "likes AggregateFunction(uniq, FixedString(64))",
 			},
-			"profiles_latest": {
+			"latest_k0": {
 				"pubkey": "pubkey FixedString(64)",
 				"name":   "name String",
 			},
@@ -156,7 +156,7 @@ func TestComputeReconcilePlan_DropsExtrasAddsMissing(t *testing.T) {
 
 	actualTables := map[string]string{
 		"note_like_counts":    "AggregatingMergeTree",
-		"profiles_latest":     "ReplacingMergeTree",
+		"latest_k0":           "ReplacingMergeTree",
 		"event_embeddings":    "MergeTree",        // dead table -> drop
 		"mv_note_like_counts": "MaterializedView", // declared view -> keep
 		"mv_dead_view":        "MaterializedView", // dead view -> drop
@@ -166,7 +166,7 @@ func TestComputeReconcilePlan_DropsExtrasAddsMissing(t *testing.T) {
 			"target_event_id": {},
 			"likes":           {},
 		},
-		"profiles_latest": {
+		"latest_k0": {
 			"pubkey":     {},
 			"old_column": {}, // not desired -> drop
 			// "name" missing -> add
@@ -182,11 +182,11 @@ func TestComputeReconcilePlan_DropsExtrasAddsMissing(t *testing.T) {
 	if got := names(plan.dropViews); !equalSet(got, []string{"mv_dead_view"}) {
 		t.Errorf("dropViews = %v, want [mv_dead_view]", got)
 	}
-	if len(plan.dropColumns) != 1 || plan.dropColumns[0].table != "profiles_latest" || plan.dropColumns[0].column != "old_column" {
-		t.Errorf("dropColumns = %+v, want [{profiles_latest old_column}]", plan.dropColumns)
+	if len(plan.dropColumns) != 1 || plan.dropColumns[0].table != "latest_k0" || plan.dropColumns[0].column != "old_column" {
+		t.Errorf("dropColumns = %+v, want [{latest_k0 old_column}]", plan.dropColumns)
 	}
-	if len(plan.addColumns) != 1 || plan.addColumns[0].table != "profiles_latest" || plan.addColumns[0].column != "name" {
-		t.Errorf("addColumns = %+v, want [{profiles_latest name ...}]", plan.addColumns)
+	if len(plan.addColumns) != 1 || plan.addColumns[0].table != "latest_k0" || plan.addColumns[0].column != "name" {
+		t.Errorf("addColumns = %+v, want [{latest_k0 name ...}]", plan.addColumns)
 	}
 	if def := plan.addColumns[0].definition; def != "name String" {
 		t.Errorf("addColumns definition = %q, want %q", def, "name String")
@@ -315,11 +315,11 @@ func TestSchemaReconcileMode_Default(t *testing.T) {
 func TestDirectRepliesMigration_DeclaresEdgeTable(t *testing.T) {
 	sql := mustReadMigration("007_direct_replies.sql")
 	for _, want := range []string{
-		"CREATE TABLE IF NOT EXISTS note_reply_edges",
+		"CREATE TABLE IF NOT EXISTS ref_edges",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply')",
 		"argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = '')",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root')",
-		"has(quote_targets, parent_id)",
+		"has(quote_targets, target_id)",
 		"kind IN (1, 1111)",
 	} {
 		if !strings.Contains(sql, want) {
@@ -331,8 +331,8 @@ func TestDirectRepliesMigration_DeclaresEdgeTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
-	if _, ok := desired.tables["note_reply_edges"]; !ok {
-		t.Error("expected table note_reply_edges declared by 007")
+	if _, ok := desired.tables["ref_edges"]; !ok {
+		t.Error("expected table ref_edges declared by 007")
 	}
 	if _, ok := desired.tables["note_direct_reply_counts"]; ok {
 		t.Error("note_direct_reply_counts must no longer be declared by static SQL")

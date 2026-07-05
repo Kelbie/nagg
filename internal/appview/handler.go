@@ -30,20 +30,20 @@ type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
-	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
-	FollowCounts(context.Context, string) (chstore.FollowCounts, error)
+	LatestK0(context.Context, []string) (map[string]chstore.K0Row, error)
+	PubkeyStats(context.Context, string) (chstore.PubkeyStats, error)
 	ProfileFirstEventCreatedAt(context.Context, string) (*time.Time, error)
 	CachedVertexProfile(context.Context, string) (vertex.ProfileResult, bool, error)
 	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	SaveVertexProfile(context.Context, vertex.ProfileResult) error
-	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
-	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
-	BatchFollowCounts(context.Context, []string) (map[string]chstore.FollowCounts, error)
+	DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
+	ViewerFeed(context.Context, chstore.ViewerFeedInput) ([]chstore.ViewerFeedRow, error)
+	BatchPubkeyStats(context.Context, []string) (map[string]chstore.PubkeyStats, error)
 	FollowEdges(context.Context, string, []string) (map[string]chstore.FollowEdge, error)
-	RankedDirectReplyIDs(context.Context, string, string, int, int) ([]string, error)
-	AuthoredReplyChain(context.Context, string, string, int) ([]string, error)
-	FollowedReplies(context.Context, string, []string) (map[string]string, error)
-	SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
+	RankedRefSources(context.Context, string, string, int, int) ([]string, error)
+	AuthoredRefChain(context.Context, string, string, int) ([]string, error)
+	FollowedRefs(context.Context, string, []string) (map[string]string, error)
+	SearchK0(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 }
 
 // RankedFeedProvider runs the shared ranked-feed ranking pipeline. It is
@@ -684,7 +684,7 @@ type NotificationsEnvelope struct {
 }
 
 // notifications is the REST counterpart of the GraphQL notifications resolver.
-// It builds a chstore.NotificationInput from request params (mirroring the
+// It builds a chstore.ViewerFeedInput from request params (mirroring the
 // GraphQL input: viewer, tab, policy, replyScope, since, until, limit), calls
 // store.Notifications, then enriches the notification events with the same
 // Metrics/Profiles/Quoted hydration the feed uses.
@@ -724,10 +724,10 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		}
 		bodyInput := input
 		bodyInput.Limit = uint64(bodyWindow)
-		bodyInput.ExcludeReasons = append([]string{"follow"}, input.ExcludeReasons...)
-		var bodyRows []chstore.NotificationRow
+		bodyInput.ExcludeKinds = append([]int64{3}, input.ExcludeKinds...)
+		var bodyRows []chstore.ViewerFeedRow
 		err = recordPhase(r.Context(), "db", func() (e error) {
-			bodyRows, e = h.store.Notifications(r.Context(), bodyInput)
+			bodyRows, e = h.store.ViewerFeed(r.Context(), bodyInput)
 			return
 		})
 		if err != nil {
@@ -739,30 +739,30 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 		// The follow group is a single collapsed entry pinned to the top of the
 		// first page; don't re-fetch/re-emit it while paginating (until > 0) or it
 		// would repeat on every scroll page.
-		var followRows []chstore.NotificationRow
+		var followRows []chstore.ViewerFeedRow
 		if input.Tab != "MENTIONS" && input.Until == 0 {
 			followInput := input
-			followInput.Reasons = []string{"follow"}
-			followInput.ExcludeReasons = nil
+			followInput.Kinds = []int64{3}
+			followInput.ExcludeKinds = nil
 			followInput.Limit = 12
 			// Follows are kind-3, never replies, so the reply-reference scans (the
 			// most expensive part of the notifications query) are pure waste here.
 			// "NONE" falls through the store's DIRECT/THREAD switch, skipping the
 			// reply joins entirely without changing which follow rows return.
 			followInput.ReplyScope = "NONE"
-			if fr, ferr := h.store.Notifications(r.Context(), followInput); ferr == nil {
+			if fr, ferr := h.store.ViewerFeed(r.Context(), followInput); ferr == nil {
 				followRows = fr
 			}
 		}
 
-		allRows := make([]chstore.NotificationRow, 0, len(followRows)+len(bodyRows))
+		allRows := make([]chstore.ViewerFeedRow, 0, len(followRows)+len(bodyRows))
 		allRows = append(allRows, followRows...)
 		allRows = append(allRows, bodyRows...)
 		entries, referenced, actorPubkeys, hasNext = h.groupNotifications(r.Context(), input, allRows, windowSaturated)
 	} else {
-		var rows []chstore.NotificationRow
+		var rows []chstore.ViewerFeedRow
 		err = recordPhase(r.Context(), "db", func() (e error) {
-			rows, e = h.store.Notifications(r.Context(), input)
+			rows, e = h.store.ViewerFeed(r.Context(), input)
 			return
 		})
 		if err != nil {
@@ -780,7 +780,7 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 				Actors: []NotificationActor{{
 					PubKey:           row.ActorPubKey,
 					EventID:          row.Event.ID,
-					CreatedAt:        row.NotificationCreatedAt.Unix(),
+					CreatedAt:        row.RefCreatedAt.Unix(),
 					ActorVertexScore: row.ActorVertexScore,
 				}},
 			})
@@ -803,7 +803,7 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 	}
 	// Sample actors beyond the representative are not event authors, so embed
 	// their kind-0 profile events explicitly for the avatar cluster.
-	if err := h.appendProfileEventsTo(r.Context(), &envelope, actorPubkeys); err != nil {
+	if err := h.appendK0EventsTo(r.Context(), &envelope, actorPubkeys); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -814,31 +814,32 @@ func (h *Handler) notifications(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// notificationGroupReasons collapse into a single item. reply / quote / mention
+// notificationGroupable kinds collapse into a single item (kind-3 references,
+// kind-6/16 references, kind-7 references, kind-9735 receipts). Kind-1 events
 // carry text and always render individually.
-func notificationGroupable(reason string) bool {
-	switch reason {
-	case "follow", "repost", "reaction", "zap":
+func notificationGroupable(kind int) bool {
+	switch kind {
+	case 3, 6, 16, 7, 9735:
 		return true
 	}
 	return false
 }
 
-// notificationGroupKey is what same-reason notifications collapse on. All
-// follows share one group; repost/reaction/zap collapse per target post (or a
-// per-reason "profile" bucket when there's no target event, e.g. a profile zap).
-func notificationGroupKey(reason, targetID string) string {
-	if reason == "follow" {
-		return "follow"
+// notificationGroupKey is what same-kind entries collapse on. All kind-3
+// references share one group; the rest collapse per target event (or a
+// per-kind "pubkey" bucket when there is no target event).
+func notificationGroupKey(kind int, targetID string) string {
+	if kind == 3 {
+		return "k3"
 	}
 	if targetID == "" {
-		return reason + ":profile"
+		return fmt.Sprintf("k%d:pubkey", kind)
 	}
-	return reason + ":" + targetID
+	return fmt.Sprintf("k%d:%s", kind, targetID)
 }
 
 type notificationGroupAcc struct {
-	rep       chstore.NotificationRow // representative = most-recent member
+	rep       chstore.ViewerFeedRow // representative = most-recent member
 	targetID  string
 	total     int
 	actors    []NotificationActor
@@ -850,17 +851,17 @@ type notificationGroupAcc struct {
 // returns the entries, the events to embed (representatives + targets), the
 // sample-actor pubkeys to profile-hydrate, and whether more items exist past
 // the page. All product semantics live here; the store query stays generic.
-func (h *Handler) groupNotifications(ctx context.Context, input chstore.NotificationInput, rows []chstore.NotificationRow, windowSaturated bool) ([]NotificationEntry, []chstore.EventView, []string, bool) {
+func (h *Handler) groupNotifications(ctx context.Context, input chstore.ViewerFeedInput, rows []chstore.ViewerFeedRow, windowSaturated bool) ([]NotificationEntry, []chstore.EventView, []string, bool) {
 	order := make([]string, 0, len(rows))
 	groups := make(map[string]*notificationGroupAcc, len(rows))
 	for _, row := range rows {
 		targetID := ""
-		if row.Reason == "repost" || row.Reason == "reaction" || row.Reason == "zap" {
+		if row.Kind == 6 || row.Kind == 16 || row.Kind == 7 || row.Kind == 9735 {
 			targetID = firstEventTag(row.Event)
 		}
 		var key string
-		if notificationGroupable(row.Reason) {
-			key = notificationGroupKey(row.Reason, targetID)
+		if notificationGroupable(row.Kind) {
+			key = notificationGroupKey(row.Kind, targetID)
 		} else {
 			// reply/quote/mention: each is its own single item.
 			key = "single:" + row.Event.ID
@@ -877,7 +878,7 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 			acc.actors = append(acc.actors, NotificationActor{
 				PubKey:           row.ActorPubKey,
 				EventID:          row.Event.ID,
-				CreatedAt:        row.NotificationCreatedAt.Unix(),
+				CreatedAt:        row.RefCreatedAt.Unix(),
 				ActorVertexScore: row.ActorVertexScore,
 			})
 		}
@@ -887,7 +888,7 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 	// concatenated windows (e.g. follows fetched separately from everything
 	// else), so we can't rely on first-seen order being globally sorted.
 	sort.SliceStable(order, func(i, j int) bool {
-		return groups[order[i]].rep.NotificationCreatedAt.After(groups[order[j]].rep.NotificationCreatedAt)
+		return groups[order[i]].rep.RefCreatedAt.After(groups[order[j]].rep.RefCreatedAt)
 	})
 	// More items exist if we collapsed past the page, or if the candidate window
 	// was saturated (older candidates remain beyond it — they may collapse into
@@ -903,8 +904,8 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 	followTotal := -1
 	if input.Policy != "FOLLOWS" {
 		for _, key := range order {
-			if key == "follow" {
-				if counts, err := h.store.FollowCounts(ctx, input.Viewer); err == nil {
+			if key == "k3" {
+				if counts, err := h.store.PubkeyStats(ctx, input.Viewer); err == nil {
 					followTotal = int(counts.Followers)
 				}
 				break
@@ -924,9 +925,9 @@ func (h *Handler) groupNotifications(ctx context.Context, input chstore.Notifica
 			Actors: acc.actors,
 		}
 		referenced = append(referenced, acc.rep.Event)
-		if notificationGroupable(acc.rep.Reason) && acc.total >= 2 {
+		if notificationGroupable(acc.rep.Kind) && acc.total >= 2 {
 			entry.Total = acc.total
-			if acc.rep.Reason == "follow" && followTotal >= 0 {
+			if acc.rep.Kind == 3 && followTotal >= 0 {
 				entry.Total = followTotal
 			} else {
 				entry.TotalCapped = windowSaturated
@@ -976,14 +977,14 @@ func notificationEndCursor(entries []NotificationEntry, byID map[string]chstore.
 	return &cursor
 }
 
-// parseNotificationRequest builds a chstore.NotificationInput from the request,
+// parseNotificationRequest builds a chstore.ViewerFeedInput from the request,
 // accepting both query params (GET) and a JSON body (POST). Defaults match the
 // GraphQL parseNotificationInput: tab ALL, policy STRICT, replyScope THREAD,
 // limit 50. The viewer pubkey falls back to the configured viewer. It also
 // returns whether the response should be grouped (default true) — the
 // followers-detail screen passes grouped=false to read the raw follow list.
-func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.NotificationInput, bool, error) {
-	input := chstore.NotificationInput{
+func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.ViewerFeedInput, bool, error) {
+	input := chstore.ViewerFeedInput{
 		Tab:        "ALL",
 		Policy:     "STRICT",
 		ReplyScope: "THREAD",
@@ -1089,14 +1090,14 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := intParam(r, "limit", 1000)
-	root, events, err := h.store.ThreadEvents(r.Context(), id, limit)
+	root, events, err := h.store.DescendantEvents(r.Context(), id, limit)
 	if errors.Is(err, sql.ErrNoRows) {
 		if h.tryBackfillThread(r.Context(), id, limit) {
-			root, events, err = h.store.ThreadEvents(r.Context(), id, limit)
+			root, events, err = h.store.DescendantEvents(r.Context(), id, limit)
 		}
 	} else if err == nil && h.shouldBackfillThread(events, limit) {
 		if h.tryBackfillThread(r.Context(), id, limit) {
-			root, events, err = h.store.ThreadEvents(r.Context(), id, limit)
+			root, events, err = h.store.DescendantEvents(r.Context(), id, limit)
 		}
 	}
 	if err != nil {
@@ -1155,7 +1156,7 @@ const (
 )
 
 // threadOrdering builds the server-authoritative reply manifest. The default
-// ("" / "new") order is the chronological/rank descendant order ThreadEvents
+// ("" / "new") order is the chronological/rank descendant order DescendantEvents
 // already returned — unchanged, backward-compatible. "ranked" orders direct
 // replies by engagement; "relevant" reproduces the viewer-specific merge the
 // client used to assemble from nested GraphQL resolvers (author self-reply chain
@@ -1173,7 +1174,7 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) Order
 	case "relevant":
 		ordered, err = h.relevantReplyOrder(ctx, p)
 	case "ranked":
-		ordered, err = h.store.RankedDirectReplyIDs(ctx, p.rootID, threadRankedSort, candidateLimitOr(p.candidateLimit), 0)
+		ordered, err = h.store.RankedRefSources(ctx, p.rootID, threadRankedSort, candidateLimitOr(p.candidateLimit), 0)
 	}
 	if err != nil {
 		slog.Warn("appview.thread.order failed; using rank fallback", "sort", p.sort, "root", p.rootID, "error", err)
@@ -1203,7 +1204,7 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) Order
 		add(id)
 	}
 	// Replies the merge didn't surface (e.g. nested descendants) keep their
-	// ThreadEvents order at the tail so the flat list stays complete.
+	// DescendantEvents order at the tail so the flat list stays complete.
 	for _, e := range p.replies {
 		add(e.ID)
 	}
@@ -1223,7 +1224,7 @@ func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) (
 	merged := make([]string, 0, candidateLimit)
 
 	// 1. The author's self-reply chain from the root.
-	authorChain, err := h.store.AuthoredReplyChain(ctx, p.rootID, p.author, threadAuthorChainDepth)
+	authorChain, err := h.store.AuthoredRefChain(ctx, p.rootID, p.author, threadAuthorChainDepth)
 	if err != nil {
 		return nil, err
 	}
@@ -1235,7 +1236,7 @@ func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) (
 		if len(authorChain) > 0 {
 			tail = authorChain[len(authorChain)-1]
 		}
-		followed, err := h.store.FollowedReplies(ctx, p.viewer, []string{tail})
+		followed, err := h.store.FollowedRefs(ctx, p.viewer, []string{tail})
 		if err != nil {
 			return nil, err
 		}
@@ -1245,12 +1246,12 @@ func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) (
 	}
 
 	// 3. Ranked direct replies, then 4. all direct replies (recency).
-	ranked, err := h.store.RankedDirectReplyIDs(ctx, p.rootID, threadRankedSort, rankedLimit, 0)
+	ranked, err := h.store.RankedRefSources(ctx, p.rootID, threadRankedSort, rankedLimit, 0)
 	if err != nil {
 		return nil, err
 	}
 	merged = append(merged, ranked...)
-	all, err := h.store.RankedDirectReplyIDs(ctx, p.rootID, "new", candidateLimit, 0)
+	all, err := h.store.RankedRefSources(ctx, p.rootID, "new", candidateLimit, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1292,20 +1293,20 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.tryBackfillFollows(r.Context(), pubkey)
-	counts, err := h.store.FollowCounts(r.Context(), pubkey)
+	counts, err := h.store.PubkeyStats(r.Context(), pubkey)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
-	if err := h.appendProfileEventsTo(r.Context(), &envelope, []string{pubkey}); err != nil {
+	if err := h.appendK0EventsTo(r.Context(), &envelope, []string{pubkey}); err != nil {
 		writeError(w, err)
 		return
 	}
 	for _, event := range envelope.Events {
 		envelope.Order = append(envelope.Order, event.ID)
 	}
-	followAggregates(&envelope, pubkey, counts, 0)
+	pubkeyAggregates(&envelope, pubkey, counts, 0)
 	writeJSON(w, envelope)
 }
 
@@ -1452,16 +1453,16 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 	}
 	pubkeys := normalizePubkeys(csv(raw))
 	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
-	if err := h.appendProfileEventsTo(r.Context(), &envelope, pubkeys); err != nil {
+	if err := h.appendK0EventsTo(r.Context(), &envelope, pubkeys); err != nil {
 		writeError(w, err)
 		return
 	}
 	for _, event := range envelope.Events {
 		envelope.Order = append(envelope.Order, event.ID)
 	}
-	if counts, err := h.store.BatchFollowCounts(r.Context(), pubkeys); err == nil {
+	if counts, err := h.store.BatchPubkeyStats(r.Context(), pubkeys); err == nil {
 		for _, pubkey := range pubkeys {
-			followAggregates(&envelope, pubkey, counts[pubkey], 0)
+			pubkeyAggregates(&envelope, pubkey, counts[pubkey], 0)
 		}
 	}
 	writeJSON(w, envelope)
@@ -1479,12 +1480,12 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	h.tryBackfillProfileSummary(ctx, pubkey)
-	profiles, err := h.store.LatestProfiles(ctx, []string{pubkey})
+	profiles, err := h.store.LatestK0(ctx, []string{pubkey})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	counts, err := h.store.FollowCounts(ctx, pubkey)
+	counts, err := h.store.PubkeyStats(ctx, pubkey)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1532,8 +1533,8 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 	if fields := h.profileFields(ctx, pubkey, profile); fields.fields.NIP05Valid != nil {
 		envelope.setProvider(pubkey, "nip05", map[string]any{"valid": *fields.fields.NIP05Valid})
 	}
-	followAggregates(&envelope.Envelope, pubkey, counts, 0)
-	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, append([]string{pubkey}, followerPubkeys...)); err != nil {
+	pubkeyAggregates(&envelope.Envelope, pubkey, counts, 0)
+	if err := h.appendK0EventsTo(ctx, &envelope.Envelope, append([]string{pubkey}, followerPubkeys...)); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1609,7 +1610,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	// credit-free path: it serves any indexed profile (including brand-new
 	// queries) without touching the live DVM.
 	if len(results) < limit {
-		localRows, err := h.store.SearchProfiles(r.Context(), query, uint64(limit-len(results)))
+		localRows, err := h.store.SearchK0(r.Context(), query, uint64(limit-len(results)))
 		if err != nil {
 			writeError(w, err)
 			return
@@ -1672,12 +1673,12 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 		}
 		envelope.setProvider(row.PubKey, h.scoreProviderName(), payload)
 	}
-	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
+	if err := h.appendK0EventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
 		return ProvidersEnvelope{}, err
 	}
-	if counts, err := h.store.BatchFollowCounts(ctx, envelope.Pubkeys); err == nil {
+	if counts, err := h.store.BatchPubkeyStats(ctx, envelope.Pubkeys); err == nil {
 		for _, pubkey := range envelope.Pubkeys {
-			followAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
+			pubkeyAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
 		}
 	}
 	eventByPubkey := make(map[string]string, len(envelope.Events))
@@ -1754,12 +1755,12 @@ func (h *Handler) eventsByID(ctx context.Context, ids []string) (map[string]chst
 
 func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[string]ProfileInfo, error) {
 	pubkeys = normalizePubkeys(pubkeys)
-	rows, err := h.store.LatestProfiles(ctx, pubkeys)
+	rows, err := h.store.LatestK0(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
 	if missing := missingProfiles(pubkeys, rows); len(missing) > 0 && h.tryBackfillProfiles(ctx, missing) {
-		refreshed, err := h.store.LatestProfiles(ctx, missing)
+		refreshed, err := h.store.LatestK0(ctx, missing)
 		if err != nil {
 			return nil, err
 		}
@@ -2104,7 +2105,7 @@ func missingIDs(ids []string, found map[string]chstore.EventView) []string {
 	return out
 }
 
-func missingProfiles(pubkeys []string, rows map[string]chstore.ProfileRow) []string {
+func missingProfiles(pubkeys []string, rows map[string]chstore.K0Row) []string {
 	out := make([]string, 0)
 	for _, pubkey := range pubkeys {
 		if row, ok := rows[pubkey]; !ok || row.EventID == "" {
@@ -2136,7 +2137,7 @@ func (h *Handler) vertexProfile(ctx context.Context, pubkey string, followers ui
 	return profile, ok
 }
 
-func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, localProfile chstore.ProfileRow) (*int64, error) {
+func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, localProfile chstore.K0Row) (*int64, error) {
 	firstEventAt, err := h.store.ProfileFirstEventCreatedAt(ctx, pubkey)
 	if err != nil {
 		return nil, err
@@ -2147,7 +2148,7 @@ func (h *Handler) localProfileCreatedAt(ctx context.Context, pubkey string, loca
 	return unixPtr(localProfile.CreatedAt), nil
 }
 
-func (h *Handler) profileFields(ctx context.Context, pubkey string, row chstore.ProfileRow) profileFieldsResult {
+func (h *Handler) profileFields(ctx context.Context, pubkey string, row chstore.K0Row) profileFieldsResult {
 	fields := ProfileFields{
 		Name:        stringPtr(row.Name),
 		DisplayName: stringPtr(row.DisplayName),

@@ -4,7 +4,7 @@
 // The exemption set is (known Sovran viewers) ∪ (everyone they follow). Viewers
 // become known on their FIRST app request (the appview touches them on
 // notifications / DM / thread reads), so a brand-new profile is never treated
-// like a firehose bot. Follows come from user_contacts_latest, which the
+// like a firehose bot. Follows come from latest_k3, which the
 // app-view already maintains.
 package relevance
 

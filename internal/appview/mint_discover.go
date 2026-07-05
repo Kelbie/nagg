@@ -143,9 +143,9 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	if perr != nil {
 		profiles = map[string]ProfileInfo{}
 	}
-	followCounts, ferr := h.store.BatchFollowCounts(ctx, operatorPubkeys)
+	followCounts, ferr := h.store.BatchPubkeyStats(ctx, operatorPubkeys)
 	if ferr != nil {
-		followCounts = map[string]chstore.FollowCounts{}
+		followCounts = map[string]chstore.PubkeyStats{}
 	}
 	vertexProfiles, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys)
 	if verr != nil {
@@ -301,7 +301,7 @@ func buildDiscoverMint(
 	agg mintReviewAgg,
 	auditByKey map[string]auditor.Mint,
 	operatorByKey map[string]string,
-	followCounts map[string]chstore.FollowCounts,
+	followCounts map[string]chstore.PubkeyStats,
 	vertexProfiles map[string]vertex.ProfileResult,
 ) DiscoverMint {
 	var row DiscoverMint

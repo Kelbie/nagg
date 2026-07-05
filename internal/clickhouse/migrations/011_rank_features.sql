@@ -5,35 +5,35 @@
 -- supplied as bind params, ORDER BY score DESC LIMIT N.
 --
 -- Assembled by the rollup job each tick over the bounded recent/engaged event set:
---   raw_*   from the note_*_counts aggregates (uniqMerge / sumMerge)
---   real_*  from note_engagement_real FINAL
---   author_vertex_score / author_followers from vertex_scores (argMax by fetched_at)
+--   rule aggregates (agg_*) (uniqMerge / sumMerge)
+--   gated_* from gated_ref_counts FINAL
+--   author_score / author_followers from vertex_scores (argMax by fetched_at)
 --   contribution_quality from derived_metrics (argMax by computed_at)
 --
 -- ReplacingMergeTree(computed_at) keyed by (created_at, event_id): recompute
 -- overwrites, never additive. ORDER BY leads with created_at so the trending scan
 -- (created_at >= now() - INTERVAL N HOUR) is a partition-pruned range scan.
 
-CREATE TABLE IF NOT EXISTS note_rank_features
+CREATE TABLE IF NOT EXISTS rank_features
 (
     event_id             FixedString(64),
     pubkey               FixedString(64),
     kind                 UInt32,
     created_at           DateTime,
-    raw_likes            UInt64,
-    raw_reposts          UInt64,
-    raw_replies          UInt64,
-    raw_quotes           UInt64,
-    raw_zaps             UInt64,
-    raw_zap_sats         UInt64,
-    real_likes           UInt64,
-    real_reposts         UInt64,
-    real_replies         UInt64,
-    real_quotes          UInt64,
-    real_zaps            UInt64,
-    real_zap_sats        UInt64,
-    real_actors          UInt64,
-    author_vertex_score  Float64,
+    k7_e_actors            UInt64,
+    k6_16_e_actors          UInt64,
+    k1_1111_e_reply_sources          UInt64,
+    k1_q_sources           UInt64,
+    k9735_e_sources             UInt64,
+    k9735_e_value_total         UInt64,
+    gated_k7_e_actors           UInt64,
+    gated_k6_16_e_actors         UInt64,
+    gated_k1_1111_e_reply_sources         UInt64,
+    gated_k1_q_sources          UInt64,
+    gated_k9735_e_sources            UInt64,
+    gated_k9735_e_value_total        UInt64,
+    gated_actors          UInt64,
+    author_score  Float64,
     author_followers     UInt64,
     contribution_quality Float64,
     threshold_version    LowCardinality(String),

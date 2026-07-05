@@ -80,7 +80,7 @@ type Config struct {
 	// setting. 0 leaves it unset (server default). See config.APIConfig docs.
 	MaxQueryMemoryBytes int64
 	// NotificationsLegacyRead forces the legacy live-join notifications query
-	// even when the notifications_feed read-model is caught up. Emergency
+	// even when the viewer_feed read-model is caught up. Emergency
 	// escape hatch for the first read-model deploys — remove once the model
 	// has served production for a while.
 	NotificationsLegacyRead bool
@@ -102,7 +102,7 @@ type Store struct {
 	dvm *dvm.Registry
 	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
 	notificationsLegacyRead bool
-	// Cached notifications_feed readiness (see notificationsFeedReady).
+	// Cached viewer_feed readiness (see notificationsFeedReady).
 	feedReadyMu        sync.Mutex
 	feedReady          bool
 	feedReadyCheckedAt time.Time
@@ -620,6 +620,18 @@ func (s *Store) applyGeneratedSchema(ctx context.Context) error {
 		}
 	}
 
+	for _, proj := range s.rules.Projections() {
+		table := rules.ProjTableName(proj.Name)
+		if _, ok := existing[table]; ok {
+			continue
+		}
+		start := time.Now()
+		if err := s.conn.Exec(ctx, rules.ProjectionBackfillSQL(proj)); err != nil {
+			return fmt.Errorf("backfill projection %s: %w", proj.Name, err)
+		}
+		slog.Info("projection backfilled", "projection", proj.Name, "duration", time.Since(start))
+	}
+
 	// Extractor-based history must be replayed through Go: the sources are
 	// raw events, not tag rows. One pass repopulates event_refs; the
 	// materialized views fire per inserted row and fill the new aggregates.
@@ -677,41 +689,21 @@ func (s *Store) Backfill(ctx context.Context) error {
 			statements = append(statements, sql)
 		}
 	}
+	for _, proj := range s.rules.Projections() {
+		statements = append(statements, "TRUNCATE TABLE IF EXISTS "+rules.ProjTableName(proj.Name))
+	}
+	for _, proj := range s.rules.Projections() {
+		statements = append(statements, rules.ProjectionBackfillSQL(proj))
+	}
 	statements = append(statements,
-		"TRUNCATE TABLE IF EXISTS profiles_latest",
-		"TRUNCATE TABLE IF EXISTS notification_candidates",
-		`INSERT INTO profiles_latest
-		 SELECT
-		   pubkey,
-		   id AS event_id,
-		   created_at,
-		   JSONExtractString(content, 'name') AS name,
-		   JSONExtractString(content, 'display_name') AS display_name,
-		   JSONExtractString(content, 'picture') AS picture,
-		   JSONExtractString(content, 'about') AS about,
-		   JSONExtractString(content, 'nip05') AS nip05,
-		   JSONExtractString(content, 'lud16') AS lud16,
-		   JSONExtractString(content, 'lud06') AS lud06,
-		   JSONExtractString(content, 'banner') AS banner,
-		   JSONExtractString(content, 'website') AS website,
-		   content AS raw_json
-		 FROM nostr_events FINAL
-		 WHERE kind = 0`,
-		`INSERT INTO notification_candidates
+		"TRUNCATE TABLE IF EXISTS viewer_refs",
+		`INSERT INTO viewer_refs
 		 SELECT
 		   tag_value AS viewer,
 		   event_id,
 		   pubkey AS actor_pubkey,
 		   kind,
-		   created_at,
-		   multiIf(
-		     kind = 3, 'follow',
-		     kind = 1, 'mention',
-		     kind IN (6, 16), 'repost',
-		     kind = 7, 'reaction',
-		     kind = 9735, 'zap',
-		     'mention'
-		   ) AS reason
+		   created_at
 		 FROM event_tags
 		 WHERE tag_key = 'p'
 		   AND length(tag_value) = 64

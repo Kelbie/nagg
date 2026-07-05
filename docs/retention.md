@@ -23,7 +23,7 @@ expensive to run for everyone. nagg sidesteps both with a signal it already has:
    request** — it can never be treated like a spammer. Rows expire after a year
    without a sighting.
 2. **Their follows**: everyone on a known viewer's latest contact list
-   (`user_contacts_latest`).
+   (`latest_k3`).
 
 `relevance.Tracker` refreshes this exemption set from ClickHouse every 15
 minutes and **fails open**: until the first successful refresh, nobody is

@@ -11,6 +11,6 @@
 -- materialize_ttl_after_modify = 0, so the deploy does NOT trigger a one-shot
 -- mutation over the whole table — the TTL is applied lazily by background merges.
 
-ALTER TABLE note_rank_features MODIFY TTL created_at + INTERVAL 3 DAY;
+ALTER TABLE rank_features MODIFY TTL created_at + INTERVAL 3 DAY;
 
-ALTER TABLE note_engagement_real MODIFY TTL computed_at + INTERVAL 3 DAY;
+ALTER TABLE gated_ref_counts MODIFY TTL computed_at + INTERVAL 3 DAY;

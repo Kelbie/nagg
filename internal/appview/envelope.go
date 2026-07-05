@@ -84,11 +84,11 @@ func (h *Handler) assembleEnvelope(ctx context.Context, order []string, orderBy 
 		return Envelope{}, err
 	}
 
-	profileEvents, err := h.profileEvents(ctx, pubkeys)
+	latestK0Events, err := h.latestK0Events(ctx, pubkeys)
 	if err != nil {
 		return Envelope{}, err
 	}
-	for _, event := range profileEvents {
+	for _, event := range latestK0Events {
 		if _, ok := seenEvents[event.ID]; ok {
 			continue
 		}
@@ -108,19 +108,19 @@ func (h *Handler) assembleEnvelope(ctx context.Context, order []string, orderBy 
 	}, nil
 }
 
-// profileEvents returns each author's latest kind-0 event, reconstructed from
+// latestK0Events returns each author's latest kind-0 event, reconstructed from
 // the profiles projection — hydration is just more events in the envelope.
-func (h *Handler) profileEvents(ctx context.Context, pubkeys []string) ([]FeedEvent, error) {
+func (h *Handler) latestK0Events(ctx context.Context, pubkeys []string) ([]FeedEvent, error) {
 	pubkeys = normalizePubkeys(pubkeys)
 	if len(pubkeys) == 0 {
 		return nil, nil
 	}
-	rows, err := h.store.LatestProfiles(ctx, pubkeys)
+	rows, err := h.store.LatestK0(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
 	if missing := missingProfiles(pubkeys, rows); len(missing) > 0 && h.tryBackfillProfiles(ctx, missing) {
-		refreshed, err := h.store.LatestProfiles(ctx, missing)
+		refreshed, err := h.store.LatestK0(ctx, missing)
 		if err != nil {
 			return nil, err
 		}
@@ -258,13 +258,13 @@ func inlineEnvelope(order []string, orderBy string, events []chstore.EventView, 
 	}
 }
 
-// appendProfileEventsTo merges the latest kind-0 events for pubkeys into an
+// appendK0EventsTo merges the latest kind-0 events for pubkeys into an
 // envelope, deduplicating by event id.
-func (h *Handler) appendProfileEventsTo(ctx context.Context, env *Envelope, pubkeys []string) error {
+func (h *Handler) appendK0EventsTo(ctx context.Context, env *Envelope, pubkeys []string) error {
 	if len(pubkeys) == 0 {
 		return nil
 	}
-	profileEvents, err := h.profileEvents(ctx, pubkeys)
+	latestK0Events, err := h.latestK0Events(ctx, pubkeys)
 	if err != nil {
 		return err
 	}
@@ -272,7 +272,7 @@ func (h *Handler) appendProfileEventsTo(ctx context.Context, env *Envelope, pubk
 	for _, event := range env.Events {
 		seen[event.ID] = struct{}{}
 	}
-	for _, event := range profileEvents {
+	for _, event := range latestK0Events {
 		if _, ok := seen[event.ID]; ok {
 			continue
 		}
@@ -300,11 +300,11 @@ func setPubkeyAggregate(env *Envelope, pubkey, rule, metric string, value uint64
 	env.Aggregates[pubkey][rule][metric] = value
 }
 
-// followAggregates records a pubkey's relationship counts under the kind-based
+// pubkeyAggregates records a pubkey's relationship counts under the kind-based
 // rule names: followers = latest kind-3 lists referencing the pubkey
 // (k3_p_latest.actors), following = the pubkey's own latest kind-3 list size
 // (k3_author_latest.sources), created events = k1_1111_author.sources.
-func followAggregates(env *Envelope, pubkey string, counts chstore.FollowCounts, created uint64) {
+func pubkeyAggregates(env *Envelope, pubkey string, counts chstore.PubkeyStats, created uint64) {
 	setPubkeyAggregate(env, pubkey, "k3_p_latest", "actors", counts.Followers)
 	setPubkeyAggregate(env, pubkey, "k3_author_latest", "sources", counts.Follows)
 	setPubkeyAggregate(env, pubkey, "k1_1111_author", "sources", created)

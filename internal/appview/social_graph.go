@@ -9,7 +9,7 @@ import (
 // Social graph: contacts / profiles / relay-lists in one bundled response — the
 // "fetch all my follows, with their profiles and my relay/mute lists" seed the
 // nagg-ts facade's nagg tier targets. Bundling the follow profiles inline (one
-// LatestProfiles call) avoids the client fanning out N kind-0 fetches on cold
+// LatestK0 call) avoids the client fanning out N kind-0 fetches on cold
 // start.
 //
 // Reads the viewer's latest kind-3 (follows), kind-10002 (NIP-65 relay list),
@@ -55,7 +55,7 @@ func (h *Handler) socialGraph(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	envelope := inlineEnvelope(order, orderByCreatedAt, referenced, nil)
-	if err := h.appendProfileEventsTo(r.Context(), &envelope, pTagValues(latest[kindContacts])); err != nil {
+	if err := h.appendK0EventsTo(r.Context(), &envelope, pTagValues(latest[kindContacts])); err != nil {
 		writeError(w, err)
 		return
 	}

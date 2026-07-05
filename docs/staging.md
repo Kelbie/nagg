@@ -132,7 +132,7 @@ observed conc=2 OK / conc=4 fail.
 
 ### What was applied (and the result)
 
-1. **Cut per-query memory (done):** removed `notification_candidates FINAL` (→ windowed
+1. **Cut per-query memory (done):** removed `viewer_refs FINAL` (→ windowed
    `LIMIT 1 BY (event_id, reason)`) and both `vertex_scores FINAL` joins (→
    `argMax(score, fetched_at) GROUP BY pubkey`) in `internal/clickhouse/read.go`. Modest:
    notifications `db` p50 ≈ 550ms. Same data (ungrouped id sets match prod 100%).

@@ -47,8 +47,8 @@ the app-view is unavailable, errors, or returns empty. The old per-surface
 
 ## 3. Data model — candidate generation
 
-`notification_candidates` (a `ReplacingMergeTree`, ORDER BY
-`(viewer, created_at, event_id, reason)`) is filled by the `mv_notification_candidates`
+`viewer_refs` (a `ReplacingMergeTree`, ORDER BY
+`(viewer, created_at, event_id, reason)`) is filled by the `mv_viewer_refs`
 materialized view from `event_tags`: every `p`-tag reference to the viewer on a
 kind 1/3/6/7/16/9735 event becomes one row `(viewer, event_id, actor_pubkey,
 kind, created_at, reason)`. See `migrations/006_notifications.sql`.
@@ -255,7 +255,7 @@ any consumer that wants the unsummarised stream.
 - `internal/clickhouse/read.go` — `Notifications` (query, `recent` CTE, policy/
   reason filters), `notificationPolicyThresholds`, `FollowCounts`
 - `internal/appview/handler.go` — `notifications`, `groupNotifications`,
-  `parseNotificationRequest`, `NotificationRowJSON`/`NotificationGroup` shapes
+  `parseNotificationRequest`, `NotificationEntry`/`NotificationGroup` shapes
 - `internal/graphqlapi/schema.go` — generic resolver + `NotificationPolicy` enum
 
 **nagg-ts**

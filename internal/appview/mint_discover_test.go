@@ -21,10 +21,10 @@ func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 	const opPk = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	store := mintReviewStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				opPk: {PubKey: opPk, DisplayName: "Op Account", Picture: "https://op/pic.png"},
 			},
-			counts: chstore.FollowCounts{Followers: 1234, Follows: 56},
+			counts: chstore.PubkeyStats{Followers: 1234, Follows: 56},
 		},
 		events: []chstore.EventView{
 			reviewEvent("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "https://m1", "great [5/5]", 100),

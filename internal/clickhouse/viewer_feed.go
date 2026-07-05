@@ -12,7 +12,7 @@ import (
 // The legacy Notifications read derived reply markers, parent authors, and
 // viewer-thread references per request over event_tags + FINAL joins — the
 // heaviest sanctioned read on the instance (multi-second cold for engaged
-// accounts). notifications_feed holds each notification fully denormalized so
+// accounts). viewer_feed holds each notification fully denormalized so
 // the read is a keyed range scan with no joins.
 //
 // RecomputeNotificationsFeed is the single writer: a fast incremental tick
@@ -23,10 +23,10 @@ import (
 
 const (
 	// Head cursor: the near-now high-water mark, advanced every tick.
-	notificationsFeedTask = "notifications_feed"
+	notificationsFeedTask = "viewer_feed"
 	// Backfill cursor: walks BACKWARD from the first head slice toward the
 	// 30-day history target, one slice per tick.
-	notificationsFeedBackfillTask = "notifications_feed_backfill"
+	notificationsFeedBackfillTask = "viewer_feed_backfill"
 	// How far back history extends; matches the table TTL. 14 days: paging
 	// deeper is rare, and history size is what blew the disk in the first
 	// (denormalized) shape.
@@ -34,7 +34,7 @@ const (
 	// Steady-state re-process overlap: late-arriving events for a window and
 	// vertex-score drift converge on rewrite (ReplacingMergeTree by computed_at).
 	notificationsFeedOverlap = 10 * time.Minute
-	// Slice per tick. Kept small on purpose: notification_candidates is sorted
+	// Slice per tick. Kept small on purpose: viewer_refs is sorted
 	// by viewer (created_at windows cannot prune it) and month-old event_tags
 	// granules are cold — the original 6h forward slices ran ~5 MINUTES and
 	// died on the ~300s infra connection ceiling (CH 394 client-cancel).
@@ -116,17 +116,17 @@ func (s *Store) RecomputeNotificationsFeed(ctx context.Context, now time.Time) (
 }
 
 // buildNotificationsFeedSQL denormalizes the candidate window [from, to) into
-// notifications_feed. The reply-marker coalesce mirrors migration 007 /
+// viewer_feed. The reply-marker coalesce mirrors migration 007 /
 // the legacy read exactly; every subquery is bounded to the window's event ids.
 func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 	return fmt.Sprintf(`
-		INSERT INTO notifications_feed
-			(viewer, created_at, event_id, reason, actor_pubkey, event_pubkey, event_kind, event_created_at, is_reply, direct_parent_author, replies_viewer_thread, actor_score, computed_at)
+		INSERT INTO viewer_feed
+			(viewer, created_at, event_id, kind, actor_pubkey, event_pubkey, event_kind, event_created_at, is_ref, target_author, in_viewer_tree, actor_score, computed_at)
 		WITH window_candidates AS (
-			SELECT viewer, event_id, actor_pubkey, created_at, reason
-			FROM notification_candidates
+			SELECT viewer, event_id, actor_pubkey, created_at, kind
+			FROM viewer_refs
 			WHERE created_at >= toDateTime(%[1]d) AND created_at < toDateTime(%[2]d)
-			LIMIT 1 BY viewer, event_id, reason
+			LIMIT 1 BY viewer, event_id, kind
 		),
 		candidate_events AS (
 			-- NARROW columns only: event bodies are hydrated by id at read
@@ -156,7 +156,7 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 		reply_meta AS (
 			SELECT
 				event_id,
-				countIf(marker IN ('', 'root', 'reply')) > 0 AS is_reply,
+				countIf(marker IN ('', 'root', 'reply')) > 0 AS is_ref,
 				coalesce(
 					nullIf(argMinIf(tag_value, tag_index, marker = 'reply'), ''),
 					nullIf(argMaxIf(tag_value, tag_index, marker = ''), ''),
@@ -189,14 +189,14 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 			n.viewer AS viewer,
 			n.created_at AS created_at,
 			n.event_id AS event_id,
-			n.reason AS reason,
+			n.kind AS kind,
 			n.actor_pubkey AS actor_pubkey,
 			e.pubkey AS event_pubkey,
 			e.kind AS event_kind,
 			e.created_at AS event_created_at,
-			toUInt8(ifNull(rm.is_reply, 0)) AS is_reply,
-			ifNull(toString(rp.pubkey), '') AS direct_parent_author,
-			toUInt8(notEmpty(toString(ra.ref_author))) AS replies_viewer_thread,
+			toUInt8(ifNull(rm.is_ref, 0)) AS is_ref,
+			ifNull(toString(rp.pubkey), '') AS target_author,
+			toUInt8(notEmpty(toString(ra.ref_author))) AS in_viewer_tree,
 			ifNull(sc.score, 0) AS actor_score,
 			toDateTime(%[3]d) AS computed_at
 		FROM window_candidates AS n
@@ -236,13 +236,13 @@ func (s *Store) notificationsFeedReady(ctx context.Context) bool {
 }
 
 // notificationsFromFeed is the read-model query: a keyed range scan over
-// notifications_feed with the same follow-dedupe, reply-scope, and policy
+// viewer_feed with the same follow-dedupe, reply-scope, and policy
 // semantics as the legacy read — but every predicate hits a stored column.
-func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInput, tab, policy, replyScope string) ([]NotificationRow, error) {
+func (s *Store) notificationsFromFeed(ctx context.Context, input ViewerFeedInput, tab, policy, replyScope string) ([]ViewerFeedRow, error) {
 	filters := ""
 	args := []any{input.Viewer}
 	if tab == "MENTIONS" {
-		filters += " AND reason = 'mention'"
+		filters += " AND kind = 1"
 	}
 	if input.Since > 0 {
 		filters += " AND created_at >= ?"
@@ -252,31 +252,31 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 		filters += " AND created_at < ?"
 		args = append(args, time.Unix(input.Until, 0).UTC())
 	}
-	if len(input.Reasons) > 0 {
-		filters += " AND reason IN (?)"
-		args = append(args, input.Reasons)
+	if len(input.Kinds) > 0 {
+		filters += " AND kind IN (?)"
+		args = append(args, input.Kinds)
 	}
-	if len(input.ExcludeReasons) > 0 {
-		filters += " AND reason NOT IN (?)"
-		args = append(args, input.ExcludeReasons)
+	if len(input.ExcludeKinds) > 0 {
+		filters += " AND kind NOT IN (?)"
+		args = append(args, input.ExcludeKinds)
 	}
 	if policy == "FOLLOWS" {
 		// Actor must be in the viewer's latest contact list — served by the
-		// ingest-maintained user_contacts_latest, not a raw kind-3 read.
+		// ingest-maintained latest_k3, not a raw kind-3 read.
 		filters += ` AND actor_pubkey IN (
-			SELECT arrayJoin(argMax(contacts, created_at))
-			FROM user_contacts_latest
+			SELECT arrayJoin(argMax(refs, created_at))
+			FROM latest_k3
 			WHERE pubkey = ?
 		)`
 		args = append(args, input.Viewer)
 	}
 
-	outer := "WHERE (reason != 'follow' OR actor_reason_rank = 1)"
+	outer := "WHERE (kind != 3 OR actor_kind_rank = 1)"
 	switch replyScope {
 	case "DIRECT":
-		outer += " AND (event_kind != 1 OR is_reply = 0 OR direct_parent_author = viewer)"
+		outer += " AND (event_kind != 1 OR is_ref = 0 OR target_author = viewer)"
 	case "THREAD":
-		outer += " AND (event_kind != 1 OR is_reply = 0 OR replies_viewer_thread = 1)"
+		outer += " AND (event_kind != 1 OR is_ref = 0 OR in_viewer_tree = 1)"
 	}
 
 	// Policy: actor_score >= actorThreshold OR viewer_score >= viewerThreshold.
@@ -306,23 +306,23 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 
 	query := fmt.Sprintf(`
 		SELECT
-			event_id, reason, actor_score, actor_pubkey, created_at
+			event_id, kind, actor_score, actor_pubkey, created_at
 		FROM (
 			SELECT
 				*,
 				row_number() OVER (
-					PARTITION BY reason, actor_pubkey
+					PARTITION BY kind, actor_pubkey
 					ORDER BY created_at ASC, event_id ASC
-				) AS actor_reason_rank
+				) AS actor_kind_rank
 			FROM (
 				SELECT
-					viewer, created_at, event_id, reason, actor_pubkey,
-					event_pubkey, event_kind, event_created_at, is_reply,
-					direct_parent_author, replies_viewer_thread, actor_score
-				FROM notifications_feed
+					viewer, created_at, event_id, kind, actor_pubkey,
+					event_pubkey, event_kind, event_created_at, is_ref,
+					target_author, in_viewer_tree, actor_score
+				FROM viewer_feed
 				WHERE viewer = ?%s
 				ORDER BY created_at DESC, event_id DESC, computed_at DESC
-				LIMIT 1 BY event_id, reason
+				LIMIT 1 BY event_id, kind
 				LIMIT ?
 			)
 		)
@@ -338,7 +338,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 
 	type pageRow struct {
 		eventID    string
-		reason     string
+		kind       uint32
 		actorScore float64
 		actorPk    string
 		createdAt  time.Time
@@ -347,7 +347,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 	eventIDs := []string{}
 	for rows.Next() {
 		var r pageRow
-		if err := rows.Scan(&r.eventID, &r.reason, &r.actorScore, &r.actorPk, &r.createdAt); err != nil {
+		if err := rows.Scan(&r.eventID, &r.kind, &r.actorScore, &r.actorPk, &r.createdAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -360,7 +360,7 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 	}
 	rows.Close()
 	if len(page) == 0 {
-		return []NotificationRow{}, nil
+		return []ViewerFeedRow{}, nil
 	}
 
 	// Hydrate event bodies for JUST this page — one bounded IN-list read. The
@@ -372,21 +372,19 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input NotificationInp
 		return nil, err
 	}
 
-	out := make([]NotificationRow, 0, len(page))
+	out := make([]ViewerFeedRow, 0, len(page))
 	for _, r := range page {
 		event, ok := events[r.eventID]
 		if !ok {
 			continue
 		}
-		row := NotificationRow{
-			Event:                 event,
-			Reason:                r.reason,
-			ActorVertexScore:      r.actorScore,
-			ActorPubKey:           r.actorPk,
-			NotificationCreatedAt: r.createdAt,
-		}
-		row.Reason = notificationReasonForEvent(row.Event, row.Reason)
-		out = append(out, row)
+		out = append(out, ViewerFeedRow{
+			Event:            event,
+			Kind:             int(r.kind),
+			ActorVertexScore: r.actorScore,
+			ActorPubKey:      r.actorPk,
+			RefCreatedAt:     r.createdAt,
+		})
 	}
 	return out, nil
 }

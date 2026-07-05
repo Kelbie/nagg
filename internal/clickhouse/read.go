@@ -117,7 +117,7 @@ type NoteStats struct {
 	ReplyCount  uint64 `json:"replyCount"`
 	SatsZapped  uint64 `json:"satsZapped"`
 	// Vertex-real counts: distinct engagers whose saved Vertex score clears the
-	// rollup threshold (bot-resistant). Sourced from note_engagement_real; zero
+	// rollup threshold (bot-resistant). Sourced from gated_ref_counts; zero
 	// until the rollup has computed a row for the event.
 	RealLikeCount   uint64 `json:"realLikeCount"`
 	RealRepostCount uint64 `json:"realRepostCount"`
@@ -125,7 +125,7 @@ type NoteStats struct {
 	RealSatsZapped  uint64 `json:"realSatsZapped"`
 }
 
-type FollowCounts struct {
+type PubkeyStats struct {
 	Follows   uint64 `json:"follows"`
 	Followers uint64 `json:"followers"`
 }
@@ -145,7 +145,7 @@ type VertexSearchCacheEntry struct {
 	FetchedAt time.Time
 }
 
-type NotificationInput struct {
+type ViewerFeedInput struct {
 	Viewer     string
 	Tab        string
 	Policy     string
@@ -153,27 +153,29 @@ type NotificationInput struct {
 	Since      int64
 	Until      int64
 	Limit      uint64
-	// Reasons / ExcludeReasons filter the candidate window by reason (follow,
-	// reply, quote, mention, repost, reaction, zap). The app-view grouping layer
-	// uses them to fetch follows and non-follows on separate windows so a flood
-	// of follow candidates can't crowd everything else out of the page.
-	Reasons        []string
-	ExcludeReasons []string
+	// Kinds / ExcludeKinds filter the candidate window by the triggering
+	// event's kind. The app-view grouping layer uses them to fetch kind-3
+	// references and everything else on separate windows so a flood of kind-3
+	// candidates can't crowd everything else out of the page.
+	Kinds        []int64
+	ExcludeKinds []int64
 }
 
-type NotificationRow struct {
-	Event            EventView `json:"event"`
-	Reason           string    `json:"reason"`
-	ActorVertexScore float64   `json:"actorVertexScore"`
-	// ActorPubKey is the follower/reposter/reactor/zapper. NotificationCreatedAt
+type ViewerFeedRow struct {
+	Event EventView `json:"event"`
+	// Kind is the triggering event's kind (3, 1, 6/16, 7, 9735); the client
+	// derives any display label from it plus the event's own tags.
+	Kind             int     `json:"kind"`
+	ActorVertexScore float64 `json:"actorVertexScore"`
+	// ActorPubKey is the follower/reposter/reactor/zapper. RefCreatedAt
 	// is the candidate's recency (not the event's created_at, which can differ
 	// for re-broadcast follows). Both feed the app-view grouping layer; the
 	// generic GraphQL path ignores them.
-	ActorPubKey           string    `json:"actorPubkey"`
-	NotificationCreatedAt time.Time `json:"notificationCreatedAt"`
+	ActorPubKey  string    `json:"actorPubkey"`
+	RefCreatedAt time.Time `json:"notificationCreatedAt"`
 }
 
-type ProfileRow struct {
+type K0Row struct {
 	PubKey      string    `json:"pubkey"`
 	EventID     string    `json:"event_id"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -190,9 +192,9 @@ type ProfileRow struct {
 }
 
 type ProfileSearchRow struct {
-	Profile ProfileRow `json:"profile"`
-	Rank    float64    `json:"rank"`
-	Score   float64    `json:"score"`
+	Profile K0Row   `json:"profile"`
+	Rank    float64 `json:"rank"`
+	Score   float64 `json:"score"`
 }
 
 func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string, kinds []int, limitPerPubKey uint64) (map[string][]EventView, error) {
@@ -275,20 +277,20 @@ func (s *Store) QueryLatestEventsByPubKeys(ctx context.Context, pubkeys []string
 	return out, rows.Err()
 }
 
-// LatestContacts returns each pubkey's latest kind-3 contact set (p-tag values)
-// from the ingest-maintained user_contacts_latest table. Follow-graph reads must
+// LatestK3Refs returns each pubkey's latest kind-3 contact set (p-tag values)
+// from the ingest-maintained latest_k3 table. Follow-graph reads must
 // use this instead of QueryLatestEventsByPubKeys(kind=3): contact lists are the
 // largest events on the network, and pulling them through the raw events table
 // was the 7 GiB-per-lookup query that OOMed ClickHouse.
-func (s *Store) LatestContacts(ctx context.Context, pubkeys []string) (map[string]map[string]struct{}, error) {
+func (s *Store) LatestK3Refs(ctx context.Context, pubkeys []string) (map[string]map[string]struct{}, error) {
 	pubkeys = uniqueStrings(pubkeys)
 	out := make(map[string]map[string]struct{}, len(pubkeys))
 	if len(pubkeys) == 0 {
 		return out, nil
 	}
 	rows, err := s.conn.Query(ctx, `
-		SELECT pubkey, argMax(contacts, created_at)
-		FROM user_contacts_latest
+		SELECT pubkey, argMax(refs, created_at)
+		FROM latest_k3
 		WHERE pubkey IN (?)
 		GROUP BY pubkey
 	`, pubkeys)
@@ -336,16 +338,16 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 			ifNull(rp.c, 0) AS reposts,
 			ifNull(dr.c, 0) AS replies,
 			ifNull(z.s, 0)  AS zap_sats,
-			ifNull(er.rl, 0) AS real_likes,
-			ifNull(er.rr, 0) AS real_reposts,
-			ifNull(er.re, 0) AS real_replies,
-			ifNull(er.rz, 0) AS real_zap_sats
+			ifNull(er.rl, 0) AS gated_k7_e_actors,
+			ifNull(er.rr, 0) AS gated_k6_16_e_actors,
+			ifNull(er.re, 0) AS gated_k1_1111_e_reply_sources,
+			ifNull(er.rz, 0) AS gated_k9735_e_value_total
 		FROM (
 			SELECT target AS id FROM agg_k7_e WHERE target IN (?)
 			UNION DISTINCT SELECT target FROM agg_k6_16_e WHERE target IN (?)
 			UNION DISTINCT SELECT target FROM agg_k1_1111_e_reply WHERE target IN (?)
 			UNION DISTINCT SELECT target FROM agg_k9735_e WHERE target IN (?)
-			UNION DISTINCT SELECT event_id FROM note_engagement_real WHERE event_id IN (?)
+			UNION DISTINCT SELECT event_id FROM gated_ref_counts WHERE event_id IN (?)
 		) ids
 		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k7_e WHERE target IN (?) GROUP BY target) l ON l.target = ids.id
 		LEFT JOIN (SELECT target, uniqMerge(actors) AS c FROM agg_k6_16_e WHERE target IN (?) GROUP BY target) rp ON rp.target = ids.id
@@ -353,11 +355,11 @@ func (s *Store) NoteStats(ctx context.Context, ids []string) (map[string]NoteSta
 		LEFT JOIN (SELECT target, sumMerge(value_total) AS s FROM agg_k9735_e WHERE target IN (?) GROUP BY target) z ON z.target = ids.id
 		LEFT JOIN (
 			SELECT event_id,
-				argMax(real_likes, computed_at) AS rl,
-				argMax(real_reposts, computed_at) AS rr,
-				argMax(real_replies, computed_at) AS re,
-				argMax(real_zap_sats, computed_at) AS rz
-			FROM note_engagement_real WHERE event_id IN (?) GROUP BY event_id
+				argMax(k7_e_actors, computed_at) AS rl,
+				argMax(k6_16_e_actors, computed_at) AS rr,
+				argMax(k1_1111_e_reply_sources, computed_at) AS re,
+				argMax(k9735_e_value_total, computed_at) AS rz
+			FROM gated_ref_counts WHERE event_id IN (?) GROUP BY event_id
 		) er ON er.event_id = ids.id`
 	rows, err := s.conn.Query(ctx, query, ids, ids, ids, ids, ids, ids, ids, ids, ids, ids)
 	if err != nil {
@@ -416,17 +418,17 @@ func buildEventAggregatesQuery(reg *rules.Registry) (string, []aggCol, int) {
 			"LEFT JOIN (SELECT target, %s FROM %s WHERE target IN (?) GROUP BY target) %s ON %s.target = ids.id",
 			strings.Join(metricSelects, ", "), table, alias, alias))
 	}
-	unions = append(unions, "UNION DISTINCT SELECT event_id FROM note_engagement_real WHERE event_id IN (?)")
+	unions = append(unions, "UNION DISTINCT SELECT event_id FROM gated_ref_counts WHERE event_id IN (?)")
 	joins = append(joins, `LEFT JOIN (
 			SELECT event_id,
-				argMax(real_likes, computed_at) AS rl,
-				argMax(real_reposts, computed_at) AS rr,
-				argMax(real_replies, computed_at) AS re,
-				argMax(real_quotes, computed_at) AS rq,
-				argMax(real_zaps, computed_at) AS rzn,
-				argMax(real_zap_sats, computed_at) AS rz,
-				argMax(real_actors, computed_at) AS ra
-			FROM note_engagement_real WHERE event_id IN (?) GROUP BY event_id
+				argMax(k7_e_actors, computed_at) AS rl,
+				argMax(k6_16_e_actors, computed_at) AS rr,
+				argMax(k1_1111_e_reply_sources, computed_at) AS re,
+				argMax(k1_q_sources, computed_at) AS rq,
+				argMax(k9735_e_sources, computed_at) AS rzn,
+				argMax(k9735_e_value_total, computed_at) AS rz,
+				argMax(actors, computed_at) AS ra
+			FROM gated_ref_counts WHERE event_id IN (?) GROUP BY event_id
 		) er ON er.event_id = ids.id`)
 	for _, c := range []struct{ expr, rule, metric string }{
 		{"ifNull(er.rl, 0)", "vertex_k7_e", "actors"},
@@ -453,7 +455,7 @@ func buildEventAggregatesQuery(reg *rules.Registry) (string, []aggCol, int) {
 // target -> rule name -> metric name. This is the generic successor of
 // NoteStats: the rule set comes from the registry, so a newly declared
 // relationship shows up in every envelope without a read-path change. The
-// vertex-real threshold-filtered counts (note_engagement_real) are exposed
+// vertex-real threshold-filtered counts (gated_ref_counts) are exposed
 // under "vertex_"-prefixed rule names pending the DVM plugin seam.
 //
 // ONE query on ONE connection: LEFT JOIN every aggregate onto the UNION of
@@ -527,7 +529,7 @@ type FeatureWeights struct {
 }
 
 // FeatureRankInput parameterizes the DB-side weighted top-N scan over
-// note_rank_features. Since bounds the scan to a recent window so the trending
+// rank_features. Since bounds the scan to a recent window so the trending
 // query is a partition-pruned range scan, not a full-table read.
 type FeatureRankInput struct {
 	Kinds              []int
@@ -550,7 +552,7 @@ type RankedFeatureRow struct {
 }
 
 // RankedEventsByFeatures runs the whole weighted top-N ranking as one ClickHouse
-// scan over the precomputed note_rank_features table. It replaces the per-request,
+// scan over the precomputed rank_features table. It replaces the per-request,
 // per-term live aggregation (weightedRankBaseScores): recency decay + weighted sum
 // over feature columns, ORDER BY score DESC LIMIT N. The recency and LOG1P
 // transforms mirror candidateFieldValue / transformedFloatRankValue exactly
@@ -574,13 +576,13 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		w.Recency, halfLife,
 	}
 	score := `
-		  ? * log(1 + real_likes)
-		+ ? * log(1 + real_replies)
-		+ ? * log(1 + real_reposts)
-		+ ? * log(1 + real_quotes)
-		+ ? * log(1 + real_zap_sats)
-		+ ? * real_actors
-		+ ? * if(author_followers >= ?, author_vertex_score, 0)
+		  ? * log(1 + gated_k7_e_actors)
+		+ ? * log(1 + gated_k1_1111_e_reply_sources)
+		+ ? * log(1 + gated_k6_16_e_actors)
+		+ ? * log(1 + gated_k1_q_sources)
+		+ ? * log(1 + gated_k9735_e_value_total)
+		+ ? * gated_actors
+		+ ? * if(author_followers >= ?, author_score, 0)
 		+ ? * contribution_quality
 		+ ? * pow(0.5, greatest(toUnixTimestamp(now()) - toUnixTimestamp(created_at), 0) / ?)`
 
@@ -588,10 +590,10 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 	// qualified with the table name so they bind to the raw columns rather than the
 	// argMax/max aliases of the same name in the SELECT (ClickHouse's analyzer would
 	// otherwise reject "max(created_at) found in WHERE").
-	where := "WHERE note_rank_features.created_at >= toDateTime(?)"
+	where := "WHERE rank_features.created_at >= toDateTime(?)"
 	args = append(args, in.Since)
 	if in.Until > 0 {
-		where += " AND note_rank_features.created_at <= toDateTime(?)"
+		where += " AND rank_features.created_at <= toDateTime(?)"
 		args = append(args, in.Until)
 	}
 	if len(in.Kinds) > 0 {
@@ -602,13 +604,13 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		args = append(args, in.ExcludeIDs)
 	}
 	if len(in.ExcludePubKeys) > 0 {
-		where += " AND note_rank_features.pubkey NOT IN (?)"
+		where += " AND rank_features.pubkey NOT IN (?)"
 		args = append(args, in.ExcludePubKeys)
 	}
 
 	// Collapse the ReplacingMergeTree(computed_at) duplicates with argMax/GROUP BY
 	// instead of FINAL. The rollup re-inserts the whole target set each tick, so
-	// note_rank_features carries several unmerged versions per event until a
+	// rank_features carries several unmerged versions per event until a
 	// background merge; FINAL merges every part on each read, whereas a hash
 	// aggregation over the (partition-pruned) recent window does not. The score
 	// expression and bind order are unchanged — only the source is grouped.
@@ -619,16 +621,16 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 				event_id,
 				argMax(pubkey, computed_at) AS pubkey,
 				max(created_at) AS created_at,
-				argMax(real_likes, computed_at) AS real_likes,
-				argMax(real_replies, computed_at) AS real_replies,
-				argMax(real_reposts, computed_at) AS real_reposts,
-				argMax(real_quotes, computed_at) AS real_quotes,
-				argMax(real_zap_sats, computed_at) AS real_zap_sats,
-				argMax(real_actors, computed_at) AS real_actors,
+				argMax(k7_e_actors, computed_at) AS gated_k7_e_actors,
+				argMax(k1_1111_e_reply_sources, computed_at) AS gated_k1_1111_e_reply_sources,
+				argMax(k6_16_e_actors, computed_at) AS gated_k6_16_e_actors,
+				argMax(k1_q_sources, computed_at) AS gated_k1_q_sources,
+				argMax(k9735_e_value_total, computed_at) AS gated_k9735_e_value_total,
+				argMax(actors, computed_at) AS gated_actors,
 				argMax(author_followers, computed_at) AS author_followers,
-				argMax(author_vertex_score, computed_at) AS author_vertex_score,
+				argMax(author_score, computed_at) AS author_score,
 				argMax(contribution_quality, computed_at) AS contribution_quality
-			FROM note_rank_features
+			FROM rank_features
 			%s
 			GROUP BY event_id
 		)
@@ -653,21 +655,21 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 	return out, rows.Err()
 }
 
-// DirectReplyIDs returns the ids of the DIRECT (NIP-10/22) replies to parentID,
-// from the authoritative note_reply_edges table. This excludes grandchildren and
+// RefSourceIDs returns the ids of the DIRECT (NIP-10/22) replies to parentID,
+// from the authoritative ref_edges table. This excludes grandchildren and
 // quotes that the any-e-tag reverse-reference query would otherwise include. The
 // caller (thread view) applies its own ordering / ranking / pagination over the
 // returned set; the cap bounds a pathological reply storm.
-func (s *Store) DirectReplyIDs(ctx context.Context, parentID string) ([]string, error) {
+func (s *Store) RefSourceIDs(ctx context.Context, parentID string) ([]string, error) {
 	if len(parentID) != 64 {
 		return nil, nil
 	}
 	rows, err := s.conn.Query(ctx, `
-		SELECT child_id
-		FROM note_reply_edges
-		WHERE parent_id = ?
-		GROUP BY child_id
-		ORDER BY max(created_at) DESC, child_id DESC
+		SELECT source_id
+		FROM ref_edges
+		WHERE target_id = ?
+		GROUP BY source_id
+		ORDER BY max(created_at) DESC, source_id DESC
 		LIMIT 5000
 	`, parentID)
 	if err != nil {
@@ -701,14 +703,14 @@ func (s *Store) refRankSpec(sort string) (rules.ReadSpec, bool) {
 	return s.rules.ReadSpec(rule, metric)
 }
 
-// RankedDirectReplyIDs returns the DIRECT (NIP-10/22) replies to parentID
+// RankedRefSources returns the DIRECT (NIP-10/22) replies to parentID
 // ordered by a declared aggregation ("rule.metric" sort keys such as
 // "k7_e.actors" or "k9735_e.value_total") or by recency ("new"/""). It reads
-// only precomputed tables — note_reply_edges for the reply set + the rule's
+// only precomputed tables — ref_edges for the reply set + the rule's
 // aggregate table for the sort — so the thread reply list ranks without a
 // live aggregation. A LEFT JOIN keeps replies with zero engagement
 // (recency tiebreak), so the full reply set is returned, ranked.
-func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error) {
+func (s *Store) RankedRefSources(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error) {
 	if len(parentID) != 64 {
 		return nil, nil
 	}
@@ -725,27 +727,27 @@ func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string,
 	if !ranked {
 		// Recency: the edge table already carries the reply created_at.
 		query = `
-			SELECT child_id
-			FROM note_reply_edges
-			WHERE parent_id = ?
-			GROUP BY child_id
-			ORDER BY max(created_at) DESC, child_id DESC
+			SELECT source_id
+			FROM ref_edges
+			WHERE target_id = ?
+			GROUP BY source_id
+			ORDER BY max(created_at) DESC, source_id DESC
 			LIMIT ? OFFSET ?`
 		args = []any{parentID, limit, offset}
 	} else {
 		query = fmt.Sprintf(`
-			SELECT e.child_id
+			SELECT e.source_id
 			FROM (
-				SELECT child_id, max(created_at) AS created_at
-				FROM note_reply_edges WHERE parent_id = ? GROUP BY child_id
+				SELECT source_id, max(created_at) AS created_at
+				FROM ref_edges WHERE target_id = ? GROUP BY source_id
 			) e
 			LEFT JOIN (
 				SELECT target, %s(%s) AS c
 				FROM %s
-				WHERE target IN (SELECT child_id FROM note_reply_edges WHERE parent_id = ?)
+				WHERE target IN (SELECT source_id FROM ref_edges WHERE target_id = ?)
 				GROUP BY target
-			) m ON m.target = e.child_id
-			ORDER BY ifNull(m.c, 0) DESC, e.created_at DESC, e.child_id DESC
+			) m ON m.target = e.source_id
+			ORDER BY ifNull(m.c, 0) DESC, e.created_at DESC, e.source_id DESC
 			LIMIT ? OFFSET ?`, spec.MergeFunc, spec.Column, spec.Table)
 		args = []any{parentID, parentID, limit, offset}
 	}
@@ -766,12 +768,12 @@ func (s *Store) RankedDirectReplyIDs(ctx context.Context, parentID, sort string,
 	return out, rows.Err()
 }
 
-// AuthoredReplyChain walks the precomputed direct-reply edges (note_reply_edges)
+// AuthoredRefChain walks the precomputed direct-reply edges (ref_edges)
 // down from rootID, following the single EARLIEST direct reply authored by
 // `author` at each level — the author's self-reply chain that the live
 // authoredReplyChain field computed with a per-depth event_tags scan. Each step is
-// an indexed parent_id lookup; bounded by maxDepth.
-func (s *Store) AuthoredReplyChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error) {
+// an indexed target_id lookup; bounded by maxDepth.
+func (s *Store) AuthoredRefChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error) {
 	if len(rootID) != 64 || len(author) != 64 {
 		return nil, nil
 	}
@@ -803,11 +805,11 @@ func (s *Store) AuthoredReplyChain(ctx context.Context, rootID, author string, m
 // `author` (matching bestAuthoredDirectChild's selection), or "" when none.
 func (s *Store) earliestAuthoredChild(ctx context.Context, parentID, author string) (string, error) {
 	rows, err := s.conn.Query(ctx, `
-		SELECT child_id
-		FROM note_reply_edges
-		WHERE parent_id = ? AND child_pubkey = ?
-		GROUP BY child_id
-		ORDER BY min(created_at) ASC, child_id ASC
+		SELECT source_id
+		FROM ref_edges
+		WHERE target_id = ? AND source_pubkey = ?
+		GROUP BY source_id
+		ORDER BY min(created_at) ASC, source_id ASC
 		LIMIT 1
 	`, parentID, author)
 	if err != nil {
@@ -824,14 +826,14 @@ func (s *Store) earliestAuthoredChild(ctx context.Context, parentID, author stri
 	return child, rows.Err()
 }
 
-// FollowedReplies returns, for each parent in parentIDs, the single best reply
+// FollowedRefs returns, for each parent in parentIDs, the single best reply
 // authored by someone the viewer follows — the precomputed, BATCHED replacement
 // for the per-node followedReply (rankedReferencedBy over the viewer's follow list)
 // the feed used to embed. "Best" = most-liked (note_like_counts), tie-broken by
-// recency. Reads only precomputed tables: note_reply_edges (NIP-10/22 direct
-// replies), note_like_counts (ranking), user_contacts_latest (the viewer's
+// recency. Reads only precomputed tables: ref_edges (NIP-10/22 direct
+// replies), note_like_counts (ranking), latest_k3 (the viewer's
 // replaceable-aware follow set) — no live aggregation, one round-trip for the page.
-func (s *Store) FollowedReplies(ctx context.Context, viewerPubkey string, parentIDs []string) (map[string]string, error) {
+func (s *Store) FollowedRefs(ctx context.Context, viewerPubkey string, parentIDs []string) (map[string]string, error) {
 	out := make(map[string]string, len(parentIDs))
 	if len(viewerPubkey) != 64 || len(parentIDs) == 0 {
 		return out, nil
@@ -840,27 +842,27 @@ func (s *Store) FollowedReplies(ctx context.Context, viewerPubkey string, parent
 	// sort_key packs likes into the high 32 bits and the reply timestamp into the
 	// low 32 bits, so argMax picks the most-liked reply, tie-broken by newest.
 	rows, err := s.conn.Query(ctx, `
-		SELECT parent_id, argMax(child_id, sort_key) AS reply_id
+		SELECT target_id, argMax(source_id, sort_key) AS reply_id
 		FROM (
 			SELECT
-				e.parent_id AS parent_id,
-				e.child_id  AS child_id,
+				e.target_id AS target_id,
+				e.source_id  AS source_id,
 				bitShiftLeft(toUInt64(ifNull(lc.likes, 0)), 32) + toUInt64(toUnixTimestamp(e.created_at)) AS sort_key
-			FROM note_reply_edges e
+			FROM ref_edges e
 			LEFT JOIN (
 				SELECT target, uniqMerge(actors) AS likes
 				FROM agg_k7_e
 				WHERE target IN (
-					SELECT child_id FROM note_reply_edges WHERE parent_id IN (?)
+					SELECT source_id FROM ref_edges WHERE target_id IN (?)
 				)
 				GROUP BY target
-			) lc ON e.child_id = lc.target
-			WHERE e.parent_id IN (?)
-			  AND e.child_pubkey IN (
-				SELECT arrayJoin(contacts) FROM user_contacts_latest FINAL WHERE pubkey = ?
+			) lc ON e.source_id = lc.target
+			WHERE e.target_id IN (?)
+			  AND e.source_pubkey IN (
+				SELECT arrayJoin(refs) FROM latest_k3 FINAL WHERE pubkey = ?
 			  )
 		)
-		GROUP BY parent_id
+		GROUP BY target_id
 	`, parentIDs, parentIDs, viewerPubkey)
 	if err != nil {
 		return nil, err
@@ -878,24 +880,24 @@ func (s *Store) FollowedReplies(ctx context.Context, viewerPubkey string, parent
 	return out, rows.Err()
 }
 
-func (s *Store) FollowCounts(ctx context.Context, pubkey string) (FollowCounts, error) {
-	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
+func (s *Store) PubkeyStats(ctx context.Context, pubkey string) (PubkeyStats, error) {
+	counts, err := s.BatchPubkeyStats(ctx, []string{pubkey})
 	if err != nil {
-		return FollowCounts{}, err
+		return PubkeyStats{}, err
 	}
 	return counts[pubkey], nil
 }
 
-func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[string]FollowCounts, error) {
+func (s *Store) BatchPubkeyStats(ctx context.Context, pubkeys []string) (map[string]PubkeyStats, error) {
 	pubkeys = uniqueStrings(pubkeys)
-	out := make(map[string]FollowCounts, len(pubkeys))
+	out := make(map[string]PubkeyStats, len(pubkeys))
 	for _, pubkey := range pubkeys {
-		out[pubkey] = FollowCounts{}
+		out[pubkey] = PubkeyStats{}
 	}
 	if len(pubkeys) == 0 {
 		return out, nil
 	}
-	contacts, err := s.LatestContacts(ctx, pubkeys)
+	contacts, err := s.LatestK3Refs(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
@@ -905,14 +907,14 @@ func (s *Store) BatchFollowCounts(ctx context.Context, pubkeys []string) (map[st
 		out[pubkey] = counts
 	}
 
-	// Followers come from the rollup-maintained user_stats table (015 backfilled
+	// Followers come from the rollup-maintained pubkey_stats table (015 backfilled
 	// it to full coverage). The previous read — uniqExact over the ENTIRE global
 	// kind-3 p-tag history in event_tags — was both wrong (counted every pubkey
 	// that EVER followed, ignoring NIP-02 replaceability) and one of the heavy
 	// per-request aggregations on a 2B-row table.
 	rows, err := s.conn.Query(ctx, `
 		SELECT pubkey, argMax(followers, computed_at)
-		FROM user_stats
+		FROM pubkey_stats
 		WHERE pubkey IN (?)
 		GROUP BY pubkey
 	`, pubkeys)
@@ -956,7 +958,7 @@ func (s *Store) FollowEdges(ctx context.Context, viewer string, candidates []str
 
 	// Both directions from the ingest-maintained latest contact lists — one
 	// batched read covers the viewer and every candidate.
-	contacts, err := s.LatestContacts(ctx, append([]string{viewer}, candidates...))
+	contacts, err := s.LatestK3Refs(ctx, append([]string{viewer}, candidates...))
 	if err != nil {
 		return nil, err
 	}
@@ -975,7 +977,7 @@ func (s *Store) FollowEdges(ctx context.Context, viewer string, candidates []str
 }
 
 func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error) {
-	counts, err := s.BatchFollowCounts(ctx, []string{pubkey})
+	counts, err := s.BatchPubkeyStats(ctx, []string{pubkey})
 	if err != nil {
 		return 0, err
 	}
@@ -1000,10 +1002,10 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 			-- Follower count from the LATEST contact list per follower (NIP-02 is
 			-- replaceable). The legacy uniqExact over all kind-3 history counted
 			-- anyone who EVER followed you, inflating the count and wasting Vertex
-			-- credits on over-qualified authors. user_contacts_latest is MV-fed +
+			-- credits on over-qualified authors. latest_k3 is MV-fed +
 			-- backfilled, so this needs no rollup bootstrap.
 			SELECT follow AS pubkey, count() AS followers
-			FROM (SELECT arrayJoin(contacts) AS follow FROM user_contacts_latest FINAL)
+			FROM (SELECT arrayJoin(contacts) AS follow FROM latest_k3 FINAL)
 			GROUP BY follow
 			HAVING followers >= ?
 		) AS follower_counts ON follower_counts.pubkey = recent.pubkey
@@ -1327,10 +1329,10 @@ func (s *Store) DerivedMetricValues(ctx context.Context, metric string, eventIDs
 	return out, rows.Err()
 }
 
-func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]NotificationRow, error) {
+func (s *Store) ViewerFeed(ctx context.Context, input ViewerFeedInput) ([]ViewerFeedRow, error) {
 	input.Viewer = strings.TrimSpace(strings.ToLower(input.Viewer))
 	if input.Viewer == "" {
-		return []NotificationRow{}, nil
+		return []ViewerFeedRow{}, nil
 	}
 	if input.Limit == 0 || input.Limit > 100 {
 		input.Limit = 50
@@ -1376,7 +1378,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	recentFilters := ""
 	recentArgs := []any{}
 	if tab == "MENTIONS" {
-		recentFilters += " AND reason = 'mention'"
+		recentFilters += " AND kind = 1"
 	}
 	if input.Since > 0 {
 		recentFilters += " AND created_at >= ?"
@@ -1386,13 +1388,13 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 		recentFilters += " AND created_at < ?"
 		recentArgs = append(recentArgs, time.Unix(input.Until, 0).UTC())
 	}
-	if len(input.Reasons) > 0 {
-		recentFilters += " AND reason IN (?)"
-		recentArgs = append(recentArgs, input.Reasons)
+	if len(input.Kinds) > 0 {
+		recentFilters += " AND kind IN (?)"
+		recentArgs = append(recentArgs, input.Kinds)
 	}
-	if len(input.ExcludeReasons) > 0 {
-		recentFilters += " AND reason NOT IN (?)"
-		recentArgs = append(recentArgs, input.ExcludeReasons)
+	if len(input.ExcludeKinds) > 0 {
+		recentFilters += " AND kind NOT IN (?)"
+		recentArgs = append(recentArgs, input.ExcludeKinds)
 	}
 	if policy == "FOLLOWS" {
 		// Only notifications whose actor is in the viewer's follow set: the p-tags
@@ -1448,7 +1450,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 						nullIf(argMinIf(tag_value, tag_index, marker = 'reply'), ''),
 						nullIf(argMaxIf(tag_value, tag_index, marker = ''), ''),
 						nullIf(argMinIf(tag_value, tag_index, marker = 'root'), '')
-					) AS direct_parent_id
+					) AS direct_target_id
 				FROM (
 					SELECT
 						event_id,
@@ -1471,7 +1473,7 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				)
 				ORDER BY id ASC, last_seen_at DESC
 				LIMIT 1 BY id
-			) AS reply_parent ON reply_parent.id = reply_meta.direct_parent_id
+			) AS reply_parent ON reply_parent.id = reply_meta.direct_target_id
 			LEFT JOIN (
 				SELECT rt.event_id, count() > 0 AS has_viewer_reply_reference
 				FROM event_tags AS rt
@@ -1517,15 +1519,15 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		WITH recent AS (
-			SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+			SELECT viewer, event_id, actor_pubkey, kind, created_at
 			FROM (
-				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
-				FROM notification_candidates
+				SELECT viewer, event_id, actor_pubkey, kind, created_at
+				FROM viewer_refs
 				WHERE viewer = ?%s
 				ORDER BY created_at DESC, event_id DESC
 				LIMIT ?
 			)
-			LIMIT 1 BY event_id, reason
+			LIMIT 1 BY event_id, kind
 		)
 		SELECT
 			id,
@@ -1536,7 +1538,6 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			tags_json,
 			sig,
 			last_seen_at,
-			reason,
 			actor_vertex_score,
 			actor_pubkey,
 			notification_created_at
@@ -1550,13 +1551,12 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 				e.tags_json AS tags_json,
 				e.sig AS sig,
 				e.last_seen_at AS last_seen_at,
-				n.reason AS reason,
 				ifNull(actor_score.score, 0) AS actor_vertex_score,
 				n.actor_pubkey AS actor_pubkey,
 				n.created_at AS notification_created_at,
 				n.event_id AS notification_event_id
 			FROM (
-				SELECT viewer, event_id, actor_pubkey, kind, created_at, reason
+				SELECT viewer, event_id, actor_pubkey, kind, created_at
 				FROM (
 					SELECT
 						viewer,
@@ -1564,14 +1564,13 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 						actor_pubkey,
 						kind,
 						created_at,
-						reason,
 						row_number() OVER (
-							PARTITION BY reason, actor_pubkey
+							PARTITION BY kind, actor_pubkey
 							ORDER BY created_at ASC, event_id ASC
-						) AS actor_reason_rank
+						) AS actor_kind_rank
 					FROM recent
 				)
-				WHERE reason != 'follow' OR actor_reason_rank = 1
+				WHERE kind != 3 OR actor_kind_rank = 1
 			) AS n
 			INNER JOIN (
 				SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
@@ -1603,9 +1602,9 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 	}
 	defer rows.Close()
 
-	out := []NotificationRow{}
+	out := []ViewerFeedRow{}
 	for rows.Next() {
-		var row NotificationRow
+		var row ViewerFeedRow
 		var tagsJSON string
 		var kind uint32
 		if err := rows.Scan(
@@ -1617,72 +1616,18 @@ func (s *Store) Notifications(ctx context.Context, input NotificationInput) ([]N
 			&tagsJSON,
 			&row.Event.Sig,
 			&row.Event.UpdatedAt,
-			&row.Reason,
 			&row.ActorVertexScore,
 			&row.ActorPubKey,
-			&row.NotificationCreatedAt,
+			&row.RefCreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		row.Event.Kind = int(kind)
+		row.Kind = int(kind)
 		_ = json.Unmarshal([]byte(tagsJSON), &row.Event.Tags)
-		row.Reason = notificationReasonForEvent(row.Event, row.Reason)
 		out = append(out, row)
 	}
 	return out, rows.Err()
-}
-
-func notificationReasonForEvent(event EventView, fallback string) string {
-	switch event.Kind {
-	case 3:
-		return "follow"
-	case 1:
-		if notificationHasReplyReference(event.Tags) {
-			return "reply"
-		}
-		if notificationHasQuoteReference(event.Tags) {
-			return "quote"
-		}
-		return "mention"
-	case 6, 16:
-		return "repost"
-	case 7:
-		return "reaction"
-	case 9735:
-		return "zap"
-	default:
-		if fallback != "" {
-			return fallback
-		}
-		return "mention"
-	}
-}
-
-func notificationHasReplyReference(tags [][]string) bool {
-	for _, tag := range tags {
-		if len(tag) <= 1 || tag[0] != "e" || len(tag[1]) != 64 {
-			continue
-		}
-		if len(tag) < 4 || tag[3] == "" || tag[3] == "root" || tag[3] == "reply" {
-			return true
-		}
-	}
-	return false
-}
-
-func notificationHasQuoteReference(tags [][]string) bool {
-	for _, tag := range tags {
-		if len(tag) <= 1 || len(tag[1]) != 64 {
-			continue
-		}
-		if tag[0] == "q" {
-			return true
-		}
-		if tag[0] == "e" && len(tag) >= 4 && tag[3] == "mention" {
-			return true
-		}
-	}
-	return false
 }
 
 func notificationPolicyThresholds(policy string) (float64, float64) {
@@ -1698,15 +1643,15 @@ func notificationPolicyThresholds(policy string) (float64, float64) {
 	}
 }
 
-func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[string]ProfileRow, error) {
+func (s *Store) LatestK0(ctx context.Context, pubkeys []string) (map[string]K0Row, error) {
 	pubkeys = uniqueStrings(pubkeys)
-	out := make(map[string]ProfileRow, len(pubkeys))
+	out := make(map[string]K0Row, len(pubkeys))
 	if len(pubkeys) == 0 {
 		return out, nil
 	}
 	rows, err := s.conn.Query(ctx, `
 		SELECT pubkey, event_id, created_at, name, display_name, picture, about, nip05, lud16, lud06, banner, website, raw_json
-		FROM profiles_latest FINAL
+		FROM latest_k0 FINAL
 		WHERE pubkey IN (?)
 	`, pubkeys)
 	if err != nil {
@@ -1714,7 +1659,7 @@ func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[strin
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var profile ProfileRow
+		var profile K0Row
 		if err := rows.Scan(
 			&profile.PubKey,
 			&profile.EventID,
@@ -1737,7 +1682,7 @@ func (s *Store) LatestProfiles(ctx context.Context, pubkeys []string) (map[strin
 	return out, rows.Err()
 }
 
-func (s *Store) SearchProfiles(ctx context.Context, query string, limit uint64) ([]ProfileSearchRow, error) {
+func (s *Store) SearchK0(ctx context.Context, query string, limit uint64) ([]ProfileSearchRow, error) {
 	query = strings.TrimSpace(query)
 	if len(query) < 3 {
 		return []ProfileSearchRow{}, nil
@@ -1746,7 +1691,7 @@ func (s *Store) SearchProfiles(ctx context.Context, query string, limit uint64) 
 		limit = 10
 	}
 	if pubkey, ok := vertex.NormalizePubkey(query); ok {
-		profiles, err := s.LatestProfiles(ctx, []string{pubkey})
+		profiles, err := s.LatestK0(ctx, []string{pubkey})
 		if err != nil {
 			return nil, err
 		}
@@ -1784,7 +1729,7 @@ func (s *Store) SearchProfiles(ctx context.Context, query string, limit uint64) 
 	}
 	rows, err := s.conn.Query(ctx, `
 		SELECT pubkey, event_id, created_at, name, display_name, picture, about, nip05, lud16, lud06, banner, website, raw_json, `+scoreExpr+` AS relevance
-		FROM profiles_latest FINAL
+		FROM latest_k0 FINAL
 		WHERE positionCaseInsensitiveUTF8(concat(name, ' ', display_name, ' ', nip05, ' ', lud16, ' ', website, ' ', about, ' ', raw_json), ?) > 0
 		ORDER BY relevance DESC, created_at DESC, pubkey ASC
 		LIMIT ?
@@ -1860,7 +1805,7 @@ func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, 
 	return scanEventRows(rows)
 }
 
-func (s *Store) ThreadEvents(ctx context.Context, id string, limit int) (*EventView, []EventView, error) {
+func (s *Store) DescendantEvents(ctx context.Context, id string, limit int) (*EventView, []EventView, error) {
 	root, err := s.EventByID(ctx, id)
 	if err != nil {
 		return nil, nil, err

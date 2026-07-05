@@ -32,21 +32,21 @@ type Store interface {
 	QueryLatestEventsByPubKeys(context.Context, []string, []int, uint64) (map[string][]chstore.EventView, error)
 	AggregateEvents(context.Context, chstore.AggregateInput) ([]chstore.AggregateRow, error)
 	AggregateEventReferencesToTargets(context.Context, chstore.AggregateInput, chstore.EventQueryInput) ([]chstore.AggregateRow, error)
-	LatestProfiles(context.Context, []string) (map[string]chstore.ProfileRow, error)
-	BatchFollowCounts(context.Context, []string) (map[string]chstore.FollowCounts, error)
+	LatestK0(context.Context, []string) (map[string]chstore.K0Row, error)
+	BatchPubkeyStats(context.Context, []string) (map[string]chstore.PubkeyStats, error)
 	FollowEdges(context.Context, string, []string) (map[string]chstore.FollowEdge, error)
-	SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
+	SearchK0(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 	CachedVertexProfiles(context.Context, []string) (map[string]vertex.ProfileResult, error)
 	PubkeyScores(context.Context, string, []string) (map[string]chstore.PubkeyScore, error)
 	DerivedMetricValues(context.Context, string, []string) (map[string]float64, error)
-	Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error)
-	ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
+	ViewerFeed(context.Context, chstore.ViewerFeedInput) ([]chstore.ViewerFeedRow, error)
+	DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error)
 	RankedEventsByFeatures(context.Context, chstore.FeatureRankInput) ([]chstore.RankedFeatureRow, error)
-	DirectReplyIDs(context.Context, string) ([]string, error)
-	RankedDirectReplyIDs(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error)
-	AuthoredReplyChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error)
+	RefSourceIDs(context.Context, string) ([]string, error)
+	RankedRefSources(ctx context.Context, parentID, sort string, limit, offset int) ([]string, error)
+	AuthoredRefChain(ctx context.Context, rootID, author string, maxDepth int) ([]string, error)
 	NoteStats(context.Context, []string) (map[string]chstore.NoteStats, error)
-	FollowedReplies(context.Context, string, []string) (map[string]string, error)
+	FollowedRefs(context.Context, string, []string) (map[string]string, error)
 }
 
 var graphqlOperationNamePattern = regexp.MustCompile(`\b(?:query|mutation)\s+([A-Za-z0-9_]+)`)
@@ -199,18 +199,18 @@ type eventNode struct {
 }
 
 type notificationNode struct {
-	row   chstore.NotificationRow
+	row   chstore.ViewerFeedRow
 	event eventNode
 }
 
 type notificationConnectionSource struct {
-	rows  []chstore.NotificationRow
+	rows  []chstore.ViewerFeedRow
 	nodes []notificationNode
 }
 
 type profileSearchResultNode struct {
 	row     vertex.SearchResult
-	profile chstore.ProfileRow
+	profile chstore.K0Row
 	vertex  *vertex.ProfileResult
 }
 
@@ -403,7 +403,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 			},
 			"index": &graphql.InputObjectFieldConfig{Type: graphql.Int},
 			// directReplies restricts an 'e'-tag reverse reference to NIP-10/22
-			// direct replies (via note_reply_edges), excluding grandchildren and
+			// direct replies (via ref_edges), excluding grandchildren and
 			// quotes. Used by the thread view.
 			"directReplies": &graphql.InputObjectFieldConfig{Type: graphql.Boolean},
 		},
@@ -622,7 +622,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 		},
 	})
 	notificationInputType = graphql.NewInputObject(graphql.InputObjectConfig{
-		Name: "NotificationInput",
+		Name: "ViewerFeedInput",
 		Fields: graphql.InputObjectConfigFieldMap{
 			"pubkey":     &graphql.InputObjectFieldConfig{Type: graphql.NewNonNull(graphql.String)},
 			"tab":        &graphql.InputObjectFieldConfig{Type: notificationTabEnumType, DefaultValue: "ALL"},
@@ -728,10 +728,12 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 				},
 			},
 			"reason": &graphql.Field{
+				// Display adapter: the store speaks kinds; this route-aligned
+				// GraphQL surface derives its label from the kind + tags.
 				Type: graphql.NewNonNull(graphql.String),
 				Resolve: func(p graphql.ResolveParams) (any, error) {
 					node, _ := p.Source.(notificationNode)
-					return node.row.Reason, nil
+					return displayReasonForEvent(node.row.Event, node.row.Kind), nil
 				},
 			},
 			"actorVertexScore": &graphql.Field{
@@ -858,7 +860,7 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 						return nil, err
 					}
 					r.hydrateNotificationInput(p.Context, input)
-					rows, err := r.store.Notifications(p.Context, input)
+					rows, err := r.store.ViewerFeed(p.Context, input)
 					if err != nil {
 						return nil, err
 					}
@@ -933,7 +935,7 @@ func (r *resolver) hydrateAuthors(ctx context.Context, pubkeys []string, limit u
 func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (profileSearchConnectionSource, error) {
 	args := vertex.NormalizeSearchArgs(input)
 	rows := make([]vertex.SearchResult, 0, args.Limit)
-	profiles := make(map[string]chstore.ProfileRow)
+	profiles := make(map[string]chstore.K0Row)
 	seen := make(map[string]struct{})
 
 	fromCache := true
@@ -966,7 +968,7 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 
 	if len(rows) < args.Limit {
 		remaining := args.Limit - len(rows)
-		localRows, err := r.store.SearchProfiles(ctx, args.Query, uint64(remaining))
+		localRows, err := r.store.SearchK0(ctx, args.Query, uint64(remaining))
 		if err != nil {
 			return profileSearchConnectionSource{}, err
 		}
@@ -1005,7 +1007,7 @@ func (r *resolver) profileSearch(ctx context.Context, input vertex.SearchArgs) (
 			slog.Warn("graphql profile search profile backfill failed", "pubkeys", len(pubkeys), "error", err)
 		}
 	}
-	latestProfiles, err := r.store.LatestProfiles(ctx, pubkeys)
+	latestProfiles, err := r.store.LatestK0(ctx, pubkeys)
 	if err != nil {
 		return profileSearchConnectionSource{}, err
 	}
@@ -1048,7 +1050,7 @@ type graphTagPredicate struct {
 	ExcludeMarkers []string
 	Index          int
 	// DirectReplies restricts an 'e'-tag reverse reference to NIP-10/22 DIRECT
-	// replies (via the note_reply_edges table) instead of every event that
+	// replies (via the ref_edges table) instead of every event that
 	// e-tags the target. Used by the thread view so grandchildren and quotes do
 	// not leak in.
 	DirectReplies bool
@@ -1112,7 +1114,7 @@ func (r *resolver) eventFollowedReply(ctx context.Context, event chstore.EventVi
 	if viewer == "" {
 		return eventConnectionSource{}, nil
 	}
-	byParent, err := r.store.FollowedReplies(ctx, viewer, []string{event.ID})
+	byParent, err := r.store.FollowedRefs(ctx, viewer, []string{event.ID})
 	if err != nil {
 		return eventConnectionSource{}, err
 	}
@@ -1155,7 +1157,7 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 	// the expensive aggregation off the hot path for every viewer in the TTL
 	// window. Everything else uses the direct path.
 	// Database-first path: when the weighted terms map cleanly to the precomputed
-	// note_rank_features columns (the For-You / trending recipe terms do), the whole
+	// rank_features columns (the For-You / trending recipe terms do), the whole
 	// weighted top-N is one indexed ClickHouse scan — no per-request live
 	// aggregation. The per-viewer follow-boost + shuffle are then applied cheaply by
 	// finalizeRankedIDs. Falls through to the base-pool/direct path when the feature
@@ -1189,13 +1191,13 @@ func (r *resolver) rankedEventViews(ctx context.Context, input rankedEventsInput
 // featureRankWindow bounds the recent-events window the feature scan reads. It
 // matches the rollup's maintained window (RecentWindow, 48h): rows older than that
 // are not refreshed, and the recency half-life makes them score negligibly anyway.
-// A tighter bound is also a real speedup — note_rank_features carries a row per
+// A tighter bound is also a real speedup — rank_features carries a row per
 // (event, rollup tick) until background merges collapse the ReplacingMergeTree, so
 // the FINAL scan cost grows with the window.
 const featureRankWindow = 48 * time.Hour
 
 // featureRankTargetIsGlobal reports whether a ranked request targets a global
-// (kind-only) candidate pool — the only shape note_rank_features can serve. The
+// (kind-only) candidate pool — the only shape rank_features can serve. The
 // feature scan honors only kinds (+ exclusions, forwarded separately); a request
 // that scopes candidates by pubkey, tag, search, or a time window must fall
 // through to the live aggregation path, which applies those filters. Without this
@@ -1314,7 +1316,7 @@ func featureWeightsFromTerms(terms []weightedRankTerm, scoreSource string) (chst
 }
 
 // rankedEventViewsFromFeatures runs the DB-side weighted top-N over
-// note_rank_features, hydrates the pool, and applies the per-viewer follow-boost +
+// rank_features, hydrates the pool, and applies the per-viewer follow-boost +
 // shuffle. served=false signals a cold feature table so the caller can fall back.
 func (r *resolver) rankedEventViewsFromFeatures(ctx context.Context, input rankedEventsInput, weights chstore.FeatureWeights, halfLife float64, minFollowers uint64) ([]chstore.EventView, bool, error) {
 	rows, err := r.store.RankedEventsByFeatures(ctx, chstore.FeatureRankInput{
@@ -1684,7 +1686,7 @@ func (r *resolver) reverseReferenceQuery(ctx context.Context, event chstore.Even
 	}
 	input.Offset = uint64(intValue(m["offset"], int(input.Offset)))
 	if via.DirectReplies {
-		childIDs, err := r.store.DirectReplyIDs(ctx, target)
+		childIDs, err := r.store.RefSourceIDs(ctx, target)
 		if err != nil {
 			return input, err
 		}
@@ -2738,7 +2740,7 @@ func (r *resolver) hydrateAggregateInput(ctx context.Context, input chstore.Aggr
 	return r.hydrateRelayEventQuery(ctx, eventInput, label)
 }
 
-func (r *resolver) hydrateNotificationInput(ctx context.Context, input chstore.NotificationInput) bool {
+func (r *resolver) hydrateNotificationInput(ctx context.Context, input chstore.ViewerFeedInput) bool {
 	if input.Viewer == "" {
 		return false
 	}
@@ -3042,8 +3044,8 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 	)
 }
 
-func parseNotificationInput(raw map[string]any) (chstore.NotificationInput, error) {
-	input := chstore.NotificationInput{
+func parseNotificationInput(raw map[string]any) (chstore.ViewerFeedInput, error) {
+	input := chstore.ViewerFeedInput{
 		Tab:        "ALL",
 		Policy:     "STRICT",
 		ReplyScope: "THREAD",
@@ -3407,7 +3409,7 @@ func newEventConnectionWithCaches(events []chstore.EventView, relations *pubkeyR
 	return eventConnectionSource{raw: events, nodes: wrapEvents(events, relations, eventRelations)}
 }
 
-func newNotificationConnection(store Store, rows []chstore.NotificationRow, pubkeyScoreMinFollowers uint64) notificationConnectionSource {
+func newNotificationConnection(store Store, rows []chstore.ViewerFeedRow, pubkeyScoreMinFollowers uint64) notificationConnectionSource {
 	events := make([]chstore.EventView, 0, len(rows))
 	for _, row := range rows {
 		events = append(events, row.Event)
@@ -3549,7 +3551,7 @@ func (c *eventRelationCache) loadFollowedReplyBatch(ctx context.Context, r *reso
 	for _, event := range c.events {
 		parentIDs = append(parentIDs, event.ID)
 	}
-	byParent, err := c.store.FollowedReplies(ctx, viewer, parentIDs)
+	byParent, err := c.store.FollowedRefs(ctx, viewer, parentIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -3873,4 +3875,57 @@ func jsonScalar(name string) *graphql.Scalar {
 			return nil
 		},
 	})
+}
+
+func displayReasonForEvent(event chstore.EventView, kind int) string {
+	if event.Kind == 0 && kind != 0 {
+		event.Kind = kind
+	}
+	switch event.Kind {
+	case 3:
+		return "follow"
+	case 1:
+		if notificationHasReplyReference(event.Tags) {
+			return "reply"
+		}
+		if notificationHasQuoteReference(event.Tags) {
+			return "quote"
+		}
+		return "mention"
+	case 6, 16:
+		return "repost"
+	case 7:
+		return "reaction"
+	case 9735:
+		return "zap"
+	default:
+		return "mention"
+	}
+}
+
+func notificationHasReplyReference(tags [][]string) bool {
+	for _, tag := range tags {
+		if len(tag) <= 1 || tag[0] != "e" || len(tag[1]) != 64 {
+			continue
+		}
+		if len(tag) < 4 || tag[3] == "" || tag[3] == "root" || tag[3] == "reply" {
+			return true
+		}
+	}
+	return false
+}
+
+func notificationHasQuoteReference(tags [][]string) bool {
+	for _, tag := range tags {
+		if len(tag) <= 1 || len(tag[1]) != 64 {
+			continue
+		}
+		if tag[0] == "q" {
+			return true
+		}
+		if tag[0] == "e" && len(tag) >= 4 && tag[3] == "mention" {
+			return true
+		}
+	}
+	return false
 }

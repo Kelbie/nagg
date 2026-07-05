@@ -1,20 +1,29 @@
--- One-time full population of user_stats (010 created it rollup-fed only, so
+-- One-time full population of pubkey_stats (010 created it rollup-fed only, so
 -- coverage was 16k of 551k profiled pubkeys — every uncovered pubkey read
 -- follower counts through the legacy global event_tags scan, which is both
 -- wrong (counts all kind-3 history, ignoring NIP-02 replaceability) and heavy.
--- After this backfill the read path serves user_stats exclusively; the rollup
+-- After this backfill the read path serves pubkey_stats exclusively; the rollup
 -- keeps touched pubkeys fresh.
 --
--- Idempotent: user_stats is ReplacingMergeTree(computed_at) keyed by pubkey —
+-- Idempotent: pubkey_stats is ReplacingMergeTree(computed_at) keyed by pubkey —
 -- a re-run converges to the recomputed row. Runs once under the ledger.
-INSERT INTO user_stats
+INSERT INTO pubkey_stats
 WITH latest_contacts AS (
-    SELECT pubkey, argMax(contacts, created_at) AS contacts
-    FROM user_contacts_latest
+    SELECT pubkey, argMax(refs, created_at) AS refs
+    FROM (
+        SELECT
+            pubkey,
+            created_at,
+            arrayMap(t -> t[2],
+                arrayFilter(t -> length(t) >= 2 AND t[1] = 'p' AND length(t[2]) = 64,
+                    JSONExtract(tags_json, 'Array(Array(String))'))) AS refs
+        FROM nostr_events
+        WHERE kind = 3
+    )
     GROUP BY pubkey
 ),
 fan_in AS (
-    SELECT arrayJoin(contacts) AS pubkey, toUInt64(count()) AS followers
+    SELECT arrayJoin(refs) AS pubkey, toUInt64(count()) AS followers
     FROM latest_contacts
     GROUP BY pubkey
 ),
@@ -27,7 +36,7 @@ post_counts AS (
 population AS (
     SELECT DISTINCT pubkey FROM
     (
-        SELECT pubkey FROM profiles_latest
+        SELECT DISTINCT pubkey FROM nostr_events WHERE kind = 0
         UNION ALL
         SELECT pubkey FROM latest_contacts
         UNION ALL
@@ -38,9 +47,9 @@ population AS (
 )
 SELECT
     population.pubkey AS pubkey,
-    toUInt64(length(ifNull(lc.contacts, []))) AS following,
-    ifNull(fi.followers, 0) AS followers,
-    ifNull(pc.posts, 0) AS posts,
+    toUInt64(length(ifNull(lc.refs, []))) AS k3_out,
+    ifNull(fi.followers, 0) AS k3_in,
+    ifNull(pc.posts, 0) AS k1_1111_authored,
     now() AS computed_at
 FROM population
 LEFT JOIN latest_contacts AS lc ON lc.pubkey = population.pubkey

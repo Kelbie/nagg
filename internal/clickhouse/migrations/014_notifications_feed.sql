@@ -19,22 +19,22 @@
 --
 -- actor_score drifts as vertex scores update; the rollup refreshes it on
 -- rewrite. TTL bounds the table to the window the app actually pages.
-CREATE TABLE IF NOT EXISTS notifications_feed
+CREATE TABLE IF NOT EXISTS viewer_feed
 (
     viewer                FixedString(64),
     created_at            DateTime,
     event_id              FixedString(64),
-    reason                LowCardinality(String),
+    kind                  UInt32,
     actor_pubkey          FixedString(64),
     event_pubkey          FixedString(64),
     event_kind            UInt32,
     event_created_at      DateTime,
-    is_reply              UInt8,
-    direct_parent_author  String DEFAULT '',
-    replies_viewer_thread UInt8,
+    is_ref                UInt8,
+    target_author         String DEFAULT '',
+    in_viewer_tree        UInt8,
     actor_score           Float64,
     computed_at           DateTime
 )
 ENGINE = ReplacingMergeTree(computed_at)
-ORDER BY (viewer, created_at, event_id, reason)
+ORDER BY (viewer, created_at, event_id, kind)
 TTL created_at + INTERVAL 14 DAY;

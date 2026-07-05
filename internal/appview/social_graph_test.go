@@ -12,7 +12,7 @@ import (
 )
 
 // socialGraphStore returns canned list events for QueryEvents and inherits
-// fakeStore's profile map for LatestProfiles.
+// fakeStore's profile map for LatestK0.
 type socialGraphStore struct {
 	fakeStore
 	events []chstore.EventView
@@ -30,7 +30,7 @@ const (
 
 func TestSocialGraphBundlesFollowsProfilesRelaysMutes(t *testing.T) {
 	store := socialGraphStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{
 			follow1: {Name: "alice", Picture: "http://x/a.png", EventID: "p1", RawJSON: `{"name":"alice"}`},
 		}},
 		events: []chstore.EventView{
@@ -78,7 +78,7 @@ func TestSocialGraphBundlesFollowsProfilesRelaysMutes(t *testing.T) {
 
 func TestSocialGraphPrefersNewerContactList(t *testing.T) {
 	store := socialGraphStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		events: []chstore.EventView{
 			{ID: "old", Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(100, 0), Tags: [][]string{{"p", follow1}}},
 			{ID: "new", Kind: 3, PubKey: testPubkey, CreatedAt: time.Unix(200, 0), Tags: [][]string{{"p", follow1}, {"p", follow2}}},

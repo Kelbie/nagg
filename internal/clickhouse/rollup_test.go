@@ -24,13 +24,13 @@ func TestSanitizeVersion(t *testing.T) {
 
 func TestBuildReplyEdgesSQL_DirectParentAndBounding(t *testing.T) {
 	since := time.Unix(1_700_000_000, 0)
-	sql := buildReplyEdgesSQL(since, 1234)
+	sql := buildRefEdgesSQL(since, 1234)
 	for _, want := range []string{
-		"INSERT INTO note_reply_edges",
+		"INSERT INTO ref_edges",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply')",
 		"argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = '')",
 		"argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root')",
-		"NOT has(quote_targets, parent_id)", // quote exclusion
+		"NOT has(quote_targets, target_id)", // quote exclusion
 		"kind IN (1, 1111)",
 		"created_at >= toDateTime(1700000000)", // bounded
 		"LIMIT 1234",
@@ -42,9 +42,9 @@ func TestBuildReplyEdgesSQL_DirectParentAndBounding(t *testing.T) {
 }
 
 func TestBuildDirectReplyCountsSQL_IdempotentUnion(t *testing.T) {
-	sql := buildDirectReplyCountsSQL(time.Unix(1_700_000_000, 0), 10)
-	if !strings.Contains(sql, "uniqState(child_id)") {
-		t.Error("direct reply counts must use uniqState(child_id) for idempotent union")
+	sql := buildRefSourceCountsSQL(time.Unix(1_700_000_000, 0), 10)
+	if !strings.Contains(sql, "uniqState(source_id)") {
+		t.Error("direct reply counts must use uniqState(source_id) for idempotent union")
 	}
 	if !strings.Contains(sql, "INSERT INTO agg_k1_1111_e_reply") {
 		t.Error("must insert into agg_k1_1111_e_reply")
@@ -77,19 +77,19 @@ func TestTargetIDsSubquery_RecencyOrderedEngagedOnly(t *testing.T) {
 func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing.T) {
 	since := time.Unix(1_700_000_000, 0)
 	computedAt := time.Unix(1_700_009_999, 0)
-	sql := buildEngagementRealSQL(since, 500, Thresholds{MinActorScore: 0.42, Version: "v3"}, computedAt)
+	sql := buildGatedRefCountsSQL(since, 500, Thresholds{MinActorScore: 0.42, Version: "v3"}, computedAt)
 	for _, want := range []string{
-		"INSERT INTO note_engagement_real",
-		// explicit column list (real_actors is ALTER-appended / physically last)
-		"(event_id, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, threshold_version, computed_at)",
+		"INSERT INTO gated_ref_counts",
+		// explicit column list (actors is ALTER-appended / physically last)
+		"(event_id, k7_e_actors, k6_16_e_actors, k1_1111_e_reply_sources, k1_q_sources, k9735_e_sources, k9735_e_value_total, actors, threshold_version, computed_at)",
 		"sc >= 0.42",            // threshold gate
 		"et.pubkey IN (scored)", // only scored actors
 		"uniqExactIf(et.pubkey, et.pubkey != a2.author)", // self-exclusion
 		"'v3' AS threshold_version",                      // stamped version
 		"toDateTime(1700009999) AS computed_at",
-		"note_reply_edges", // real replies via edge authors
+		"ref_edges",        // real replies via edge authors
 		"event_refs",       // real zaps
-		"AS real_actors",   // combined distinct-engager count
+		"AS actors",        // combined distinct-engager count
 		"uniqExact(actor)", // actors = distinct engagers across types
 	} {
 		if !strings.Contains(sql, want) {
@@ -98,15 +98,15 @@ func TestBuildEngagementRealSQL_ScoredActorsSelfExclusionAndOverwrite(t *testing
 	}
 }
 
-func TestBuildUserStatsSQL_FollowerFanInAndPosts(t *testing.T) {
-	sql := buildUserStatsSQL(time.Unix(1_700_000_000, 0), 1000, time.Unix(1_700_001_000, 0))
+func TestBuildPubkeyStatsSQL_FanInAndAuthored(t *testing.T) {
+	sql := buildPubkeyStatsSQL(time.Unix(1_700_000_000, 0), 1000, time.Unix(1_700_001_000, 0))
 	for _, want := range []string{
-		"INSERT INTO user_stats",
-		"length(u.contacts) AS following",
-		"arrayJoin(contacts)",        // follower fan-in
-		"user_contacts_latest FINAL", // latest list only (fixes the bug)
+		"INSERT INTO pubkey_stats",
+		"length(u.refs) AS k3_out",
+		"arrayJoin(refs)", // fan-in over latest reference lists
+		"latest_k3 FINAL", // latest list only (fixes the bug)
 		"uniqMerge(sources)",
-		"WHERE follow IN (touched)", // bounded emission
+		"WHERE ref IN (touched)", // bounded emission
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("user-stats SQL missing %q", want)
@@ -117,14 +117,14 @@ func TestBuildUserStatsSQL_FollowerFanInAndPosts(t *testing.T) {
 func TestBuildRankFeaturesSQL_AssemblesRawAndReal(t *testing.T) {
 	sql := buildRankFeaturesSQL(time.Unix(1_700_000_000, 0), 50000, Thresholds{Version: "v1"}, time.Unix(1_700_002_000, 0))
 	for _, want := range []string{
-		"INSERT INTO note_rank_features",
-		// explicit column list maps by name (real_actors is physically last)
-		"real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)",
+		"INSERT INTO rank_features",
+		// explicit column list maps by name (gated_actors is physically last)
+		"gated_actors, author_score, author_followers, contribution_quality, threshold_version, computed_at)",
 		"uniqMerge(actors)",
 		"agg_k1_1111_e_reply", // direct replies, not any-e-tag
 		"uniqMerge(sources)",
 		"sumMerge(value_total)",
-		"note_engagement_real",               // real columns
+		"gated_ref_counts",                   // real columns
 		"argMax(score, fetched_at) AS score", // author vertex score
 		"metric = 'contribution_quality'",
 		"'v1' AS threshold_version",

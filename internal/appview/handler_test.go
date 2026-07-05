@@ -18,15 +18,15 @@ import (
 const testPubkey = "82341f05fdb1dffbc78894993292171ed03abbed34a95f22f55f9b6371723ee6"
 
 type fakeStore struct {
-	profiles       map[string]chstore.ProfileRow
-	counts         chstore.FollowCounts
+	profiles       map[string]chstore.K0Row
+	counts         chstore.PubkeyStats
 	firstEventAt   *time.Time
 	cachedVertex   vertex.ProfileResult
 	cachedVertexOK bool
 	profileSearch  []chstore.ProfileSearchRow
 }
 
-func (s fakeStore) SearchProfiles(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error) {
+func (s fakeStore) SearchK0(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error) {
 	return s.profileSearch, nil
 }
 
@@ -46,8 +46,8 @@ func (s fakeStore) EventAggregates(context.Context, []string) (map[string]map[st
 	return map[string]map[string]map[string]uint64{}, nil
 }
 
-func (s fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[string]chstore.ProfileRow, error) {
-	out := make(map[string]chstore.ProfileRow, len(pubkeys))
+func (s fakeStore) LatestK0(_ context.Context, pubkeys []string) (map[string]chstore.K0Row, error) {
+	out := make(map[string]chstore.K0Row, len(pubkeys))
 	for _, pubkey := range pubkeys {
 		if profile, ok := s.profiles[pubkey]; ok {
 			out[pubkey] = profile
@@ -56,7 +56,7 @@ func (s fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[stri
 	return out, nil
 }
 
-func (s fakeStore) FollowCounts(context.Context, string) (chstore.FollowCounts, error) {
+func (s fakeStore) PubkeyStats(context.Context, string) (chstore.PubkeyStats, error) {
 	return s.counts, nil
 }
 
@@ -82,16 +82,16 @@ func (s fakeStore) SaveVertexProfile(context.Context, vertex.ProfileResult) erro
 	return nil
 }
 
-func (s fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
+func (s fakeStore) DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return nil, nil, nil
 }
 
-func (s fakeStore) Notifications(context.Context, chstore.NotificationInput) ([]chstore.NotificationRow, error) {
+func (s fakeStore) ViewerFeed(context.Context, chstore.ViewerFeedInput) ([]chstore.ViewerFeedRow, error) {
 	return nil, nil
 }
 
-func (s fakeStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
-	out := make(map[string]chstore.FollowCounts, len(pubkeys))
+func (s fakeStore) BatchPubkeyStats(_ context.Context, pubkeys []string) (map[string]chstore.PubkeyStats, error) {
+	out := make(map[string]chstore.PubkeyStats, len(pubkeys))
 	for _, pubkey := range pubkeys {
 		out[pubkey] = s.counts
 	}
@@ -106,15 +106,15 @@ func (s fakeStore) FollowEdges(_ context.Context, _ string, candidates []string)
 	return out, nil
 }
 
-func (s fakeStore) RankedDirectReplyIDs(context.Context, string, string, int, int) ([]string, error) {
+func (s fakeStore) RankedRefSources(context.Context, string, string, int, int) ([]string, error) {
 	return nil, nil
 }
 
-func (s fakeStore) AuthoredReplyChain(context.Context, string, string, int) ([]string, error) {
+func (s fakeStore) AuthoredRefChain(context.Context, string, string, int) ([]string, error) {
 	return nil, nil
 }
 
-func (s fakeStore) FollowedReplies(context.Context, string, []string) (map[string]string, error) {
+func (s fakeStore) FollowedRefs(context.Context, string, []string) (map[string]string, error) {
 	return map[string]string{}, nil
 }
 
@@ -124,10 +124,10 @@ type followCountSpyStore struct {
 	pubkeys []string
 }
 
-func (s *followCountSpyStore) FollowCounts(ctx context.Context, pubkey string) (chstore.FollowCounts, error) {
+func (s *followCountSpyStore) PubkeyStats(ctx context.Context, pubkey string) (chstore.PubkeyStats, error) {
 	s.calls++
 	s.pubkeys = append(s.pubkeys, pubkey)
-	return s.fakeStore.FollowCounts(ctx, pubkey)
+	return s.fakeStore.PubkeyStats(ctx, pubkey)
 }
 
 type profilePolicySpyStore struct {
@@ -195,7 +195,7 @@ type sequencedThreadStore struct {
 	calls   int
 }
 
-func (s *sequencedThreadStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
+func (s *sequencedThreadStore) DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	idx := s.calls
 	if idx >= len(s.threads) {
 		idx = len(s.threads) - 1
@@ -426,7 +426,7 @@ func (v fakeVertex) ProfileRefresh(context.Context, string) (vertex.ProfileResul
 
 func TestConfiguredViewerPubkeyFallsBackForUserFeed(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 	}
 	handler := New(
 		store,
@@ -448,7 +448,7 @@ func TestConfiguredViewerPubkeyFallsBackForUserFeed(t *testing.T) {
 
 func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 	}
 	handler := New(
 		store,
@@ -470,7 +470,7 @@ func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
 
 func TestFeedWithoutAuthorsReturnsEmpty(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 	}
 	handler := New(
 		store,
@@ -495,7 +495,7 @@ func TestFeedWithoutAuthorsReturnsEmpty(t *testing.T) {
 
 func TestConfiguredViewerPubkeyFallsBackForFollows(t *testing.T) {
 	store := &followCountSpyStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 	}
 	handler := New(
 		store,
@@ -517,7 +517,7 @@ func TestConfiguredViewerPubkeyFallsBackForFollows(t *testing.T) {
 
 func TestExplicitInvalidPubkeyStillFailsWithViewerFallback(t *testing.T) {
 	handler := New(
-		fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore{profiles: map[string]chstore.K0Row{}},
 		WithViewerPubkey(testPubkey),
 		WithNIP05Validation(false),
 	)
@@ -533,7 +533,7 @@ func TestExplicitInvalidPubkeyStillFailsWithViewerFallback(t *testing.T) {
 
 func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feeds: [][]chstore.EventView{
 			nil,
 			{{
@@ -579,7 +579,7 @@ func TestUserFeedBackfillRunsWhenFirstPageShort(t *testing.T) {
 
 func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feeds: [][]chstore.EventView{
 			nil,
 			{{
@@ -624,7 +624,7 @@ func TestUserFeedHydrationReturnsIndexedDataWhenHydrationIsSlow(t *testing.T) {
 
 func TestUserFeedWaitsThenReturnsBackfilledPosts(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feeds: [][]chstore.EventView{
 			nil,
 			{{
@@ -672,7 +672,7 @@ func TestUserFeedWaitsThenReturnsBackfilledPosts(t *testing.T) {
 
 func TestUserFeedWarmSkipsBackfill(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feeds: [][]chstore.EventView{
 			{{
 				ID:        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -710,7 +710,7 @@ func TestUserFeedWarmSkipsBackfill(t *testing.T) {
 
 func TestUserFeedPaginationSkipsBackfill(t *testing.T) {
 	store := &sequencedFeedStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feeds:     [][]chstore.EventView{nil},
 	}
 	backfiller := &fakeHydratingUserBackfiller{completed: true}
@@ -738,7 +738,7 @@ func TestUserFeedPaginationSkipsBackfill(t *testing.T) {
 }
 
 func TestDMEnvelopesHydratesViewerInbox(t *testing.T) {
-	store := &sequencedEventStore{fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}}}
+	store := &sequencedEventStore{fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}}}
 	backfiller := &fakeDMEnvelopeBackfiller{}
 	handler := New(
 		store,
@@ -786,7 +786,7 @@ func TestDMEnvelopesReturnsEncryptedContentVerbatim(t *testing.T) {
 		Sig:       strings.Repeat("c", 128),
 	}
 	store := &sequencedEventStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		// First call is the authored query, second is the received query.
 		events: [][]chstore.EventView{{envelope}, nil},
 	}
@@ -826,7 +826,7 @@ func TestDMEnvelopesReturnsEncryptedContentVerbatim(t *testing.T) {
 func TestEventsEndpointBackfillsMissingEventsBeforeEnrichment(t *testing.T) {
 	const eventID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	store := &sequencedEventStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		events: [][]chstore.EventView{
 			nil,
 			{{
@@ -892,7 +892,7 @@ func TestThreadBackfillsWhenIndexedRepliesAreShort(t *testing.T) {
 		Sig:       "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
 	}
 	store := &sequencedThreadStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		root:      root,
 		threads: [][]chstore.EventView{
 			nil,
@@ -973,7 +973,7 @@ func TestFeedHydratesRootAndQuotedEvents(t *testing.T) {
 	}
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				rootPubkey:  {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
 				testPubkey:  {PubKey: testPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Reply Author", RawJSON: `{"display_name":"Reply Author"}`},
 				quotePubkey: {PubKey: quotePubkey, EventID: strings.Repeat("0", 63) + "1", CreatedAt: time.Unix(1_700_000_002, 0), DisplayName: "Quote Author", RawJSON: `{"display_name":"Quote Author"}`},
@@ -1065,7 +1065,7 @@ func TestFeedKeepsRootIDWhenRootUnavailable(t *testing.T) {
 		Sig:       "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 	}
 	store := &appViewHydrationStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 		feed:      []chstore.EventView{reply},
 		events:    map[string]chstore.EventView{},
 		stats:     map[string]chstore.NoteStats{replyID: {LikeCount: 1}},
@@ -1137,7 +1137,7 @@ func TestFeedResolvesUpstreamRootFromParentReply(t *testing.T) {
 	}
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				rootPubkey: {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
 				testPubkey: {PubKey: testPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Reply Author", RawJSON: `{"display_name":"Reply Author"}`},
 			},
@@ -1220,7 +1220,7 @@ func TestFeedHydratesRepostOriginalRoot(t *testing.T) {
 	}
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				rootPubkey:     {PubKey: rootPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Root Author", RawJSON: `{"display_name":"Root Author"}`},
 				originalPubkey: {PubKey: originalPubkey, EventID: strings.Repeat("f", 64), CreatedAt: time.Unix(1_700_000_001, 0), DisplayName: "Original Author", RawJSON: `{"display_name":"Original Author"}`},
 				testPubkey:     {PubKey: testPubkey, EventID: strings.Repeat("0", 63) + "1", CreatedAt: time.Unix(1_700_000_002, 0), DisplayName: "Reposter", RawJSON: `{"display_name":"Reposter"}`},
@@ -1282,7 +1282,7 @@ func mustNoteURI(t *testing.T, id string) string {
 func TestProfilesEndpointReturnsPictureEvenWhenNameMissing(t *testing.T) {
 	handler := New(
 		fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:  testPubkey,
 					EventID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -1321,7 +1321,7 @@ func TestProfileSkipsVertexBelowLocalFollowerThreshold(t *testing.T) {
 	refreshCalls := 0
 	store := &profilePolicySpyStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:      testPubkey,
 					CreatedAt:   localCreatedAt,
@@ -1330,7 +1330,7 @@ func TestProfileSkipsVertexBelowLocalFollowerThreshold(t *testing.T) {
 					Picture:     "https://example.test/avatar.png",
 				},
 			},
-			counts:       chstore.FollowCounts{Follows: 7, Followers: 499},
+			counts:       chstore.PubkeyStats{Follows: 7, Followers: 499},
 			firstEventAt: &firstEventAt,
 			cachedVertex: vertex.ProfileResult{
 				PubKey:    testPubkey,
@@ -1399,7 +1399,7 @@ func TestProfileRefreshesAndSavesVertexAtFollowerThreshold(t *testing.T) {
 	refreshCalls := 0
 	store := &profilePolicySpyStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:      testPubkey,
 					Name:        "sovran",
@@ -1407,7 +1407,7 @@ func TestProfileRefreshesAndSavesVertexAtFollowerThreshold(t *testing.T) {
 					Picture:     "https://example.test/avatar.png",
 				},
 			},
-			counts:       chstore.FollowCounts{Follows: 30, Followers: 500},
+			counts:       chstore.PubkeyStats{Follows: 30, Followers: 500},
 			firstEventAt: &firstEventAt,
 		},
 	}
@@ -1472,7 +1472,7 @@ func TestProfileFallsBackToLocalCreatedAtWhenVertexMissing(t *testing.T) {
 	createdAt := time.Unix(1_710_000_000, 0)
 	handler := New(
 		fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:    testPubkey,
 					CreatedAt: createdAt,
@@ -1510,14 +1510,14 @@ func TestProfileFallsBackToCachedVertexProfileWhenRefreshFails(t *testing.T) {
 	refreshCalls := 0
 	store := &profilePolicySpyStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:      testPubkey,
 					Name:        "sovran",
 					DisplayName: "Sovran",
 				},
 			},
-			counts: chstore.FollowCounts{Follows: 30, Followers: 500},
+			counts: chstore.PubkeyStats{Follows: 30, Followers: 500},
 			cachedVertex: vertex.ProfileResult{
 				PubKey: testPubkey,
 				Npub:   vertex.Npub(testPubkey),
@@ -1572,13 +1572,13 @@ func TestProfileReturnsLocalOnlyWhenVertexAndCacheMiss(t *testing.T) {
 	refreshCalls := 0
 	store := &profilePolicySpyStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:    testPubkey,
 					CreatedAt: time.Unix(1_710_000_000, 0),
 				},
 			},
-			counts: chstore.FollowCounts{Follows: 30, Followers: 500},
+			counts: chstore.PubkeyStats{Follows: 30, Followers: 500},
 		},
 	}
 	handler := New(
@@ -1621,7 +1621,7 @@ func TestSearchEnrichesRowsWithLocalProfiles(t *testing.T) {
 	score := 42.5
 	handler := New(
 		fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:      testPubkey,
 					DisplayName: "Sovran",
@@ -1679,7 +1679,7 @@ func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
 	score := 88.0
 	handler := New(
 		fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				testPubkey: {
 					PubKey:      testPubkey,
 					DisplayName: "Sovran",
@@ -1687,7 +1687,7 @@ func TestSearchFallsBackToLocalIndexWhenVertexErrors(t *testing.T) {
 				},
 			},
 			profileSearch: []chstore.ProfileSearchRow{{
-				Profile: chstore.ProfileRow{PubKey: testPubkey, DisplayName: "Sovran"},
+				Profile: chstore.K0Row{PubKey: testPubkey, DisplayName: "Sovran"},
 				Rank:    rank,
 				Score:   score,
 			}},
@@ -1728,7 +1728,7 @@ func TestSearchHonorsProviderOrdering(t *testing.T) {
 	const pubB = "1111111111111111111111111111111111111111111111111111111111111111"
 	rA, rB := 0.1, 0.9
 	handler := New(
-		fakeStore{profiles: map[string]chstore.ProfileRow{
+		fakeStore{profiles: map[string]chstore.K0Row{
 			pubA: {PubKey: pubA, DisplayName: "Alice", EventID: strings.Repeat("a", 64), RawJSON: `{"display_name":"Alice"}`},
 			pubB: {PubKey: pubB, DisplayName: "Bob", EventID: strings.Repeat("b", 64), RawJSON: `{"display_name":"Bob"}`},
 		}},
@@ -1764,7 +1764,7 @@ func TestSearchHonorsProviderOrdering(t *testing.T) {
 func TestSearchClampsLimitAboveCeiling(t *testing.T) {
 	var captured vertex.SearchArgs
 	handler := New(
-		fakeStore{profiles: map[string]chstore.ProfileRow{
+		fakeStore{profiles: map[string]chstore.K0Row{
 			testPubkey: {PubKey: testPubkey, DisplayName: "Sovran"},
 		}},
 		WithProfileSearch(fakeVertex{
@@ -1854,7 +1854,7 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 	}
 	store := &appViewHydrationStore{
 		fakeStore: fakeStore{
-			profiles: map[string]chstore.ProfileRow{
+			profiles: map[string]chstore.K0Row{
 				authorPubkey: {PubKey: authorPubkey, EventID: strings.Repeat("e", 64), CreatedAt: time.Unix(1_700_000_000, 0), DisplayName: "Ranked Author", RawJSON: `{"display_name":"Ranked Author"}`},
 			},
 		},
@@ -1900,7 +1900,7 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 }
 
 func TestRankedFeedWithoutProviderReturnsServiceUnavailable(t *testing.T) {
-	handler := New(fakeStore{profiles: map[string]chstore.ProfileRow{}}, WithNIP05Validation(false))
+	handler := New(fakeStore{profiles: map[string]chstore.K0Row{}}, WithNIP05Validation(false))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/nostr/feed/ranked", strings.NewReader(`{}`))
@@ -1913,7 +1913,7 @@ func TestRankedFeedWithoutProviderReturnsServiceUnavailable(t *testing.T) {
 
 func TestRankedFeedRejectsNonPost(t *testing.T) {
 	ranker := &fakeRanker{}
-	handler := New(fakeStore{profiles: map[string]chstore.ProfileRow{}}, WithRankedFeed(ranker), WithNIP05Validation(false))
+	handler := New(fakeStore{profiles: map[string]chstore.K0Row{}}, WithRankedFeed(ranker), WithNIP05Validation(false))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/nostr/feed/ranked", nil)
@@ -1929,32 +1929,32 @@ func TestRankedFeedRejectsNonPost(t *testing.T) {
 
 type notificationStore struct {
 	appViewHydrationStore
-	rows      []chstore.NotificationRow
-	lastInput chstore.NotificationInput
+	rows      []chstore.ViewerFeedRow
+	lastInput chstore.ViewerFeedInput
 }
 
-func (s *notificationStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
-	// Record the primary (non-follow) call; the grouped handler also makes a
-	// small follow-only sub-call we don't want to clobber the mirrored input.
-	if len(input.Reasons) == 0 {
+func (s *notificationStore) ViewerFeed(_ context.Context, input chstore.ViewerFeedInput) ([]chstore.ViewerFeedRow, error) {
+	// Record the primary (non-kind-3) call; the grouped handler also makes a
+	// small kind-3-only sub-call we don't want to clobber the mirrored input.
+	if len(input.Kinds) == 0 {
 		s.lastInput = input
 	}
-	// Honor the reason include/exclude filters the way ClickHouse does, so the
-	// grouped handler's separate follow / non-follow windows behave realistically.
-	include := map[string]bool{}
-	for _, reason := range input.Reasons {
-		include[reason] = true
+	// Honor the kind include/exclude filters the way ClickHouse does, so the
+	// grouped handler's separate kind-3 / other windows behave realistically.
+	include := map[int64]bool{}
+	for _, kind := range input.Kinds {
+		include[kind] = true
 	}
-	exclude := map[string]bool{}
-	for _, reason := range input.ExcludeReasons {
-		exclude[reason] = true
+	exclude := map[int64]bool{}
+	for _, kind := range input.ExcludeKinds {
+		exclude[kind] = true
 	}
-	out := make([]chstore.NotificationRow, 0, len(s.rows))
+	out := make([]chstore.ViewerFeedRow, 0, len(s.rows))
 	for _, row := range s.rows {
-		if len(include) > 0 && !include[row.Reason] {
+		if len(include) > 0 && !include[int64(row.Kind)] {
 			continue
 		}
-		if exclude[row.Reason] {
+		if exclude[int64(row.Kind)] {
 			continue
 		}
 		out = append(out, row)
@@ -1977,16 +1977,16 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{
-				profiles: map[string]chstore.ProfileRow{
+				profiles: map[string]chstore.K0Row{
 					actorPubkey: {PubKey: actorPubkey, EventID: eventID, DisplayName: "Reactor"},
 				},
 			},
 			events: map[string]chstore.EventView{},
 			stats:  map[string]chstore.NoteStats{eventID: {LikeCount: 3}},
 		},
-		rows: []chstore.NotificationRow{{
+		rows: []chstore.ViewerFeedRow{{
 			Event:            event,
-			Reason:           "REACTION",
+			Kind:             7,
 			ActorVertexScore: 0.42,
 		}},
 	}
@@ -2044,7 +2044,7 @@ func TestNotificationsEnrichesEventsAndMirrorsInput(t *testing.T) {
 func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
-			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
 			stats:     map[string]chstore.NoteStats{},
 		},
@@ -2075,7 +2075,7 @@ func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 func TestNotificationsAcceptsFollowsPolicy(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
-			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
 			stats:     map[string]chstore.NoteStats{},
 		},
@@ -2095,7 +2095,7 @@ func TestNotificationsAcceptsFollowsPolicy(t *testing.T) {
 func TestNotificationsRequiresViewer(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
-			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
 			stats:     map[string]chstore.NoteStats{},
 		},
@@ -2114,32 +2114,32 @@ func TestNotificationsRequiresViewer(t *testing.T) {
 func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) {
 	hex := func(c byte) string { return strings.Repeat(string(c), 64) }
 	target := hex('f')
-	mk := func(id, actor string, kind int, reason string, at int64, tags [][]string) chstore.NotificationRow {
-		return chstore.NotificationRow{
-			Event:                 chstore.EventView{ID: id, PubKey: actor, Kind: kind, CreatedAt: time.Unix(at, 0), Tags: tags},
-			Reason:                reason,
-			ActorPubKey:           actor,
-			NotificationCreatedAt: time.Unix(at, 0),
+	mk := func(id, actor string, kind int, at int64, tags [][]string) chstore.ViewerFeedRow {
+		return chstore.ViewerFeedRow{
+			Event:        chstore.EventView{ID: id, PubKey: actor, Kind: kind, CreatedAt: time.Unix(at, 0), Tags: tags},
+			Kind:         kind,
+			ActorPubKey:  actor,
+			RefCreatedAt: time.Unix(at, 0),
 		}
 	}
 	reactionTags := [][]string{{"e", target}, {"p", testPubkey}}
 	// Newest-first, as the store returns them.
-	rows := []chstore.NotificationRow{
-		mk(hex('a'), hex('1'), 7, "reaction", 300, reactionTags),
-		mk(hex('b'), hex('2'), 7, "reaction", 290, reactionTags),
-		mk(hex('c'), hex('3'), 3, "follow", 280, nil),
-		mk(hex('d'), hex('4'), 3, "follow", 270, nil),
-		mk(hex('e'), hex('5'), 3, "follow", 260, nil),
-		mk(hex('9'), hex('6'), 1, "reply", 250, [][]string{{"e", target, "", "reply"}}),
+	rows := []chstore.ViewerFeedRow{
+		mk(hex('a'), hex('1'), 7, 300, reactionTags),
+		mk(hex('b'), hex('2'), 7, 290, reactionTags),
+		mk(hex('c'), hex('3'), 3, 280, nil),
+		mk(hex('d'), hex('4'), 3, 270, nil),
+		mk(hex('e'), hex('5'), 3, 260, nil),
+		mk(hex('9'), hex('6'), 1, 250, [][]string{{"e", target, "", "reply"}}),
 	}
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
 			fakeStore: fakeStore{
-				profiles: map[string]chstore.ProfileRow{
+				profiles: map[string]chstore.K0Row{
 					hex('1'): {PubKey: hex('1'), DisplayName: "A1", EventID: hex('7'), RawJSON: `{"display_name":"A1"}`},
 					hex('2'): {PubKey: hex('2'), DisplayName: "A2", EventID: hex('8'), RawJSON: `{"display_name":"A2"}`},
 				},
-				counts: chstore.FollowCounts{Followers: 100},
+				counts: chstore.PubkeyStats{Followers: 100},
 			},
 			events: map[string]chstore.EventView{target: {ID: target, PubKey: testPubkey, Kind: 1, Content: "my post"}},
 			stats:  map[string]chstore.NoteStats{},
@@ -2179,7 +2179,7 @@ func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) 
 	if !targetEmbedded {
 		t.Fatalf("target event not embedded: %v", resp.Order)
 	}
-	// entry[1]: kind-3 group with the exact count from FollowCounts.
+	// entry[1]: kind-3 group with the exact count from PubkeyStats.
 	if entries[1].Kind != 3 || entries[1].Total != 100 || entries[1].TotalCapped {
 		t.Fatalf("kind-3 group = %+v", entries[1])
 	}
@@ -2215,13 +2215,13 @@ func TestNotificationsGroupsFollowsReactionsAndKeepsRepliesSingle(t *testing.T) 
 
 func TestNotificationsGroupedFalseReturnsRawSingles(t *testing.T) {
 	hex := func(c byte) string { return strings.Repeat(string(c), 64) }
-	rows := []chstore.NotificationRow{
-		{Event: chstore.EventView{ID: hex('a'), PubKey: hex('1'), Kind: 3, CreatedAt: time.Unix(300, 0)}, Reason: "follow", ActorPubKey: hex('1'), NotificationCreatedAt: time.Unix(300, 0)},
-		{Event: chstore.EventView{ID: hex('b'), PubKey: hex('2'), Kind: 3, CreatedAt: time.Unix(290, 0)}, Reason: "follow", ActorPubKey: hex('2'), NotificationCreatedAt: time.Unix(290, 0)},
+	rows := []chstore.ViewerFeedRow{
+		{Event: chstore.EventView{ID: hex('a'), PubKey: hex('1'), Kind: 3, CreatedAt: time.Unix(300, 0)}, Kind: 3, ActorPubKey: hex('1'), RefCreatedAt: time.Unix(300, 0)},
+		{Event: chstore.EventView{ID: hex('b'), PubKey: hex('2'), Kind: 3, CreatedAt: time.Unix(290, 0)}, Kind: 3, ActorPubKey: hex('2'), RefCreatedAt: time.Unix(290, 0)},
 	}
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{
-			fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{}},
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 			events:    map[string]chstore.EventView{},
 			stats:     map[string]chstore.NoteStats{},
 		},

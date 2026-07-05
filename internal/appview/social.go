@@ -57,7 +57,7 @@ func (h *Handler) followStatus(w http.ResponseWriter, r *http.Request) {
 
 // ownProfiles returns metadata + follower/following counts for a small set of
 // the viewer's own accounts (capped at 10) — the REST counterpart of the
-// GraphQL ownProfiles resolver, reusing store.LatestProfiles + BatchFollowCounts.
+// GraphQL ownProfiles resolver, reusing store.LatestK0 + BatchPubkeyStats.
 // Registered at /nostr/own/profiles, which ServeMux routes to this exact path
 // ahead of the /nostr/own/ history subtree.
 func (h *Handler) ownProfiles(w http.ResponseWriter, r *http.Request) {
@@ -75,13 +75,13 @@ func (h *Handler) ownProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	h.tryBackfillProfiles(ctx, pubkeys)
-	counts, err := h.store.BatchFollowCounts(ctx, pubkeys)
+	counts, err := h.store.BatchPubkeyStats(ctx, pubkeys)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
-	if err := h.appendProfileEventsTo(ctx, &envelope, pubkeys); err != nil {
+	if err := h.appendK0EventsTo(ctx, &envelope, pubkeys); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -89,7 +89,7 @@ func (h *Handler) ownProfiles(w http.ResponseWriter, r *http.Request) {
 		envelope.Order = append(envelope.Order, event.ID)
 	}
 	for _, pubkey := range pubkeys {
-		followAggregates(&envelope, pubkey, counts[pubkey], 0)
+		pubkeyAggregates(&envelope, pubkey, counts[pubkey], 0)
 	}
 	writeJSON(w, envelope)
 }

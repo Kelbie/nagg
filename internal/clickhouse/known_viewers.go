@@ -21,8 +21,8 @@ func (s *Store) ExemptPubkeys(ctx context.Context) ([]string, error) {
 		FROM (
 			SELECT pubkey AS p FROM known_viewers
 			UNION ALL
-			SELECT arrayJoin(contacts) AS p
-			FROM user_contacts_latest FINAL
+			SELECT arrayJoin(refs) AS p
+			FROM latest_k3 FINAL
 			WHERE pubkey IN (SELECT pubkey FROM known_viewers)
 		)
 	`)

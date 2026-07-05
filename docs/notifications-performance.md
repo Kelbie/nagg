@@ -161,12 +161,12 @@ with the ClickHouse query being killed by the 30 s context.
 
 ### Why the query was slow (`internal/clickhouse/read.go`)
 
-`notification_candidates` is a `ReplacingMergeTree` keyed
+`viewer_refs` is a `ReplacingMergeTree` keyed
 `ORDER BY (viewer, created_at, event_id, reason)`, fed by a materialized view
 from `event_tags` (every `p`-tag reference to the viewer — every reaction,
 repost, zap, reply, mention). The legacy read did, in order:
 
-1. `SELECT … FROM notification_candidates FINAL WHERE viewer = ?` — the viewer's
+1. `SELECT … FROM viewer_refs FINAL WHERE viewer = ?` — the viewer's
    **entire** history, plus a `row_number()` window over all of it.
 2. `INNER JOIN nostr_events AS e FINAL` — `FINAL` merge over the events table.
 3. Two `LEFT JOIN vertex_scores … FINAL` — two more merge-on-read joins.
@@ -263,7 +263,7 @@ compatibility shim (per `no-backwards-compatibility`).
 
 - **nagg**: GraphQL `NotificationInput.viewer → pubkey`
   (`parseNotificationInput`), REST `parseNotificationRequest` query param + JSON
-  field `viewer → pubkey`. The internal `notification_candidates.viewer` column
+  field `viewer → pubkey`. The internal `viewer_refs.viewer` column
   and `NotificationInput.Viewer` Go field keep their name — it's a meaningful
   domain term in the data model; only the request surface changed.
 - **nagg-ts** (`0.3.0 → 0.4.0`, breaking): `NotificationsInput`,
@@ -325,13 +325,13 @@ The restructure removed the timeouts; a denormalized read-model removes the
 remaining multi-second cold by eliminating the read-time `FINAL` merges and the
 reply scan entirely. Sketch:
 
-- A `notifications_feed` table keyed `(viewer, created_at, event_id)` holding the
+- A `viewer_feed` table keyed `(viewer, created_at, event_id)` holding the
   **denormalized** notification: event id/pubkey/kind/created_at/content/tags +
   `actor_pubkey` + precomputed `is_reply` / `is_reply_to_viewer` + the actor's
   last-known `actor_score`. Reads become a plain
   `WHERE viewer = ? [policy on stored score] ORDER BY created_at DESC LIMIT N`
   — no `FINAL`, no joins, no tag scan → sub-second.
-- Population: extend the existing `mv_notification_candidates` MV (or a
+- Population: extend the existing `mv_viewer_refs` MV (or a
   companion MV/enrich task) to denormalize event fields and the reply flags at
   ingest. `is_reply` / parent are knowable from the event's own tags;
   `is_reply_to_viewer` needs the parent's author, resolvable in the enrich pass.

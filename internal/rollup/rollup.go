@@ -19,9 +19,9 @@ import (
 // Store is the subset of the ClickHouse store the rollup needs. Defined as an
 // interface so the runner can be unit-tested with a mock.
 type Store interface {
-	RecomputeReplyEdges(ctx context.Context, since time.Time, limit int) error
-	RecomputeEngagementReal(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
-	RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error
+	RecomputeRefEdges(ctx context.Context, since time.Time, limit int) error
+	RecomputeGatedRefCounts(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
+	RecomputePubkeyStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error
 	RecomputeRankFeatures(ctx context.Context, since time.Time, limit int, th clickhouse.Thresholds, computedAt time.Time) error
 	RecomputeNotificationsFeed(ctx context.Context, now time.Time) (bool, error)
 	RunRetention(ctx context.Context, dryRun bool) ([]clickhouse.RetentionRunResult, error)
@@ -29,14 +29,14 @@ type Store interface {
 	SaveRollupState(ctx context.Context, st clickhouse.RollupState) error
 }
 
-const rollupTask = "engagement"
+const rollupTask = "gated_counts"
 
 type Config struct {
 	Interval     time.Duration
 	RecentWindow time.Duration
 	MaxTargets   int
 	Thresholds   clickhouse.Thresholds
-	// NotificationsInterval paces the notifications_feed incremental tick —
+	// NotificationsInterval paces the viewer_feed incremental tick —
 	// much faster than the main rollup (notifications must be seconds-to-a-
 	// minute fresh, not 15m). During historical catch-up the loop ticks
 	// near-continuously until the watermark reaches now.
@@ -94,7 +94,7 @@ func (r *Runner) Run(ctx context.Context) {
 	if r == nil || r.store == nil {
 		return
 	}
-	safego.Go("rollup.notifications_feed", func() { r.runNotificationsLoop(ctx) })
+	safego.Go("rollup.viewer_feed", func() { r.runNotificationsLoop(ctx) })
 	safego.Go("rollup.retention", func() { r.runRetentionLoop(ctx) })
 	for {
 		if err := r.RunOnce(ctx); err != nil {
@@ -109,7 +109,7 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// runNotificationsLoop maintains the notifications_feed read-model: fast
+// runNotificationsLoop maintains the viewer_feed read-model: fast
 // incremental ticks in steady state, near-continuous slices while the
 // historical catch-up is still behind. Each slice holds one gate slot so the
 // catch-up can never crowd out user reads.
@@ -224,13 +224,13 @@ func (r *Runner) RunOnce(ctx context.Context) error {
 	limit := r.config.MaxTargets
 	th := r.config.Thresholds
 
-	if err := r.store.RecomputeReplyEdges(ctx, since, limit); err != nil {
+	if err := r.store.RecomputeRefEdges(ctx, since, limit); err != nil {
 		return err
 	}
-	if err := r.store.RecomputeEngagementReal(ctx, since, limit, th, now); err != nil {
+	if err := r.store.RecomputeGatedRefCounts(ctx, since, limit, th, now); err != nil {
 		return err
 	}
-	if err := r.store.RecomputeUserStats(ctx, since, limit, now); err != nil {
+	if err := r.store.RecomputePubkeyStats(ctx, since, limit, now); err != nil {
 		return err
 	}
 	if err := r.store.RecomputeRankFeatures(ctx, since, limit, th, now); err != nil {

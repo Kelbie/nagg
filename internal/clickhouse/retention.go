@@ -102,7 +102,7 @@ func eventKindRetentionMutations(allowed []int) []string {
 		fmt.Sprintf("ALTER TABLE event_seen_relays DELETE WHERE event_id IN (%s)", prunedEventIDs),
 		fmt.Sprintf("ALTER TABLE derived_tags DELETE WHERE %s", predicate),
 		fmt.Sprintf("ALTER TABLE derived_metrics DELETE WHERE %s", predicate),
-		fmt.Sprintf("ALTER TABLE notification_candidates DELETE WHERE %s", predicate),
+		fmt.Sprintf("ALTER TABLE viewer_refs DELETE WHERE %s", predicate),
 		fmt.Sprintf("ALTER TABLE event_tags DELETE WHERE %s", predicate),
 		fmt.Sprintf("ALTER TABLE nostr_events DELETE WHERE %s", predicate),
 	}

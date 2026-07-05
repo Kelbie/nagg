@@ -47,6 +47,9 @@ func (r *Registry) GeneratedDDL() []string {
 			out = append(out, materializedViewDDL(rel))
 		}
 	}
+	for _, proj := range r.projections {
+		out = append(out, projectionTableDDL(proj), projectionViewDDL(proj))
+	}
 	return out
 }
 

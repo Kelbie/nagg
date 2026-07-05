@@ -74,6 +74,32 @@ func Default(capMax int) (*Registry, error) {
 		},
 	}
 
+	// Latest-per-author projections: the kind-0 metadata table and the
+	// kind-3 reference-list table, declared instead of hand-written.
+	projections := []Projection{
+		{
+			Name:  "k0",
+			Kinds: []int{0},
+			Fields: []ProjField{
+				{Name: "name", JSONPath: "name"},
+				{Name: "display_name", JSONPath: "display_name"},
+				{Name: "picture", JSONPath: "picture"},
+				{Name: "about", JSONPath: "about"},
+				{Name: "nip05", JSONPath: "nip05"},
+				{Name: "lud16", JSONPath: "lud16"},
+				{Name: "lud06", JSONPath: "lud06"},
+				{Name: "banner", JSONPath: "banner"},
+				{Name: "website", JSONPath: "website"},
+				{Name: "raw_json", RawContent: true},
+			},
+		},
+		{
+			Name:   "k3",
+			Kinds:  []int{3},
+			Fields: []ProjField{{Name: "refs", TagKey: "p"}},
+		},
+	}
+
 	// Superseded-version pruning is opt-in per kind; anything not listed
 	// here keeps every version forever. These kinds are pruned because
 	// relays and every reader only ever use the newest version (measured:
@@ -117,7 +143,7 @@ func Default(capMax int) (*Registry, error) {
 		})
 	}
 
-	return New(relationships, supersessions, lifetimes, caps)
+	return New(relationships, projections, supersessions, lifetimes, caps)
 }
 
 // MustDefault is Default for wiring paths without an error channel (config

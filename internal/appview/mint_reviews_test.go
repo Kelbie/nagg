@@ -74,7 +74,7 @@ func TestMintReviewsBundlesReviewerProfiles(t *testing.T) {
 	const alicePk = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const bobPk = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	store := mintReviewStore{
-		fakeStore: fakeStore{profiles: map[string]chstore.ProfileRow{
+		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{
 			alicePk: {PubKey: alicePk, DisplayName: "Alice", Picture: "https://a/pic.png"},
 			// bob has no kind-0 row → absent from the profiles map, not an error
 		}},

@@ -188,22 +188,22 @@ func scoredActorsSubquery(minScore float64) string {
 		) WHERE sc >= %v`, minScore)
 }
 
-func buildReplyEdgesSQL(since time.Time, limit int) string {
+func buildRefEdgesSQL(since time.Time, limit int) string {
 	children := recentChildrenSubquery(since, limit)
 	return fmt.Sprintf(`
-		INSERT INTO note_reply_edges
-		SELECT child_id, parent_id, child_pubkey, kind, created_at
+		INSERT INTO ref_edges
+		SELECT source_id, target_id, source_pubkey, kind, created_at
 		FROM (
 			SELECT
-				event_id AS child_id,
-				any(pubkey) AS child_pubkey,
+				event_id AS source_id,
+				any(pubkey) AS source_pubkey,
 				any(kind) AS kind,
 				any(created_at) AS created_at,
 				coalesce(
 					nullIf(argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'reply'), ''),
 					nullIf(argMaxIf(tag_value, tag_index, tag_key = 'e' AND marker = ''), ''),
 					nullIf(argMinIf(tag_value, tag_index, tag_key = 'e' AND marker = 'root'), '')
-				) AS parent_id,
+				) AS target_id,
 				groupArrayIf(tag_value, tag_key = 'q') AS quote_targets
 			FROM (
 				SELECT event_id, pubkey, kind, created_at, tag_key, tag_value, tag_index,
@@ -214,55 +214,55 @@ func buildReplyEdgesSQL(since time.Time, limit int) string {
 			)
 			GROUP BY event_id
 		)
-		WHERE parent_id != '' AND length(parent_id) = 64 AND NOT has(quote_targets, parent_id)`, children)
+		WHERE target_id != '' AND length(target_id) = 64 AND NOT has(quote_targets, target_id)`, children)
 }
 
-func buildDirectReplyCountsSQL(since time.Time, limit int) string {
+func buildRefSourceCountsSQL(since time.Time, limit int) string {
 	children := recentChildrenSubquery(since, limit)
 	return fmt.Sprintf(`
 		INSERT INTO agg_k1_1111_e_reply
-		SELECT parent_id AS target, uniqState(child_id) AS sources
-		FROM note_reply_edges
-		WHERE child_id IN (%s)
-		GROUP BY parent_id`, children)
+		SELECT target_id AS target, uniqState(source_id) AS sources
+		FROM ref_edges
+		WHERE source_id IN (%s)
+		GROUP BY target_id`, children)
 }
 
-// RecomputeReplyEdges rebuilds the direct-reply edges and counts for recent reply
+// RecomputeRefEdges rebuilds the direct-reply edges and counts for recent reply
 // candidates. uniqState makes the count rebuild idempotent (set union).
-func (s *Store) RecomputeReplyEdges(ctx context.Context, since time.Time, limit int) error {
-	if err := s.execRollup(ctx, "recompute reply edges", buildReplyEdgesSQL(since, limit)); err != nil {
+func (s *Store) RecomputeRefEdges(ctx context.Context, since time.Time, limit int) error {
+	if err := s.execRollup(ctx, "recompute reply edges", buildRefEdgesSQL(since, limit)); err != nil {
 		return err
 	}
-	return s.execRollup(ctx, "recompute direct reply counts", buildDirectReplyCountsSQL(since, limit))
+	return s.execRollup(ctx, "recompute direct reply counts", buildRefSourceCountsSQL(since, limit))
 }
 
-func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
+func buildGatedRefCountsSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
 	targets := targetIDsSubquery(since, limit)
 	scored := scoredActorsSubquery(th.MinActorScore)
 	version := sanitizeVersion(th.Version)
 	// Each metric subquery counts only scored actors and excludes the target's
 	// own author (self-engagement). The author per target comes from `authors`.
-	// Explicit column list: real_actors was added to note_engagement_real via a
+	// Explicit column list: actors was added to gated_ref_counts via a
 	// later ALTER ADD COLUMN, so it is physically LAST in the table while the SELECT
 	// emits it mid-row. Without this list the positional INSERT shifts every column
 	// after it (threshold_version → computed_at), failing with a DateTime parse
 	// error (code 41) on every tick — which is why the feature table went stale.
 	return fmt.Sprintf(`
-		INSERT INTO note_engagement_real
-			(event_id, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, threshold_version, computed_at)
+		INSERT INTO gated_ref_counts
+			(event_id, k7_e_actors, k6_16_e_actors, k1_1111_e_reply_sources, k1_q_sources, k9735_e_sources, k9735_e_value_total, actors, threshold_version, computed_at)
 		WITH
 			target_ids AS (%s),
 			scored AS (%s),
 			authors AS (SELECT id AS event_id, pubkey AS author FROM nostr_events FINAL WHERE id IN (target_ids))
 		SELECT
 			a.event_id,
-			ifNull(l.c, 0)  AS real_likes,
-			ifNull(rp.c, 0) AS real_reposts,
-			ifNull(re.c, 0) AS real_replies,
-			ifNull(q.c, 0)  AS real_quotes,
-			ifNull(z.cnt, 0)  AS real_zaps,
-			ifNull(z.sats, 0) AS real_zap_sats,
-			ifNull(act.c, 0)  AS real_actors,
+			ifNull(l.c, 0)  AS k7_e_actors,
+			ifNull(rp.c, 0) AS k6_16_e_actors,
+			ifNull(re.c, 0) AS k1_1111_e_reply_sources,
+			ifNull(q.c, 0)  AS k1_q_sources,
+			ifNull(z.cnt, 0)  AS k9735_e_sources,
+			ifNull(z.sats, 0) AS k9735_e_value_total,
+			ifNull(act.c, 0)  AS actors,
 			'%s' AS threshold_version,
 			toDateTime(%d) AS computed_at
 		FROM authors a
@@ -281,10 +281,10 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 			GROUP BY event_id
 		) rp ON rp.event_id = a.event_id
 		LEFT JOIN (
-			SELECT e.parent_id AS event_id, uniqExactIf(e.child_pubkey, e.child_pubkey != a2.author) AS c
-			FROM note_reply_edges e
-			INNER JOIN authors a2 ON a2.event_id = e.parent_id
-			WHERE e.child_pubkey IN (scored)
+			SELECT e.target_id AS event_id, uniqExactIf(e.source_pubkey, e.source_pubkey != a2.author) AS c
+			FROM ref_edges e
+			INNER JOIN authors a2 ON a2.event_id = e.target_id
+			WHERE e.source_pubkey IN (scored)
 			GROUP BY event_id
 		) re ON re.event_id = a.event_id
 		LEFT JOIN (
@@ -317,9 +317,9 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 				WHERE et.kind = 1 AND et.tag_key = 'q' AND length(et.tag_value) = 64
 				  AND et.pubkey IN (scored) AND et.pubkey != a2.author
 				UNION ALL
-				SELECT e.parent_id AS event_id, e.child_pubkey AS actor
-				FROM note_reply_edges e INNER JOIN authors a2 ON a2.event_id = e.parent_id
-				WHERE e.child_pubkey IN (scored) AND e.child_pubkey != a2.author
+				SELECT e.target_id AS event_id, e.source_pubkey AS actor
+				FROM ref_edges e INNER JOIN authors a2 ON a2.event_id = e.target_id
+				WHERE e.source_pubkey IN (scored) AND e.source_pubkey != a2.author
 				UNION ALL
 				SELECT zz.target AS event_id, zz.pubkey AS actor
 				FROM event_refs zz INNER JOIN authors a2 ON a2.event_id = zz.target
@@ -330,10 +330,10 @@ func buildEngagementRealSQL(since time.Time, limit int, th Thresholds, computedA
 		targets, scored, version, computedAt.Unix())
 }
 
-// RecomputeEngagementReal recomputes vertex-real engagement counts for the bounded
+// RecomputeGatedRefCounts recomputes vertex-real engagement counts for the bounded
 // target set. ReplacingMergeTree(computed_at) overwrites, so this is idempotent.
-func (s *Store) RecomputeEngagementReal(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
-	return s.execRollup(ctx, "recompute engagement real", buildEngagementRealSQL(since, limit, th, computedAt))
+func (s *Store) RecomputeGatedRefCounts(ctx context.Context, since time.Time, limit int, th Thresholds, computedAt time.Time) error {
+	return s.execRollup(ctx, "recompute engagement real", buildGatedRefCountsSQL(since, limit, th, computedAt))
 }
 
 func touchedAuthorsSubquery(since time.Time, limit int) string {
@@ -343,80 +343,80 @@ func touchedAuthorsSubquery(since time.Time, limit int) string {
 		LIMIT %d`, since.Unix(), limit)
 }
 
-func buildUserStatsSQL(since time.Time, limit int, computedAt time.Time) string {
+func buildPubkeyStatsSQL(since time.Time, limit int, computedAt time.Time) string {
 	touched := touchedAuthorsSubquery(since, limit)
-	// following = size of the latest contact list; posts = uniqMerge of the post
-	// aggregate; followers = fan-in over every user's LATEST contact list. The
-	// fan-in scans all contact lists (any user may follow a touched pubkey) but
-	// only emits rows for touched pubkeys.
+	// k3_out = size of the pubkey's latest kind-3 reference list; k1_1111_authored
+	// = uniqMerge of the author rule aggregate; k3_in = fan-in over every
+	// pubkey's LATEST kind-3 list. The fan-in scans all latest lists (anyone may
+	// reference a touched pubkey) but only emits rows for touched pubkeys.
 	return fmt.Sprintf(`
-		INSERT INTO user_stats
+		INSERT INTO pubkey_stats
 		WITH touched AS (%s)
 		SELECT
 			u.pubkey,
-			length(u.contacts) AS following,
-			ifNull(f.followers, 0) AS followers,
-			ifNull(p.posts, 0) AS posts,
+			length(u.refs) AS k3_out,
+			ifNull(f.k3_in, 0) AS k3_in,
+			ifNull(p.authored, 0) AS k1_1111_authored,
 			toDateTime(%d) AS computed_at
 		FROM (
-			SELECT pubkey, argMax(contacts, created_at) AS contacts
-			FROM user_contacts_latest
+			SELECT pubkey, argMax(refs, created_at) AS refs
+			FROM latest_k3
 			WHERE pubkey IN (touched)
 			GROUP BY pubkey
 		) u
 		LEFT JOIN (
-			SELECT follow AS pubkey, count() AS followers
+			SELECT ref AS pubkey, count() AS k3_in
 			FROM (
-				SELECT arrayJoin(contacts) AS follow
-				FROM user_contacts_latest FINAL
+				SELECT arrayJoin(refs) AS ref
+				FROM latest_k3 FINAL
 			)
-			WHERE follow IN (touched)
-			GROUP BY follow
+			WHERE ref IN (touched)
+			GROUP BY ref
 		) f ON f.pubkey = u.pubkey
 		LEFT JOIN (
-			SELECT target AS pubkey, uniqMerge(sources) AS posts
+			SELECT target AS pubkey, uniqMerge(sources) AS authored
 			FROM agg_k1_1111_author
 			WHERE target IN (touched)
 			GROUP BY target
 		) p ON p.pubkey = u.pubkey`, touched, computedAt.Unix())
 }
 
-// RecomputeUserStats recomputes follower / following / post counts for authors
-// touched since `since`. Fixes the legacy follower-count bug (which counted all
-// kind-3 history instead of only the latest contact list per follower).
-func (s *Store) RecomputeUserStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error {
-	return s.execRollup(ctx, "recompute user stats", buildUserStatsSQL(since, limit, computedAt))
+// RecomputePubkeyStats recomputes the per-pubkey kind-3 in/out and authored
+// counts for authors touched since `since`. Fixes the legacy fan-in bug (which
+// counted all kind-3 history instead of only the latest list per referencer).
+func (s *Store) RecomputePubkeyStats(ctx context.Context, since time.Time, limit int, computedAt time.Time) error {
+	return s.execRollup(ctx, "recompute user stats", buildPubkeyStatsSQL(since, limit, computedAt))
 }
 
 func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt time.Time) string {
 	targets := targetIDsSubquery(since, limit)
 	version := sanitizeVersion(th.Version)
-	// Explicit column list — see buildEngagementRealSQL: real_actors is physically
+	// Explicit column list — see buildGatedRefCountsSQL: gated_actors is physically
 	// last (ALTER-appended) but emitted mid-row, so a positional INSERT misaligns
 	// every following column and fails. Mapping by name is order-independent.
 	return fmt.Sprintf(`
-		INSERT INTO note_rank_features
-			(event_id, pubkey, kind, created_at, raw_likes, raw_reposts, raw_replies, raw_quotes, raw_zaps, raw_zap_sats, real_likes, real_reposts, real_replies, real_quotes, real_zaps, real_zap_sats, real_actors, author_vertex_score, author_followers, contribution_quality, threshold_version, computed_at)
+		INSERT INTO rank_features
+			(event_id, pubkey, kind, created_at, k7_e_actors, k6_16_e_actors, k1_1111_e_reply_sources, k1_q_sources, k9735_e_sources, k9735_e_value_total, gated_k7_e_actors, gated_k6_16_e_actors, gated_k1_1111_e_reply_sources, gated_k1_q_sources, gated_k9735_e_sources, gated_k9735_e_value_total, gated_actors, author_score, author_followers, contribution_quality, threshold_version, computed_at)
 		WITH target_ids AS (%s)
 		SELECT
 			n.id AS event_id,
 			n.pubkey,
 			n.kind,
 			n.created_at,
-			ifNull(lk.v, 0) AS raw_likes,
-			ifNull(rp.v, 0) AS raw_reposts,
-			ifNull(re.v, 0) AS raw_replies,
-			ifNull(qt.v, 0) AS raw_quotes,
-			ifNull(zt.zaps, 0) AS raw_zaps,
-			ifNull(zt.sats, 0) AS raw_zap_sats,
-			ifNull(er.real_likes, 0) AS real_likes,
-			ifNull(er.real_reposts, 0) AS real_reposts,
-			ifNull(er.real_replies, 0) AS real_replies,
-			ifNull(er.real_quotes, 0) AS real_quotes,
-			ifNull(er.real_zaps, 0) AS real_zaps,
-			ifNull(er.real_zap_sats, 0) AS real_zap_sats,
-			ifNull(er.real_actors, 0) AS real_actors,
-			ifNull(vs.score, 0) AS author_vertex_score,
+			ifNull(lk.v, 0) AS k7_e_actors,
+			ifNull(rp.v, 0) AS k6_16_e_actors,
+			ifNull(re.v, 0) AS k1_1111_e_reply_sources,
+			ifNull(qt.v, 0) AS k1_q_sources,
+			ifNull(zt.zaps, 0) AS k9735_e_sources,
+			ifNull(zt.sats, 0) AS k9735_e_value_total,
+			ifNull(er.gated_k7_e_actors, 0) AS gated_k7_e_actors,
+			ifNull(er.gated_k6_16_e_actors, 0) AS gated_k6_16_e_actors,
+			ifNull(er.gated_k1_1111_e_reply_sources, 0) AS gated_k1_1111_e_reply_sources,
+			ifNull(er.gated_k1_q_sources, 0) AS gated_k1_q_sources,
+			ifNull(er.gated_k9735_e_sources, 0) AS gated_k9735_e_sources,
+			ifNull(er.gated_k9735_e_value_total, 0) AS gated_k9735_e_value_total,
+			ifNull(er.gated_actors, 0) AS gated_actors,
+			ifNull(vs.score, 0) AS author_score,
 			ifNull(vs.followers, 0) AS author_followers,
 			ifNull(dm.value, 0) AS contribution_quality,
 			'%s' AS threshold_version,
@@ -427,7 +427,7 @@ func buildRankFeaturesSQL(since time.Time, limit int, th Thresholds, computedAt 
 		LEFT JOIN (SELECT target AS id, uniqMerge(sources) AS v FROM agg_k1_1111_e_reply WHERE target IN (target_ids) GROUP BY id) re ON re.id = n.id
 		LEFT JOIN (SELECT target AS id, uniqMerge(sources) AS v FROM agg_k1_q WHERE target IN (target_ids) GROUP BY id) qt ON qt.id = n.id
 		LEFT JOIN (SELECT target AS id, sumMerge(value_total) AS sats, uniqMerge(sources) AS zaps FROM agg_k9735_e WHERE target IN (target_ids) GROUP BY id) zt ON zt.id = n.id
-		LEFT JOIN (SELECT event_id AS id, argMax(real_likes, computed_at) AS real_likes, argMax(real_reposts, computed_at) AS real_reposts, argMax(real_replies, computed_at) AS real_replies, argMax(real_quotes, computed_at) AS real_quotes, argMax(real_zaps, computed_at) AS real_zaps, argMax(real_zap_sats, computed_at) AS real_zap_sats, argMax(real_actors, computed_at) AS real_actors FROM note_engagement_real WHERE event_id IN (target_ids) GROUP BY id) er ON er.id = n.id
+		LEFT JOIN (SELECT event_id AS id, argMax(k7_e_actors, computed_at) AS gated_k7_e_actors, argMax(k6_16_e_actors, computed_at) AS gated_k6_16_e_actors, argMax(k1_1111_e_reply_sources, computed_at) AS gated_k1_1111_e_reply_sources, argMax(k1_q_sources, computed_at) AS gated_k1_q_sources, argMax(k9735_e_sources, computed_at) AS gated_k9735_e_sources, argMax(k9735_e_value_total, computed_at) AS gated_k9735_e_value_total, argMax(actors, computed_at) AS gated_actors FROM gated_ref_counts WHERE event_id IN (target_ids) GROUP BY id) er ON er.id = n.id
 		LEFT JOIN (SELECT pubkey, argMax(score, fetched_at) AS score, argMax(followers, fetched_at) AS followers FROM vertex_scores WHERE source = 'vertex' GROUP BY pubkey) vs ON vs.pubkey = n.pubkey
 		LEFT JOIN (SELECT event_id AS id, argMax(value, computed_at) AS value FROM derived_metrics WHERE metric = 'contribution_quality' AND event_id IN (target_ids) GROUP BY id) dm ON dm.id = n.id`,
 		targets, version, computedAt.Unix())

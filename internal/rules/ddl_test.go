@@ -116,7 +116,7 @@ func TestMarkerFilter(t *testing.T) {
 		Metrics: []Metric{{Name: "sources", Agg: AggUniqSources}},
 		Refresh: RefreshIngest,
 	}
-	r, err := New([]Relationship{rel}, nil, nil, nil)
+	r, err := New([]Relationship{rel}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -18,7 +18,7 @@ func TestBuildEventAggregatesQuery(t *testing.T) {
 		"SELECT target AS id FROM agg_k7_e WHERE target IN (?)",
 		"LEFT JOIN (SELECT target, uniqMerge(actors) AS actors FROM agg_k7_e WHERE target IN (?) GROUP BY target)",
 		"LEFT JOIN (SELECT target, sumMerge(value_total) AS value_total, uniqMerge(sources) AS sources FROM agg_k9735_e WHERE target IN (?) GROUP BY target)",
-		"note_engagement_real",
+		"gated_ref_counts",
 	} {
 		if !strings.Contains(query, want) {
 			t.Errorf("query missing %q:\n%s", want, query)

@@ -1,9 +1,9 @@
--- Vertex-backed "real" engagement counts (bot-resistant).
+-- Vertex-score-gated reference counts (bot-resistant).
 --
--- Raw counts (note_*_counts) count every distinct actor. A "real" count only
+-- Raw rule aggregates count every distinct actor. A gated count only
 -- counts actors whose saved Vertex score clears a threshold, weeding out bot
 -- farms. Vertex scores arrive asynchronously (the vertex syncer fetches them on a
--- 30-min cycle), so the real count cannot be a pure incremental materialized view
+-- 30-min cycle), so the gated count cannot be a pure incremental materialized view
 -- — it is recomputed by the bounded periodic rollup job (internal/rollup), which
 -- joins each metric's actor set against vertex_scores.
 --
@@ -13,19 +13,19 @@
 -- land as a new logical row rather than silently mutating history. Reads use FINAL
 -- or argMax(..., computed_at).
 
-CREATE TABLE IF NOT EXISTS note_engagement_real
+CREATE TABLE IF NOT EXISTS gated_ref_counts
 (
     event_id          FixedString(64),
-    real_likes        UInt64,
-    real_reposts      UInt64,
-    real_replies      UInt64,
-    real_quotes       UInt64,
-    real_zaps         UInt64,
-    real_zap_sats     UInt64,
+    k7_e_actors        UInt64,
+    k6_16_e_actors      UInt64,
+    k1_1111_e_reply_sources      UInt64,
+    k1_q_sources       UInt64,
+    k9735_e_sources         UInt64,
+    k9735_e_value_total     UInt64,
     -- Distinct vertex-scored engagers across ALL reaction types (likes/reposts/
     -- quotes/replies/zaps), the "actors" signal the For-You rank uses as its
     -- primary engagement term.
-    real_actors       UInt64,
+    actors       UInt64,
     threshold_version LowCardinality(String),
     computed_at       DateTime
 )

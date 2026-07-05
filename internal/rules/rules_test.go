@@ -74,7 +74,7 @@ func TestNewValidation(t *testing.T) {
 			rel := valid
 			rel.Metrics = append([]Metric(nil), valid.Metrics...)
 			c.mutate(&rel)
-			_, err := New([]Relationship{rel}, nil, nil, nil)
+			_, err := New([]Relationship{rel}, nil, nil, nil, nil)
 			if c.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -96,7 +96,7 @@ func TestNewRejectsDuplicateNames(t *testing.T) {
 		Metrics: []Metric{{Name: "actors", Agg: AggUniqActors}},
 		Refresh: RefreshIngest,
 	}
-	_, err := New([]Relationship{rel, rel}, nil, nil, nil)
+	_, err := New([]Relationship{rel, rel}, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Fatalf("error = %v, want duplicate name", err)
 	}
@@ -110,7 +110,7 @@ func TestLifetimeValidation(t *testing.T) {
 		Metrics: []Metric{{Name: "actors", Agg: AggUniqActors}},
 		Refresh: RefreshIngest,
 	}
-	_, err := New([]Relationship{rel}, nil, []Lifetime{{
+	_, err := New([]Relationship{rel}, nil, nil, []Lifetime{{
 		Name:   "bad",
 		Kinds:  []int{1},
 		Policy: MaxAgeUnlessReferenced{Age: time.Hour, ByRules: []string{"missing"}},
@@ -121,11 +121,11 @@ func TestLifetimeValidation(t *testing.T) {
 }
 
 func TestCapValidation(t *testing.T) {
-	_, err := New(nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 0}})
+	_, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 0}})
 	if err == nil || !strings.Contains(err.Error(), "non-positive max") {
 		t.Fatalf("error = %v, want non-positive max", err)
 	}
-	if _, err := New(nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 5}}); err != nil {
+	if _, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 5}}); err != nil {
 		t.Fatalf("lifetime cap (zero window) should validate: %v", err)
 	}
 }
@@ -152,7 +152,7 @@ func TestDefaultRegistry(t *testing.T) {
 }
 
 func TestSupersessionCompilesToLifetime(t *testing.T) {
-	r, err := New(nil, []Supersession{
+	r, err := New(nil, nil, []Supersession{
 		{Name: "replaceable_latest", Kinds: []int{0, 3}},
 		{Name: "param_latest", Kinds: []int{30078}, PerDTag: true},
 	}, nil, nil)
@@ -170,7 +170,7 @@ func TestSupersessionCompilesToLifetime(t *testing.T) {
 	}
 
 	// Absence = keep every version: an empty rule set prunes nothing.
-	empty, err := New(nil, nil, nil, nil)
+	empty, err := New(nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New(empty): %v", err)
 	}
@@ -180,10 +180,10 @@ func TestSupersessionCompilesToLifetime(t *testing.T) {
 }
 
 func TestSupersessionValidation(t *testing.T) {
-	if _, err := New(nil, []Supersession{{Name: "", Kinds: []int{0}}}, nil, nil); err == nil {
+	if _, err := New(nil, nil, []Supersession{{Name: "", Kinds: []int{0}}}, nil, nil); err == nil {
 		t.Error("empty supersession name must fail")
 	}
-	if _, err := New(nil, []Supersession{{Name: "x", Kinds: nil}}, nil, nil); err == nil {
+	if _, err := New(nil, nil, []Supersession{{Name: "x", Kinds: nil}}, nil, nil); err == nil {
 		t.Error("kindless supersession must fail")
 	}
 }

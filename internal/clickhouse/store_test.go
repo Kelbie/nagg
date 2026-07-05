@@ -43,52 +43,6 @@ func TestNotificationPolicyThresholds(t *testing.T) {
 	}
 }
 
-func TestNotificationReasonForEvent(t *testing.T) {
-	validEventID := strings.Repeat("a", 64)
-	tests := map[string]struct {
-		event EventView
-		want  string
-	}{
-		"follow": {
-			event: EventView{Kind: 3},
-			want:  "follow",
-		},
-		"plain mention": {
-			event: EventView{Kind: 1, Tags: [][]string{{"p", strings.Repeat("b", 64)}}},
-			want:  "mention",
-		},
-		"reply": {
-			event: EventView{Kind: 1, Tags: [][]string{{"e", validEventID}, {"p", strings.Repeat("b", 64)}}},
-			want:  "reply",
-		},
-		"quote mention marker": {
-			event: EventView{Kind: 1, Tags: [][]string{{"e", validEventID, "", "mention"}}},
-			want:  "quote",
-		},
-		"q tag quote": {
-			event: EventView{Kind: 1, Tags: [][]string{{"q", validEventID}, {"p", strings.Repeat("b", 64)}}},
-			want:  "quote",
-		},
-		"reaction": {
-			event: EventView{Kind: 7},
-			want:  "reaction",
-		},
-		"zap": {
-			event: EventView{Kind: 9735},
-			want:  "zap",
-		},
-		"fallback": {
-			event: EventView{Kind: 30023},
-			want:  "custom",
-		},
-	}
-	for name, tc := range tests {
-		if got := notificationReasonForEvent(tc.event, "custom"); got != tc.want {
-			t.Fatalf("%s reason = %q, want %q", name, got, tc.want)
-		}
-	}
-}
-
 func TestEventOrderByAddsShuffleTieBreaker(t *testing.T) {
 	orderBy, args := eventOrderBy("e.created_at", "e.id", ShuffleInput{
 		Seed:     "seed-a",

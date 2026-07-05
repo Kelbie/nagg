@@ -169,6 +169,7 @@ type Cap struct {
 // validates cross-references and uniqueness.
 type Registry struct {
 	relationships []Relationship
+	projections   []Projection
 	lifetimes     []Lifetime
 	caps          []Cap
 
@@ -179,7 +180,7 @@ type Registry struct {
 // at startup: a malformed rule set is a programming error, so callers should
 // treat an error as fatal. Supersessions compile into lifetime rules (listed
 // first, so retention considers cheap supersession prunes before age rules).
-func New(relationships []Relationship, supersessions []Supersession, lifetimes []Lifetime, caps []Cap) (*Registry, error) {
+func New(relationships []Relationship, projections []Projection, supersessions []Supersession, lifetimes []Lifetime, caps []Cap) (*Registry, error) {
 	compiled := make([]Lifetime, 0, len(supersessions)+len(lifetimes))
 	for _, s := range supersessions {
 		if s.Name == "" {
@@ -195,9 +196,20 @@ func New(relationships []Relationship, supersessions []Supersession, lifetimes [
 
 	r := &Registry{
 		relationships: relationships,
+		projections:   projections,
 		lifetimes:     lifetimes,
 		caps:          caps,
 		byName:        make(map[string]*Relationship, len(relationships)),
+	}
+	seenProj := map[string]bool{}
+	for _, proj := range projections {
+		if err := validateProjection(proj); err != nil {
+			return nil, fmt.Errorf("projection %q: %w", proj.Name, err)
+		}
+		if seenProj[proj.Name] {
+			return nil, fmt.Errorf("projection %q: duplicate name", proj.Name)
+		}
+		seenProj[proj.Name] = true
 	}
 	for i := range relationships {
 		rel := &relationships[i]

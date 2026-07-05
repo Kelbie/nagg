@@ -36,14 +36,14 @@ type fakeStore struct {
 	aggregateInputs             []chstore.AggregateInput
 	pubkeyScoreRows             map[string]chstore.PubkeyScore
 	pubkeyScoreInputs           []pubkeyScoreInput
-	profileRows                 map[string]chstore.ProfileRow
+	profileRows                 map[string]chstore.K0Row
 	profileSearchRows           []chstore.ProfileSearchRow
 	profileSearchInputs         []profileSearchInput
 	vertexProfileRows           map[string]vertex.ProfileResult
 	derivedMetricRows           map[string]map[string]float64
 	derivedMetricInputs         []derivedMetricInput
-	notificationRows            []chstore.NotificationRow
-	notificationInputs          []chstore.NotificationInput
+	notificationRows            []chstore.ViewerFeedRow
+	notificationInputs          []chstore.ViewerFeedInput
 	featureRankRows             []chstore.RankedFeatureRow
 	featureRankInputs           []chstore.FeatureRankInput
 	directReplyIDs              map[string][]string
@@ -276,8 +276,8 @@ func (s *fakeStore) AggregateEventsByTagTargets(_ context.Context, input chstore
 	return out, true, nil
 }
 
-func (s *fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[string]chstore.ProfileRow, error) {
-	out := make(map[string]chstore.ProfileRow, len(pubkeys))
+func (s *fakeStore) LatestK0(_ context.Context, pubkeys []string) (map[string]chstore.K0Row, error) {
+	out := make(map[string]chstore.K0Row, len(pubkeys))
 	for _, pubkey := range pubkeys {
 		if s.profileRows == nil {
 			continue
@@ -289,15 +289,15 @@ func (s *fakeStore) LatestProfiles(_ context.Context, pubkeys []string) (map[str
 	return out, nil
 }
 
-func (s *fakeStore) SearchProfiles(_ context.Context, query string, limit uint64) ([]chstore.ProfileSearchRow, error) {
+func (s *fakeStore) SearchK0(_ context.Context, query string, limit uint64) ([]chstore.ProfileSearchRow, error) {
 	s.profileSearchInputs = append(s.profileSearchInputs, profileSearchInput{query: query, limit: limit})
 	return s.profileSearchRows, nil
 }
 
-func (s *fakeStore) BatchFollowCounts(_ context.Context, pubkeys []string) (map[string]chstore.FollowCounts, error) {
-	out := make(map[string]chstore.FollowCounts, len(pubkeys))
+func (s *fakeStore) BatchPubkeyStats(_ context.Context, pubkeys []string) (map[string]chstore.PubkeyStats, error) {
+	out := make(map[string]chstore.PubkeyStats, len(pubkeys))
 	for _, pubkey := range pubkeys {
-		out[pubkey] = chstore.FollowCounts{}
+		out[pubkey] = chstore.PubkeyStats{}
 	}
 	return out, nil
 }
@@ -358,12 +358,12 @@ func (s *fakeStore) DerivedMetricValues(_ context.Context, metric string, eventI
 	return out, nil
 }
 
-func (s *fakeStore) Notifications(_ context.Context, input chstore.NotificationInput) ([]chstore.NotificationRow, error) {
+func (s *fakeStore) ViewerFeed(_ context.Context, input chstore.ViewerFeedInput) ([]chstore.ViewerFeedRow, error) {
 	s.notificationInputs = append(s.notificationInputs, input)
 	return s.notificationRows, nil
 }
 
-func (s *fakeStore) ThreadEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
+func (s *fakeStore) DescendantEvents(context.Context, string, int) (*chstore.EventView, []chstore.EventView, error) {
 	return nil, nil, nil
 }
 
@@ -372,12 +372,12 @@ func (s *fakeStore) RankedEventsByFeatures(_ context.Context, input chstore.Feat
 	return s.featureRankRows, nil
 }
 
-func (s *fakeStore) DirectReplyIDs(_ context.Context, parentID string) ([]string, error) {
+func (s *fakeStore) RefSourceIDs(_ context.Context, parentID string) ([]string, error) {
 	s.directReplyParents = append(s.directReplyParents, parentID)
 	return s.directReplyIDs[parentID], nil
 }
 
-func (s *fakeStore) RankedDirectReplyIDs(_ context.Context, parentID, sort string, limit, offset int) ([]string, error) {
+func (s *fakeStore) RankedRefSources(_ context.Context, parentID, sort string, limit, offset int) ([]string, error) {
 	s.rankedDirectReplyCalls = append(s.rankedDirectReplyCalls, rankedDirectReplyCall{parentID: parentID, sort: sort, limit: limit, offset: offset})
 	ids := s.rankedDirectReplyIDs[parentID]
 	if offset >= len(ids) {
@@ -390,7 +390,7 @@ func (s *fakeStore) RankedDirectReplyIDs(_ context.Context, parentID, sort strin
 	return ids, nil
 }
 
-func (s *fakeStore) AuthoredReplyChain(_ context.Context, rootID, author string, maxDepth int) ([]string, error) {
+func (s *fakeStore) AuthoredRefChain(_ context.Context, rootID, author string, maxDepth int) ([]string, error) {
 	s.authoredReplyChainCalls = append(s.authoredReplyChainCalls, authoredReplyChainCall{rootID: rootID, author: author, maxDepth: maxDepth})
 	return s.authoredReplyChains[rootID], nil
 }
@@ -404,7 +404,7 @@ func (s *fakeStore) NoteStats(_ context.Context, ids []string) (map[string]chsto
 	return out, nil
 }
 
-func (s *fakeStore) FollowedReplies(_ context.Context, viewer string, parentIDs []string) (map[string]string, error) {
+func (s *fakeStore) FollowedRefs(_ context.Context, viewer string, parentIDs []string) (map[string]string, error) {
 	s.followedReplyViewer = viewer
 	s.followedReplyParents = append(s.followedReplyParents, parentIDs)
 	out := make(map[string]string, len(parentIDs))
@@ -492,7 +492,7 @@ func TestReverseReferenceQuery_DirectRepliesUsesEdgeTable(t *testing.T) {
 		t.Fatalf("reverseReferenceQuery error: %v", err)
 	}
 	if len(store.directReplyParents) != 1 || store.directReplyParents[0] != parent.ID {
-		t.Fatalf("DirectReplyIDs not queried for the parent; got %v", store.directReplyParents)
+		t.Fatalf("RefSourceIDs not queried for the parent; got %v", store.directReplyParents)
 	}
 	if len(input.Tags) != 0 {
 		t.Errorf("direct-reply query must not use the broad e-tag filter; got tags %+v", input.Tags)
@@ -717,7 +717,7 @@ func TestProfileSearchReturnsSearchAndProfileScores(t *testing.T) {
 		fromCache: true,
 	}
 	store := &fakeStore{
-		profileRows: map[string]chstore.ProfileRow{
+		profileRows: map[string]chstore.K0Row{
 			testPubkey: {
 				PubKey:      testPubkey,
 				Name:        "jack",
@@ -808,7 +808,7 @@ func TestProfileSearchReturnsSearchAndProfileScores(t *testing.T) {
 func TestProfileSearchReturnsLocalProfileEventsWithoutVertex(t *testing.T) {
 	store := &fakeStore{
 		profileSearchRows: []chstore.ProfileSearchRow{{
-			Profile: chstore.ProfileRow{
+			Profile: chstore.K0Row{
 				PubKey:      testPubkey,
 				Name:        "calle",
 				DisplayName: "calle BTC",
@@ -880,7 +880,7 @@ func TestProfileSearchPreservesVertexOrderBeforeLocalFallback(t *testing.T) {
 		}},
 	}
 	store := &fakeStore{
-		profileRows: map[string]chstore.ProfileRow{
+		profileRows: map[string]chstore.K0Row{
 			testPubkey: {
 				PubKey:      testPubkey,
 				Name:        "calle",
@@ -889,7 +889,7 @@ func TestProfileSearchPreservesVertexOrderBeforeLocalFallback(t *testing.T) {
 			},
 		},
 		profileSearchRows: []chstore.ProfileSearchRow{{
-			Profile: chstore.ProfileRow{
+			Profile: chstore.K0Row{
 				PubKey:      localPubkey,
 				Name:        "calle1cashume",
 				DisplayName: "calle",
@@ -1034,9 +1034,9 @@ func TestFollowedReplyFieldBatchesPrecomputedReplies(t *testing.T) {
 		t.Fatalf("graphql errors = %+v", result.Errors)
 	}
 
-	// One batched FollowedReplies call for the whole page (both parents, one viewer).
+	// One batched FollowedRefs call for the whole page (both parents, one viewer).
 	if len(store.followedReplyParents) != 1 {
-		t.Fatalf("expected 1 batched FollowedReplies call, got %d", len(store.followedReplyParents))
+		t.Fatalf("expected 1 batched FollowedRefs call, got %d", len(store.followedReplyParents))
 	}
 	if store.followedReplyViewer != viewer {
 		t.Fatalf("viewer = %q, want %q", store.followedReplyViewer, viewer)
@@ -2172,7 +2172,7 @@ func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
 	eventID := testHex("8")
 	actorPubkey := testHex("a")
 	store := &fakeStore{
-		notificationRows: []chstore.NotificationRow{
+		notificationRows: []chstore.ViewerFeedRow{
 			{
 				Event: chstore.EventView{
 					ID:        eventID,
@@ -2184,7 +2184,7 @@ func TestNotificationsReturnsPolicyFilteredConnection(t *testing.T) {
 					Sig:       strings.Repeat("8", 128),
 					UpdatedAt: time.Unix(1_710_000_001, 0),
 				},
-				Reason:           "mention",
+				Kind:             1,
 				ActorVertexScore: 77,
 			},
 		},
@@ -2268,5 +2268,51 @@ func TestNotificationsDefaultsToAllStrict(t *testing.T) {
 	input := store.notificationInputs[0]
 	if input.Tab != "ALL" || input.Policy != "STRICT" || input.ReplyScope != "THREAD" || input.Limit != 50 {
 		t.Fatalf("notification input defaults = %+v", input)
+	}
+}
+
+func TestDisplayReasonForEvent(t *testing.T) {
+	validEventID := strings.Repeat("a", 64)
+	tests := map[string]struct {
+		event chstore.EventView
+		want  string
+	}{
+		"follow": {
+			event: chstore.EventView{Kind: 3},
+			want:  "follow",
+		},
+		"plain mention": {
+			event: chstore.EventView{Kind: 1, Tags: [][]string{{"p", strings.Repeat("b", 64)}}},
+			want:  "mention",
+		},
+		"reply": {
+			event: chstore.EventView{Kind: 1, Tags: [][]string{{"e", validEventID}, {"p", strings.Repeat("b", 64)}}},
+			want:  "reply",
+		},
+		"quote mention marker": {
+			event: chstore.EventView{Kind: 1, Tags: [][]string{{"e", validEventID, "", "mention"}}},
+			want:  "quote",
+		},
+		"q tag quote": {
+			event: chstore.EventView{Kind: 1, Tags: [][]string{{"q", validEventID}, {"p", strings.Repeat("b", 64)}}},
+			want:  "quote",
+		},
+		"reaction": {
+			event: chstore.EventView{Kind: 7},
+			want:  "reaction",
+		},
+		"zap": {
+			event: chstore.EventView{Kind: 9735},
+			want:  "zap",
+		},
+		"fallback": {
+			event: chstore.EventView{Kind: 30023},
+			want:  "mention",
+		},
+	}
+	for name, tc := range tests {
+		if got := displayReasonForEvent(tc.event, 0); got != tc.want {
+			t.Fatalf("%s reason = %q, want %q", name, got, tc.want)
+		}
 	}
 }
