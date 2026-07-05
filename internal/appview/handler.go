@@ -30,6 +30,7 @@ type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
+	LatestK3Refs(context.Context, []string) (map[string]map[string]struct{}, error)
 	LatestK0(context.Context, []string) (map[string]chstore.K0Row, error)
 	PubkeyStats(context.Context, string) (chstore.PubkeyStats, error)
 	ProfileFirstEventCreatedAt(context.Context, string) (*time.Time, error)
@@ -479,7 +480,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		req.Offset = uint64(intParam(r, "offset", 0))
 	}
 
-	authors := h.authorsFromFeedRequest(req.Spec, req.UserPubKey, r)
+	authors := h.authorsFromFeedRequest(r.Context(), req.Spec, req.UserPubKey, r)
 	if len(authors) == 0 {
 		h.writeFeedEnvelope(w, r, nil, orderByCreatedAt)
 		return
@@ -505,19 +506,21 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	h.writeFeedEnvelope(w, r, events, orderByCreatedAt)
 }
 
-func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Request) []string {
+// authorsFromFeedRequest resolves whose events the feed returns. An explicit
+// `pubkeys` list is used as-is (the caller says exactly which authors). A
+// single viewer anchor means "the authors the viewer's latest kind-3
+// references" — a feed anchored on a viewer is what the people they
+// reference publish, never what the viewer publishes (/nostr/feed/user
+// serves authored events).
+func (h *Handler) authorsFromFeedRequest(ctx context.Context, spec, userPubkey string, r *http.Request) []string {
 	if r.Method == http.MethodGet {
-		// Accept the plural `pubkeys` and, for parity with the single-viewer
-		// routes, fall back to a single `pubkey`/`viewer` author.
-		raw := r.URL.Query().Get("pubkeys")
-		if strings.TrimSpace(raw) == "" {
-			raw = queryViewerParam(r)
+		if raw := r.URL.Query().Get("pubkeys"); strings.TrimSpace(raw) != "" {
+			return normalizePubkeys(csv(raw))
 		}
-		authors := normalizePubkeys(csv(raw))
-		if len(authors) == 0 && h.viewerPubkey != "" {
-			authors = []string{h.viewerPubkey}
+		if viewer, err := h.viewerPubkeyOr(queryViewerParam(r)); err == nil {
+			return h.referencedAuthors(ctx, viewer)
 		}
-		return authors
+		return nil
 	}
 	var parsed struct {
 		PubKey  string   `json:"pubkey"`
@@ -530,20 +533,35 @@ func (h *Handler) authorsFromFeedRequest(spec, userPubkey string, r *http.Reques
 	if len(parsed.PubKeys) > 0 {
 		return normalizePubkeys(parsed.PubKeys)
 	}
-	if single := firstNonEmpty(parsed.PubKey, parsed.Viewer); single != "" {
-		if pubkey, err := normalizePubkey(single); err == nil {
-			return []string{pubkey}
+	viewer := firstNonEmpty(parsed.PubKey, parsed.Viewer, userPubkey, h.viewerPubkey)
+	if viewer == "" {
+		return nil
+	}
+	normalized, err := normalizePubkey(viewer)
+	if err != nil {
+		return nil
+	}
+	return h.referencedAuthors(ctx, normalized)
+}
+
+// referencedAuthors returns the pubkeys the viewer's latest kind-3 list
+// references, backfilling the list from relays when it is not indexed yet.
+func (h *Handler) referencedAuthors(ctx context.Context, viewer string) []string {
+	refs, err := h.store.LatestK3Refs(ctx, []string{viewer})
+	if err != nil {
+		slog.Warn("feed: latest kind-3 read failed", "viewer", viewer, "error", err)
+		return nil
+	}
+	if len(refs[viewer]) == 0 && h.tryBackfillFollows(ctx, viewer) {
+		if refreshed, err := h.store.LatestK3Refs(ctx, []string{viewer}); err == nil {
+			refs = refreshed
 		}
 	}
-	if userPubkey != "" {
-		if pubkey, err := normalizePubkey(userPubkey); err == nil {
-			return []string{pubkey}
-		}
+	out := make([]string, 0, len(refs[viewer]))
+	for ref := range refs[viewer] {
+		out = append(out, ref)
 	}
-	if h.viewerPubkey != "" {
-		return []string{h.viewerPubkey}
-	}
-	return nil
+	return out
 }
 
 func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {

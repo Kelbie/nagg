@@ -17,13 +17,16 @@ import (
 
 const testPubkey = "82341f05fdb1dffbc78894993292171ed03abbed34a95f22f55f9b6371723ee6"
 
+const fakeFollowedAuthor = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
 type fakeStore struct {
-	profiles       map[string]chstore.K0Row
-	counts         chstore.PubkeyStats
-	firstEventAt   *time.Time
-	cachedVertex   vertex.ProfileResult
-	cachedVertexOK bool
-	profileSearch  []chstore.ProfileSearchRow
+	followsByViewer map[string]map[string]struct{}
+	profiles        map[string]chstore.K0Row
+	counts          chstore.PubkeyStats
+	firstEventAt    *time.Time
+	cachedVertex    vertex.ProfileResult
+	cachedVertexOK  bool
+	profileSearch   []chstore.ProfileSearchRow
 }
 
 func (s fakeStore) SearchK0(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error) {
@@ -40,6 +43,21 @@ func (s fakeStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chst
 
 func (s fakeStore) EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error) {
 	return map[string]map[string]map[string]uint64{}, nil
+}
+
+// followsByViewer lets tests declare each viewer's latest kind-3 reference
+// set; a nil map means "follows one placeholder author" so viewer-anchored
+// feed tests still resolve a non-empty author set.
+func (s fakeStore) LatestK3Refs(_ context.Context, pubkeys []string) (map[string]map[string]struct{}, error) {
+	out := make(map[string]map[string]struct{}, len(pubkeys))
+	for _, pk := range pubkeys {
+		if s.followsByViewer != nil {
+			out[pk] = s.followsByViewer[pk]
+			continue
+		}
+		out[pk] = map[string]struct{}{fakeFollowedAuthor: {}}
+	}
+	return out, nil
 }
 
 func (s fakeStore) LatestK0(_ context.Context, pubkeys []string) (map[string]chstore.K0Row, error) {
@@ -443,6 +461,8 @@ func TestConfiguredViewerPubkeyFallsBackForUserFeed(t *testing.T) {
 }
 
 func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
+	// A viewer-anchored feed (no explicit pubkeys) serves the authors the
+	// viewer's latest kind-3 references — never the viewer's own events.
 	store := &sequencedFeedStore{
 		fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
 	}
@@ -459,8 +479,45 @@ func TestConfiguredViewerPubkeyFallsBackForGenericFeed(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
-	if len(store.authors) != 1 || len(store.authors[0]) != 1 || store.authors[0][0] != testPubkey {
-		t.Fatalf("authors = %+v", store.authors)
+	if len(store.authors) != 1 || len(store.authors[0]) != 1 || store.authors[0][0] != fakeFollowedAuthor {
+		t.Fatalf("authors = %+v, want the viewer's referenced authors, not the viewer", store.authors)
+	}
+}
+
+func TestViewerAnchoredFeedServesReferencedAuthors(t *testing.T) {
+	// POST spec with only a viewer pubkey: the author set is the viewer's
+	// latest kind-3 reference set (the reported bug: it used to be the
+	// viewer themselves, so "Following" showed the viewer's own events).
+	followed := map[string]struct{}{
+		"1111111111111111111111111111111111111111111111111111111111111111": {},
+		"2222222222222222222222222222222222222222222222222222222222222222": {},
+	}
+	store := &sequencedFeedStore{
+		fakeStore: fakeStore{
+			profiles:        map[string]chstore.K0Row{},
+			followsByViewer: map[string]map[string]struct{}{testPubkey: followed},
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/nostr/feed",
+		strings.NewReader(`{"spec":"{\"id\":\"following-recent\",\"pubkey\":\"`+testPubkey+`\"}","limit":5}`),
+	)
+	handler.feed(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.authors) != 1 || len(store.authors[0]) != 2 {
+		t.Fatalf("authors = %+v, want the 2 referenced authors", store.authors)
+	}
+	for _, author := range store.authors[0] {
+		if _, ok := followed[author]; !ok {
+			t.Fatalf("unexpected author %q (viewer leaked into the author set?)", author)
+		}
 	}
 }
 
