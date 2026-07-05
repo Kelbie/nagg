@@ -471,6 +471,15 @@ const checks: Check[] = [
       t.ok(Array.isArray(r.body.entries), "entries missing");
       t.ok(typeof r.body.hasNext === "boolean", "hasNext missing");
       t.ok((r.body.entries ?? []).length > 0, "no entries for the pinned ACTIVE viewer (14d read model — re-pin viewer if dormant)");
+      // Follow-only output is the read-model's signature failure (kind-3 keeps
+      // flowing because contact lists republish with fresh timestamps while
+      // late-ingested engagement history gets skipped) — an active viewer must
+      // show at least one non-follow entry, or the pipeline upstream of the
+      // page read is broken even though entries[] is non-empty.
+      t.ok(
+        (r.body.entries ?? []).some((e: any) => e.kind !== 3),
+        "entries are follow-only — engagement rows lost upstream (viewer_refs → viewer_feed rollup)",
+      );
       const byId = eventsById(r.body);
       for (const e of r.body.entries ?? []) {
         t.ok(NOTIF_KINDS.has(e.kind), `entry kind outside closed set: ${e.kind}`);
