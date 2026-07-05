@@ -45,8 +45,8 @@ func TestPluginCapabilitiesNilUntilAttached(t *testing.T) {
 func TestPluginPolicy(t *testing.T) {
 	p := NewPlugin()
 	policy := p.Policy()
-	if policy.CacheTTL != 7*24*time.Hour {
-		t.Errorf("CacheTTL = %v, want 7 days", policy.CacheTTL)
+	if policy.CacheTTL != time.Minute {
+		t.Errorf("CacheTTL = %v, want 1m (bootstrap always-refetch)", policy.CacheTTL)
 	}
 	if policy.MinInboundRefs != 100 {
 		t.Errorf("MinInboundRefs = %d, want 100 (bootstrap setting)", policy.MinInboundRefs)

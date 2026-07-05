@@ -115,6 +115,7 @@ type VertexConfig struct {
 	Relay         string
 	ValidateNIP05 bool
 	SyncBatch     int
+	SyncInterval  time.Duration
 	SyncThrottle  time.Duration
 }
 
@@ -223,6 +224,7 @@ func Load() (Config, error) {
 			Relay:         env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
 			ValidateNIP05: parseBool(env("NAGG_NIP05_VALIDATE", "true")),
 			SyncBatch:     parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
+			SyncInterval:  parseDuration(env("NAGG_VERTEX_SYNC_INTERVAL", "30m")),
 			SyncThrottle:  parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
 		},
 		Auditor: AuditorConfig{

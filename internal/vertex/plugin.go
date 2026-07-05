@@ -43,13 +43,16 @@ func (p *Plugin) WithRecommend(client *Client) *Plugin {
 // are worth consulting the provider for — the declarative form of the
 // historical >500-followers requirement.
 //
-// BOOTSTRAP SETTING: 100 (was 500) while the self-hosted provider's graph
-// is young — in-graph follower counts lag the real network, so at 500 the
-// For-You rank gate matched almost nobody. Raise back toward 500 as the
-// graph converges.
+// BOOTSTRAP SETTINGS while the self-hosted provider's graph is young:
+//   - CacheTTL 1 minute (target: 7 days): effectively always-refetch — every
+//     sync tick re-scores its whole batch, so improving graph values land in
+//     nagg as fast as the sync can carry them instead of being trusted for a
+//     week. Raise to 7 * 24h once the graph has converged.
+//   - MinInboundRefs 100 (target: 500): in-graph follower counts lag the
+//     real network; at 500 the For-You rank gate matched almost nobody.
 func (p *Plugin) Policy() dvm.Policy {
 	return dvm.Policy{
-		CacheTTL:       7 * 24 * time.Hour,
+		CacheTTL:       time.Minute,
 		MinInboundRefs: 100,
 	}
 }

@@ -153,7 +153,7 @@ A plugin also declares its usage policy: `Policy{CacheTTL, MinInboundRefs}`.
 score sync refetches them; `MinInboundRefs` gates which pubkeys the provider
 is consulted for, measured as latest-list kind-3 inbound refs (`latest_k3`
 fan-in) — the declarative form of the historical >500-followers requirement.
-Vertex declares `7 * 24h` and `500`. The old NAGG_VERTEX_*_MIN_FOLLOWERS env
+Vertex currently declares bootstrap values (`time.Minute` = always-refetch, `100`) while the self-hosted graph converges; steady-state targets are `7 * 24h` and `500`. The old NAGG_VERTEX_*_MIN_FOLLOWERS env
 vars are gone; change the declaration instead.
 
 ## Deliberately outside the registry
