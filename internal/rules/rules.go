@@ -132,6 +132,28 @@ type Lifetime struct {
 	Policy LifetimePolicy
 }
 
+// Supersession declares that once an author publishes a newer event of one of
+// Kinds, the older versions are pruned (NIP-01 replaceable semantics; PerDTag
+// versions per (author, d-tag) instead of per author). THE DEFAULT IS KEEP:
+// kinds with no Supersession rule retain every version forever — declaring
+// one is an explicit, per-kind opt into deleting replaced events, exactly
+// like any other lifetime decision.
+type Supersession struct {
+	Name    string
+	Kinds   []int
+	PerDTag bool
+}
+
+// lifetime compiles the supersession into the retention machinery's rule
+// shape; supersessions ARE lifetimes, just declared by intent.
+func (s Supersession) lifetime() Lifetime {
+	var policy LifetimePolicy = KeepLatestPerAuthor{}
+	if s.PerDTag {
+		policy = KeepLatestPerAuthorDTag{}
+	}
+	return Lifetime{Name: s.Name, Kinds: s.Kinds, Policy: policy}
+}
+
 // Cap limits how many events of Kinds a single pubkey may ingest within
 // Window. Window == 0 means a lifetime cap (no window). Exempt authors
 // (known viewers and their follows) bypass the cap when ExemptKnownViewers.
@@ -155,8 +177,22 @@ type Registry struct {
 
 // New validates the rule set and returns a Registry. It is intended to run
 // at startup: a malformed rule set is a programming error, so callers should
-// treat an error as fatal.
-func New(relationships []Relationship, lifetimes []Lifetime, caps []Cap) (*Registry, error) {
+// treat an error as fatal. Supersessions compile into lifetime rules (listed
+// first, so retention considers cheap supersession prunes before age rules).
+func New(relationships []Relationship, supersessions []Supersession, lifetimes []Lifetime, caps []Cap) (*Registry, error) {
+	compiled := make([]Lifetime, 0, len(supersessions)+len(lifetimes))
+	for _, s := range supersessions {
+		if s.Name == "" {
+			return nil, fmt.Errorf("supersession: empty name")
+		}
+		if len(s.Kinds) == 0 {
+			return nil, fmt.Errorf("supersession %q: no kinds", s.Name)
+		}
+		compiled = append(compiled, s.lifetime())
+	}
+	compiled = append(compiled, lifetimes...)
+	lifetimes = compiled
+
 	r := &Registry{
 		relationships: relationships,
 		lifetimes:     lifetimes,

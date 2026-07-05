@@ -74,16 +74,27 @@ parsing the bolt11 invoice).
 
 **Add an extractor only when a real rule needs it — never speculatively.**
 
+## Supersessions
+
+`Supersession{Name, Kinds, PerDTag}` declares that once an author publishes a
+newer event of one of `Kinds`, the replaced versions get pruned (per author,
+or per `(author, d-tag)` with `PerDTag`). **The default is keep**: a kind with
+no supersession rule retains every version forever — deleting replaced events
+is an explicit per-kind opt-in, exactly like any other lifetime decision.
+Supersessions compile into lifetime rules and run through the same retention
+machinery.
+
 ## Lifetimes
 
 Absence of a rule means events live forever. Policies:
 
-- `KeepLatestPerAuthor` / `KeepLatestPerAuthorDTag` — NIP-01 replaceable /
-  parameterized-replaceable semantics;
 - `MaxAgeUnlessReferenced{Age, ByRules}` — expire after `Age` unless any of
   the named relationships recorded a reference; the protection ledger is the
   rules' aggregate tables, which outlive the referencing events;
-- `MaxAge{Age}` — unconditional.
+- `MaxAge{Age}` — unconditional;
+- `KeepLatestPerAuthor` / `KeepLatestPerAuthorDTag` — the policies
+  supersession rules compile to; declare a `Supersession` instead of using
+  these directly.
 
 Execution mechanics (async lightweight DELETEs, one mutation at a time,
 headroom guard) are unchanged — see `docs/retention.md`.

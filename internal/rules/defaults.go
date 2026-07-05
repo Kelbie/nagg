@@ -74,20 +74,16 @@ func Default(capMax int) (*Registry, error) {
 		},
 	}
 
+	// Superseded-version pruning is opt-in per kind; anything not listed
+	// here keeps every version forever. These kinds are pruned because
+	// relays and every reader only ever use the newest version (measured:
+	// 80-98% of stored rows were superseded dead weight).
+	supersessions := []Supersession{
+		{Name: "replaceable_latest", Kinds: []int{0, 3, 10050, 10051}},
+		{Name: "param_replaceable_latest", Kinds: []int{30078, 38000}, PerDTag: true},
+	}
+
 	lifetimes := []Lifetime{
-		{
-			// Replaceable events (NIP-01): relays and every reader keep only
-			// the newest event per author; older versions are dead weight.
-			Name:   "replaceable_latest",
-			Kinds:  []int{0, 3, 10050, 10051},
-			Policy: KeepLatestPerAuthor{},
-		},
-		{
-			// Parameterized-replaceable: versioned per (author, d-tag).
-			Name:   "param_replaceable_latest",
-			Kinds:  []int{30078, 38000},
-			Policy: KeepLatestPerAuthorDTag{},
-		},
 		{
 			// Events of kinds 1/1111 that nothing ever referenced expire
 			// after a year. The referencing relationships' aggregate tables
@@ -121,7 +117,7 @@ func Default(capMax int) (*Registry, error) {
 		})
 	}
 
-	return New(relationships, lifetimes, caps)
+	return New(relationships, supersessions, lifetimes, caps)
 }
 
 // MustDefault is Default for wiring paths without an error channel (config
