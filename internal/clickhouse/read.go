@@ -931,7 +931,11 @@ const recentAuthorsBySyncGateQuery = `
 		(
 			SELECT pubkey, max(created_at) AS last_event_at
 			FROM nostr_events FINAL
-			WHERE length(pubkey) = 64 AND created_at >= now() - INTERVAL 30 DAY
+			-- No byte-size filter on the author column: it is FixedString(64),
+			-- so the check is a tautology — and ClickHouse 26.6 returns ZERO
+			-- rows for FINAL combined with such filters (observed live: it
+			-- silently emptied the sync candidate set).
+			WHERE created_at >= now() - INTERVAL 30 DAY
 			GROUP BY pubkey
 		) AS recent
 		INNER JOIN

@@ -134,5 +134,8 @@ func TestSyncCandidatesReadMatchesDeclaredColumns(t *testing.T) {
 		if !strings.Contains(q, "arrayJoin(refs)") {
 			t.Errorf("sync candidate query must read latest_k3.refs:\n%s", q)
 		}
+		if strings.Contains(q, "length(pubkey)") {
+			t.Errorf("length(FixedString) under FINAL empties the result set on CH 26.6 (and is a tautology on FixedString(64)):\n%s", q)
+		}
 	}
 }
