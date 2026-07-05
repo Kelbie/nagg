@@ -48,7 +48,7 @@ func TestPluginPolicy(t *testing.T) {
 	if policy.CacheTTL != 7*24*time.Hour {
 		t.Errorf("CacheTTL = %v, want 7 days", policy.CacheTTL)
 	}
-	if policy.MinInboundRefs != 500 {
-		t.Errorf("MinInboundRefs = %d, want 500", policy.MinInboundRefs)
+	if policy.MinInboundRefs != 100 {
+		t.Errorf("MinInboundRefs = %d, want 100 (bootstrap setting)", policy.MinInboundRefs)
 	}
 }

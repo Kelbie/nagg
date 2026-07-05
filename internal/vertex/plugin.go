@@ -39,13 +39,18 @@ func (p *Plugin) WithRecommend(client *Client) *Plugin {
 
 // Policy: cached values are trusted for 7 days before the sync refetches
 // them (best-effort scores that sharpen as the provider's graph matures),
-// and only pubkeys with at least 500 latest-list inbound refs are worth
-// consulting the provider for — the declarative form of the historical
-// >500-followers requirement.
+// and only pubkeys with at least MinInboundRefs latest-list inbound refs
+// are worth consulting the provider for — the declarative form of the
+// historical >500-followers requirement.
+//
+// BOOTSTRAP SETTING: 100 (was 500) while the self-hosted provider's graph
+// is young — in-graph follower counts lag the real network, so at 500 the
+// For-You rank gate matched almost nobody. Raise back toward 500 as the
+// graph converges.
 func (p *Plugin) Policy() dvm.Policy {
 	return dvm.Policy{
 		CacheTTL:       7 * 24 * time.Hour,
-		MinInboundRefs: 500,
+		MinInboundRefs: 100,
 	}
 }
 
