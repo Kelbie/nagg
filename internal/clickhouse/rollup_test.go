@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +132,28 @@ func TestBuildRankFeaturesSQL_AssemblesRawAndReal(t *testing.T) {
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("rank-features SQL missing %q", want)
+		}
+	}
+}
+
+// TestRollupSQLHasNoConsecutiveWhereClauses guards the class of bug that
+// silently killed the whole rollup: a table swap that left "FROM x WHERE a"
+// followed by the template's own "WHERE b" — a syntax error string
+// assertions cannot see. Every built statement is scanned for stacked WHEREs.
+func TestRollupSQLHasNoConsecutiveWhereClauses(t *testing.T) {
+	since := time.Unix(1_700_000_000, 0)
+	at := time.Unix(1_700_001_000, 0)
+	statements := map[string]string{
+		"ref_edges":     buildRefEdgesSQL(since, 100),
+		"ref_counts":    buildRefSourceCountsSQL(since, 100),
+		"gated_counts":  buildGatedRefCountsSQL(since, 100, Thresholds{MinActorScore: 1, Version: "v"}, at),
+		"pubkey_stats":  buildPubkeyStatsSQL(since, 100, at),
+		"rank_features": buildRankFeaturesSQL(since, 100, Thresholds{Version: "v"}, at),
+	}
+	re := regexp.MustCompile(`(?i)\bWHERE\b[^()]*?\n\s*WHERE\b`)
+	for name, sql := range statements {
+		if m := re.FindString(sql); m != "" {
+			t.Errorf("%s: consecutive WHERE clauses:\n%s", name, m)
 		}
 	}
 }

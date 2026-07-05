@@ -167,8 +167,8 @@ func targetIDsSubquery(since time.Time, limit int) string {
 				WHERE tag_key = 'e' AND length(tag_value) = 64
 				  AND created_at >= toDateTime(%d) AND kind IN (1, 6, 7, 16, 1111)
 				UNION ALL
-				SELECT target AS event_id, created_at AS engaged_at FROM event_refs WHERE rule = 'k9735_e'
-				WHERE created_at >= toDateTime(%d)
+				SELECT target AS event_id, created_at AS engaged_at FROM event_refs
+				WHERE rule = 'k9735_e' AND created_at >= toDateTime(%d)
 			)
 			GROUP BY event_id
 			ORDER BY engaged_at DESC
