@@ -697,7 +697,11 @@ func (s *Store) Backfill(ctx context.Context) error {
 	}
 	statements = append(statements,
 		"TRUNCATE TABLE IF EXISTS viewer_refs",
-		`INSERT INTO viewer_refs
+		// ingested_at is left to its DEFAULT (created_at): true arrival times
+		// are unrecoverable for re-derived rows, and event time is the best
+		// stand-in. The cursor reset below makes the viewer_feed walker
+		// re-cover them regardless.
+		`INSERT INTO viewer_refs (viewer, event_id, actor_pubkey, kind, created_at)
 		 SELECT
 		   tag_value AS viewer,
 		   event_id,
@@ -717,6 +721,16 @@ func (s *Store) Backfill(ctx context.Context) error {
 	}
 	if err := s.replayEventRefs(ctx); err != nil {
 		return fmt.Errorf("backfill event refs failed: %w", err)
+	}
+	// viewer_refs was just rebuilt with fresh arrival estimates; drop the
+	// viewer_feed cursors so the read-model walker starts over from it (reads
+	// serve through the legacy query until it catches back up). A DELETE, not
+	// a zero-cursor upsert: a Go zero time does not survive the DateTime
+	// round-trip as IsZero, and 1970 would read back as a real cursor.
+	for _, task := range []string{notificationsFeedTask, notificationsFeedBackfillTask} {
+		if err := s.conn.Exec(ctx, "DELETE FROM rollup_state WHERE task = ?", task); err != nil {
+			return fmt.Errorf("reset rollup cursor %s: %w", task, err)
+		}
 	}
 	return nil
 }

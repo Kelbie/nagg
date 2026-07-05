@@ -103,6 +103,14 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		t.Errorf("first_seen_at definition lost its DEFAULT: %q", def)
 	}
 
+	// viewer_refs.ingested_at is what the viewer_feed rollup windows on; if it
+	// falls out of the desired schema the reconciler drops the live column and
+	// the read-model stops filling. Its DEFAULT keeps rows inserted without it
+	// (seed/backfill re-derivations) on event time, the best arrival estimate.
+	if def := desired.tables["viewer_refs"]["ingested_at"]; !strings.Contains(def, "DEFAULT created_at") {
+		t.Errorf("viewer_refs.ingested_at missing or lost its DEFAULT: %q", def)
+	}
+
 	// Paren-nested AggregateFunction type must be kept whole in the definition
 	// (generated DDL exercises the same parser paths as static SQL).
 	actorCols := desired.tables["agg_k7_e"]

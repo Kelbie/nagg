@@ -149,6 +149,7 @@ func TestRollupSQLHasNoConsecutiveWhereClauses(t *testing.T) {
 		"gated_counts":  buildGatedRefCountsSQL(since, 100, Thresholds{MinActorScore: 1, Version: "v"}, at),
 		"pubkey_stats":  buildPubkeyStatsSQL(since, 100, at),
 		"rank_features": buildRankFeaturesSQL(since, 100, Thresholds{Version: "v"}, at),
+		"viewer_feed":   buildNotificationsFeedSQL(since, at, at),
 	}
 	re := regexp.MustCompile(`(?i)\bWHERE\b[^()]*?\n\s*WHERE\b`)
 	for name, sql := range statements {

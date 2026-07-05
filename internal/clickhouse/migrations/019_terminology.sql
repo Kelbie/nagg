@@ -72,7 +72,14 @@ CREATE TABLE IF NOT EXISTS viewer_refs
     event_id FixedString(64),
     actor_pubkey FixedString(64),
     kind UInt32,
-    created_at DateTime
+    created_at DateTime,
+    -- Arrival time, NOT event time. The viewer_feed rollup windows on this
+    -- column so history that reaches us late (relay backfills, post-wipe
+    -- relistens) still flows into the read-model; created_at windows would
+    -- skip any event older than the slice that already processed its window.
+    -- Rows inserted without it (seed/backfill re-derivations) fall back to
+    -- the event time — the best arrival estimate we have for them.
+    ingested_at DateTime DEFAULT created_at
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMM(created_at)
@@ -87,7 +94,8 @@ SELECT
     event_id,
     pubkey AS actor_pubkey,
     kind,
-    created_at
+    created_at,
+    now() AS ingested_at
 FROM event_tags
 WHERE tag_key = 'p'
   AND length(tag_value) = 64
@@ -130,7 +138,7 @@ ORDER BY pubkey;
 -- coalesce). viewer_feed and the rollup-fed tables repopulate from their
 -- watermarks/ticks.
 
-INSERT INTO viewer_refs
+INSERT INTO viewer_refs (viewer, event_id, actor_pubkey, kind, created_at)
 SELECT
     tag_value AS viewer,
     event_id,

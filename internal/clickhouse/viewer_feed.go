@@ -23,10 +23,19 @@ import (
 
 const (
 	// Head cursor: the near-now high-water mark, advanced every tick.
-	notificationsFeedTask = "viewer_feed"
+	//
+	// Both task keys carry an "_ingest" suffix: slices window on
+	// viewer_refs.ingested_at (arrival time), not event created_at. The
+	// original event-time windows permanently skipped history that arrived
+	// late — after a wipe-and-relisten, relay backfills delivered weeks-old
+	// likes/replies hours after the backward walker had already passed their
+	// created_at windows, so the read-model served follows only. The key
+	// bump abandons the old cursors, forcing a fresh walk under the new
+	// semantics on deploy.
+	notificationsFeedTask = "viewer_feed_ingest"
 	// Backfill cursor: walks BACKWARD from the first head slice toward the
-	// 30-day history target, one slice per tick.
-	notificationsFeedBackfillTask = "viewer_feed_backfill"
+	// history target, one slice per tick.
+	notificationsFeedBackfillTask = "viewer_feed_ingest_backfill"
 	// How far back history extends; matches the table TTL. 14 days: paging
 	// deeper is rare, and history size is what blew the disk in the first
 	// (denormalized) shape.
@@ -35,7 +44,7 @@ const (
 	// vertex-score drift converge on rewrite (ReplacingMergeTree by computed_at).
 	notificationsFeedOverlap = 10 * time.Minute
 	// Slice per tick. Kept small on purpose: viewer_refs is sorted
-	// by viewer (created_at windows cannot prune it) and month-old event_tags
+	// by viewer (ingested_at windows cannot prune it) and month-old event_tags
 	// granules are cold — the original 6h forward slices ran ~5 MINUTES and
 	// died on the ~300s infra connection ceiling (CH 394 client-cancel).
 	notificationsFeedSlice = time.Hour
@@ -115,9 +124,14 @@ func (s *Store) RecomputeNotificationsFeed(ctx context.Context, now time.Time) (
 	return !sliceFrom.After(target), nil
 }
 
-// buildNotificationsFeedSQL denormalizes the candidate window [from, to) into
-// viewer_feed. The reply-marker coalesce mirrors migration 007 /
-// the legacy read exactly; every subquery is bounded to the window's event ids.
+// buildNotificationsFeedSQL denormalizes the ARRIVAL window [from, to) —
+// viewer_refs rows whose ingested_at falls inside it, whatever their event
+// created_at — into viewer_feed. Windowing on arrival is what lets
+// late-delivered history (relay backfills, post-wipe relistens) reach the
+// read-model; the previous created_at windows lost any event older than the
+// slice that had already covered its timestamp. The reply-marker coalesce
+// mirrors migration 007 / the legacy read exactly; every subquery is bounded
+// to the window's event ids.
 func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 	return fmt.Sprintf(`
 		INSERT INTO viewer_feed
@@ -125,8 +139,16 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 		WITH window_candidates AS (
 			SELECT viewer, event_id, actor_pubkey, created_at, kind
 			FROM viewer_refs
-			WHERE created_at >= toDateTime(%[1]d) AND created_at < toDateTime(%[2]d)
+			WHERE ingested_at >= toDateTime(%[1]d) AND ingested_at < toDateTime(%[2]d)
 			LIMIT 1 BY viewer, event_id, kind
+		),
+		-- The candidates' EVENT-time span. An arrival window no longer bounds
+		-- created_at, so the event_tags scans below prune on this span instead
+		-- (scalar subqueries evaluate to constants before index analysis). A
+		-- steady-state slice of live traffic spans minutes; a relay-backfill
+		-- slice can span weeks and simply pays for the rows it recovers.
+		bounds AS (
+			SELECT min(created_at) AS lo, max(created_at) AS hi FROM window_candidates
 		),
 		candidate_events AS (
 			-- NARROW columns only: event bodies are hydrated by id at read
@@ -141,8 +163,9 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 		candidate_tags AS (
 			-- Tags OF the window's candidate events. event_tags rows carry
 			-- their event's created_at, so the scan is granule-pruned to the
-			-- window instead of walking the whole tag_key='e' range (the
-			-- unbounded form read >100M rows per one-hour slice).
+			-- candidates' event-time span instead of walking the whole
+			-- tag_key='e' range (the unbounded form read >100M rows per
+			-- one-hour slice).
 			SELECT
 				event_id,
 				tag_value,
@@ -150,7 +173,7 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 				lower(if(length(tag_extra) >= 2, tag_extra[2], '')) AS marker
 			FROM event_tags
 			WHERE tag_key = 'e' AND length(tag_value) = 64
-			  AND created_at >= toDateTime(%[1]d) AND created_at < toDateTime(%[2]d)
+			  AND created_at >= (SELECT lo FROM bounds) AND created_at <= (SELECT hi FROM bounds)
 			  AND event_id IN (SELECT event_id FROM window_candidates)
 		),
 		reply_meta AS (
