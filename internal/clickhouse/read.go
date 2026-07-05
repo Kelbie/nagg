@@ -483,6 +483,29 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 	if in.Limit == 0 {
 		return nil, nil
 	}
+	query, args := buildRankedEventsByFeaturesQuery(in)
+
+	rows, err := s.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]RankedFeatureRow, 0, in.Limit)
+	for rows.Next() {
+		var row RankedFeatureRow
+		if err := rows.Scan(&row.EventID, &row.PubKey, &row.Score); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+// buildRankedEventsByFeaturesQuery renders the DB-first ranked read over
+// rank_features. Split from the executor so tests can pin its column
+// references against the declared schema (SQL is not compile-checked).
+func buildRankedEventsByFeaturesQuery(in FeatureRankInput) (string, []any) {
 	halfLife := in.HalfLifeSeconds
 	if halfLife <= 0 {
 		halfLife = 86400
@@ -543,12 +566,12 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 				event_id,
 				argMax(pubkey, computed_at) AS pubkey,
 				max(created_at) AS created_at,
-				argMax(k7_e_actors, computed_at) AS gated_k7_e_actors,
-				argMax(k1_1111_e_reply_sources, computed_at) AS gated_k1_1111_e_reply_sources,
-				argMax(k6_16_e_actors, computed_at) AS gated_k6_16_e_actors,
-				argMax(k1_q_sources, computed_at) AS gated_k1_q_sources,
-				argMax(k9735_e_value_total, computed_at) AS gated_k9735_e_value_total,
-				argMax(actors, computed_at) AS gated_actors,
+				argMax(gated_k7_e_actors, computed_at) AS gated_k7_e_actors,
+				argMax(gated_k1_1111_e_reply_sources, computed_at) AS gated_k1_1111_e_reply_sources,
+				argMax(gated_k6_16_e_actors, computed_at) AS gated_k6_16_e_actors,
+				argMax(gated_k1_q_sources, computed_at) AS gated_k1_q_sources,
+				argMax(gated_k9735_e_value_total, computed_at) AS gated_k9735_e_value_total,
+				argMax(gated_actors, computed_at) AS gated_actors,
 				argMax(author_followers, computed_at) AS author_followers,
 				argMax(author_score, computed_at) AS author_score,
 				argMax(contribution_quality, computed_at) AS contribution_quality
@@ -560,21 +583,7 @@ func (s *Store) RankedEventsByFeatures(ctx context.Context, in FeatureRankInput)
 		LIMIT %d
 	`, score, where, in.Limit)
 
-	rows, err := s.conn.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]RankedFeatureRow, 0, in.Limit)
-	for rows.Next() {
-		var row RankedFeatureRow
-		if err := rows.Scan(&row.EventID, &row.PubKey, &row.Score); err != nil {
-			return nil, err
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
+	return query, args
 }
 
 // RefSourceIDs returns the ids of the DIRECT (NIP-10/22) replies to parentID,

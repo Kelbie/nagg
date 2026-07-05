@@ -1,6 +1,7 @@
 package clickhouse
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -74,5 +75,31 @@ func TestPubkeyStatsReadMatchesDeclaredColumns(t *testing.T) {
 	}
 	if !strings.Contains(batchPubkeyStatsQuery, "argMax(k3_in, computed_at)") {
 		t.Errorf("BatchPubkeyStats must read k3_in:\n%s", batchPubkeyStatsQuery)
+	}
+}
+
+// TestRankFeaturesReadMatchesDeclaredColumns pins the ranked-feed DB path's
+// column references against the declared rank_features schema — the second
+// rename-missed-a-read bug (the query aliased RAW columns as gated_* and
+// referenced a nonexistent `actors`), caught live by the For-You feed.
+func TestRankFeaturesReadMatchesDeclaredColumns(t *testing.T) {
+	desired, err := parseDesiredSchema(embeddedMigrations())
+	if err != nil {
+		t.Fatalf("parseDesiredSchema: %v", err)
+	}
+	cols, ok := desired.tables["rank_features"]
+	if !ok {
+		t.Fatalf("rank_features not declared")
+	}
+	query, _ := buildRankedEventsByFeaturesQuery(FeatureRankInput{Limit: 10, Since: 1})
+	for _, ref := range regexp.MustCompile(`argMax\(([a-z0-9_]+),`).FindAllStringSubmatch(query, -1) {
+		if _, ok := cols[ref[1]]; !ok {
+			t.Errorf("query references undeclared rank_features column %q", ref[1])
+		}
+	}
+	for _, want := range []string{"gated_k7_e_actors", "gated_actors", "author_score"} {
+		if !strings.Contains(query, "argMax("+want+",") {
+			t.Errorf("query must read declared column %q", want)
+		}
 	}
 }

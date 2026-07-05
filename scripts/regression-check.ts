@@ -355,6 +355,24 @@ const checks: Check[] = [
     },
   ),
 
+  // -- feed/ranked (gated): the app's For-You shape — vertex pubkeyScore gate
+  // + weighted rule-name terms — which routes through the DB-first
+  // rank_features scan. Structure-only, but 200 is the assertion that the
+  // rank_features column vocabulary matches the read (broke 2026-07-05).
+  httpCheck(
+    "feed/ranked (gated)",
+    [],
+    () => {
+      const input = structuredClone(fixtures.rankedFeedInput.gatedInput);
+      input.references.since = now() - fixtures.rankedFeedInput.sinceHoursAgo * 3600;
+      return call("/nostr/feed/ranked", input);
+    },
+    (t, r) => {
+      checkEnvelope(t, r.body);
+      t.ok(r.body.orderBy === "rank", `orderBy = ${r.body.orderBy}, want rank`);
+    },
+  ),
+
   // -- events: exact content equality for three pinned immutable events
   //    (kind-1, kind-7, kind-9735 — generic kinds, not "post/like/zap").
   httpCheck(
