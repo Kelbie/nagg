@@ -47,3 +47,32 @@ func TestBuildEventAggregatesQuery(t *testing.T) {
 		}
 	}
 }
+
+// TestPubkeyStatsReadMatchesDeclaredColumns pins the BatchPubkeyStats read to
+// the columns the schema actually declares — SQL strings aren't
+// compile-checked, and a table rename that misses one read surfaces as a
+// production 500 (this exact bug shipped once: the query still said
+// `followers` after the pubkey_stats rename).
+func TestPubkeyStatsReadMatchesDeclaredColumns(t *testing.T) {
+	desired, err := parseDesiredSchema(embeddedMigrations())
+	if err != nil {
+		t.Fatalf("parseDesiredSchema: %v", err)
+	}
+	cols, ok := desired.tables["pubkey_stats"]
+	if !ok {
+		t.Fatalf("pubkey_stats not declared")
+	}
+	for _, want := range []string{"pubkey", "k3_out", "k3_in", "k1_1111_authored", "computed_at"} {
+		if _, ok := cols[want]; !ok {
+			t.Errorf("pubkey_stats missing declared column %q", want)
+		}
+	}
+	for gone := range map[string]struct{}{"followers": {}, "following": {}, "posts": {}} {
+		if _, ok := cols[gone]; ok {
+			t.Errorf("pubkey_stats still declares retired column %q", gone)
+		}
+	}
+	if !strings.Contains(batchPubkeyStatsQuery, "argMax(k3_in, computed_at)") {
+		t.Errorf("BatchPubkeyStats must read k3_in:\n%s", batchPubkeyStatsQuery)
+	}
+}

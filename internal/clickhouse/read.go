@@ -802,6 +802,13 @@ func (s *Store) FollowedRefs(ctx context.Context, viewerPubkey string, parentIDs
 	return out, rows.Err()
 }
 
+const batchPubkeyStatsQuery = `
+		SELECT pubkey, argMax(k3_in, computed_at)
+		FROM pubkey_stats
+		WHERE pubkey IN (?)
+		GROUP BY pubkey
+	`
+
 func (s *Store) PubkeyStats(ctx context.Context, pubkey string) (PubkeyStats, error) {
 	counts, err := s.BatchPubkeyStats(ctx, []string{pubkey})
 	if err != nil {
@@ -834,12 +841,7 @@ func (s *Store) BatchPubkeyStats(ctx context.Context, pubkeys []string) (map[str
 	// kind-3 p-tag history in event_tags — was both wrong (counted every pubkey
 	// that EVER followed, ignoring NIP-02 replaceability) and one of the heavy
 	// per-request aggregations on a 2B-row table.
-	rows, err := s.conn.Query(ctx, `
-		SELECT pubkey, argMax(followers, computed_at)
-		FROM pubkey_stats
-		WHERE pubkey IN (?)
-		GROUP BY pubkey
-	`, pubkeys)
+	rows, err := s.conn.Query(ctx, batchPubkeyStatsQuery, pubkeys)
 	if err != nil {
 		return nil, err
 	}
