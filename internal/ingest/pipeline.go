@@ -20,6 +20,9 @@ type Config struct {
 	FlushInterval time.Duration
 	QueueSize     int
 	VerifyEvents  bool
+	// SeedKinds are fetched from relay history once when locally empty — see
+	// SeedFetch. A live firehose never surfaces old, rarely-republished kinds.
+	SeedKinds []int
 	// Caps are the declarative per-author ingest cap rules (rules.Cap): each
 	// caps how many events of its kinds a NON-exempt author gets ingested per
 	// window; the rest are dropped at the firehose. Measured on prod: ~90% of

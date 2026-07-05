@@ -917,6 +917,14 @@ func (s *Store) FollowerCount(ctx context.Context, pubkey string) (uint64, error
 	return counts[pubkey].Followers, nil
 }
 
+// CountEventsOfKind reports how many events of one kind are stored — the
+// seed fetch's empty-store gate.
+func (s *Store) CountEventsOfKind(ctx context.Context, kind int) (uint64, error) {
+	var count uint64
+	err := s.conn.QueryRow(ctx, "SELECT count() FROM nostr_events WHERE kind = ?", kind).Scan(&count)
+	return count, err
+}
+
 const recentAuthorsBySyncGateQuery = `
 		SELECT recent.pubkey
 		FROM

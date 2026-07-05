@@ -415,6 +415,14 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 	}
 
 	pipeline := ingest.New(store, cfg.Ingest, ingest.WithExemption(exempt))
+
+	// Seed rarely-republished kinds from relay history before live ingestion
+	// piles up (async; the empty-store gate makes this a no-op after success).
+	go func() {
+		defer safego.Recover("api.seed_fetch")
+		ingest.SeedFetch(ctx, store, cfg.Firehose.Relays, cfg.Ingest.SeedKinds, slog.Default())
+	}()
+
 	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)
 	slog.Info("in-process ingester starting", "relays", len(cfg.Firehose.Relays), "kinds", cfg.Firehose.Kinds)
 	go func() {
