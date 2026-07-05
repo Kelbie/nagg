@@ -1,8 +1,6 @@
 {
   "_note": "Pinned real events + stable invariants for the v2 app-view regression suite (scripts/regression-check.ts). PIN only what should never change: a pinned event's id/kind/pubkey/created_at/content-hash, envelope structure, registry rule names, privacy invariants. NEVER pin volatile values: aggregate counts, rankings, reply sets, follower edges' truth values, profile kind-0 contents (replaceable). Discovered live against https://nagg-production.up.railway.app on 2026-07-05, nagg branch v2 @ a068020. Re-pin only on an INTENTIONAL contract change (see docs/regression-suite.md).",
-
   "base": "https://nagg-production.up.railway.app",
-
   "registry": {
     "_note": "The aggregate vocabulary clients may ever see. Event-keyed names from internal/rules/defaults.go (CanonicalName) plus the rollup's vertex_-prefixed gated variants (internal/clickhouse/read.go); pubkey-keyed names from internal/appview/envelope.go pubkeyAggregates. A key outside these sets means the registry contract changed.",
     "eventRules": [
@@ -18,23 +16,29 @@
       "vertex_k9735_e",
       "vertex_actors"
     ],
-    "pubkeyRules": ["k3_p_latest", "k3_author_latest", "k1_1111_author"],
-    "providerNamespaces": ["vertex", "nip05", "nagg"],
-    "notificationKinds": [1, 3, 6, 7, 16, 9735]
+    "pubkeyRules": [
+      "k3_p_latest",
+      "k3_author_latest",
+      "k1_1111_author"
+    ],
+    "providerNamespaces": [
+      "vertex",
+      "nip05",
+      "nagg"
+    ],
+    "notificationKinds": [
+      1,
+      3,
+      6,
+      7,
+      16,
+      9735
+    ]
   },
-
-  "knownIssues": [
-    {
-      "id": "pubkey-stats-column-rename",
-      "_note": "REAL SERVER BUG present at pinning time, reported 2026-07-05: internal/clickhouse/read.go BatchPubkeyStats still SELECTs `argMax(followers, computed_at)` from pubkey_stats, but migration 019_terminology.sql renamed the columns to k3_out/k3_in/k1_1111_authored. Every route that calls BatchPubkeyStats 500s in prod (/nostr/follows, /nostr/profile, /nostr/own/profiles). Checks matching this signature report XFAIL (tracked, non-gating) so the suite stays usable as a deploy gate; when the fix ships they flip to PASS and this entry must be deleted.",
-      "httpStatus": 500,
-      "bodyIncludes": "argMax(followers, computed_at)"
-    }
-  ],
-
+  "knownIssues": [],
   "pinned": {
     "thread": {
-      "_note": "User-chosen thread root (2026-07-03, kind-7-referenced so retention-protected). Pinned exactly: id/kind/pubkey/created_at/sha256(content). Volatile, asserted as presence classes only: the reply SET (>=1 kind-1/1111 e-tagging the root must persist — events here are never deleted), aggregate counts, reply ranking.",
+      "_note": "User-chosen thread root (2026-07-03, kind-7-referenced so retention-protected). Pinned exactly: id/kind/pubkey/created_at/sha256(content). Volatile, asserted as presence classes only: the reply SET (>=1 kind-1/1111 e-tagging the root must persist \u2014 events here are never deleted), aggregate counts, reply ranking.",
       "rootId": "595ca7cfdc38b4340c4fbf322a7682306251a5d1ca3f97a15fde8915c3faa4a3",
       "rootKind": 1,
       "rootPubkey": "67ada8e344532cbf82f0e702472e24c7896e0e1c96235eacbaaa4b8616052171",
@@ -43,7 +47,7 @@
     },
     "feedAuthors": [
       {
-        "_note": "jack — high-fanout account; the pinned kind-1 is 200+ days old and heavily kind-7/kind-9735-referenced, so the 1y-unreferenced retention rule can never prune it. until = createdAt+1 windows the feed page over it.",
+        "_note": "jack \u2014 high-fanout account; the pinned kind-1 is 200+ days old and heavily kind-7/kind-9735-referenced, so the 1y-unreferenced retention rule can never prune it. until = createdAt+1 windows the feed page over it.",
         "label": "jack",
         "pubkey": "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2",
         "eventId": "e2f809f982970fcd7f47bfc5e1dc8d1eeec8ac0915ba0caf7bc079d8157f48af",
@@ -52,7 +56,7 @@
         "contentSha256": "e15b3b76aa13fddf2c685efe2130df8164e66d4468d15ec2981d8b64a381ef23"
       },
       {
-        "_note": "gigi — well-referenced kind-1 (kind-7 + kind-9735 + kind-6/16 references recorded), ~1 month old at pinning.",
+        "_note": "gigi \u2014 well-referenced kind-1 (kind-7 + kind-9735 + kind-6/16 references recorded), ~1 month old at pinning.",
         "label": "gigi",
         "pubkey": "6e468422dfb74a5738702a8823b9b28168abab8655faacb6853cd0ee15deee93",
         "eventId": "f3421f05622d32e6362f838e91e3d20f430b80bc17ac4c32633faf1e4b7a45eb",
@@ -63,7 +67,7 @@
     ],
     "events": [
       {
-        "_note": "kind-1 (jack's, also the feed + aggregates fixture target). Content pinned by hash — events are immutable.",
+        "_note": "kind-1 (jack's, also the feed + aggregates fixture target). Content pinned by hash \u2014 events are immutable.",
         "id": "e2f809f982970fcd7f47bfc5e1dc8d1eeec8ac0915ba0caf7bc079d8157f48af",
         "kind": 1,
         "pubkey": "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2",
@@ -71,7 +75,7 @@
         "contentSha256": "e15b3b76aa13fddf2c685efe2130df8164e66d4468d15ec2981d8b64a381ef23"
       },
       {
-        "_note": "kind-7 referencing the pinned kind-1 (content '+'). Kind-7 has NO lifetime rule — kept forever.",
+        "_note": "kind-7 referencing the pinned kind-1 (content '+'). Kind-7 has NO lifetime rule \u2014 kept forever.",
         "id": "a0f7716b70236a34c58331f7808b60857a7ef920397b97e257d24e01a6db8914",
         "kind": 7,
         "pubkey": "5b393627d3f6732f47e15a9bc334d4674c4b49cb88be31bfb0fa9f0bc770e2b8",
@@ -79,7 +83,7 @@
         "contentSha256": "a318c24216defe206feeb73ef5be00033fa9c4a74d0b967f6532a26ca5906d3b"
       },
       {
-        "_note": "kind-9735 zap receipt referencing the pinned kind-1 (empty content — sha256 of ''). Kind-9735 has NO lifetime rule — kept forever.",
+        "_note": "kind-9735 zap receipt referencing the pinned kind-1 (empty content \u2014 sha256 of ''). Kind-9735 has NO lifetime rule \u2014 kept forever.",
         "id": "13c35b8fd8df40c52ebbb2ecc470946e77a5fcf98901d3f462fc0058c005efc8",
         "kind": 9735,
         "pubkey": "f81611363554b64306467234d7396ec88455707633f54738f6c4683535098cd3",
@@ -88,14 +92,16 @@
       }
     ],
     "aggregatesTarget": {
-      "_note": "A long-referenced event: k7_e and k9735_e keys must EXIST with value >= 1 (references accumulate; the aggregate ledger outlives referencing events, so presence can never regress). Exact counts are volatile — never pinned.",
+      "_note": "A long-referenced event: k7_e and k9735_e keys must EXIST with value >= 1 (references accumulate; the aggregate ledger outlives referencing events, so presence can never regress). Exact counts are volatile \u2014 never pinned.",
       "id": "e2f809f982970fcd7f47bfc5e1dc8d1eeec8ac0915ba0caf7bc079d8157f48af",
-      "mustHaveRules": ["k7_e", "k9735_e"]
+      "mustHaveRules": [
+        "k7_e",
+        "k9735_e"
+      ]
     }
   },
-
   "viewers": {
-    "_note": "Viewer-keyed fixtures. notificationsViewer = an active known viewer (the pinned thread's root author) whose feed had 20+ entries and hasNext at pinning time. The notifications read model keeps 14 DAYS of rows — if this account goes dormant the presence assertion starts failing; re-pin to another active viewer, that is fixture drift, not a server regression.",
+    "_note": "Viewer-keyed fixtures. notificationsViewer = an active known viewer (the pinned thread's root author) whose feed had 20+ entries and hasNext at pinning time. The notifications read model keeps 14 DAYS of rows \u2014 if this account goes dormant the presence assertion starts failing; re-pin to another active viewer, that is fixture drift, not a server regression.",
     "notificationsViewer": "67ada8e344532cbf82f0e702472e24c7896e0e1c96235eacbaaa4b8616052171",
     "notificationsPolicy": "RELAXED",
     "_notePolicy": "policy=RELAXED is pinned because the default (stricter) policy legitimately score-gates this viewer's entries to zero; the presence class 'entries non-empty' is only stable on the relaxed policy.",
@@ -113,7 +119,6 @@
     "ownHistoryPubkey": "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
     "dmViewer": "82341f882b6eabcd2ba7f1ef90aad961cf074af15b9ef44a09f9d2a8fbfbe6a2"
   },
-
   "search": {
     "_note": "Structure-only: result ranking and membership are volatile, and the gold path depends on Vertex DVM credits. A 5xx naming vertex/DVM is a SKIP, not a FAIL. The local-index fallback normally keeps this route 200 even with the DVM down.",
     "query": "fiatjaf",
@@ -124,27 +129,46 @@
     "source": "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d",
     "limit": 5
   },
-
   "mint": {
     "_note": "Non-envelope routes: assert 200 + parseable + top-level shape only. Review counts/mint sets are volatile.",
     "reviewsUrl": "https://mint.minibits.cash/Bitcoin",
     "discoverLimit": 5
   },
-
   "rankedFeedInput": {
-    "_note": "Minimal live ranked input (same map GraphQL rankedEvents accepts). sinceHoursAgo is resolved to a unix timestamp at run time — ranking output is fully volatile, so only envelope structure and orderBy:'rank' are asserted.",
+    "_note": "Minimal live ranked input (same map GraphQL rankedEvents accepts). sinceHoursAgo is resolved to a unix timestamp at run time \u2014 ranking output is fully volatile, so only envelope structure and orderBy:'rank' are asserted.",
     "sinceHoursAgo": 48,
     "input": {
-      "references": { "kinds": [7, 9735, 6, 16, 1, 1111], "limit": 500 },
-      "via": { "key": "e" },
-      "target": { "kinds": [1, 1111], "limit": 10 },
-      "metric": { "name": "actors", "op": "COUNT_DISTINCT", "distinctField": "PUBKEY" },
+      "references": {
+        "kinds": [
+          7,
+          9735,
+          6,
+          16,
+          1,
+          1111
+        ],
+        "limit": 500
+      },
+      "via": {
+        "key": "e"
+      },
+      "target": {
+        "kinds": [
+          1,
+          1111
+        ],
+        "limit": 10
+      },
+      "metric": {
+        "name": "actors",
+        "op": "COUNT_DISTINCT",
+        "distinctField": "PUBKEY"
+      },
       "limit": 10
     }
   },
-
   "capabilities": {
-    "_note": "appViewVersion is pinned; the advertised route list doubles as the did-we-forget-an-endpoint check — every advertised route must be covered by at least one check in scripts/regression-check.ts, and the runner fails if a NEW route appears without coverage.",
+    "_note": "appViewVersion is pinned; the advertised route list doubles as the did-we-forget-an-endpoint check \u2014 every advertised route must be covered by at least one check in scripts/regression-check.ts, and the runner fails if a NEW route appears without coverage.",
     "appViewVersion": "v2"
   }
 }

@@ -526,7 +526,9 @@ const checks: Check[] = [
     ["/nostr/search"],
     () => call(`/nostr/search?query=${fixtures.search.query}&limit=${fixtures.search.limit}`),
     (t, r) => {
-      checkEnvelope(t, r.body);
+      // Search is a pubkey-centric route: its aggregates are keyed by pubkey
+      // (k3_p_latest / k3_author_latest / k1_1111_author), not by event id.
+      checkEnvelope(t, r.body, { pubkeyKeyedAggregates: true });
       t.ok(Array.isArray(r.body.pubkeys), "pubkeys missing");
       t.ok((r.body.pubkeys ?? []).length > 0, "no results for a well-indexed query");
       for (const pk of r.body.pubkeys ?? []) t.ok(HEX64.test(pk), `pubkeys entry not 64-hex: ${pk}`);
