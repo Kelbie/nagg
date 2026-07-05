@@ -1298,6 +1298,13 @@ func (h *Handler) follows(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
+	if err := h.appendProfileEventsTo(r.Context(), &envelope, []string{pubkey}); err != nil {
+		writeError(w, err)
+		return
+	}
+	for _, event := range envelope.Events {
+		envelope.Order = append(envelope.Order, event.ID)
+	}
 	followAggregates(&envelope, pubkey, counts, 0)
 	writeJSON(w, envelope)
 }
@@ -1443,13 +1450,19 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(raw) == "" {
 		raw = queryViewerParam(r)
 	}
+	pubkeys := normalizePubkeys(csv(raw))
 	envelope := inlineEnvelope(nil, orderByCreatedAt, nil, nil)
-	if err := h.appendProfileEventsTo(r.Context(), &envelope, normalizePubkeys(csv(raw))); err != nil {
+	if err := h.appendProfileEventsTo(r.Context(), &envelope, pubkeys); err != nil {
 		writeError(w, err)
 		return
 	}
 	for _, event := range envelope.Events {
 		envelope.Order = append(envelope.Order, event.ID)
+	}
+	if counts, err := h.store.BatchFollowCounts(r.Context(), pubkeys); err == nil {
+		for _, pubkey := range pubkeys {
+			followAggregates(&envelope, pubkey, counts[pubkey], 0)
+		}
 	}
 	writeJSON(w, envelope)
 }
@@ -1661,6 +1674,11 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 	}
 	if err := h.appendProfileEventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
 		return ProvidersEnvelope{}, err
+	}
+	if counts, err := h.store.BatchFollowCounts(ctx, envelope.Pubkeys); err == nil {
+		for _, pubkey := range envelope.Pubkeys {
+			followAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
+		}
 	}
 	eventByPubkey := make(map[string]string, len(envelope.Events))
 	for _, event := range envelope.Events {
