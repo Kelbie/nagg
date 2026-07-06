@@ -23,14 +23,18 @@ type RelayBackfillState struct {
 // RelayBackfillStates returns the newest state row per (kind, relay) for one
 // backfill rule.
 func (s *Store) RelayBackfillStates(ctx context.Context, rule string) ([]RelayBackfillState, error) {
+	// Output aliases must NOT reuse source column names: ClickHouse resolves
+	// a shadowing alias inside the other aggregates ("max(updated_at) AS
+	// updated_at" turns argMax(x, updated_at) into an aggregate-in-aggregate,
+	// error 184).
 	rows, err := s.conn.Query(ctx, `
 		SELECT
 			kind,
 			relay,
-			argMax(oldest_synced, updated_at) AS oldest_synced,
-			argMax(newest_synced, updated_at) AS newest_synced,
-			argMax(completed, updated_at) AS completed,
-			max(updated_at) AS updated_at
+			argMax(oldest_synced, updated_at) AS oldest_state,
+			argMax(newest_synced, updated_at) AS newest_state,
+			argMax(completed, updated_at) AS completed_state,
+			max(updated_at) AS last_updated
 		FROM relay_backfill_state
 		WHERE rule = ?
 		GROUP BY kind, relay
