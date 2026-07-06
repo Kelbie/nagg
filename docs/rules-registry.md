@@ -197,3 +197,9 @@ vars are gone; change the declaration instead.
   a DVM, so not a plugin.
 - **The enricher** (`internal/enrich`): model-computed derived metrics
   (`contribution_quality`), a different kind of provider.
+- **Mint-info snapshots** (`internal/mintinfo`): a daily poller that snapshots
+  each Cashu mint's NUT-06 `/v1/info` (stored full only on change, every poll
+  logged) and serves the history as an initial document + RFC 6902 diffs. Polled
+  HTTP config, not a Nostr primitive — so it sits here with the auditor, with its
+  own tables (`mint_info_snapshots`, `mint_info_observations`) and a declarative
+  `mintinfo.Source` (info path + volatile keys) rather than a registry rule.

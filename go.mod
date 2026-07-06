@@ -4,18 +4,21 @@ go 1.26.3
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.40.3
+	github.com/KimMachineGun/automemlimit v0.7.5
 	github.com/gorilla/websocket v1.5.3
+	github.com/gowebpki/jcs v1.0.1
 	github.com/graphql-go/graphql v0.8.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/nbd-wtf/go-nostr v0.52.0
 	github.com/redis/go-redis/v9 v9.7.3
+	github.com/wI2L/jsondiff v0.7.1
+	go.uber.org/automaxprocs v1.6.0
 	golang.org/x/sync v0.20.0
 )
 
 require (
 	github.com/ClickHouse/ch-go v0.68.0 // indirect
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
-	github.com/KimMachineGun/automemlimit v0.7.5 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.5 // indirect
@@ -51,10 +54,10 @@ require (
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
+	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	go.opentelemetry.io/otel v1.38.0 // indirect
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
-	go.uber.org/automaxprocs v1.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.15.0 // indirect
 	golang.org/x/exp v0.0.0-20260508232706-74f9aab9d74a // indirect

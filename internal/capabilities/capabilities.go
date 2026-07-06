@@ -69,6 +69,7 @@ var AppViewRoutes = []string{
 	"/nostr/follow-status",
 	"/nostr/mint/reviews",
 	"/nostr/mint/discover",
+	"/nostr/mint/history",
 	"/nostr/social-graph",
 	"/nostr/own/profiles",
 	"/nostr/own/",

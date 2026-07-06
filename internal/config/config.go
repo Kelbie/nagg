@@ -37,6 +37,7 @@ type Config struct {
 	Auditor    AuditorConfig
 	AppVersion AppVersionConfig
 	Routstr    RoutstrConfig
+	MintInfo   MintInfoConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -53,6 +54,22 @@ type Config struct {
 	// RunRollup hosts the rollup job in the API process (alongside the Vertex
 	// syncer + enricher). Default on.
 	RunRollup bool
+
+	// RunMintInfo hosts the mint-info snapshotter (internal/mintinfo) in the API
+	// process. Default on. The read side (/nostr/mint/history) is always served;
+	// this only gates the background poller.
+	RunMintInfo bool
+}
+
+// MintInfoConfig parameterizes the mint-info snapshotter (internal/mintinfo):
+// how often it re-checks for due mints, the per-mint minimum between polls (the
+// anti-spam gate), the delay between fetches in one pass, and the per-fetch HTTP
+// budget.
+type MintInfoConfig struct {
+	Interval time.Duration
+	MinAge   time.Duration
+	Throttle time.Duration
+	Timeout  time.Duration
 }
 
 // RollupConfig parameterizes the periodic rollup job. MinActorScore is the Vertex
@@ -293,6 +310,13 @@ func Load() (Config, error) {
 		RunIngester: parseBool(env("NAGG_RUN_INGESTER", "true")),
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
 		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", "true")),
+		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", "true")),
+		MintInfo: MintInfoConfig{
+			Interval: parseDuration(env("NAGG_MINT_INFO_INTERVAL", "1h")),
+			MinAge:   parseDuration(env("NAGG_MINT_INFO_MIN_AGE", "24h")),
+			Throttle: parseDuration(env("NAGG_MINT_INFO_THROTTLE", "1.5s")),
+			Timeout:  parseDuration(env("NAGG_MINT_INFO_TIMEOUT", "8s")),
+		},
 		Rollup: RollupConfig{
 			Interval:          parseDuration(env("NAGG_ROLLUP_INTERVAL", "15m")),
 			RecentWindow:      parseDuration(env("NAGG_ROLLUP_RECENT_WINDOW", "48h")),

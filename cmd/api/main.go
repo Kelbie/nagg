@@ -25,6 +25,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/mintinfo"
 	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/rollup"
 	"github.com/vertex-lab/nagg/internal/routstr"
@@ -260,10 +261,14 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			plugin.WithRecommend(vertexClient)
 		}
 	}
+	// Mint-info history reader: shared read model behind the REST
+	// /nostr/mint/history route and the GraphQL mintInfoHistory field.
+	mintReader := mintinfo.NewReader(store, mintinfo.CashuNUT06)
 	schemaOpts := []graphqlapi.Option{
 		graphqlapi.WithPubkeyScoreMinFollowers(int(vertexPolicy.MinInboundRefs)),
 		graphqlapi.WithProfileSearch(searchProvider),
 		graphqlapi.WithDVM(cfg.DVM),
+		graphqlapi.WithMintHistory(mintReader),
 	}
 	// Attach on-demand relay hydration to the GraphQL schema (and, via schemaOpts
 	// reuse below, the REST ranked-feed) only when explicitly enabled. This is
@@ -317,8 +322,9 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}
+	var auditorClient *auditor.HTTPClient
 	if cfg.Auditor.Enabled && cfg.Auditor.URL != "" {
-		auditorClient := auditor.NewHTTPClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
+		auditorClient = auditor.NewHTTPClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
 		appviewOpts = append(appviewOpts, appview.WithAuditor(auditorClient))
 		slog.Info("mint auditor enabled", "url", cfg.Auditor.URL, "limit", cfg.Auditor.Limit)
 		// Warm the auditor cache in the background so the first /nostr/mint/discover
@@ -331,6 +337,30 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 				slog.Warn("mint auditor warm-up failed", "error", err)
 			}
 		}()
+	}
+
+	// Mint-info snapshots: the read side (/nostr/mint/history + GraphQL) is always
+	// served; the write side (the daily poller) is gated by NAGG_RUN_MINT_INFO and
+	// the worker schema. The work-list unions the auditor's mints with the NIP-87
+	// recommendations (nil-safe when the auditor is disabled), polls each due
+	// mint's /v1/info at most once per MinAge, and stores a snapshot only on change.
+	appviewOpts = append(appviewOpts, appview.WithMintHistory(mintReader))
+	if cfg.RunMintInfo && workerSchemaReady {
+		var auditorLister mintinfo.AuditorClient
+		if auditorClient != nil {
+			auditorLister = auditorClient
+		}
+		workList := mintinfo.NewWorkList(auditorLister, store, logger)
+		fetcher := mintinfo.NewHTTPFetcher(mintinfo.CashuNUT06, cfg.MintInfo.Timeout, logger)
+		snapshotter := mintinfo.NewSnapshotter(store, workList, fetcher, mintinfo.CashuNUT06, mintinfo.Config{
+			Interval: cfg.MintInfo.Interval,
+			MinAge:   cfg.MintInfo.MinAge,
+			Throttle: cfg.MintInfo.Throttle,
+			Timeout:  cfg.MintInfo.Timeout,
+		}, logger)
+		safego.Go("api.mintinfo", func() { snapshotter.Run(ctx) })
+		slog.Info("mint info snapshotter enabled",
+			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
 	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage))
 	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {

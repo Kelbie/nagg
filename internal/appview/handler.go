@@ -78,6 +78,7 @@ type Handler struct {
 	cacheStaleFor             time.Duration
 	ranker                    RankedFeedProvider
 	auditor                   AuditorClient
+	mintInfo                  MintHistoryProvider
 	appLatestVersion          string
 	appUpdateMessage          string
 	routstrClient             RoutstrClient
@@ -232,6 +233,14 @@ func WithAuditor(client AuditorClient) Option {
 	}
 }
 
+// WithMintHistory wires the NUT-06 info-history reader behind GET
+// /nostr/mint/history. Without it the route responds 503.
+func WithMintHistory(provider MintHistoryProvider) Option {
+	return func(h *Handler) {
+		h.mintInfo = provider
+	}
+}
+
 // WithAILineup wires the Routstr catalog client behind GET /app/ai-lineup,
 // with the vendor tabs to curate and optional per-vendor tier pins
 // (appview.ParseAILineupPins). Without it the route responds 503 and the app
@@ -337,6 +346,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/follow-status", h.followStatus, false},
 		{"/nostr/mint/reviews", h.mintReviews, true},
 		{"/nostr/mint/discover", h.discoverMints, true},
+		{"/nostr/mint/history", h.mintHistory, true},
 		{"/nostr/social-graph", h.socialGraph, true},
 		// Exact path; ServeMux routes it ahead of the /nostr/own/ subtree.
 		{"/nostr/own/profiles", h.ownProfiles, false},

@@ -94,6 +94,7 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/follow-status` | no | envelope + `edges` (§4) |
 | GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) |
 | GET | `/nostr/mint/discover` | yes | **not an envelope** |
+| GET | `/nostr/mint/history` | yes | **not an envelope**: NUT-06 info snapshot history (§7) |
 | GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags |
 | GET | `/nostr/own/profiles` | no | envelope: kind-0 events + pubkey-keyed aggregates |
 | GET | `/nostr/own/{type}` | yes | envelope of the viewer's own action history |
@@ -180,3 +181,38 @@ follows, dm, profiles, profile, social-graph, search), so a cold author or
 thread is populated from relays and served. Backfill failures are logged and
 the response proceeds with whatever is available. `feed/ranked` (precomputed)
 and the mint/events-query paths do not backfill.
+
+## 7. Mint info snapshot history
+
+`GET /nostr/mint/history?u=<mintUrl>` returns a Cashu mint's NUT-06 `/v1/info`
+drift over time. A background poller (`internal/mintinfo`, gated by
+`NAGG_RUN_MINT_INFO`) walks the auditor ∪ kind-38000 work-list ~daily, stores a
+full canonical document only when it changes (the volatile `time` field is
+stripped so it isn't a phantom change), and records every poll.
+
+The response is **not an envelope**. It leads with the initial full document,
+then one `revisions[]` entry per change (newest first) as an
+[RFC 6902](https://datatracker.ietf.org/doc/html/rfc6902) JSON Patch against the
+previous document, plus a server-rendered human `summary` (e.g. `"version:
+Nutshell/0.15.0 → Nutshell/0.16.0"`, `"NUT-17 enabled"`). "Checked, unchanged"
+is conveyed by top-level `lastCheckedAt` / `checkCount` / `unchangedSince`, not
+by empty rows; append `&observations=true` for the full per-poll `observations[]`
+log. 404 when the mint has never been observed. The same data is served by the
+GraphQL `mintInfoHistory(input: {mintUrl, includeObservations})` field.
+
+```jsonc
+{
+  "mintUrl": "https://mint.host", "normalizedUrl": "https://mint.host",
+  "currentHash": "9f2c…", "firstSeenAt": 1719792000,
+  "lastCheckedAt": 1751760000, "checkCount": 142, "unchangedSince": 1751328000,
+  "initial":   { "at": 1719792000, "hash": "3b7d…", "document": { /* full NUT-06 */ } },
+  "revisions": [ {
+    "at": 1751328000, "previousLastSeenAt": 1751241600, "hash": "9f2c…",
+    "summary": ["version: Nutshell/0.15.0 → Nutshell/0.16.0", "NUT-17 enabled"],
+    "patch": [ { "op": "test", "path": "/version", "value": "Nutshell/0.15.0" },
+               { "op": "replace", "path": "/version", "value": "Nutshell/0.16.0" },
+               { "op": "add", "path": "/nuts/17", "value": { "supported": true } } ]
+  } ],
+  "observations": null
+}
+```

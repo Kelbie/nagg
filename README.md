@@ -193,6 +193,22 @@ concepts are client query recipes over `kinds` and tag filters, and
 server-side joins stay generic through primitive relations like
 `pubkeyEvents(kinds: [0], limit: 1)`.
 
+A few cashu-specific surfaces sit alongside the generic core under
+`/nostr/mint/*` (the generic event/aggregate schema stays protocol-neutral):
+`reviews` and `discover`, plus **`GET /nostr/mint/history?u=<mintUrl>`** — the
+NUT-06 info snapshot history. It returns the initial full document then one
+entry per change as an RFC 6902 JSON Patch (with a human `summary`), collapsing
+unchanged checks into `lastCheckedAt`/`checkCount`/`unchangedSince`; add
+`&observations=true` for the full per-poll log. The same data is served by the
+GraphQL `mintInfoHistory(input: {mintUrl})` field. See `internal/mintinfo`; the
+daily poller is documented under "The declarative registry → deliberately
+outside the registry" (`docs/rules-registry.md`) and configured with
+`NAGG_RUN_MINT_INFO` (default on), `NAGG_MINT_INFO_INTERVAL` (1h — how often it
+re-checks for due mints), `NAGG_MINT_INFO_MIN_AGE` (24h — per-mint minimum
+between polls, the anti-spam gate), `NAGG_MINT_INFO_THROTTLE` (1.5s between
+fetches), and `NAGG_MINT_INFO_TIMEOUT` (8s per fetch). The work-list is the
+auditor's mints ∪ the NIP-87 kind-38000 recommendations.
+
 ## Prerequisites
 
 ### ClickHouse

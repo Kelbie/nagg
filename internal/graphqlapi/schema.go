@@ -67,6 +67,7 @@ type resolver struct {
 	pubkeyScoreMinFollowers uint64
 	basePool                *basePoolCache
 	dvm                     *dvm.Registry
+	mintInfo                MintHistoryProvider
 }
 
 // defaultScoreSource is the pubkey-score provider rank terms use when a term
@@ -127,6 +128,14 @@ func WithUserFeedBackfill(backfiller UserFeedBackfiller) Option {
 
 // WithDVM installs the DVM plugin registry: rank-term score sources resolve
 // against registered plugin names instead of a hardcoded vendor string.
+// WithMintHistory wires the cashu mint-info history reader behind the
+// mintInfoHistory query. Without it the field resolves null.
+func WithMintHistory(provider MintHistoryProvider) Option {
+	return func(r *resolver) {
+		r.mintInfo = provider
+	}
+}
+
 func WithDVM(reg *dvm.Registry) Option {
 	return func(r *resolver) {
 		r.dvm = reg
@@ -877,6 +886,9 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 	})
 
 	for name, field := range socialQueryFields(r, eventConnectionType) {
+		queryType.AddFieldConfig(name, field)
+	}
+	for name, field := range mintQueryFields(r, jsonType) {
 		queryType.AddFieldConfig(name, field)
 	}
 

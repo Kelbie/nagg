@@ -42,6 +42,8 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"viewer_refs",
 		"known_viewers",
 		"relay_backfill_state",
+		"mint_info_snapshots",
+		"mint_info_observations",
 		// registry-generated
 		"vertex_scores",
 		"vertex_profile_cache",
