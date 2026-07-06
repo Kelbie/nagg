@@ -347,6 +347,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/mint/reviews", h.mintReviews, true},
 		{"/nostr/mint/discover", h.discoverMints, true},
 		{"/nostr/mint/history", h.mintHistory, true},
+		{"/nostr/mint/changes", h.mintChanges, true},
 		{"/nostr/social-graph", h.socialGraph, true},
 		// Exact path; ServeMux routes it ahead of the /nostr/own/ subtree.
 		{"/nostr/own/profiles", h.ownProfiles, false},

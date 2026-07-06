@@ -300,6 +300,8 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	mux.HandleFunc("/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
 	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
 	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
+	// Ecosystem changelog page: a served HTML view over /nostr/mint/changes.
+	mux.HandleFunc("/mint-changes", appview.MintObservatoryHandler())
 	// Reuse the GraphQL schema options so the REST ranked-feed route runs the
 	// exact same ranking pipeline (scoring + on-demand hydration) as the
 	// GraphQL rankedEvents resolver.

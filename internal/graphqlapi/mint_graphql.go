@@ -15,10 +15,11 @@ import (
 // product concept (like the /nostr/mint/* REST routes), so it lives here and is
 // merged into the Query type in NewSchema, exactly like socialQueryFields.
 
-// MintHistoryProvider serves a mint's NUT-06 info history. Satisfied by
-// *mintinfo.Reader.
+// MintHistoryProvider serves per-mint NUT-06 info history and the
+// ecosystem-wide changelog. Satisfied by *mintinfo.Reader.
 type MintHistoryProvider interface {
 	History(ctx context.Context, mintURL string, includeObservations bool) (*mintinfo.History, bool, error)
+	GlobalChanges(ctx context.Context, limit int) (*mintinfo.GlobalChanges, error)
 }
 
 // mintQueryFields builds the mintInfoHistory root query field.
@@ -72,6 +73,29 @@ func mintQueryFields(r *resolver, jsonType *graphql.Scalar) graphql.Fields {
 			"includeObservations": &graphql.InputObjectFieldConfig{Type: graphql.Boolean},
 		},
 	})
+
+	changeType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "MintInfoChange",
+		Fields: graphql.Fields{
+			"mintUrl":            &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"name":               &graphql.Field{Type: graphql.String},
+			"at":                 &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+			"previousLastSeenAt": &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+			"hash":               &graphql.Field{Type: graphql.NewNonNull(graphql.String)},
+			"summary":            &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(graphql.String)))},
+			"patch":              &graphql.Field{Type: jsonType},
+		},
+	})
+	changesType := graphql.NewObject(graphql.ObjectConfig{
+		Name: "MintInfoChanges",
+		Fields: graphql.Fields{
+			"trackedMints":   &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+			"reachableMints": &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+			"totalChanges":   &graphql.Field{Type: graphql.NewNonNull(graphql.Int)},
+			"changes":        &graphql.Field{Type: graphql.NewNonNull(graphql.NewList(graphql.NewNonNull(changeType)))},
+		},
+	})
+
 	return graphql.Fields{
 		"mintInfoHistory": &graphql.Field{
 			Type: historyType,
@@ -80,7 +104,38 @@ func mintQueryFields(r *resolver, jsonType *graphql.Scalar) graphql.Fields {
 				return r.mintInfoHistory(p.Context, p.Args["input"].(map[string]any))
 			},
 		},
+		"mintInfoChanges": &graphql.Field{
+			Type: changesType,
+			Args: graphql.FieldConfigArgument{"limit": &graphql.ArgumentConfig{Type: graphql.Int}},
+			Resolve: func(p graphql.ResolveParams) (any, error) {
+				return r.mintInfoChanges(p.Context, intValue(p.Args["limit"], 100))
+			},
+		},
 	}
+}
+
+func (r *resolver) mintInfoChanges(ctx context.Context, limit int) (any, error) {
+	if r.mintInfo == nil {
+		return nil, nil
+	}
+	changes, err := r.mintInfo.GlobalChanges(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]map[string]any, 0, len(changes.Changes))
+	for _, c := range changes.Changes {
+		items = append(items, map[string]any{
+			"mintUrl": c.MintURL, "name": c.Name, "at": c.At,
+			"previousLastSeenAt": c.PreviousLastSeenAt, "hash": c.Hash,
+			"summary": c.Summary, "patch": rawToAny(c.Patch),
+		})
+	}
+	return map[string]any{
+		"trackedMints":   changes.TrackedMints,
+		"reachableMints": changes.ReachableMints,
+		"totalChanges":   changes.TotalChanges,
+		"changes":        items,
+	}, nil
 }
 
 func (r *resolver) mintInfoHistory(ctx context.Context, raw map[string]any) (any, error) {

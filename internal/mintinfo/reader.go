@@ -4,15 +4,53 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/wI2L/jsondiff"
 )
 
-// ReaderStore is the read seam (implemented by *clickhouse.Store).
+// ReaderStore is the per-mint read seam (implemented by *clickhouse.Store).
 type ReaderStore interface {
 	MintObservations(ctx context.Context, mintURL string) ([]Observation, error)
 	MintSnapshots(ctx context.Context, mintURL string, hashes []string) (map[string]Snapshot, error)
+}
+
+// GlobalStore adds the ecosystem-wide reads the global changelog needs.
+type GlobalStore interface {
+	ReaderStore
+	// RecentlyChangedMintURLs returns mints that have had at least one real
+	// revision (≥2 distinct reachable content hashes), most-recent-change first.
+	RecentlyChangedMintURLs(ctx context.Context, limit int) ([]string, error)
+	// MintInfoStats is the roster summary for the changelog header.
+	MintInfoStats(ctx context.Context) (MintInfoStats, error)
+}
+
+// MintInfoStats is the tracked/reachable roster summary.
+type MintInfoStats struct {
+	Tracked   int
+	Reachable int
+}
+
+// GlobalChange is one mint's info change, for the ecosystem-wide feed. It is a
+// per-mint Revision tagged with which mint it belongs to.
+type GlobalChange struct {
+	MintURL            string          `json:"mintUrl"`
+	Name               string          `json:"name"`
+	At                 int64           `json:"at"`
+	PreviousLastSeenAt int64           `json:"previousLastSeenAt"`
+	Hash               string          `json:"hash"`
+	Summary            []string        `json:"summary"`
+	Patch              json.RawMessage `json:"patch"`
+}
+
+// GlobalChanges is the ecosystem-wide changelog: recent revisions across all
+// tracked mints, newest first, plus roster stats for the header.
+type GlobalChanges struct {
+	TrackedMints   int            `json:"trackedMints"`
+	ReachableMints int            `json:"reachableMints"`
+	TotalChanges   int            `json:"totalChanges"`
+	Changes        []GlobalChange `json:"changes"`
 }
 
 // SnapshotView is the initial full document in a history response.
@@ -46,6 +84,7 @@ type ObservationView struct {
 type History struct {
 	MintURL        string            `json:"mintUrl"`
 	NormalizedURL  string            `json:"normalizedUrl"`
+	Name           string            `json:"name"`
 	CurrentHash    string            `json:"currentHash"`
 	FirstSeenAt    int64             `json:"firstSeenAt"`
 	LastCheckedAt  int64             `json:"lastCheckedAt"`
@@ -56,14 +95,78 @@ type History struct {
 	Observations   []ObservationView `json:"observations"`
 }
 
-// Reader assembles a mint's info history at read time.
+// Reader assembles mint info history at read time — per mint (History) and
+// ecosystem-wide (GlobalChanges).
 type Reader struct {
-	store  ReaderStore
+	store  GlobalStore
 	source Source
 }
 
-func NewReader(store ReaderStore, source Source) *Reader {
+func NewReader(store GlobalStore, source Source) *Reader {
 	return &Reader{store: store, source: source}
+}
+
+// globalChangeMintCap bounds how many changed mints a single global feed read
+// fans out over. Far above any realistic count of mints that have ever revised.
+const globalChangeMintCap = 500
+
+// GlobalChanges builds the ecosystem-wide changelog: every mint's revisions,
+// flattened and sorted newest first, capped at limit. A per-mint read failing
+// is skipped rather than failing the whole aggregate — it's a best-effort
+// monitoring view, and the per-mint endpoint surfaces individual errors.
+func (r *Reader) GlobalChanges(ctx context.Context, limit int) (*GlobalChanges, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	stats, err := r.store.MintInfoStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mints, err := r.store.RecentlyChangedMintURLs(ctx, globalChangeMintCap)
+	if err != nil {
+		return nil, err
+	}
+
+	var all []GlobalChange
+	for _, mintURL := range mints {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		h, found, err := r.History(ctx, mintURL, false)
+		if err != nil || !found || h == nil {
+			continue
+		}
+		for _, rev := range h.Revisions {
+			all = append(all, GlobalChange{
+				MintURL:            h.MintURL,
+				Name:               h.Name,
+				At:                 rev.At,
+				PreviousLastSeenAt: rev.PreviousLastSeenAt,
+				Hash:               rev.Hash,
+				Summary:            rev.Summary,
+				Patch:              rev.Patch,
+			})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].At != all[j].At {
+			return all[i].At > all[j].At
+		}
+		return all[i].MintURL < all[j].MintURL
+	})
+	total := len(all)
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	if all == nil {
+		all = []GlobalChange{}
+	}
+	return &GlobalChanges{
+		TrackedMints:   stats.Tracked,
+		ReachableMints: stats.Reachable,
+		TotalChanges:   total,
+		Changes:        all,
+	}, nil
 }
 
 // run is one contiguous stretch of identical-hash observations.
@@ -136,6 +239,9 @@ func (r *Reader) History(ctx context.Context, rawMintURL string, includeObservat
 	if doc, ok := snaps[initial.hash]; ok {
 		out.Initial = &SnapshotView{At: initial.firstAt, Hash: initial.hash, Document: doc.Document}
 	}
+	if doc, ok := snaps[out.CurrentHash]; ok {
+		out.Name = extractName(doc.Document)
+	}
 
 	// Diff each run against its predecessor; emit newest-first.
 	prevDoc := docBytes(snaps, initial.hash)
@@ -168,6 +274,18 @@ func (r *Reader) History(ctx context.Context, rawMintURL string, includeObservat
 	}
 	out.Revisions = revisions
 	return out, true, nil
+}
+
+// extractName pulls the NUT-06 "name" field from a canonical document, for
+// display in the changelog. Empty when absent.
+func extractName(doc json.RawMessage) string {
+	var fields struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(doc, &fields); err != nil {
+		return ""
+	}
+	return fields.Name
 }
 
 func docBytes(snaps map[string]Snapshot, hash string) []byte {

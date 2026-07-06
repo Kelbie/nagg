@@ -137,6 +137,62 @@ func (s *Store) MintSnapshots(ctx context.Context, mintURL string, hashes []stri
 	return out, rows.Err()
 }
 
+// RecentlyChangedMintURLs returns mints that have had at least one real revision
+// — two or more distinct reachable content hashes — most-recent-change first.
+// A mint with a single hash (only ever one config observed) has no revision to
+// show and is excluded. Powers the ecosystem-wide changelog.
+func (s *Store) RecentlyChangedMintURLs(ctx context.Context, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT mint_url
+		FROM mint_info_observations
+		WHERE reachable = 1 AND content_hash != ''
+		GROUP BY mint_url
+		HAVING uniqExact(content_hash) >= 2
+		ORDER BY max(checked_at) DESC
+		LIMIT ?
+	`, uint64(limit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var url string
+		if err := rows.Scan(&url); err != nil {
+			return nil, err
+		}
+		out = append(out, url)
+	}
+	return out, rows.Err()
+}
+
+// MintInfoStats is the changelog header roster: how many mints are tracked and
+// how many have ever returned usable info.
+func (s *Store) MintInfoStats(ctx context.Context) (mintinfo.MintInfoStats, error) {
+	rows, err := s.conn.Query(ctx, `
+		SELECT
+			uniqExact(mint_url) AS tracked,
+			uniqExactIf(mint_url, reachable = 1) AS reachable
+		FROM mint_info_observations
+	`)
+	if err != nil {
+		return mintinfo.MintInfoStats{}, err
+	}
+	defer rows.Close()
+
+	var tracked, reachable uint64
+	if rows.Next() {
+		if err := rows.Scan(&tracked, &reachable); err != nil {
+			return mintinfo.MintInfoStats{}, err
+		}
+	}
+	return mintinfo.MintInfoStats{Tracked: int(tracked), Reachable: int(reachable)}, rows.Err()
+}
+
 // CashuMintURLs returns the distinct mint URLs recommended via NIP-87 kind-38000
 // events tagged k=38172 (cashu mints). Values are raw u-tags — the caller
 // normalizes. This is the Nostr half of the snapshot work-list (the auditor is

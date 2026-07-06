@@ -2,6 +2,7 @@ package mintinfo
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -70,6 +71,59 @@ func (f *fakeStore) MintSnapshots(_ context.Context, url string, hashes []string
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeStore) RecentlyChangedMintURLs(_ context.Context, limit int) ([]string, error) {
+	type agg struct {
+		hashes map[string]struct{}
+		last   time.Time
+	}
+	m := map[string]*agg{}
+	for _, o := range f.obs {
+		if !o.Reachable || o.Hash == "" {
+			continue
+		}
+		a := m[o.MintURL]
+		if a == nil {
+			a = &agg{hashes: map[string]struct{}{}}
+			m[o.MintURL] = a
+		}
+		a.hashes[o.Hash] = struct{}{}
+		if o.CheckedAt.After(a.last) {
+			a.last = o.CheckedAt
+		}
+	}
+	type row struct {
+		url  string
+		last time.Time
+	}
+	var rows []row
+	for u, a := range m {
+		if len(a.hashes) >= 2 {
+			rows = append(rows, row{u, a.last})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].last.After(rows[j].last) })
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.url)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *fakeStore) MintInfoStats(_ context.Context) (MintInfoStats, error) {
+	tracked := map[string]struct{}{}
+	reach := map[string]struct{}{}
+	for _, o := range f.obs {
+		tracked[o.MintURL] = struct{}{}
+		if o.Reachable {
+			reach[o.MintURL] = struct{}{}
+		}
+	}
+	return MintInfoStats{Tracked: len(tracked), Reachable: len(reach)}, nil
 }
 
 type fakeFetcher struct {
@@ -255,6 +309,61 @@ func TestReaderBuildsInitialPlusNewestFirstRevisions(t *testing.T) {
 	}
 	if string(rev.Patch) == "[]" || len(rev.Patch) == 0 {
 		t.Fatalf("revision patch must be a non-empty RFC 6902 array: %s", rev.Patch)
+	}
+}
+
+func TestGlobalChangesFlattensAndSortsNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	put := func(url string, docs ...[]byte) []string {
+		hashes := make([]string, 0, len(docs))
+		for _, d := range docs {
+			c, _ := CashuNUT06.Canonicalize(d)
+			h := Hash(c)
+			store.PutSnapshot(ctx, url, h, c, time.Now())
+			hashes = append(hashes, h)
+		}
+		return hashes
+	}
+	t0 := time.Unix(1_700_000_000, 0).UTC()
+	obs := func(url, hash string, at time.Time) {
+		store.PutObservation(ctx, Observation{MintURL: url, CheckedAt: at, Hash: hash, Reachable: true})
+	}
+
+	// Mint A: v1 -> v2 at t1 (a change). Mint B: only v1 (no change). Mint C:
+	// v1 -> v2 at t2 (a change, more recent than A's).
+	ha := put("https://a", []byte(`{"name":"Alpha","version":"1.0"}`), []byte(`{"name":"Alpha","version":"1.1"}`))
+	put("https://b", []byte(`{"name":"Bravo","version":"1.0"}`))
+	hc := put("https://c", []byte(`{"name":"Charlie","version":"2.0"}`), []byte(`{"name":"Charlie","version":"2.1","nuts":{"17":{"supported":true}}}`))
+	hb, _ := CashuNUT06.Canonicalize([]byte(`{"name":"Bravo","version":"1.0"}`))
+	obs("https://a", ha[0], t0)
+	obs("https://a", ha[1], t0.Add(24*time.Hour)) // t1
+	obs("https://b", Hash(hb), t0)
+	obs("https://c", hc[0], t0)
+	obs("https://c", hc[1], t0.Add(48*time.Hour)) // t2 (newest)
+
+	g, err := NewReader(store, CashuNUT06).GlobalChanges(ctx, 100)
+	if err != nil {
+		t.Fatalf("GlobalChanges: %v", err)
+	}
+	if g.TrackedMints != 3 || g.ReachableMints != 3 {
+		t.Fatalf("stats: tracked=%d reachable=%d, want 3/3", g.TrackedMints, g.ReachableMints)
+	}
+	if g.TotalChanges != 2 || len(g.Changes) != 2 {
+		t.Fatalf("changes = %d (total %d), want 2 (B contributes none)", len(g.Changes), g.TotalChanges)
+	}
+	// Newest first: C's change (t2) before A's (t1).
+	if g.Changes[0].MintURL != "https://c" || g.Changes[0].At != t0.Add(48*time.Hour).Unix() {
+		t.Fatalf("changes[0] = %s @ %d, want https://c @ %d", g.Changes[0].MintURL, g.Changes[0].At, t0.Add(48*time.Hour).Unix())
+	}
+	if g.Changes[1].MintURL != "https://a" {
+		t.Fatalf("changes[1] = %s, want https://a", g.Changes[1].MintURL)
+	}
+	if g.Changes[0].Name != "Charlie" {
+		t.Fatalf("changes[0].Name = %q, want Charlie", g.Changes[0].Name)
+	}
+	if len(g.Changes[0].Summary) == 0 || string(g.Changes[0].Patch) == "[]" {
+		t.Fatalf("changes[0] must carry a summary + patch: %+v", g.Changes[0])
 	}
 }
 

@@ -9,10 +9,12 @@ import (
 )
 
 // MintHistoryProvider serves a mint's NUT-06 info history (initial document +
-// RFC 6902 diffs). Satisfied by *mintinfo.Reader. Cashu-specific, like the
-// sibling reviews/discover surfaces under /nostr/mint/*.
+// RFC 6902 diffs) per mint, and the ecosystem-wide changelog across all mints.
+// Satisfied by *mintinfo.Reader. Cashu-specific, like the sibling
+// reviews/discover surfaces under /nostr/mint/*.
 type MintHistoryProvider interface {
 	History(ctx context.Context, mintURL string, includeObservations bool) (*mintinfo.History, bool, error)
+	GlobalChanges(ctx context.Context, limit int) (*mintinfo.GlobalChanges, error)
 }
 
 // mintHistory serves GET /nostr/mint/history?u=<mintUrl>[&observations=true].
@@ -45,4 +47,25 @@ func (h *Handler) mintHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, history)
+}
+
+// mintChanges serves GET /nostr/mint/changes?limit=N — the ecosystem-wide
+// changelog: every mint's info revisions, flattened newest-first, plus tracked/
+// reachable roster stats. Powers the observatory page.
+func (h *Handler) mintChanges(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET /nostr/mint/changes only", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.mintInfo == nil {
+		http.Error(w, "mint info history not configured", http.StatusServiceUnavailable)
+		return
+	}
+	limit := intParam(r, "limit", 100)
+	changes, err := h.mintInfo.GlobalChanges(r.Context(), limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, changes)
 }
