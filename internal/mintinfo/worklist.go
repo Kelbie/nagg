@@ -3,6 +3,7 @@ package mintinfo
 import (
 	"context"
 	"log/slog"
+	"net/url"
 	"strings"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
@@ -77,9 +78,24 @@ func (w *WorkList) MintURLs(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
-// NormalizeMintURL is the canonical mint key: lowercase, no trailing slash. It
-// matches appview.normalizeMintURL so the same mint keys across reviews,
-// discover, and info history.
-func NormalizeMintURL(url string) string {
-	return strings.ToLower(strings.TrimRight(strings.TrimSpace(url), "/"))
+// NormalizeMintURL is both the storage key AND the fetch target, so unlike
+// appview.normalizeMintURL (a pure dedup key that lowercases everything) it
+// lowercases ONLY the scheme and host and PRESERVES the path. HTTP paths are
+// case-sensitive: https://mint.minibits.cash/Bitcoin serves /v1/info, but
+// /bitcoin/v1/info 404s — lowercasing the whole URL made every mixed-case-path
+// mint unreachable. Trailing slash is trimmed so a mint referenced with and
+// without one collapses to a single watch target.
+func NormalizeMintURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		// Unparseable: trim only, preserving case (the path may be significant).
+		return strings.TrimRight(raw, "/")
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	return strings.TrimRight(u.String(), "/")
 }

@@ -93,6 +93,21 @@ func at(clock *time.Time) func() time.Time { return func() time.Time { return *c
 
 // --- tests ------------------------------------------------------------------
 
+func TestNormalizeMintURLPreservesPathCase(t *testing.T) {
+	cases := map[string]string{
+		"https://mint.minibits.cash/Bitcoin":     "https://mint.minibits.cash/Bitcoin", // path case kept — it's the fetch target
+		"https://Mint.Minibits.Cash/Bitcoin/":    "https://mint.minibits.cash/Bitcoin", // host lowered, slash trimmed
+		"  https://nofees.testnut.cashu.space  ": "https://nofees.testnut.cashu.space",
+		"HTTPS://8333.SPACE:3338/":               "https://8333.space:3338",
+		"":                                       "",
+	}
+	for in, want := range cases {
+		if got := NormalizeMintURL(in); got != want {
+			t.Errorf("NormalizeMintURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCanonicalizeStripsTimeAndIsOrderStable(t *testing.T) {
 	a := []byte(`{"name":"m","time":1,"nuts":{"7":{"supported":true}}}`)
 	b := []byte(`{"nuts":{"7":{"supported":true}},"name":"m","time":99999}`)
