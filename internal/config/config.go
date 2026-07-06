@@ -36,6 +36,7 @@ type Config struct {
 	Cache      CacheConfig
 	Auditor    AuditorConfig
 	AppVersion AppVersionConfig
+	Routstr    RoutstrConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -88,6 +89,19 @@ type AuditorConfig struct {
 	URL     string
 	Enabled bool
 	Limit   int
+}
+
+// RoutstrConfig configures the Routstr node catalog client behind
+// GET /app/ai-lineup. URL empty (or Enabled false) leaves the route 503 and
+// the app derives its AI lineup client-side. Vendors is the ordered
+// comma-separated vendor-slug list to curate tabs for; Pins is a JSON blob of
+// per-vendor tier overrides ({"anthropic":{"max":"claude-opus-4.7"}}), the
+// OTA lever for hardcoding a model onto old app builds.
+type RoutstrConfig struct {
+	URL     string
+	Enabled bool
+	Vendors []string
+	Pins    string
 }
 
 type APIConfig struct {
@@ -239,6 +253,12 @@ func Load() (Config, error) {
 		AppVersion: AppVersionConfig{
 			LatestVersion: os.Getenv("NAGG_APP_LATEST_VERSION"),
 			UpdateMessage: os.Getenv("NAGG_APP_UPDATE_MESSAGE"),
+		},
+		Routstr: RoutstrConfig{
+			URL:     env("NAGG_ROUTSTR_URL", "https://api.routstr.com"),
+			Enabled: parseBool(env("NAGG_ROUTSTR_ENABLED", "true")),
+			Vendors: splitCSV(env("NAGG_AI_LINEUP_VENDORS", "openai,anthropic,x-ai,google")),
+			Pins:    os.Getenv("NAGG_AI_LINEUP_PINS"),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,

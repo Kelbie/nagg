@@ -27,6 +27,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/rollup"
+	"github.com/vertex-lab/nagg/internal/routstr"
 	"github.com/vertex-lab/nagg/internal/runtimelimits"
 	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -332,6 +333,22 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		}()
 	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage))
+	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {
+		routstrClient := routstr.NewHTTPClient(cfg.Routstr.URL)
+		pins := appview.ParseAILineupPins(cfg.Routstr.Pins)
+		appviewOpts = append(appviewOpts, appview.WithAILineup(routstrClient, cfg.Routstr.Vendors, pins))
+		slog.Info("ai lineup enabled", "url", cfg.Routstr.URL, "vendors", strings.Join(cfg.Routstr.Vendors, ","), "pinned_vendors", len(pins))
+		// Warm the catalog cache in the background so the first /app/ai-lineup
+		// request doesn't pay the cold upstream fetch.
+		go func() {
+			defer safego.Recover("api.worker")
+			warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if _, err := routstrClient.Models(warmCtx); err != nil {
+				slog.Warn("ai lineup warm-up failed", "error", err)
+			}
+		}()
+	}
 	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}

@@ -78,6 +78,7 @@ var AppViewRoutes = []string{
 	"/nostr/search",
 	"/nostr/recommended",
 	"/app/latest-version",
+	"/app/ai-lineup",
 }
 
 func ServiceInfo() map[string]any {

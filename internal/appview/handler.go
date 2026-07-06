@@ -80,6 +80,9 @@ type Handler struct {
 	auditor                   AuditorClient
 	appLatestVersion          string
 	appUpdateMessage          string
+	routstrClient             RoutstrClient
+	aiLineupVendors           []string
+	aiLineupPins              map[string]map[string]string
 	// viewerTouch records "this pubkey is a real Sovran viewer" (relevance
 	// tracking for the ingest post cap). Called ONLY on routes where the
 	// pubkey is semantically the requesting user — notifications, DM
@@ -229,6 +232,18 @@ func WithAuditor(client AuditorClient) Option {
 	}
 }
 
+// WithAILineup wires the Routstr catalog client behind GET /app/ai-lineup,
+// with the vendor tabs to curate and optional per-vendor tier pins
+// (appview.ParseAILineupPins). Without it the route responds 503 and the app
+// falls back to deriving a lineup client-side.
+func WithAILineup(client RoutstrClient, vendors []string, pins map[string]map[string]string) Option {
+	return func(h *Handler) {
+		h.routstrClient = client
+		h.aiLineupVendors = vendors
+		h.aiLineupPins = pins
+	}
+}
+
 // WithViewerTouch wires the known-viewer recording seam (see the viewerTouch
 // field for where it fires). The func must be non-blocking (relevance.Tracker
 // throttles and inserts asynchronously).
@@ -332,6 +347,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/search", h.search, false},
 		{"/nostr/recommended", h.recommended, false},
 		{"/app/latest-version", h.latestVersion, false},
+		{"/app/ai-lineup", h.aiLineup, false},
 	}
 }
 
