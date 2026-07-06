@@ -123,6 +123,35 @@ in-process counter that resets on restart (under-enforces, never over-drops);
 a durable counter is a follow-up. The default set's exemption is the
 relevance model (known viewers ∪ their follows, `docs/retention.md`).
 
+## Backfills
+
+`Backfill{Kinds, Resync}`: events of `Kinds` are pulled out of relay history
+systematically instead of only observed live. The firehose only ever sees new
+publications, so long-lived, rarely-republished kinds (parameterized-
+replaceable app data — kind 38000 was the motivating case: months of live
+listening captured 23 events while the configured relays held ~1.5k) never
+accumulate without one.
+
+The executor is `ingest.Backfiller`. Per `(rule, kind, relay)` it walks
+NIP-01 `until`/`limit` pagination newest-first down to relay exhaustion, with
+**per-relay cursors** — a merged multi-relay cursor advances at the pace of
+whichever relay's page reached oldest and silently skips the deeper relays'
+middle ranges. Every page checkpoints watermarks to `relay_backfill_state`
+(`oldest_synced`, `newest_synced`, `completed`), so an interrupted walk
+resumes where it stopped and a partial walk is never mistaken for a complete
+one — completeness is explicit state, not inferred from "some events exist".
+Once complete, the walk re-runs every `Resync` from the top down to overlap
+with `newest_synced`, catching events published while the service was down
+(the firehose subscription looks back at most `NAGG_SINCE`). `Resync == 0`
+means initial walk only.
+
+Backfilled inserts go through `Store.InsertEvents` directly: like every
+on-demand backfill they bypass the per-author caps (which target firehose
+flooding, not history), and transport-level id + signature verification
+already happened in `relayquery`. Declare a rule only for kinds served as a
+browsable network-wide corpus; high-volume social kinds stay live-plus-on-
+demand, their history deliberately bounded by cap and lifetime rules.
+
 ## The DVM plugin seam (`internal/dvm`)
 
 External data-vending-machine integrations are plugins, not bespoke wiring:

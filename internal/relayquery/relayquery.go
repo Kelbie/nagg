@@ -88,6 +88,36 @@ func (c Client) Query(ctx context.Context, filter map[string]any, timeout time.D
 	return finishQuery(out, errs)
 }
 
+// ErrRelayBackoff reports that a relay was skipped because its circuit
+// breaker is open. Callers iterating relays should treat it as "try again
+// later", not as a relay failure (it is already one).
+var ErrRelayBackoff = errors.New("relay in backoff")
+
+// QueryOne queries a single relay with the client's timeouts, honoring and
+// feeding the health breaker. Unlike Query it does not fan out: callers that
+// paginate history need per-relay cursors — a merged multi-relay page advances
+// at the pace of whichever relay's page reached oldest, silently skipping the
+// deeper relays' middle ranges.
+func (c Client) QueryOne(ctx context.Context, relay string, filter map[string]any, timeout time.Duration) ([]Event, error) {
+	if c.Health != nil && !c.Health.available(relay, time.Now()) {
+		return nil, ErrRelayBackoff
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	qctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	subID := fmt.Sprintf("nagg-demand-%d", time.Now().UnixNano())
+	events, err := c.queryRelay(qctx, relay, subID, filter)
+	if err != nil {
+		c.Health.recordFailure(relay, time.Now())
+		return nil, err
+	}
+	c.Health.recordSuccess(relay)
+	return events, nil
+}
+
 func finishQuery(out []Event, errs []error) ([]Event, error) {
 	if len(out) > 0 {
 		return out, nil

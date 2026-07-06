@@ -165,6 +165,25 @@ type Cap struct {
 	ExemptKnownViewers bool
 }
 
+// Backfill declares that events of Kinds are pulled from relay history
+// systematically instead of only observed live. A live subscription only ever
+// sees NEW publications, so long-lived, rarely-republished kinds
+// (parameterized-replaceable app data being the canonical case) would take
+// months to accumulate from the firehose alone. A Backfill rule makes the
+// ingester walk each relay's stored history to exhaustion (NIP-01 until/limit
+// pagination) and then re-walk the recent window every Resync, catching events
+// published while nagg was offline or beyond the firehose's since window.
+// Absence of a rule means a kind is live-plus-on-demand only — the right
+// default for high-volume social kinds, whose history is deliberately bounded
+// by the cap and lifetime rules.
+type Backfill struct {
+	Name  string
+	Kinds []int
+	// Resync is the interval between top-up walks once the initial history
+	// walk has completed. 0 disables re-syncing (initial walk only).
+	Resync time.Duration
+}
+
 // Registry holds the full declared rule set. Construct with New, which
 // validates cross-references and uniqueness.
 type Registry struct {
@@ -172,6 +191,7 @@ type Registry struct {
 	projections   []Projection
 	lifetimes     []Lifetime
 	caps          []Cap
+	backfills     []Backfill
 
 	byName map[string]*Relationship
 }
@@ -180,7 +200,7 @@ type Registry struct {
 // at startup: a malformed rule set is a programming error, so callers should
 // treat an error as fatal. Supersessions compile into lifetime rules (listed
 // first, so retention considers cheap supersession prunes before age rules).
-func New(relationships []Relationship, projections []Projection, supersessions []Supersession, lifetimes []Lifetime, caps []Cap) (*Registry, error) {
+func New(relationships []Relationship, projections []Projection, supersessions []Supersession, lifetimes []Lifetime, caps []Cap, backfills []Backfill) (*Registry, error) {
 	compiled := make([]Lifetime, 0, len(supersessions)+len(lifetimes))
 	for _, s := range supersessions {
 		if s.Name == "" {
@@ -199,6 +219,7 @@ func New(relationships []Relationship, projections []Projection, supersessions [
 		projections:   projections,
 		lifetimes:     lifetimes,
 		caps:          caps,
+		backfills:     backfills,
 		byName:        make(map[string]*Relationship, len(relationships)),
 	}
 	seenProj := map[string]bool{}
@@ -231,6 +252,16 @@ func New(relationships []Relationship, projections []Projection, supersessions [
 			return nil, fmt.Errorf("cap %q: %w", c.Name, err)
 		}
 	}
+	seenBackfill := map[string]bool{}
+	for _, b := range backfills {
+		if err := validateBackfill(b); err != nil {
+			return nil, fmt.Errorf("backfill %q: %w", b.Name, err)
+		}
+		if seenBackfill[b.Name] {
+			return nil, fmt.Errorf("backfill %q: duplicate name", b.Name)
+		}
+		seenBackfill[b.Name] = true
+	}
 	return r, nil
 }
 
@@ -242,6 +273,10 @@ func (r *Registry) Lifetimes() []Lifetime { return r.lifetimes }
 
 // Caps returns the declared cap rules in declaration order.
 func (r *Registry) Caps() []Cap { return r.caps }
+
+// Backfills returns the declared relay-history backfill rules in declaration
+// order.
+func (r *Registry) Backfills() []Backfill { return r.backfills }
 
 // Relationship returns the named relationship, or nil.
 func (r *Registry) Relationship(name string) *Relationship { return r.byName[name] }
@@ -369,6 +404,22 @@ func validateCap(c Cap) error {
 	}
 	if c.Window < 0 {
 		return fmt.Errorf("negative window")
+	}
+	return nil
+}
+
+func validateBackfill(b Backfill) error {
+	if b.Name == "" {
+		return fmt.Errorf("empty name")
+	}
+	if !validIdent(b.Name) {
+		return fmt.Errorf("name must be a lowercase identifier ([a-z0-9_])")
+	}
+	if len(b.Kinds) == 0 {
+		return fmt.Errorf("no kinds")
+	}
+	if b.Resync < 0 {
+		return fmt.Errorf("negative resync")
 	}
 	return nil
 }

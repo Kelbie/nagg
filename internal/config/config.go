@@ -227,10 +227,10 @@ func Load() (Config, error) {
 			FlushInterval: parseDuration(env("NAGG_FLUSH_INTERVAL", "5s")),
 			QueueSize:     parseInt(env("NAGG_QUEUE_SIZE", "10000")),
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
-			// Kinds to seed from relay history when locally empty: long-lived,
-			// rarely-republished kinds (e.g. parameterized-replaceable app
-			// data) never show up on a live firehose.
-			SeedKinds: parseIntList(env("NAGG_SEED_KINDS", "")),
+			// Declarative relay-history backfills: kinds walked out of relay
+			// history and kept topped up, because a live firehose never
+			// surfaces old, rarely-republished events.
+			Backfills: ruleRegistry.Backfills(),
 			// Declarative per-author firehose caps for authors NOT relevant
 			// to any Sovran user (see internal/relevance). Measured 2026-07:
 			// 20/day removes ~90% of monthly post volume, all of it from
@@ -449,20 +449,6 @@ func parseDurationPtr(value string) *time.Duration {
 		return nil
 	}
 	return &d
-}
-
-func parseIntList(value string) []int {
-	var out []int
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		if n, err := strconv.Atoi(part); err == nil {
-			out = append(out, n)
-		}
-	}
-	return out
 }
 
 func parseInt(value string) int {

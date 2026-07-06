@@ -39,7 +39,7 @@ func TestProjectionValidation(t *testing.T) {
 			proj := valid
 			proj.Fields = append([]ProjField(nil), valid.Fields...)
 			c.mutate(&proj)
-			_, err := New(nil, []Projection{proj}, nil, nil, nil)
+			_, err := New(nil, []Projection{proj}, nil, nil, nil, nil)
 			if c.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -52,7 +52,7 @@ func TestProjectionValidation(t *testing.T) {
 		})
 	}
 
-	if _, err := New(nil, []Projection{valid, valid}, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "duplicate name") {
+	if _, err := New(nil, []Projection{valid, valid}, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Fatalf("duplicate projection names must fail; got %v", err)
 	}
 }

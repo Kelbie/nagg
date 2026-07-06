@@ -143,7 +143,15 @@ func Default(capMax int) (*Registry, error) {
 		})
 	}
 
-	return New(relationships, projections, supersessions, lifetimes, caps)
+	// Relay-history backfills: kinds served as a browsable network-wide corpus
+	// need the events that already exist on the relays, not just the live
+	// trickle. Measured 2026-07: the configured relay set held ~1.5k kind-38000
+	// events while months of live listening had captured 23.
+	backfills := []Backfill{
+		{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour},
+	}
+
+	return New(relationships, projections, supersessions, lifetimes, caps, backfills)
 }
 
 // MustDefault is Default for wiring paths without an error channel (config

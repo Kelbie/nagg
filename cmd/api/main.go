@@ -433,11 +433,13 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 
 	pipeline := ingest.New(store, cfg.Ingest, ingest.WithExemption(exempt))
 
-	// Seed rarely-republished kinds from relay history before live ingestion
-	// piles up (async; the empty-store gate makes this a no-op after success).
+	// Relay-history backfill: walk the declared kinds out of relay history and
+	// keep them topped up (async; checkpointed in relay_backfill_state, so
+	// every pass is resumable and completed walks re-run only on their Resync).
+	backfiller := ingest.NewBackfiller(store, cfg.Firehose.Relays, cfg.Ingest.Backfills, slog.Default())
 	go func() {
-		defer safego.Recover("api.seed_fetch")
-		ingest.SeedFetch(ctx, store, cfg.Firehose.Relays, cfg.Ingest.SeedKinds, slog.Default())
+		defer safego.Recover("api.backfill")
+		backfiller.Run(ctx)
 	}()
 
 	events := make(chan firehose.RelayEvent, cfg.Ingest.QueueSize)

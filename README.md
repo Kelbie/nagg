@@ -118,6 +118,27 @@ relationships' aggregate tables, which outlive the referencing events.
 `Window == 0` declares a lifetime cap. Exemption is the relevance model
 (known viewers and everyone they follow).
 
+**Backfills** — relay-history walks for kinds the firehose can't accumulate:
+
+```go
+{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour}
+```
+
+A live subscription only ever sees new publications, so long-lived,
+rarely-republished kinds (parameterized-replaceable app data) would take
+months to appear. A `Backfill` rule makes the ingester walk each relay's
+stored history to exhaustion — NIP-01 `until`/`limit` pagination with
+**per-relay cursors**, checkpointed page-by-page in `relay_backfill_state` so
+a partial walk resumes instead of being mistaken for a complete one — then
+re-walk the recent window every `Resync` down to overlap with the synced
+range, catching events published while the service was down or beyond the
+firehose's `since` window. Absence of a rule means live-plus-on-demand only,
+the right default for high-volume social kinds whose history is deliberately
+bounded by the cap and lifetime rules. (NIP-77 negentropy would answer "which
+events am I missing" more precisely but is draft/optional with thin relay
+support; NIP-45 COUNT is optional and approximate — `until`/`limit` paging is
+the only NIP-01-guaranteed mechanism.)
+
 **How it all derives.** At migrate time the store applies the
 registry-generated DDL after the static SQL; a table created for the first
 time is backfilled from raw history automatically (so declaring a rule
