@@ -181,6 +181,55 @@ func TestCanonicalizeStripsTimeAndIsOrderStable(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeRobustToFormatting(t *testing.T) {
+	// The SAME logical NUT-06 document, serialized every ugly way a mint might:
+	// minified, pretty-printed, keys reordered, extra whitespace, and a differing
+	// volatile `time`. All must produce the same hash so reformatting is never a
+	// false "change".
+	variants := [][]byte{
+		// minified
+		[]byte(`{"name":"Bob's Mint","version":"Nutshell/0.20.0","nuts":{"4":{"methods":[{"unit":"sat","max_amount":10000}]},"7":{"supported":true}},"time":1}`),
+		// pretty-printed, keys reordered, time differs, tabs + newlines
+		[]byte("{\n\t\"time\": 999,\n\t\"version\": \"Nutshell/0.20.0\",\n\t\"nuts\": {\n\t\t\"7\": { \"supported\": true },\n\t\t\"4\": { \"methods\": [ { \"max_amount\": 10000, \"unit\": \"sat\" } ] }\n\t},\n\t\"name\": \"Bob's Mint\"\n}"),
+		// weird spacing everywhere, no time field at all
+		[]byte(`{   "version"   :"Nutshell/0.20.0",  "name":"Bob's Mint"  ,"nuts":{  "7":{"supported":true}  ,  "4":{"methods":[{"unit":"sat" , "max_amount":10000}]}}}`),
+	}
+	first, err := CashuNUT06.Canonicalize(variants[0])
+	if err != nil {
+		t.Fatalf("canonicalize variant 0: %v", err)
+	}
+	for i, v := range variants[1:] {
+		c, err := CashuNUT06.Canonicalize(v)
+		if err != nil {
+			t.Fatalf("canonicalize variant %d: %v", i+1, err)
+		}
+		if Hash(c) != Hash(first) {
+			t.Errorf("variant %d hashes differently — reformatting must not be a change:\n  %s\n  %s", i+1, first, c)
+		}
+	}
+}
+
+func TestCanonicalizeNormalizesEscapingAndNumbers(t *testing.T) {
+	// Same logical content, but one doc JSON-escapes & < > as & < >
+	// (what Go's html-escaping json.Marshal emits) and formats a number as 1e4;
+	// the other uses literal characters and 10000. They must canonicalize to the
+	// same hash — otherwise a mint changing its serializer would look like a
+	// content change. (Double-quoted Go strings so \u.... is a real JSON escape.)
+	escaped := []byte("{\"description\":\"A \\u0026 B \\u003c C \\u003e D\",\"nuts\":{\"4\":{\"methods\":[{\"max_amount\":1e4}]}}}")
+	literal := []byte(`{"description":"A & B < C > D","nuts":{"4":{"methods":[{"max_amount":10000}]}}}`)
+	ce, err := CashuNUT06.Canonicalize(escaped)
+	if err != nil {
+		t.Fatalf("canonicalize escaped: %v", err)
+	}
+	cl, err := CashuNUT06.Canonicalize(literal)
+	if err != nil {
+		t.Fatalf("canonicalize literal: %v", err)
+	}
+	if Hash(ce) != Hash(cl) {
+		t.Errorf("escaping/number differences must normalize to the same hash:\n  %s\n  %s", ce, cl)
+	}
+}
+
 func TestSnapshotterStoresOnChangeAndObservesEveryPoll(t *testing.T) {
 	ctx := context.Background()
 	clock := time.Unix(1_700_000_000, 0).UTC()
