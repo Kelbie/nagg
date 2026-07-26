@@ -519,6 +519,8 @@ type healthResponse struct {
 	EventCount        uint64               `json:"eventCount,omitempty"`
 	StorageStatsReady bool                 `json:"storageStatsReady"`
 	EventKinds        []eventKindBreakdown `json:"eventKinds,omitempty"`
+	Memory            map[string]uint64    `json:"memory,omitempty"`
+	MemoryGB          map[string]float64   `json:"memoryGB,omitempty"`
 	Error             string               `json:"error,omitempty"`
 }
 
@@ -607,9 +609,26 @@ func bytesToDecimalGB(bytes uint64) float64 {
 	return math.Round(float64(bytes)/1_000_000_000*1_000_000) / 1_000_000
 }
 
+// healthMemoryGB mirrors the storedBytes/storedGB pairing: the raw byte counts
+// stay authoritative, the GB view is what a human reads off the endpoint.
+func healthMemoryGB(memory map[string]uint64) map[string]float64 {
+	if len(memory) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(memory))
+	for name, bytes := range memory {
+		out[name] = bytesToDecimalGB(bytes)
+	}
+	return out
+}
+
 type healthStorageSnapshot struct {
 	Ready       bool
 	StoredBytes map[int]uint64
+	// Memory is the ClickHouse server-side memory breakdown (see
+	// Store.MemoryDiagnostics). Best-effort: a failed probe leaves it nil
+	// rather than failing the whole refresh.
+	Memory map[string]uint64
 }
 
 type healthStorageStatsCache struct {
@@ -674,10 +693,22 @@ func (c *healthStorageStatsCache) refresh(ctx context.Context) {
 		storedBytes[kind] = stat.StoredBytesEstimated
 	}
 
+	// Best-effort: the memory probe reads system tables, which can be
+	// restricted or renamed across server versions. Never let it sink the
+	// storage stats that were already fetched successfully.
+	memory, err := c.store.MemoryDiagnostics(refreshCtx)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Warn("clickhouse memory diagnostics failed", "error", err)
+		}
+		memory = nil
+	}
+
 	c.mu.Lock()
 	c.snapshot = healthStorageSnapshot{
 		Ready:       true,
 		StoredBytes: storedBytes,
+		Memory:      memory,
 	}
 	c.mu.Unlock()
 }
@@ -690,9 +721,17 @@ func (c *healthStorageStatsCache) Snapshot() healthStorageSnapshot {
 	for kind, bytes := range c.snapshot.StoredBytes {
 		storedBytes[kind] = bytes
 	}
+	var memory map[string]uint64
+	if c.snapshot.Memory != nil {
+		memory = make(map[string]uint64, len(c.snapshot.Memory))
+		for name, bytes := range c.snapshot.Memory {
+			memory[name] = bytes
+		}
+	}
 	return healthStorageSnapshot{
 		Ready:       c.snapshot.Ready,
 		StoredBytes: storedBytes,
+		Memory:      memory,
 	}
 }
 
@@ -726,6 +765,8 @@ func healthHandler(store healthStore, configuredKinds []int, storageSnapshot fun
 			EventCount:        eventCount,
 			StorageStatsReady: storage.Ready,
 			EventKinds:        healthEventKindBreakdown(kindNumbers, eventKindCounts, storage),
+			Memory:            storage.Memory,
+			MemoryGB:          healthMemoryGB(storage.Memory),
 		})
 	}
 }

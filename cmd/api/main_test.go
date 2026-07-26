@@ -239,6 +239,73 @@ func TestHealthHandlerSucceedsWhenStorageStatsAreNotReady(t *testing.T) {
 	}
 }
 
+func TestHealthHandlerSurfacesClickHouseMemory(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	counter := &fakeEventCounter{
+		count:      9,
+		kindCounts: map[int]uint64{1: 3},
+	}
+
+	healthHandler(counter, []int{1}, func() healthStorageSnapshot {
+		return healthStorageSnapshot{
+			Ready: true,
+			Memory: map[string]uint64{
+				"MarkCacheBytes": 5_368_709_120,
+				"SystemLogBytes": 2_000_000_000,
+			},
+		}
+	})(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Memory["MarkCacheBytes"] != 5_368_709_120 {
+		t.Fatalf("memory = %+v", body.Memory)
+	}
+	// The GB view is what makes the endpoint readable at a glance; it must
+	// track the byte counts exactly, not just be present.
+	if body.MemoryGB["MarkCacheBytes"] != 5.368709 {
+		t.Fatalf("memoryGB = %+v", body.MemoryGB)
+	}
+	if body.MemoryGB["SystemLogBytes"] != 2 {
+		t.Fatalf("memoryGB = %+v", body.MemoryGB)
+	}
+}
+
+func TestHealthHandlerOmitsMemoryWhenProbeFailed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	counter := &fakeEventCounter{
+		count:      9,
+		kindCounts: map[int]uint64{1: 3},
+	}
+
+	// A failed memory probe leaves Memory nil; the rest of health must still
+	// report normally rather than the endpoint degrading.
+	healthHandler(counter, []int{1}, func() healthStorageSnapshot {
+		return healthStorageSnapshot{Ready: true, StoredBytes: map[int]uint64{1: 100}}
+	})(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body healthResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Memory != nil || body.MemoryGB != nil {
+		t.Fatalf("memory should be omitted: %+v", body)
+	}
+	if !body.StorageStatsReady {
+		t.Fatalf("storage stats should still be ready: %+v", body)
+	}
+}
+
 func eventKindByNumber(kinds []eventKindBreakdown, want int) *eventKindBreakdown {
 	for i := range kinds {
 		if kinds[i].Kind == want {

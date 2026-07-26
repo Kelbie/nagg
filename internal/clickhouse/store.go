@@ -446,6 +446,43 @@ func (s *Store) nostrEventsStorageFootprint(ctx context.Context) (uint64, uint64
 	return bytes, rows, nil
 }
 
+// MemoryDiagnostics reports where ClickHouse's resident memory actually sits.
+// Railway bills this instance's RAM at ~40x the rate of its disk, so the first
+// question about a memory bill is always "tunable cache, or query working
+// set?" — only the former can be fixed by config. SystemLogBytes rides along
+// because the same answer sizes the untracked disk (system logs ship with no
+// TTL). Metrics absent in a given server version are simply missing from the
+// map rather than an error.
+func (s *Store) MemoryDiagnostics(ctx context.Context) (map[string]uint64, error) {
+	rows, err := s.conn.Query(ctx, `
+		SELECT CAST(metric AS String) AS name, toUInt64(greatest(value, 0)) AS bytes
+		FROM system.asynchronous_metrics
+		WHERE metric IN (
+			'MarkCacheBytes', 'UncompressedCacheBytes', 'IndexMarkCacheBytes',
+			'PrimaryIndexCacheBytes', 'MemoryResident', 'MemoryTracking'
+		)
+		UNION ALL
+		SELECT 'SystemLogBytes' AS name, toUInt64(sum(bytes_on_disk)) AS bytes
+		FROM system.parts
+		WHERE active AND database = 'system'
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]uint64{}
+	for rows.Next() {
+		var name string
+		var bytes uint64
+		if err := rows.Scan(&name, &bytes); err != nil {
+			return nil, err
+		}
+		out[name] = bytes
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) EventKindCounts(ctx context.Context, kinds []int) (map[int]uint64, error) {
 	kinds = uniqueEventKinds(kinds)
 	out := make(map[int]uint64, len(kinds))
