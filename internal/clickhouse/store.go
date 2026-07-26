@@ -457,14 +457,17 @@ func (s *Store) MemoryDiagnostics(ctx context.Context) (map[string]uint64, error
 	rows, err := s.conn.Query(ctx, `
 		SELECT CAST(metric AS String) AS name, toUInt64(greatest(value, 0)) AS bytes
 		FROM system.asynchronous_metrics
-		WHERE metric IN (
-			'MarkCacheBytes', 'UncompressedCacheBytes', 'IndexMarkCacheBytes',
-			'PrimaryIndexCacheBytes', 'MemoryResident', 'MemoryTracking'
-		)
+		WHERE metric LIKE '%Cache%' OR metric LIKE 'Memory%'
 		UNION ALL
-		SELECT 'SystemLogBytes' AS name, toUInt64(sum(bytes_on_disk)) AS bytes
+		SELECT concat('db.', CAST(database AS String)) AS name, toUInt64(sum(bytes_on_disk)) AS bytes
+		FROM system.parts
+		WHERE active
+		GROUP BY database
+		UNION ALL
+		SELECT concat('systemlog.', CAST(table AS String)) AS name, toUInt64(sum(bytes_on_disk)) AS bytes
 		FROM system.parts
 		WHERE active AND database = 'system'
+		GROUP BY table
 	`)
 	if err != nil {
 		return nil, err
