@@ -468,6 +468,11 @@ func (s *Store) MemoryDiagnostics(ctx context.Context) (map[string]uint64, error
 		FROM system.parts
 		WHERE active AND database = 'system'
 		GROUP BY table
+		UNION ALL
+		SELECT concat('table.', CAST(table AS String)) AS name, toUInt64(sum(bytes_on_disk)) AS bytes
+		FROM system.parts
+		WHERE active AND database = currentDatabase()
+		GROUP BY table
 	`)
 	if err != nil {
 		return nil, err
