@@ -17,17 +17,20 @@ type redisCache struct {
 // deliberately non-fatal: an empty or unparseable URL yields a disabled (no-op)
 // cache and logs a warning, so a cache misconfiguration can never take down the
 // API — the cache is best-effort by design.
-func New(rawURL string, logger *slog.Logger) Cache {
+// New returns the response cache. Redis when a URL is configured (shared across
+// replicas), otherwise an in-process cache of memoryBytes — NOT the noop, which
+// left every identical request recomputing against ClickHouse.
+func New(rawURL string, memoryBytes int64, logger *slog.Logger) Cache {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if rawURL == "" {
-		return Disabled()
+		return NewMemory(memoryBytes)
 	}
 	opts, err := redis.ParseURL(rawURL)
 	if err != nil {
-		logger.Warn("invalid NAGG_REDIS_URL; response cache disabled", "error", err)
-		return Disabled()
+		logger.Warn("invalid NAGG_REDIS_URL; falling back to the in-process cache", "error", err)
+		return NewMemory(memoryBytes)
 	}
 	return &redisCache{client: redis.NewClient(opts), logger: logger}
 }

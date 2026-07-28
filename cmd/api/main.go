@@ -284,7 +284,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		return nil, fmt.Errorf("graphql schema failed: %w", err)
 	}
 
-	responseCache := cache.New(cfg.Cache.URL, logger)
+	responseCache := cache.New(cfg.Cache.URL, cfg.Cache.MemoryBytes, logger)
 	if responseCache.Enabled() {
 		slog.Info("response cache enabled", "default_ttl", cfg.Cache.DefaultTTL, "stale_for", cfg.Cache.StaleFor)
 	}

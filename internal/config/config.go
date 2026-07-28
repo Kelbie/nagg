@@ -129,11 +129,15 @@ type APIConfig struct {
 	MaxConcurrentRequests int
 }
 
-// CacheConfig configures the optional shared Redis response cache. When URL is
-// empty the cache is disabled and every request is computed as before.
+// CacheConfig configures the response cache. URL selects a shared Redis (so
+// replicas share hits); with it empty the cache falls back to an in-process
+// cache of MemoryBytes rather than being disabled.
 type CacheConfig struct {
-	URL        string
-	DefaultTTL time.Duration
+	URL string
+	// MemoryBytes bounds the in-process cache. It is response bodies only, and
+	// it lives inside nagg's container memory limit, so keep it well under it.
+	MemoryBytes int64
+	DefaultTTL  time.Duration
 	// StaleFor is how long past a key's fresh TTL a cached response may still be
 	// served while it is revalidated in the background (stale-while-revalidate).
 	// A non-positive value disables stale serving, making every expiry a full
@@ -303,9 +307,10 @@ func Load() (Config, error) {
 			ModelVersion: env("NAGG_ENRICH_MODEL_VERSION", "local-skeleton-v1"),
 		},
 		Cache: CacheConfig{
-			URL:        strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
-			DefaultTTL: parseDuration(env("NAGG_CACHE_DEFAULT_TTL", "30s")),
-			StaleFor:   parseDuration(env("NAGG_CACHE_STALE_FOR", "5m")),
+			URL:         strings.TrimSpace(os.Getenv("NAGG_REDIS_URL")),
+			MemoryBytes: parseInt64(env("NAGG_CACHE_MEMORY_BYTES", "134217728")), // 128 MiB
+			DefaultTTL:  parseDuration(env("NAGG_CACHE_DEFAULT_TTL", "30s")),
+			StaleFor:    parseDuration(env("NAGG_CACHE_STALE_FOR", "5m")),
 		},
 		RunIngester: parseBool(env("NAGG_RUN_INGESTER", "true")),
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
