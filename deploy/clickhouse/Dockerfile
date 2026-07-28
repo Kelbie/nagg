@@ -9,3 +9,4 @@
 FROM clickhouse/clickhouse-server:26.6.1.1193
 
 COPY system-logs.xml /etc/clickhouse-server/config.d/system-logs.xml
+COPY merges.xml /etc/clickhouse-server/config.d/merges.xml

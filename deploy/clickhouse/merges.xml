@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<!--
+  Keep background merges out of the page cache.
+
+  Railway bills cgroup memory, which includes page cache. This instance's
+  ClickHouse process uses ~1.9-2.3 GB resident, yet the service bills 6-13 GB —
+  the difference is page cache, and with no memory pressure the kernel never
+  drops it. Capping the container to force eviction was tried twice (4 GB and
+  8 GB) and both times collapsed query latency under concurrency, so the cache
+  supply cannot be squeezed; the accumulation has to be prevented at the source.
+
+  The dominant source is the merge pipeline: ingest runs 24/7, and background
+  merges continuously rewrite parts, streaming GBs/day through the cache for
+  data no query will read that way. Direct I/O keeps merge reads and writes out
+  of the cache entirely. The default threshold only engages for merges over
+  10 GiB — on a ~26 GB database that is effectively never. 128 MiB makes it the
+  norm while leaving the smallest (hot, recent) merges cached.
+
+  Query reads are deliberately untouched: the feed windowing already bounds
+  what queries pull in, and their cache IS load-bearing (see the failed caps).
+
+  max_bytes_to_merge_at_max_space_in_pool bounds how big a single merge can
+  get (default 150 GB). The 12-13 GB memory spikes on the half-hour coincide
+  with large merges; 8 GiB caps the working set of any one merge without
+  meaningfully changing steady-state part counts at this data size.
+-->
+<clickhouse>
+    <merge_tree>
+        <min_merge_bytes_to_use_direct_io>134217728</min_merge_bytes_to_use_direct_io>
+        <max_bytes_to_merge_at_max_space_in_pool>8589934592</max_bytes_to_merge_at_max_space_in_pool>
+    </merge_tree>
+</clickhouse>
