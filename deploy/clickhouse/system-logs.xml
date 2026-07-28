@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  Bound ClickHouse's self-logging.
+
+  Measured 2026-07-28: the `system` database held 20.2 GB against 23 GB for all
+  real data — ~44% of the volume was ClickHouse logging about itself, because
+  stock config ships these tables with no effective TTL. text_log alone was
+  9.0 GB, and it is a duplicate of the server log already readable via
+  `railway logs`.
+
+  This must live in config, NOT in an ALTER TABLE migration. ALTER ... MODIFY
+  TTL changes the table structure, so the next restart renames the table to
+  `<name>_0` and creates a fresh untouched one — which is exactly how 20 GB got
+  orphaned once already. Declaring it here makes the TTL part of the schema
+  ClickHouse expects, so no mismatch and no rename.
+
+  Removed outright: pure-noise logs nothing here queries. Kept with a short TTL:
+  the ones you actually debug with — query_log for slow queries, part_log for
+  merge/mutation forensics on an instance with a history of mutations wedging.
+-->
+<clickhouse>
+    <text_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <query_views_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+
+    <query_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+    </part_log>
+    <trace_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </trace_log>
+    <metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </metric_log>
+    <asynchronous_metric_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </asynchronous_metric_log>
+</clickhouse>

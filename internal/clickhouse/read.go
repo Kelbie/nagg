@@ -1774,23 +1774,83 @@ func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, 
 		until = time.Now().Add(time.Second).Unix()
 	}
 
+	untilTime := time.Unix(until, 0).UTC()
+
+	// Walk outward in time windows instead of scanning all history.
+	//
+	// The table's ORDER BY is (kind, created_at, pubkey, id), so `created_at <
+	// until` with no lower bound is effectively unbounded: ClickHouse reads
+	// every kind-1/6/16 row ever stored and only then filters by pubkey, which
+	// is the THIRD key column and unusable as a prefix. Measured 2026-07-28
+	// that is ~1M rows and a ~25s first query, fast afterwards only because
+	// several GB sit in page cache — which is precisely why this instance bills
+	// ~6.8 GB of memory while the server process itself uses 1.9 GB.
+	//
+	// Adding a lower bound turns it into a tight (kind, created_at) range scan.
+	// A feed's first page is nearly always satisfied by recent history, so try
+	// a small window first and widen only when it comes up short. Deep history
+	// still works — the last step has no floor, so results are identical to the
+	// old query, just usually reached without touching the whole table.
+	//
+	// OFFSET is excluded from windowing: a short window would make the offset
+	// index into a different result set. Paged reads keep the exact old
+	// behaviour (offset is rare; `until` is the normal cursor).
+	windows := feedScanWindows
+	if offset > 0 {
+		windows = []time.Duration{0}
+	}
+
+	for i, window := range windows {
+		var since any
+		if window > 0 {
+			since = untilTime.Add(-window)
+		}
+		events, err := s.followsFeedWindow(ctx, pubkeys, untilTime, since, limit, offset)
+		if err != nil {
+			return nil, err
+		}
+		// Short of a full page means the window may have clipped older
+		// results — widen. The final window has no floor, so this terminates.
+		if uint64(len(events)) >= limit || i == len(windows)-1 {
+			return events, nil
+		}
+	}
+	return []EventView{}, nil
+}
+
+// feedScanWindows are the look-back windows FollowsFeed tries in order. The
+// last entry (0) means "no lower bound" so a sparse follow set still reaches
+// arbitrarily old posts.
+var feedScanWindows = []time.Duration{
+	7 * 24 * time.Hour,
+	90 * 24 * time.Hour,
+	0,
+}
+
+func (s *Store) followsFeedWindow(ctx context.Context, pubkeys []string, until time.Time, since any, limit, offset uint64) ([]EventView, error) {
 	// Dedup with LIMIT 1 BY id instead of FINAL: for a ReplacingMergeTree keyed by
 	// (kind, created_at, pubkey, id), two rows sharing an id necessarily share the
 	// whole sort key (the id is a hash of those fields), so "latest row per id"
 	// (max last_seen_at) is identical to FINAL's result — without forcing a
-	// read-and-merge of every part. Bounded by the follow set + created_at window.
+	// read-and-merge of every part.
+	sinceClause := ""
+	args := []any{pubkeys, until}
+	if since != nil {
+		sinceClause = " AND e.created_at >= ?"
+		args = append(args, since)
+	}
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
 		FROM (
 			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
 			FROM nostr_events AS e
-			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?
+			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?%s
 			ORDER BY e.id ASC, e.last_seen_at DESC
 			LIMIT 1 BY e.id
 		)
 		ORDER BY created_at DESC, id DESC
 		LIMIT %d OFFSET %d
-	`, limit, offset), pubkeys, time.Unix(until, 0).UTC())
+	`, sinceClause, limit, offset), args...)
 	if err != nil {
 		return nil, err
 	}

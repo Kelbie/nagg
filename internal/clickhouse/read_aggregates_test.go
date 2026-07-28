@@ -139,3 +139,22 @@ func TestSyncCandidatesReadMatchesDeclaredColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestFeedScanWindowsTerminate guards the invariant that makes FollowsFeed's
+// window walk safe: windows must widen, and the last one must be unbounded (0).
+// If the final window ever gained a floor, deep pagination would silently stop
+// returning old posts instead of falling back to a full scan.
+func TestFeedScanWindowsTerminate(t *testing.T) {
+	if len(feedScanWindows) == 0 {
+		t.Fatal("feedScanWindows must not be empty")
+	}
+	last := len(feedScanWindows) - 1
+	if feedScanWindows[last] != 0 {
+		t.Fatalf("final window = %v, want 0 (unbounded)", feedScanWindows[last])
+	}
+	for i := 1; i < last; i++ {
+		if feedScanWindows[i] <= feedScanWindows[i-1] {
+			t.Fatalf("window %d (%v) does not widen on %v", i, feedScanWindows[i], feedScanWindows[i-1])
+		}
+	}
+}
