@@ -97,15 +97,19 @@ func (s *Syncer) RunOnce(ctx context.Context) (int, int, error) {
 			s.logger.Warn("vertex profile sync refresh failed", "pubkey", pubkey, "error", err)
 			continue
 		}
-		if profile.Score != nil {
-			scoreAvailable++
-		}
 		if err := s.store.SaveVertexProfile(ctx, profile); err != nil {
 			failed++
 			s.logger.Warn("vertex profile sync save failed", "pubkey", pubkey, "error", err)
 			continue
 		}
 		refreshed++
+		// Counted only after the save succeeds, so it stays a subset of
+		// `refreshed`. Counting it on fetch meant a batch with save failures
+		// reported more scores than refreshes — observed live as
+		// score_unavailable=-103 and a ratio of 2.06.
+		if profile.Score != nil {
+			scoreAvailable++
+		}
 	}
 	s.logger.Info(
 		"vertex score sync batch metrics",
