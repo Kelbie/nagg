@@ -124,7 +124,7 @@ func (s fakeStore) RankedRefSources(context.Context, string, string, int, int) (
 	return nil, nil
 }
 
-func (s fakeStore) AuthoredRefChain(context.Context, string, string, int) ([]string, error) {
+func (s fakeStore) AuthoredRefSources(context.Context, string, string, int) ([]string, error) {
 	return nil, nil
 }
 

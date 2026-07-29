@@ -46,6 +46,7 @@ var Names = []string{
 	"graphql.ownProfiles",
 	"appview.dmEnvelopes",
 	"appview.relayHydration",
+	"appview.thread.total",
 	"appview.v2",
 }
 

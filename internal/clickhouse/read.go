@@ -732,6 +732,41 @@ func (s *Store) AuthoredRefChain(ctx context.Context, rootID, author string, max
 	return chain, nil
 }
 
+// AuthoredRefSources returns ALL direct replies to parentID authored by
+// `author`, oldest first — the complete authored direct-reply set under one
+// target (earliestAuthoredChild without the LIMIT 1). One indexed
+// (target_id, source_pubkey) range read; GROUP BY collapses ReplacingMergeTree
+// duplicates, matching the existing convention.
+func (s *Store) AuthoredRefSources(ctx context.Context, parentID, author string, limit int) ([]string, error) {
+	if len(parentID) != 64 || len(author) != 64 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.conn.Query(ctx, `
+		SELECT source_id
+		FROM ref_edges
+		WHERE target_id = ? AND source_pubkey = ?
+		GROUP BY source_id
+		ORDER BY min(created_at) ASC, source_id ASC
+		LIMIT ?
+	`, parentID, author, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // earliestAuthoredChild returns the earliest direct reply to parentID authored by
 // `author` (matching bestAuthoredDirectChild's selection), or "" when none.
 func (s *Store) earliestAuthoredChild(ctx context.Context, parentID, author string) (string, error) {
@@ -1904,7 +1939,21 @@ func (s *Store) DescendantEvents(ctx context.Context, id string, limit int) (*Ev
 			events = append(events, event)
 		}
 	}
+	// Deterministic order: map iteration is random per call, and the thread
+	// endpoint's default sort and tail-append render this slice directly.
+	sortEventsByRecency(events)
 	return root, events, nil
+}
+
+// sortEventsByRecency orders events created_at DESC with an id DESC tiebreak —
+// the same total order the client's synthesized recency manifests use.
+func sortEventsByRecency(events []EventView) {
+	sort.Slice(events, func(i, j int) bool {
+		if !events[i].CreatedAt.Equal(events[j].CreatedAt) {
+			return events[i].CreatedAt.After(events[j].CreatedAt)
+		}
+		return events[i].ID > events[j].ID
+	})
 }
 
 func (s *Store) EventByID(ctx context.Context, id string) (*EventView, error) {

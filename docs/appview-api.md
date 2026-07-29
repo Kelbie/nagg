@@ -85,7 +85,7 @@ Pubkey-keyed (profile-family routes):
 | GET,POST | `/nostr/notifications` | yes | envelope + `entries` + `hasNext` (§4) |
 | GET | `/nostr/notifications/seen` | no | envelope holding the viewer's kind-30078 read-marker event; client parses `seenUntil` from its content |
 | POST | `/nostr/events/aggregates` | no | envelope, aggregates only (`order`/`events` empty). Body `{"ids": ["<id>", …]}`, ≤ 100. **Replaces `/nostr/notes/stats`.** |
-| GET | `/nostr/thread` | yes | envelope; `order[0]` is the root id, the rest is the server-ranked reply order |
+| GET | `/nostr/thread` | yes | envelope + `total` (§4); `order[0]` is the root id on every page, the rest is the server-ranked reply order |
 | GET | `/nostr/follows` | no | envelope; pubkey-keyed aggregates |
 | GET | `/nostr/events` | no | envelope; `order` = requested ids that resolved |
 | POST | `/nostr/events/query` | yes | envelope (bare when the queried kinds include 1059 — §5) |
@@ -107,7 +107,12 @@ Pubkey-keyed (profile-family routes):
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
 Thread `sort` accepts `new` (default), `ranked`, `relevant` — `ranked` orders
-by the declared `k7_e.actors` aggregation.
+by the declared `k7_e.actors` aggregation. `relevant` is the product default:
+ALL of the root author's direct replies lead the order (chronological), then
+one followed reply to the root (viewer-scoped), then ranked direct replies,
+then the remaining fetched descendants. Explicit sorts are literal — no OP pin
+on `new`/`ranked`. Every sort is deterministic and honors `offset`/`replyLimit`
+(`replyLimit=0` = everything from `offset`).
 
 ## 4. Route extensions
 
@@ -134,6 +139,28 @@ quote; `e` tag whose target is your event → reply; otherwise mention).
 Entries without `total` are singles; grouped entries collapse many
 same-kind/same-target events (grouping semantics and the conservative
 `hasNext` hint are unchanged — see `docs/notifications-flow.md`).
+
+**Thread** — envelope plus the pre-paging ordered-reply count (capability
+`appview.thread.total`):
+
+```jsonc
+{
+  "order": ["<rootId>", "<reply1>", "…"],  // root leads on EVERY page
+  "orderBy": "rank",
+  "events": [ /* the full fetched descendant set + hydration, on every page */ ],
+  "aggregates": { "…": {} },
+  "total": 130,      // ordered replies after dedupe/availability filter,
+                     // BEFORE offset/replyLimit slicing; excludes the root
+  "cursor": "0|72"   // "<until>|<offset>" (until pinned to 0); present iff
+                     // offset + (len(order) - 1) < total — echo the offset
+                     // back as ?offset= for the next page
+}
+```
+
+`hasMore` truth is `cursor != null`. Clients must not derive it from event
+counts or from the `k1_1111_e_reply` aggregate: the aggregate counts direct
+replies from never-pruned `ref_edges`, while `events` carries all fetched
+descendants — the two legitimately disagree.
 
 **Follow-status** — envelope plus directional reference edges (no verb labels;
 mutual = `out && in`):

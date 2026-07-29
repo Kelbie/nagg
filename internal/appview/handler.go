@@ -42,7 +42,7 @@ type Store interface {
 	BatchPubkeyStats(context.Context, []string) (map[string]chstore.PubkeyStats, error)
 	FollowEdges(context.Context, string, []string) (map[string]chstore.FollowEdge, error)
 	RankedRefSources(context.Context, string, string, int, int) ([]string, error)
-	AuthoredRefChain(context.Context, string, string, int) ([]string, error)
+	AuthoredRefSources(context.Context, string, string, int) ([]string, error)
 	FollowedRefs(context.Context, string, []string) (map[string]string, error)
 	SearchK0(context.Context, string, uint64) ([]chstore.ProfileSearchRow, error)
 }
@@ -1153,13 +1153,17 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		h.touchViewer(viewer)
 	}
 	replies := eventsJSON(events)
-	ordering := h.threadOrdering(r.Context(), threadOrderParams{
+	offset := intParam(r, "offset", 0)
+	if offset < 0 {
+		offset = 0
+	}
+	ordering, total := h.threadOrdering(r.Context(), threadOrderParams{
 		rootID:         id,
 		author:         root.PubKey,
 		replies:        replies,
 		sort:           strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sort"))),
 		viewer:         queryViewerParam(r),
-		offset:         intParam(r, "offset", 0),
+		offset:         offset,
 		replyLimit:     intParam(r, "replyLimit", 0),
 		candidateLimit: intParam(r, "candidateLimit", 0),
 		rankedLimit:    intParam(r, "rankedLimit", 0),
@@ -1174,7 +1178,20 @@ func (h *Handler) thread(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, envelope)
+	if offset+len(ordering.Elements) < total {
+		next := fmt.Sprintf("0|%d", offset+len(ordering.Elements))
+		envelope.Cursor = &next
+	}
+	writeJSON(w, ThreadEnvelope{Envelope: envelope, Total: total})
+}
+
+// ThreadEnvelope extends the envelope with the pre-paging ordered-reply count,
+// so clients compute hasMore from the server's truth instead of guessing from
+// candidate-limit saturation or never-pruned reply aggregates. Cursor reuses
+// the feed "<until>|<offset>" shape with until pinned to 0.
+type ThreadEnvelope struct {
+	Envelope
+	Total int `json:"total"`
 }
 
 // threadOrderParams carries the inputs that decide a thread's reply render order.
@@ -1197,22 +1214,19 @@ const (
 	threadRankedSort        = "k7_e.actors"
 	threadCandidateDefault  = 200
 	threadRankedTierDefault = 50
-	threadAuthorChainDepth  = 8
+	threadAuthorReplyLimit  = 100
 )
 
-// threadOrdering builds the server-authoritative reply manifest. The default
-// ("" / "new") order is the chronological/rank descendant order DescendantEvents
-// already returned — unchanged, backward-compatible. "ranked" orders direct
-// replies by engagement; "relevant" reproduces the viewer-specific merge the
-// client used to assemble from nested GraphQL resolvers (author self-reply chain
-// → one followed-tail reply → ranked direct replies → the rest), all from
-// precomputed store primitives. Any id without fetched event data is dropped and
-// remaining available replies are appended so the page is always complete.
-func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) OrderingManifest {
-	if p.sort != "relevant" && p.sort != "ranked" {
-		return eventsOrdering(p.replies, orderByRank)
-	}
-
+// threadOrdering builds the server-authoritative reply manifest plus the total
+// ordered-reply count before paging. The default ("" / "new") order is the
+// deterministic recency order DescendantEvents returned. "ranked" orders direct
+// replies by engagement. "relevant" is the product default: ALL of the root
+// author's direct replies first (chronological), then one followed-tail reply,
+// then ranked direct replies, then the rest — explicit sorts stay literal, the
+// OP pin applies only to "relevant". Any id without fetched event data is
+// dropped and remaining available replies are appended so the flat list stays
+// complete; every sort then pages through pageElements.
+func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) (OrderingManifest, int) {
 	var ordered []string
 	var err error
 	switch p.sort {
@@ -1222,8 +1236,8 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) Order
 		ordered, err = h.store.RankedRefSources(ctx, p.rootID, threadRankedSort, candidateLimitOr(p.candidateLimit), 0)
 	}
 	if err != nil {
-		slog.Warn("appview.thread.order failed; using rank fallback", "sort", p.sort, "root", p.rootID, "error", err)
-		return eventsOrdering(p.replies, orderByRank)
+		slog.Warn("appview.thread.order failed; using recency fallback", "sort", p.sort, "root", p.rootID, "error", err)
+		ordered = nil
 	}
 
 	available := make(map[string]struct{}, len(p.replies))
@@ -1253,12 +1267,15 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) Order
 	for _, e := range p.replies {
 		add(e.ID)
 	}
+	total := len(elements)
 	elements = pageElements(elements, p.offset, p.replyLimit)
-	slog.Info("appview.thread.relevant.merge", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "elements", len(elements))
-	return OrderingManifest{OrderBy: orderByRank, Elements: elements}
+	slog.Info("appview.thread.order", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "total", total, "elements", len(elements))
+	return OrderingManifest{OrderBy: orderByRank, Elements: elements}, total
 }
 
-// relevantReplyOrder reproduces the client's mergeRelevantReplyNodes ordering
+// relevantReplyOrder is the product-default reply merge (OP direct replies →
+// followed-tail → ranked → recency), evolved from the client's old
+// mergeRelevantReplyNodes ordering
 // server-side using only precomputed store primitives.
 func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) ([]string, error) {
 	candidateLimit := candidateLimitOr(p.candidateLimit)
@@ -1268,24 +1285,21 @@ func (h *Handler) relevantReplyOrder(ctx context.Context, p threadOrderParams) (
 	}
 	merged := make([]string, 0, candidateLimit)
 
-	// 1. The author's self-reply chain from the root.
-	authorChain, err := h.store.AuthoredRefChain(ctx, p.rootID, p.author, threadAuthorChainDepth)
+	// 1. ALL of the author's direct replies to the root, oldest first — the
+	// OP's own replies are the thread's continuation and lead the list.
+	authored, err := h.store.AuthoredRefSources(ctx, p.rootID, p.author, threadAuthorReplyLimit)
 	if err != nil {
 		return nil, err
 	}
-	merged = append(merged, authorChain...)
+	merged = append(merged, authored...)
 
-	// 2. One best reply by someone the viewer follows, to the chain's tail.
+	// 2. One best reply by someone the viewer follows, to the root.
 	if p.viewer != "" {
-		tail := p.rootID
-		if len(authorChain) > 0 {
-			tail = authorChain[len(authorChain)-1]
-		}
-		followed, err := h.store.FollowedRefs(ctx, p.viewer, []string{tail})
+		followed, err := h.store.FollowedRefs(ctx, p.viewer, []string{p.rootID})
 		if err != nil {
 			return nil, err
 		}
-		if id := followed[tail]; id != "" {
+		if id := followed[p.rootID]; id != "" {
 			merged = append(merged, id)
 		}
 	}
