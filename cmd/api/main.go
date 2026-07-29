@@ -448,6 +448,12 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 		return
 	} else if result.Skipped {
 		slog.Warn("in-process ingester event kind retention skipped: no configured NAGG_KINDS")
+	} else if result.BelowFloor {
+		slog.Info(
+			"clickhouse kind prune deferred: stray rows below mutation floor",
+			"events", result.RemovedEvents,
+			"kinds", result.RemovedCounts,
+		)
 	} else if result.RemovedEvents > 0 {
 		slog.Info(
 			"clickhouse pruned removed event kinds",

@@ -15,7 +15,19 @@ type EventKindPruneResult struct {
 	RemovedEvents   uint64
 	RebuiltAppView  bool
 	Skipped         bool
+	// BelowFloor reports that stray rows were found but too few to justify
+	// the mutations (see kindPruneMutationFloor); nothing was deleted.
+	BelowFloor bool
 }
+
+// kindPruneMutationFloor is the minimum number of stray-kind rows before the
+// prune issues its DELETE mutations. The mutations cannot granule-prune on a
+// `kind NOT IN` predicate, so each boot-time prune rewrites every part of six
+// tables (~50 GiB of I/O measured live) no matter how few rows match — at one
+// point a SINGLE stray kind-1111 event was paying that price on every deploy.
+// Below the floor the strays are harmless dead weight; they accumulate until
+// a prune is actually worth its rewrite.
+const kindPruneMutationFloor = 1000
 
 func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []int) (EventKindPruneResult, error) {
 	kinds := sortedEventKinds(configuredKinds)
@@ -36,6 +48,10 @@ func (s *Store) PruneRemovedEventKinds(ctx context.Context, configuredKinds []in
 	result.RemovedCounts = removed
 	result.RemovedEvents = total
 	if total == 0 {
+		return result, nil
+	}
+	if total < kindPruneMutationFloor {
+		result.BelowFloor = true
 		return result, nil
 	}
 
