@@ -474,6 +474,10 @@ func NewSchema(store Store, opts ...Option) (graphql.Schema, error) {
 				Type:        pubkeyScoreFilterInputType,
 				Description: "When set, only events authored by pubkeys with a matching cached score row are included.",
 			},
+			"maxContentLength": &graphql.InputObjectFieldConfig{
+				Type:        graphql.Int,
+				Description: "When set (>0), excludes text events (kinds 1/1111) whose content exceeds this many UTF-8 code points. Non-text kinds pass untouched.",
+			},
 		},
 	})
 
@@ -3027,6 +3031,9 @@ func parseEventQueryInput(raw map[string]any) (chstore.EventQueryInput, error) {
 		Offset:         uint64(intValue(raw["offset"], 0)),
 		Shuffle:        chstoreShuffleInput(raw["shuffle"]),
 		PubkeyScore:    pubkeyScoreFilterFromRaw(raw["pubkeyScore"]),
+	}
+	if max := intValue(raw["maxContentLength"], 0); max > 0 {
+		input.MaxContentLength = uint64(max)
 	}
 	if input.Search != "" && len(input.Search) < 3 {
 		return input, fmt.Errorf("events search must be at least 3 characters")

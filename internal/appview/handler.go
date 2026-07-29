@@ -27,7 +27,7 @@ import (
 )
 
 type Store interface {
-	FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error)
+	FollowsFeed(context.Context, []string, int64, uint64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
 	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
 	LatestK3Refs(context.Context, []string) (map[string]map[string]struct{}, error)
@@ -490,11 +490,12 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Spec       string `json:"spec"`
-		Limit      uint64 `json:"limit"`
-		Until      int64  `json:"until"`
-		Offset     uint64 `json:"offset"`
-		UserPubKey string `json:"user_pubkey"`
+		Spec             string `json:"spec"`
+		Limit            uint64 `json:"limit"`
+		Until            int64  `json:"until"`
+		Offset           uint64 `json:"offset"`
+		UserPubKey       string `json:"user_pubkey"`
+		MaxContentLength uint64 `json:"maxContentLength"`
 	}
 	if r.Method == http.MethodPost {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -505,6 +506,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 		req.Limit = uint64(intParam(r, "limit", 30))
 		req.Until = int64(intParam(r, "until", 0))
 		req.Offset = uint64(intParam(r, "offset", 0))
+		req.MaxContentLength = uint64(intParam(r, "maxContentLength", 0))
 	}
 
 	authors := h.authorsFromFeedRequest(r.Context(), req.Spec, req.UserPubKey, r)
@@ -514,7 +516,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	}
 	var events []chstore.EventView
 	err := recordPhase(r.Context(), "db", func() (e error) {
-		events, e = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+		events, e = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset, req.MaxContentLength)
 		return
 	})
 	if err != nil {
@@ -523,7 +525,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.shouldBackfillAuthoredFeed(events, authors, req.Until, req.Limit, req.Offset) {
 		if h.tryBackfillUserFeeds(r.Context(), takeStrings(authors, 10), req.Limit) {
-			events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset)
+			events, err = h.store.FollowsFeed(r.Context(), authors, req.Until, req.Limit, req.Offset, req.MaxContentLength)
 			if err != nil {
 				writeError(w, err)
 				return
@@ -614,7 +616,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 	offset := uint64(offsetParam)
 	var events []chstore.EventView
 	err = recordPhase(r.Context(), "db", func() (e error) {
-		events, e = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
+		events, e = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset, 0)
 		return
 	})
 	if err != nil {
@@ -626,7 +628,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 		slog.Info("profile.feed.cold", "pubkey", pubkey, "count", coldCount, "limit", limit)
 		backfillStart := time.Now()
 		if h.tryBackfillUserFeed(r.Context(), pubkey, limit) {
-			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset)
+			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset, 0)
 			if err != nil {
 				writeError(w, err)
 				return

@@ -106,6 +106,13 @@ Pubkey-keyed (profile-family routes):
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
+Feed routes additionally accept `maxContentLength` (GET param or body field on
+`/nostr/feed`; `target.maxContentLength` inside the `/nostr/feed/ranked` input,
+capability `graphql.events.maxContentLength`): when >0, text events (kinds
+1/1111) whose content exceeds that many UTF-8 code points are excluded
+server-side, so the page stays full of skimmable posts. Non-text kinds pass
+untouched (a kind-6/16 repost's content is the reposted event's JSON —
+NIP-18). `/nostr/feed/user` (an author's own page) never applies it.
 Thread `sort` accepts `new` (default), `ranked`, `relevant` — `ranked` orders
 by the declared `k7_e.actors` aggregation. `relevant` is the product default:
 ALL of the root author's direct replies lead the order (chronological), then

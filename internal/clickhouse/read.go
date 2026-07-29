@@ -47,7 +47,12 @@ type EventQueryInput struct {
 	Offset         uint64
 	Shuffle        ShuffleInput
 	PubkeyScore    PubkeyScoreFilter
-	Empty          bool
+	// MaxContentLength (>0) excludes TEXT events (kinds 1/1111) whose content
+	// exceeds this many UTF-8 code points. Other kinds pass untouched — a
+	// kind-6/16 repost's content is the stringified reposted event (NIP-18),
+	// so a raw length test on it is meaningless.
+	MaxContentLength uint64
+	Empty            bool
 }
 
 type ShuffleInput struct {
@@ -1794,10 +1799,10 @@ func (s *Store) SearchK0(ctx context.Context, query string, limit uint64) ([]Pro
 }
 
 func (s *Store) FeedByPubKeys(ctx context.Context, pubkeys []string, until int64, limit, offset uint64) ([]EventView, error) {
-	return s.FollowsFeed(ctx, pubkeys, until, limit, offset)
+	return s.FollowsFeed(ctx, pubkeys, until, limit, offset, 0)
 }
 
-func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, limit, offset uint64) ([]EventView, error) {
+func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, limit, offset, maxContentLength uint64) ([]EventView, error) {
 	pubkeys = uniqueStrings(pubkeys)
 	if len(pubkeys) == 0 {
 		return []EventView{}, nil
@@ -1840,7 +1845,7 @@ func (s *Store) FollowsFeed(ctx context.Context, pubkeys []string, until int64, 
 		if window > 0 {
 			since = untilTime.Add(-window)
 		}
-		events, err := s.followsFeedWindow(ctx, pubkeys, untilTime, since, limit, offset)
+		events, err := s.followsFeedWindow(ctx, pubkeys, untilTime, since, limit, offset, maxContentLength)
 		if err != nil {
 			return nil, err
 		}
@@ -1862,7 +1867,7 @@ var feedScanWindows = []time.Duration{
 	0,
 }
 
-func (s *Store) followsFeedWindow(ctx context.Context, pubkeys []string, until time.Time, since any, limit, offset uint64) ([]EventView, error) {
+func (s *Store) followsFeedWindow(ctx context.Context, pubkeys []string, until time.Time, since any, limit, offset, maxContentLength uint64) ([]EventView, error) {
 	// Dedup with LIMIT 1 BY id instead of FINAL: for a ReplacingMergeTree keyed by
 	// (kind, created_at, pubkey, id), two rows sharing an id necessarily share the
 	// whole sort key (the id is a hash of those fields), so "latest row per id"
@@ -1874,18 +1879,23 @@ func (s *Store) followsFeedWindow(ctx context.Context, pubkeys []string, until t
 		sinceClause = " AND e.created_at >= ?"
 		args = append(args, since)
 	}
+	lengthClause := ""
+	if clause, lengthArgs := maxContentLengthWhere("e", maxContentLength); clause != "" {
+		lengthClause = " AND " + clause
+		args = append(args, lengthArgs...)
+	}
 	rows, err := s.conn.Query(ctx, fmt.Sprintf(`
 		SELECT id, pubkey, kind, created_at, content, tags_json, sig, last_seen_at
 		FROM (
 			SELECT e.id, e.pubkey, e.kind, e.created_at, e.content, e.tags_json, e.sig, e.last_seen_at
 			FROM nostr_events AS e
-			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?%s
+			WHERE e.pubkey IN (?) AND e.kind IN (1, 6, 16) AND e.created_at < ?%s%s
 			ORDER BY e.id ASC, e.last_seen_at DESC
 			LIMIT 1 BY e.id
 		)
 		ORDER BY created_at DESC, id DESC
 		LIMIT %d OFFSET %d
-	`, sinceClause, limit, offset), args...)
+	`, sinceClause, lengthClause, limit, offset), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2873,7 +2883,21 @@ func eventWhereInput(alias string, input EventQueryInput) (string, []any) {
 		where += " AND " + clause
 		args = append(args, scoreArgs...)
 	}
+	if clause, lengthArgs := maxContentLengthWhere(alias, input.MaxContentLength); clause != "" {
+		where += " AND " + clause
+		args = append(args, lengthArgs...)
+	}
 	return where, args
+}
+
+// maxContentLengthWhere caps TEXT-note content length (UTF-8 code points).
+// Kinds other than 1/1111 pass: a kind-6/16 repost's content is the reposted
+// event's JSON (NIP-18), not prose.
+func maxContentLengthWhere(alias string, max uint64) (string, []any) {
+	if max == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("(%s.kind NOT IN (1, 1111) OR lengthUTF8(%s.content) <= ?)", alias, alias), []any{max}
 }
 
 func pubkeyScoreWhere(alias string, filter PubkeyScoreFilter) (string, []any) {

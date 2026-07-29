@@ -33,7 +33,7 @@ func (s fakeStore) SearchK0(context.Context, string, uint64) ([]chstore.ProfileS
 	return s.profileSearch, nil
 }
 
-func (s fakeStore) FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error) {
+func (s fakeStore) FollowsFeed(context.Context, []string, int64, uint64, uint64, uint64) ([]chstore.EventView, error) {
 	return nil, nil
 }
 
@@ -167,7 +167,7 @@ type sequencedFeedStore struct {
 	authors [][]string
 }
 
-func (s *sequencedFeedStore) FollowsFeed(_ context.Context, authors []string, _ int64, _ uint64, _ uint64) ([]chstore.EventView, error) {
+func (s *sequencedFeedStore) FollowsFeed(_ context.Context, authors []string, _ int64, _ uint64, _ uint64, _ uint64) ([]chstore.EventView, error) {
 	s.authors = append(s.authors, append([]string(nil), authors...))
 	if len(s.feeds) == 0 {
 		s.calls++
@@ -235,7 +235,7 @@ type appViewHydrationStore struct {
 	noteStatIDs []string
 }
 
-func (s *appViewHydrationStore) FollowsFeed(context.Context, []string, int64, uint64, uint64) ([]chstore.EventView, error) {
+func (s *appViewHydrationStore) FollowsFeed(context.Context, []string, int64, uint64, uint64, uint64) ([]chstore.EventView, error) {
 	return s.feed, nil
 }
 

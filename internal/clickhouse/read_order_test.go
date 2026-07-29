@@ -28,3 +28,19 @@ func TestSortEventsByRecencyIsDeterministic(t *testing.T) {
 		t.Fatalf("order = %v, want %s", got, want)
 	}
 }
+
+// The max-content-length filter caps TEXT kinds only: a kind-6/16 repost's
+// content is the reposted event's JSON (NIP-18), so a raw length test on it
+// would delete every repost from the feed.
+func TestMaxContentLengthWhereScopesToTextKinds(t *testing.T) {
+	clause, args := maxContentLengthWhere("e", 280)
+	if clause != "(e.kind NOT IN (1, 1111) OR lengthUTF8(e.content) <= ?)" {
+		t.Fatalf("clause = %q", clause)
+	}
+	if len(args) != 1 || args[0].(uint64) != 280 {
+		t.Fatalf("args = %v, want [280]", args)
+	}
+	if clause, args := maxContentLengthWhere("e", 0); clause != "" || args != nil {
+		t.Fatalf("zero max must be a no-op, got %q %v", clause, args)
+	}
+}
