@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	ch "github.com/ClickHouse/clickhouse-go/v2"
+
 	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
@@ -1012,12 +1014,17 @@ const recentAuthorsBySyncGateQuery = `
 		SELECT recent.pubkey
 		FROM
 		(
+			-- No FINAL: max(created_at) per pubkey is insensitive to
+			-- ReplacingMergeTree duplicates (replaced versions share id and
+			-- created_at), and lightweight-deleted rows are masked on every
+			-- SELECT without it. FINAL forced a full merge-sorted read of 30
+			-- days of events — measured live at ~2 GiB per syncer pass.
+			-- No byte-size filter on the author column either: it is
+			-- FixedString(64), so the check is a tautology — and ClickHouse
+			-- 26.6 returns ZERO rows for FINAL combined with such filters
+			-- (observed live: it silently emptied the sync candidate set).
 			SELECT pubkey, max(created_at) AS last_event_at
-			FROM nostr_events FINAL
-			-- No byte-size filter on the author column: it is FixedString(64),
-			-- so the check is a tautology — and ClickHouse 26.6 returns ZERO
-			-- rows for FINAL combined with such filters (observed live: it
-			-- silently emptied the sync candidate set).
+			FROM nostr_events
 			WHERE created_at >= now() - INTERVAL 30 DAY
 			GROUP BY pubkey
 		) AS recent
@@ -1035,8 +1042,10 @@ const recentAuthorsBySyncGateQuery = `
 		) AS follower_counts ON follower_counts.pubkey = recent.pubkey
 		LEFT JOIN
 		(
+			-- No FINAL: max(fetched_at) per pubkey already resolves the
+			-- ReplacingMergeTree versions this table keys on.
 			SELECT pubkey, max(fetched_at) AS fetched_at
-			FROM vertex_scores FINAL
+			FROM vertex_scores
 			WHERE source = 'vertex'
 			GROUP BY pubkey
 		) AS scores ON scores.pubkey = recent.pubkey
@@ -1145,6 +1154,23 @@ func (s *Store) CachedVertexProfiles(ctx context.Context, pubkeys []string) (map
 	return out, rows.Err()
 }
 
+// vertexSaveCtx makes the syncer's per-pubkey cache INSERTs server-batched.
+// Each sync pass fires hundreds of single-row INSERTs into
+// vertex_profile_cache / vertex_scores; as plain inserts every one became its
+// own part — measured live at ~118k new parts and ~115k merges per day across
+// the two tables, a constant small-merge churn through the page cache Railway
+// bills as memory. async_insert buffers them server-side into one part per
+// flush window. wait_for_async_insert=0 keeps the sequential syncer loop from
+// stalling a flush-window per row; a lost buffer on a crash only costs cache
+// rows the next pass re-fetches.
+func vertexSaveCtx(ctx context.Context) context.Context {
+	return ch.Context(ctx, ch.WithSettings(ch.Settings{
+		"async_insert":                 1,
+		"wait_for_async_insert":        0,
+		"async_insert_busy_timeout_ms": 15000,
+	}))
+}
+
 func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileResult) error {
 	pubkey, ok := vertex.NormalizePubkey(profile.PubKey)
 	if !ok {
@@ -1159,7 +1185,7 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 		return err
 	}
 	fetchedAt := time.Now().UTC()
-	if err := s.conn.Exec(ctx, `
+	if err := s.conn.Exec(vertexSaveCtx(ctx), `
 		INSERT INTO vertex_profile_cache (pubkey, fetched_at, payload)
 		VALUES (?, ?, ?)
 	`, pubkey, fetchedAt, string(payload)); err != nil {
@@ -1176,7 +1202,7 @@ func (s *Store) SaveVertexProfile(ctx context.Context, profile vertex.ProfileRes
 	if profile.Nodes != nil && *profile.Nodes > 0 {
 		nodes = uint64(*profile.Nodes)
 	}
-	return s.conn.Exec(ctx, `
+	return s.conn.Exec(vertexSaveCtx(ctx), `
 		INSERT INTO vertex_scores (source, pubkey, score, rank, followers, nodes, fetched_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`, vertex.PluginName, pubkey, *profile.Score, profile.Rank, followers, nodes, fetchedAt)
