@@ -37,6 +37,11 @@ type Config struct {
 	// through this firehose pipeline. Demand-driven fetches are definitionally
 	// relevant.
 	Caps []rules.Cap
+	// AddresseeGates are the declarative recipient-relevance rules
+	// (rules.AddresseeGate): events of their kinds ingest only when a p tag
+	// addresses the exemption universe. On-demand backfills bypass this the
+	// same way they bypass the caps.
+	AddresseeGates []rules.AddresseeGate
 }
 
 type Store interface {
@@ -49,9 +54,11 @@ type Pipeline struct {
 	batch []clickhouse.EventRecord
 
 	// cap state lives on the single batching goroutine (add/Flush), so it needs
-	// no locking. exempt nil = no exemption source = cap everyone.
+	// no locking. exempt nil = no exemption source = cap everyone (but
+	// addressee-gate NOBODY — see unaddressed).
 	exempt func(pubkey string) bool
 	caps   []*capCounter
+	gates  []*gateCounter
 	// capNow is a test seam; nil means time.Now.
 	capNow func() time.Time
 
@@ -78,6 +85,7 @@ func New(store Store, cfg Config, opts ...Option) *Pipeline {
 		cfg:   cfg,
 		batch: make([]clickhouse.EventRecord, 0, cfg.BatchSize),
 		caps:  newCapCounters(cfg.Caps),
+		gates: newGateCounters(cfg.AddresseeGates),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -231,6 +239,16 @@ func (p *Pipeline) Flush(ctx context.Context) error {
 		)
 		c.droppedSinceLog = 0
 	}
+	for _, g := range p.gates {
+		if g.droppedSinceLog == 0 {
+			continue
+		}
+		slog.Info("ingest.unaddressed",
+			"rule", g.rule.Name,
+			"dropped_events", g.droppedSinceLog,
+		)
+		g.droppedSinceLog = 0
+	}
 	return nil
 }
 
@@ -247,6 +265,9 @@ func (p *Pipeline) add(relayEvent firehose.RelayEvent) error {
 	}
 	if p.overCap(event) {
 		return errCapped
+	}
+	if p.unaddressed(event) {
+		return errUnaddressed
 	}
 
 	p.batch = append(p.batch, clickhouse.EventRecord{

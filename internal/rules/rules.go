@@ -165,6 +165,20 @@ type Cap struct {
 	ExemptKnownViewers bool
 }
 
+// AddresseeGate declares that events of Kinds are ingested from the firehose
+// only when at least one p tag addresses the ingest-exemption universe (known
+// Sovran viewers + everyone they follow — internal/relevance). The canonical
+// case is NIP-59 gift wraps: they are readable ONLY by their p-tagged
+// recipient, so a wrap addressed to a pubkey this app-view will never serve
+// is pure dead weight (measured 2026-07: 99% of 2.5M stored wraps). The
+// on-demand DM backfill fetches a new viewer's history by #p from relays, so
+// gating the firehose loses nothing. With no exemption source configured the
+// gate FAILS OPEN (everything ingests), mirroring Cap.
+type AddresseeGate struct {
+	Name  string
+	Kinds []int
+}
+
 // Backfill declares that events of Kinds are pulled from relay history
 // systematically instead of only observed live. A live subscription only ever
 // sees NEW publications, so long-lived, rarely-republished kinds
@@ -187,11 +201,12 @@ type Backfill struct {
 // Registry holds the full declared rule set. Construct with New, which
 // validates cross-references and uniqueness.
 type Registry struct {
-	relationships []Relationship
-	projections   []Projection
-	lifetimes     []Lifetime
-	caps          []Cap
-	backfills     []Backfill
+	relationships  []Relationship
+	projections    []Projection
+	lifetimes      []Lifetime
+	caps           []Cap
+	backfills      []Backfill
+	addresseeGates []AddresseeGate
 
 	byName map[string]*Relationship
 }
@@ -200,7 +215,7 @@ type Registry struct {
 // at startup: a malformed rule set is a programming error, so callers should
 // treat an error as fatal. Supersessions compile into lifetime rules (listed
 // first, so retention considers cheap supersession prunes before age rules).
-func New(relationships []Relationship, projections []Projection, supersessions []Supersession, lifetimes []Lifetime, caps []Cap, backfills []Backfill) (*Registry, error) {
+func New(relationships []Relationship, projections []Projection, supersessions []Supersession, lifetimes []Lifetime, caps []Cap, backfills []Backfill, addresseeGates []AddresseeGate) (*Registry, error) {
 	compiled := make([]Lifetime, 0, len(supersessions)+len(lifetimes))
 	for _, s := range supersessions {
 		if s.Name == "" {
@@ -215,12 +230,13 @@ func New(relationships []Relationship, projections []Projection, supersessions [
 	lifetimes = compiled
 
 	r := &Registry{
-		relationships: relationships,
-		projections:   projections,
-		lifetimes:     lifetimes,
-		caps:          caps,
-		backfills:     backfills,
-		byName:        make(map[string]*Relationship, len(relationships)),
+		relationships:  relationships,
+		projections:    projections,
+		lifetimes:      lifetimes,
+		caps:           caps,
+		backfills:      backfills,
+		addresseeGates: addresseeGates,
+		byName:         make(map[string]*Relationship, len(relationships)),
 	}
 	seenProj := map[string]bool{}
 	for _, proj := range projections {
@@ -262,6 +278,19 @@ func New(relationships []Relationship, projections []Projection, supersessions [
 		}
 		seenBackfill[b.Name] = true
 	}
+	seenGate := map[string]bool{}
+	for _, g := range addresseeGates {
+		if g.Name == "" {
+			return nil, fmt.Errorf("addressee gate: empty name")
+		}
+		if len(g.Kinds) == 0 {
+			return nil, fmt.Errorf("addressee gate %q: no kinds", g.Name)
+		}
+		if seenGate[g.Name] {
+			return nil, fmt.Errorf("addressee gate %q: duplicate name", g.Name)
+		}
+		seenGate[g.Name] = true
+	}
 	return r, nil
 }
 
@@ -277,6 +306,10 @@ func (r *Registry) Caps() []Cap { return r.caps }
 // Backfills returns the declared relay-history backfill rules in declaration
 // order.
 func (r *Registry) Backfills() []Backfill { return r.backfills }
+
+// AddresseeGates returns the declared addressee-gate rules in declaration
+// order.
+func (r *Registry) AddresseeGates() []AddresseeGate { return r.addresseeGates }
 
 // Relationship returns the named relationship, or nil.
 func (r *Registry) Relationship(name string) *Relationship { return r.byName[name] }

@@ -129,7 +129,7 @@ func TestCapFailsOpenWhenCounterFull(t *testing.T) {
 }
 
 func TestLifetimeCapBucketsOnce(t *testing.T) {
-	reg, err := rules.New(nil, nil, nil, nil, []rules.Cap{{Name: "k30078_lifetime", Kinds: []int{30078}, Max: 2}}, nil)
+	reg, err := rules.New(nil, nil, nil, nil, []rules.Cap{{Name: "k30078_lifetime", Kinds: []int{30078}, Max: 2}}, nil, nil)
 	if err != nil {
 		t.Fatalf("rules.New: %v", err)
 	}

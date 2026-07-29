@@ -116,7 +116,7 @@ func TestMarkerFilter(t *testing.T) {
 		Metrics: []Metric{{Name: "sources", Agg: AggUniqSources}},
 		Refresh: RefreshIngest,
 	}
-	r, err := New([]Relationship{rel}, nil, nil, nil, nil, nil)
+	r, err := New([]Relationship{rel}, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -192,5 +192,20 @@ func TestLifetimePredicates(t *testing.T) {
 	latest := KeepLatestPerAuthor{}.DeletePredicate([]int{0, 3}, "id")
 	if !strings.Contains(latest, "argMax(id, created_at)") || !strings.Contains(latest, "GROUP BY kind, pubkey") {
 		t.Errorf("keep-latest predicate:\n%s", latest)
+	}
+
+	addressed := KeepAddressedToKnown{}.DeletePredicate([]int{1059}, "id")
+	for _, want := range []string{
+		"kind IN (1059)",
+		// Fail closed on an empty viewer registry: without this guard a
+		// wiped known_viewers table would mass-delete every wrap.
+		"(SELECT count() FROM known_viewers) > 0",
+		"tag_key = 'p'",
+		"arrayJoin(refs) FROM latest_k3 FINAL",
+		"id NOT IN",
+	} {
+		if !strings.Contains(addressed, want) {
+			t.Errorf("addressed-to-known predicate missing %q:\n%s", want, addressed)
+		}
 	}
 }

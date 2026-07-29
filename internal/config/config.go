@@ -257,6 +257,11 @@ func Load() (Config, error) {
 			// 20/day removes ~90% of monthly post volume, all of it from
 			// firehose bridge/bot accounts.
 			Caps: ruleRegistry.Caps(),
+			// Declarative recipient-relevance gates: recipient-only kinds
+			// (gift wraps) ingest only when p-tagged to the exemption
+			// universe. Measured 2026-07: 99% of stored wraps were addressed
+			// to pubkeys no Sovran viewer maps to.
+			AddresseeGates: ruleRegistry.AddresseeGates(),
 		},
 		Vertex: VertexConfig{
 			PrivateKey:    os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),

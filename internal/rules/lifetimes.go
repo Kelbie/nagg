@@ -80,6 +80,37 @@ func (p MaxAgeUnlessReferenced) Describe() string {
 	return fmt.Sprintf("drop after %s without any referencing event", p.Age)
 }
 
+// KeepAddressedToKnown deletes events of Kinds none of whose p tags address
+// the ingest-exemption universe (known viewers + everyone they follow — the
+// same universe the AddresseeGate consults at ingest, so ingest and retention
+// can never fight over a row). The canonical case is NIP-59 gift wraps:
+// readable only by their p-tagged recipient, so wraps addressed to pubkeys
+// this app-view will never serve are dead weight (measured 2026-07: 99% of
+// 2.5M stored wraps), and a new viewer's history backfills on demand by #p.
+// The count() guard makes an EMPTY viewer registry a no-op instead of a mass
+// delete — fail closed on missing data, exactly like the tracker fails open.
+type KeepAddressedToKnown struct{}
+
+func (KeepAddressedToKnown) DeletePredicate(kinds []int, idColumn string) string {
+	return fmt.Sprintf(`kind IN (%s)
+	AND (SELECT count() FROM known_viewers) > 0
+	AND %s NOT IN (
+		SELECT event_id
+		FROM event_tags
+		WHERE kind IN (%s) AND tag_key = 'p' AND length(tag_value) = 64
+		  AND tag_value IN (
+			SELECT pubkey FROM known_viewers
+			UNION ALL
+			SELECT arrayJoin(refs) FROM latest_k3 FINAL
+			WHERE pubkey IN (SELECT pubkey FROM known_viewers)
+		  )
+	)`, intList(kinds), idColumn, intList(kinds))
+}
+
+func (KeepAddressedToKnown) Describe() string {
+	return "drop unless a p tag addresses a known viewer or their follows"
+}
+
 // MaxAge unconditionally deletes events older than Age.
 type MaxAge struct {
 	Age time.Duration

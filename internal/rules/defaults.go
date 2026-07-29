@@ -111,6 +111,15 @@ func Default(capMax int) (*Registry, error) {
 
 	lifetimes := []Lifetime{
 		{
+			// Gift wraps addressed to nobody this app-view serves are dead
+			// weight (99% of stored wraps when measured); the matching
+			// AddresseeGate stops new ones at the firehose and this rule
+			// erodes the stored backlog.
+			Name:   "k1059_known_addressee",
+			Kinds:  []int{1059},
+			Policy: KeepAddressedToKnown{},
+		},
+		{
 			// Events of kinds 1/1111 that nothing ever referenced expire
 			// after a year. The referencing relationships' aggregate tables
 			// outlive the referencing events, so pruning a referencing event
@@ -151,7 +160,14 @@ func Default(capMax int) (*Registry, error) {
 		{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour},
 	}
 
-	return New(relationships, projections, supersessions, lifetimes, caps, backfills)
+	// Firehose addressee gates: kinds only ever readable by their p-tagged
+	// recipient are ingested only when that recipient is in the exemption
+	// universe. Pairs with the k1059_known_addressee lifetime above.
+	addresseeGates := []AddresseeGate{
+		{Name: "k1059_known_addressee", Kinds: []int{1059}},
+	}
+
+	return New(relationships, projections, supersessions, lifetimes, caps, backfills, addresseeGates)
 }
 
 // MustDefault is Default for wiring paths without an error channel (config

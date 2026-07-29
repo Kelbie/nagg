@@ -58,6 +58,20 @@ Mechanics worth knowing:
 - Drops are summarized in the `ingest.capped` log line (per flush), never
   logged per event.
 
+### Addressee gates
+
+The registry's AddresseeGate rules drop recipient-only kinds at the firehose
+unless a `p` tag addresses the exemption universe. The default rule
+`k1059_known_addressee` gates NIP-59 gift wraps: a wrap is readable ONLY by
+its p-tagged recipient, so one addressed to a pubkey no Sovran viewer maps to
+can never be served to anyone. Measured 2026-07: **99% of 2.5M stored wraps
+(3.8 GB, the single largest kind) were addressed to strangers.** This reverses
+the earlier "keep the whole DM firehose" decision — the relisten/merge churn
+of network-wide DMs dominated the memory bill, and the on-demand DM backfill
+(`#p`-filtered relay query) serves a new viewer's history anyway; the round
+trip they pay once at signup is the trade. With no exemption source the gate
+fails **open**, like the caps; drops summarize in `ingest.unaddressed`.
+
 ## Layer 2 — declarative lifetime rules
 
 The registry's Lifetime rules (`rules.Default` in `internal/rules/defaults.go`)
@@ -69,6 +83,7 @@ of that kind live forever:
 | `replaceable_latest` | 0, 3, 10050, 10051 | latest event per author | Relays and every nagg reader only ever use the newest version; the rest is dead weight. Measured 2026-07: 80–92% of stored rows superseded (~13 GiB, mostly kind-3 contact lists). |
 | `param_replaceable_latest` | 30078, 38000 | latest per (author, d-tag) | Same, keyed per d-tag. Measured: 98.7% of kind-30078 superseded (~4 GiB). |
 | `k1_1111_unreferenced_1y` | 1, 1111 | events younger than 1 year OR ever referenced by any of the declared relationships (k7_e, k6_16_e, k1_q, k9735_e, k1_1111_e_reply) | Nobody reads year-old events nothing ever referenced. `MaxAgeUnlessReferenced` builds its protection ledger from the relationships' aggregate tables. Small today (index is young), load-bearing as the index ages. |
+| `k1059_known_addressee` | 1059 | wraps with a `p` tag in the exemption universe | Erodes the stored stranger-wrap backlog the matching addressee gate now stops at the firehose (99% of wraps when measured). Guarded to be a no-op while `known_viewers` is empty, so a wiped registry can never mass-delete. |
 
 Rules delete from `nostr_events` only. `event_tags` is deliberately left
 alone: its superseded-event rows measured a mere ~0.5 GiB (46.7M of 2.05B
@@ -102,10 +117,6 @@ Execution (`Store.RunRetention`, scheduled by the rollup runner):
   has converged. First pass 10 minutes after boot; one `chgate` slot per pass.
 - Every pass logs a `retention rule` line (rule, table, matched rows) for what
   it acted on.
-
-Gift wraps (kind 1059) are deliberately **not** filtered or pruned — product
-decision 2026-07: keep the whole DM firehose so a new user's history is served
-without a relay round-trip.
 
 ## Levers
 

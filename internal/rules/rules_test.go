@@ -74,7 +74,7 @@ func TestNewValidation(t *testing.T) {
 			rel := valid
 			rel.Metrics = append([]Metric(nil), valid.Metrics...)
 			c.mutate(&rel)
-			_, err := New([]Relationship{rel}, nil, nil, nil, nil, nil)
+			_, err := New([]Relationship{rel}, nil, nil, nil, nil, nil, nil)
 			if c.wantErr == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -96,7 +96,7 @@ func TestNewRejectsDuplicateNames(t *testing.T) {
 		Metrics: []Metric{{Name: "actors", Agg: AggUniqActors}},
 		Refresh: RefreshIngest,
 	}
-	_, err := New([]Relationship{rel, rel}, nil, nil, nil, nil, nil)
+	_, err := New([]Relationship{rel, rel}, nil, nil, nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "duplicate name") {
 		t.Fatalf("error = %v, want duplicate name", err)
 	}
@@ -114,18 +114,18 @@ func TestLifetimeValidation(t *testing.T) {
 		Name:   "bad",
 		Kinds:  []int{1},
 		Policy: MaxAgeUnlessReferenced{Age: time.Hour, ByRules: []string{"missing"}},
-	}}, nil, nil)
+	}}, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "unknown relationship") {
 		t.Fatalf("error = %v, want unknown relationship", err)
 	}
 }
 
 func TestCapValidation(t *testing.T) {
-	_, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 0}}, nil)
+	_, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 0}}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "non-positive max") {
 		t.Fatalf("error = %v, want non-positive max", err)
 	}
-	if _, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 5}}, nil); err != nil {
+	if _, err := New(nil, nil, nil, nil, []Cap{{Name: "c", Kinds: []int{1}, Max: 5}}, nil, nil); err != nil {
 		t.Fatalf("lifetime cap (zero window) should validate: %v", err)
 	}
 }
@@ -143,11 +143,14 @@ func TestDefaultRegistry(t *testing.T) {
 	if got := len(r.IngestExtractorRules()); got != 1 {
 		t.Errorf("ingest extractor rules = %d, want 1", got)
 	}
-	if len(r.Lifetimes()) != 3 || len(r.Caps()) != 1 {
-		t.Errorf("lifetimes/caps = %d/%d, want 3/1", len(r.Lifetimes()), len(r.Caps()))
+	if len(r.Lifetimes()) != 4 || len(r.Caps()) != 1 {
+		t.Errorf("lifetimes/caps = %d/%d, want 4/1", len(r.Lifetimes()), len(r.Caps()))
 	}
 	if r.Caps()[0].Window != 24*time.Hour {
 		t.Errorf("cap window = %v, want 24h", r.Caps()[0].Window)
+	}
+	if got := len(r.AddresseeGates()); got != 1 || r.AddresseeGates()[0].Kinds[0] != 1059 {
+		t.Errorf("addressee gates = %d, want the kind-1059 gate", got)
 	}
 }
 
@@ -155,7 +158,7 @@ func TestSupersessionCompilesToLifetime(t *testing.T) {
 	r, err := New(nil, nil, []Supersession{
 		{Name: "replaceable_latest", Kinds: []int{0, 3}},
 		{Name: "param_latest", Kinds: []int{30078}, PerDTag: true},
-	}, nil, nil, nil)
+	}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -170,7 +173,7 @@ func TestSupersessionCompilesToLifetime(t *testing.T) {
 	}
 
 	// Absence = keep every version: an empty rule set prunes nothing.
-	empty, err := New(nil, nil, nil, nil, nil, nil)
+	empty, err := New(nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New(empty): %v", err)
 	}
@@ -180,23 +183,23 @@ func TestSupersessionCompilesToLifetime(t *testing.T) {
 }
 
 func TestBackfillValidation(t *testing.T) {
-	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "", Kinds: []int{38000}}}); err == nil {
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "", Kinds: []int{38000}}}, nil); err == nil {
 		t.Error("empty backfill name must fail")
 	}
-	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "Bad-Name", Kinds: []int{38000}}}); err == nil {
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "Bad-Name", Kinds: []int{38000}}}, nil); err == nil {
 		t.Error("non-identifier backfill name must fail")
 	}
-	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: nil}}); err == nil {
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: nil}}, nil); err == nil {
 		t.Error("kindless backfill must fail")
 	}
-	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: []int{1}, Resync: -time.Hour}}); err == nil {
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: []int{1}, Resync: -time.Hour}}, nil); err == nil {
 		t.Error("negative resync must fail")
 	}
 	dup := Backfill{Name: "x", Kinds: []int{1}}
-	if _, err := New(nil, nil, nil, nil, nil, []Backfill{dup, dup}); err == nil {
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{dup, dup}, nil); err == nil {
 		t.Error("duplicate backfill names must fail")
 	}
-	r, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour}})
+	r, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour}}, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -206,10 +209,10 @@ func TestBackfillValidation(t *testing.T) {
 }
 
 func TestSupersessionValidation(t *testing.T) {
-	if _, err := New(nil, nil, []Supersession{{Name: "", Kinds: []int{0}}}, nil, nil, nil); err == nil {
+	if _, err := New(nil, nil, []Supersession{{Name: "", Kinds: []int{0}}}, nil, nil, nil, nil); err == nil {
 		t.Error("empty supersession name must fail")
 	}
-	if _, err := New(nil, nil, []Supersession{{Name: "x", Kinds: nil}}, nil, nil, nil); err == nil {
+	if _, err := New(nil, nil, []Supersession{{Name: "x", Kinds: nil}}, nil, nil, nil, nil); err == nil {
 		t.Error("kindless supersession must fail")
 	}
 }
