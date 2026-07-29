@@ -163,9 +163,14 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 			-- NARROW columns only: event bodies are hydrated by id at read
 			-- time. Storing content/tags_json per (viewer, event) row was the
 			-- disk blow-up (one mention duplicated per p-tagged viewer).
+			-- Bounded to the candidates' event-time span: viewer_refs rows
+			-- carry their event's created_at, so the span is exact and the
+			-- (kind, created_at, ...) primary index prunes what was a full
+			-- narrow-column scan (~750 MiB per one-minute tick).
 			SELECT id, pubkey, kind, created_at
 			FROM nostr_events
-			WHERE id IN (SELECT event_id FROM window_candidates)
+			WHERE created_at >= (SELECT lo FROM bounds) AND created_at <= (SELECT hi FROM bounds)
+			  AND id IN (SELECT event_id FROM window_candidates)
 			ORDER BY id ASC, last_seen_at DESC
 			LIMIT 1 BY id
 		),
