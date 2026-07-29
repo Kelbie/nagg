@@ -25,7 +25,13 @@ type Store interface {
 }
 
 const (
-	defaultRefreshInterval = 15 * time.Minute
+	// The exemption set (known viewers + their follows) churns on the pace of
+	// follow-list edits, not minutes. Each refresh arrayJoins every known
+	// viewer's latest kind-3 list out of latest_k3 FINAL — measured live at
+	// ~1.2 GiB read per pass, so the old 15m cadence cost ~119 GiB/day for a
+	// set that barely moved. An hour of staleness only means a brand-new
+	// follow stays subject to the ingest post cap for up to an hour.
+	defaultRefreshInterval = time.Hour
 	touchThrottle          = time.Hour
 	touchTimeout           = 5 * time.Second
 	// touchThrottleMaxEntries bounds the per-viewer throttle map. Overflow just
