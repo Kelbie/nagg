@@ -40,9 +40,18 @@ const (
 	// deeper is rare, and history size is what blew the disk in the first
 	// (denormalized) shape.
 	notificationsFeedHistoryWindow = 14 * 24 * time.Hour
-	// Steady-state re-process overlap: late-arriving events for a window and
-	// vertex-score drift converge on rewrite (ReplacingMergeTree by computed_at).
-	notificationsFeedOverlap = 10 * time.Minute
+	// Steady-state re-process overlap. Slices window on ingested_at (arrival
+	// time), so an arrival can only be missed if its row commits to
+	// viewer_refs AFTER a tick already read past its ingested_at — the overlap
+	// exists to absorb that insert-commit lag (seconds), not late-arriving
+	// events (those get a fresh ingested_at and are picked up by the next
+	// tick regardless). It used to be 10m, which re-inserted every
+	// notification row ~10x across consecutive one-minute ticks: measured
+	// live at 389M duplicate rows / 30 GiB inserted into viewer_feed per day,
+	// with 162 GiB/day of merge reads deduping them. Vertex-score drift does
+	// not need the rewrite either — the page read overlays live scores
+	// (notificationsFromFeedQueryTemplate).
+	notificationsFeedOverlap = 2 * time.Minute
 	// Slice per tick. Kept small on purpose: viewer_refs is sorted
 	// by viewer (ingested_at windows cannot prune it) and month-old event_tags
 	// granules are cold — the original 6h forward slices ran ~5 MINUTES and
