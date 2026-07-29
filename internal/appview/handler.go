@@ -1217,15 +1217,55 @@ const (
 	threadAuthorReplyLimit  = 100
 )
 
+// nip10DirectParentID resolves an event's direct parent per NIP-10 (kind 1)
+// and NIP-22 (kind 1111): an explicit `reply`-marked e tag wins; else the LAST
+// unmarked e tag (deprecated positional scheme — first is root, middle are
+// mentions, last is the parent; a kind-1111's lowercase `e` parent tag is
+// unmarked and resolves here too, while its uppercase `E` root tag never
+// matches the lowercase key); else the `root` marker (a direct reply to the
+// root). Mirrors buildRefEdgesSQL's argMinIf/argMaxIf coalesce exactly — the
+// ordering tiers read ref_edges, so the two derivations must agree.
+func nip10DirectParentID(tags [][]string) string {
+	positional := ""
+	root := ""
+	for _, tag := range tags {
+		if len(tag) < 2 || tag[0] != "e" || len(tag[1]) != 64 {
+			continue
+		}
+		marker := ""
+		if len(tag) >= 4 {
+			marker = strings.ToLower(tag[3])
+		}
+		switch marker {
+		case "reply":
+			return tag[1]
+		case "":
+			positional = tag[1] // keep the LAST unmarked e tag
+		case "root":
+			if root == "" {
+				root = tag[1]
+			}
+		}
+	}
+	if positional != "" {
+		return positional
+	}
+	return root
+}
+
 // threadOrdering builds the server-authoritative reply manifest plus the total
-// ordered-reply count before paging. The default ("" / "new") order is the
-// deterministic recency order DescendantEvents returned. "ranked" orders direct
-// replies by engagement. "relevant" is the product default: ALL of the root
-// author's direct replies first (chronological), then one followed-tail reply,
-// then ranked direct replies, then the rest — explicit sorts stay literal, the
-// OP pin applies only to "relevant". Any id without fetched event data is
-// dropped and remaining available replies are appended so the flat list stays
-// complete; every sort then pages through pageElements.
+// ordered-reply count before paging. The ordered list carries ONLY the root's
+// DIRECT replies (NIP-10/NIP-22 parent == root): nested descendants and
+// mention-tagged events stay in the envelope's events for hydration but are
+// never ordered as replies of the root — a reply list must not flatten the
+// tree (live check: a 106-entry manifest carried 71 nested replies at the
+// tail, which clients rendered under the wrong parent). The default ("" /
+// "new") order is the deterministic recency order DescendantEvents returned.
+// "ranked" orders direct replies by engagement. "relevant" is the product
+// default: ALL of the root author's direct replies first (chronological), then
+// one followed reply to the root, then ranked direct replies, then the
+// remaining direct replies — explicit sorts stay literal, the OP pin applies
+// only to "relevant". Every sort pages through pageElements.
 func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) (OrderingManifest, int) {
 	var ordered []string
 	var err error
@@ -1240,12 +1280,18 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) (Orde
 		ordered = nil
 	}
 
+	// Only fetched events whose NIP-10/NIP-22 parent is the root are orderable.
 	available := make(map[string]struct{}, len(p.replies))
+	dropped := 0
 	for _, e := range p.replies {
-		available[e.ID] = struct{}{}
+		if nip10DirectParentID(e.Tags) == p.rootID {
+			available[e.ID] = struct{}{}
+		} else {
+			dropped++
+		}
 	}
-	elements := make([]string, 0, len(p.replies))
-	seen := make(map[string]struct{}, len(p.replies))
+	elements := make([]string, 0, len(available))
+	seen := make(map[string]struct{}, len(available))
 	add := func(id string) {
 		if id == "" || id == p.rootID {
 			return
@@ -1262,14 +1308,14 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) (Orde
 	for _, id := range ordered {
 		add(id)
 	}
-	// Replies the merge didn't surface (e.g. nested descendants) keep their
-	// DescendantEvents order at the tail so the flat list stays complete.
+	// Direct replies the merge didn't surface keep their DescendantEvents
+	// order at the tail so the direct-reply list stays complete.
 	for _, e := range p.replies {
 		add(e.ID)
 	}
 	total := len(elements)
 	elements = pageElements(elements, p.offset, p.replyLimit)
-	slog.Info("appview.thread.order", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "total", total, "elements", len(elements))
+	slog.Info("appview.thread.order", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "total", total, "nested", dropped, "elements", len(elements))
 	return OrderingManifest{OrderBy: orderByRank, Elements: elements}, total
 }
 

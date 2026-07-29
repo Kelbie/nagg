@@ -221,6 +221,20 @@ func eventWithID(id, pubkey string) chstore.EventView {
 	return chstore.EventView{ID: id, PubKey: pubkey, Kind: 1, CreatedAt: time.Unix(1_700_000_000, 0), Tags: [][]string{}}
 }
 
+// replyTo builds a reply event with a NIP-10 marked parent: a direct reply to
+// the root carries a single root-marked e tag; a nested reply carries
+// root+reply markers. threadOrdering only orders events whose resolved parent
+// is the root, so thread fixtures must carry real tags.
+func replyTo(id, pubkey, rootID, parentID string) chstore.EventView {
+	event := eventWithID(id, pubkey)
+	if parentID == "" || parentID == rootID {
+		event.Tags = [][]string{{"e", rootID, "", "root"}}
+	} else {
+		event.Tags = [][]string{{"e", rootID, "", "root"}, {"e", parentID, "", "reply"}}
+	}
+	return event
+}
+
 func threadRequest(t *testing.T, handler *Handler, path string) ThreadEnvelope {
 	t.Helper()
 	rec := httptest.NewRecorder()
@@ -247,8 +261,8 @@ func TestThreadRelevantMergeOrder(t *testing.T) {
 	store := &relevantThreadStore{
 		root: eventWithID(root, author),
 		replies: []chstore.EventView{
-			eventWithID(ar1, author), eventWithID(ar2, author), eventWithID(fol, hexID("f")),
-			eventWithID(rk1, hexID("d")), eventWithID(rk2, hexID("e")), eventWithID(nested, hexID("c")),
+			replyTo(ar1, author, root, ""), replyTo(ar2, author, root, ""), replyTo(fol, hexID("f"), root, ""),
+			replyTo(rk1, hexID("d"), root, ""), replyTo(rk2, hexID("e"), root, ""), replyTo(nested, hexID("c"), root, ar1),
 		},
 		authoredSources: []string{ar1, ar2},
 		followed:        map[string]string{root: fol},
@@ -258,15 +272,16 @@ func TestThreadRelevantMergeOrder(t *testing.T) {
 	handler := New(store, WithNIP05Validation(false))
 	resp := threadRequest(t, handler, "/nostr/thread?id="+root+"&sort=relevant&viewer="+testPubkey)
 
-	want := []string{root, ar1, ar2, fol, rk1, rk2, nested}
+	// nested replies to ar1, not the root — it is hydrated but never ordered.
+	want := []string{root, ar1, ar2, fol, rk1, rk2}
 	if strings.Join(resp.Order, ",") != strings.Join(want, ",") {
 		t.Fatalf("order = %v\nwant    %v", resp.Order, want)
 	}
 	if resp.OrderBy != orderByRank {
 		t.Fatalf("orderBy = %q, want %q", resp.OrderBy, orderByRank)
 	}
-	if resp.Total != 6 {
-		t.Fatalf("total = %d, want 6", resp.Total)
+	if resp.Total != 5 {
+		t.Fatalf("total = %d, want 5 direct replies (nested excluded)", resp.Total)
 	}
 	if resp.Cursor != nil {
 		t.Fatalf("cursor = %q, want absent on an unpaged response", *resp.Cursor)
@@ -286,8 +301,8 @@ func TestThreadRelevantOpFirstOnlyDirectReplies(t *testing.T) {
 	store := &relevantThreadStore{
 		root: eventWithID(root, author),
 		replies: []chstore.EventView{
-			eventWithID(rk1, hexID("d")), eventWithID(rk2, hexID("e")),
-			eventWithID(opDirect, author), eventWithID(opNested, author),
+			replyTo(rk1, hexID("d"), root, ""), replyTo(rk2, hexID("e"), root, ""),
+			replyTo(opDirect, author, root, ""), replyTo(opNested, author, root, rk1),
 		},
 		authoredSources: []string{opDirect},
 		rankedByLike:    []string{rk1, rk2},
@@ -295,21 +310,21 @@ func TestThreadRelevantOpFirstOnlyDirectReplies(t *testing.T) {
 	handler := New(store, WithNIP05Validation(false))
 
 	resp := threadRequest(t, handler, "/nostr/thread?id="+root+"&sort=relevant")
-	want := []string{root, opDirect, rk1, rk2, opNested}
+	want := []string{root, opDirect, rk1, rk2}
 	if strings.Join(resp.Order, ",") != strings.Join(want, ",") {
 		t.Fatalf("relevant order = %v\nwant %v", resp.Order, want)
 	}
 
 	// sort=ranked is literal: no OP pin, ranked then leftovers in fetch order.
 	resp = threadRequest(t, handler, "/nostr/thread?id="+root+"&sort=ranked")
-	want = []string{root, rk1, rk2, opDirect, opNested}
+	want = []string{root, rk1, rk2, opDirect}
 	if strings.Join(resp.Order, ",") != strings.Join(want, ",") {
 		t.Fatalf("ranked order = %v\nwant %v", resp.Order, want)
 	}
 
 	// sort=new is literal: the DescendantEvents order verbatim.
 	resp = threadRequest(t, handler, "/nostr/thread?id="+root+"&sort=new")
-	want = []string{root, rk1, rk2, opDirect, opNested}
+	want = []string{root, rk1, rk2, opDirect}
 	if strings.Join(resp.Order, ",") != strings.Join(want, ",") {
 		t.Fatalf("new order = %v\nwant %v", resp.Order, want)
 	}
@@ -322,7 +337,7 @@ func TestThreadDefaultSortDeterministicPaged(t *testing.T) {
 	r1, r2, r3 := hexID("1"), hexID("2"), hexID("3")
 	store := &relevantThreadStore{
 		root:    eventWithID(root, testPubkey),
-		replies: []chstore.EventView{eventWithID(r1, hexID("a")), eventWithID(r2, hexID("b")), eventWithID(r3, hexID("c"))},
+		replies: []chstore.EventView{replyTo(r1, hexID("a"), root, ""), replyTo(r2, hexID("b"), root, ""), replyTo(r3, hexID("c"), root, "")},
 	}
 	handler := New(store, WithNIP05Validation(false))
 
@@ -352,7 +367,7 @@ func TestThreadPagingTotalAndCursor(t *testing.T) {
 	ids := []string{hexID("1"), hexID("2"), hexID("3"), hexID("4"), hexID("5")}
 	replies := make([]chstore.EventView, 0, len(ids))
 	for _, id := range ids {
-		replies = append(replies, eventWithID(id, hexID("d")))
+		replies = append(replies, replyTo(id, hexID("d"), root, ""))
 	}
 	store := &relevantThreadStore{
 		root:            eventWithID(root, author),
@@ -397,7 +412,7 @@ func TestThreadOrderingPrimitiveFailureDegrades(t *testing.T) {
 	r1, r2 := hexID("1"), hexID("2")
 	store := &relevantThreadStore{
 		root:        eventWithID(root, testPubkey),
-		replies:     []chstore.EventView{eventWithID(r1, hexID("a")), eventWithID(r2, hexID("b"))},
+		replies:     []chstore.EventView{replyTo(r1, hexID("a"), root, ""), replyTo(r2, hexID("b"), root, "")},
 		authoredErr: errors.New("clickhouse down"),
 	}
 	handler := New(store, WithNIP05Validation(false))
@@ -441,6 +456,30 @@ func TestDmConversationScopesDirectKindsToCounterparty(t *testing.T) {
 	for _, in := range store.inputs {
 		if len(in.Tags) != 1 || in.Tags[0].Key != "p" {
 			t.Fatalf("query missing p-tag pair scope: %+v", in)
+		}
+	}
+}
+
+func TestNip10DirectParentID(t *testing.T) {
+	root, parent, other := hexID("a"), hexID("b"), hexID("c")
+	cases := []struct {
+		name string
+		tags [][]string
+		want string
+	}{
+		{"marked reply wins", [][]string{{"e", root, "", "root"}, {"e", parent, "", "reply"}}, parent},
+		{"root marker only = direct reply to root", [][]string{{"e", root, "", "root"}}, root},
+		{"positional single tag", [][]string{{"e", parent}}, parent},
+		{"positional two tags: last is parent", [][]string{{"e", root}, {"e", parent}}, parent},
+		{"positional many: middle are mentions", [][]string{{"e", root}, {"e", other}, {"e", parent}}, parent},
+		{"mention marker never a parent", [][]string{{"e", other, "", "mention"}, {"e", root, "", "root"}}, root},
+		{"kind-1111 lowercase e parent (NIP-22)", [][]string{{"E", root}, {"e", parent}}, parent},
+		{"uppercase E root scope ignored", [][]string{{"E", root}}, ""},
+		{"no e tags", [][]string{{"p", root}}, ""},
+	}
+	for _, tc := range cases {
+		if got := nip10DirectParentID(tc.tags); got != tc.want {
+			t.Fatalf("%s: parent = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

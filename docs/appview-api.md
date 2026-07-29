@@ -110,9 +110,16 @@ Thread `sort` accepts `new` (default), `ranked`, `relevant` — `ranked` orders
 by the declared `k7_e.actors` aggregation. `relevant` is the product default:
 ALL of the root author's direct replies lead the order (chronological), then
 one followed reply to the root (viewer-scoped), then ranked direct replies,
-then the remaining fetched descendants. Explicit sorts are literal — no OP pin
+then the remaining direct replies. Explicit sorts are literal — no OP pin
 on `new`/`ranked`. Every sort is deterministic and honors `offset`/`replyLimit`
 (`replyLimit=0` = everything from `offset`).
+
+The ordered reply list carries ONLY the root's DIRECT replies — events whose
+NIP-10/NIP-22 resolved parent (`reply` marker > last unmarked `e` tag > `root`
+marker; kind-1111's lowercase `e`) is the root. Nested descendants and
+mention-tagged events remain hydrated in `events` (for tap-through and client
+caches) but are never ordered as replies of the root, and `total` counts
+direct replies only.
 
 ## 4. Route extensions
 
