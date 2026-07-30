@@ -197,6 +197,12 @@ the legacy query from. Without this fallback the two paths flap (the readiness
 check is cached for 30s): the same page-0 alternated between the full history
 and a 2-item stub, and every `until` page came back empty.
 
+"Full history" is itself bounded by `viewer_refs`' TTL — **120 days**
+(migration 028; was 45, which the NAGG_HISTORY_FLOOR walker's merges silently
+enforced against backfilled history). A history floor deeper than the
+viewer_refs TTL feeds threads/feeds but not notifications; keep the TTL ≥ the
+floor.
+
 ---
 
 ## 9. Response shape (REST)
