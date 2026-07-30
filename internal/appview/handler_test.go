@@ -2125,6 +2125,67 @@ func TestNotificationsDefaultsAndViewerFallback(t *testing.T) {
 	}
 }
 
+// External page sizes are capped at the API layer now that the store's window
+// clamp admits the grouped handler's wide internal windows.
+func TestNotificationsCapsExternalLimit(t *testing.T) {
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]testCounts{},
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/nostr/notifications?pubkey="+testPubkey+"&limit=500&grouped=false",
+		nil,
+	)
+	handler.notifications(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.lastInput.Limit != 100 {
+		t.Fatalf("limit = %d, want the 100 external cap", store.lastInput.Limit)
+	}
+}
+
+// The grouped path must ask the store for its full wide candidate window
+// (limit*6, clamped 120–600): grouping collapses many rows into few items, and
+// saturating this window is the "more pages exist" signal. The store used to
+// clamp it to 50 — pin that the wide ask reaches the store.
+func TestNotificationsGroupedBodyWindowReachesStore(t *testing.T) {
+	store := &notificationStore{
+		appViewHydrationStore: appViewHydrationStore{
+			fakeStore: fakeStore{profiles: map[string]chstore.K0Row{}},
+			events:    map[string]chstore.EventView{},
+			stats:     map[string]testCounts{},
+		},
+	}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/nostr/notifications?pubkey="+testPubkey+"&limit=50",
+		nil,
+	)
+	handler.notifications(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if store.lastInput.Limit != 300 {
+		t.Fatalf("body window limit = %d, want 300 (limit*6)", store.lastInput.Limit)
+	}
+	if len(store.lastInput.ExcludeKinds) == 0 || store.lastInput.ExcludeKinds[0] != 3 {
+		t.Fatalf("body window must exclude kind 3, got %v", store.lastInput.ExcludeKinds)
+	}
+}
+
 func TestNotificationsAcceptsFollowsPolicy(t *testing.T) {
 	store := &notificationStore{
 		appViewHydrationStore: appViewHydrationStore{

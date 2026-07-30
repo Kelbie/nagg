@@ -250,6 +250,44 @@ func buildNotificationsFeedSQL(from, to, computedAt time.Time) string {
 	`, from.Unix(), to.Unix(), computedAt.Unix())
 }
 
+// viewerFeedWindowLimit clamps a requested row window. The floor guards the
+// zero value; the ceiling exists for the grouped handler's wide candidate
+// window (bodyWindow tops out at 600 — see appview.notifications), NOT for
+// external callers: the API layers cap user-supplied limits at 100 before the
+// input reaches the store. Clamping to 50 here (the old behavior) silently
+// shrank the grouped candidate window from 300 to 50 and made its saturation
+// signal unreachable.
+func viewerFeedWindowLimit(limit uint64) uint64 {
+	if limit == 0 {
+		return 50
+	}
+	if limit > 600 {
+		return 600
+	}
+	return limit
+}
+
+// notificationsModelPageShort reports whether a read-model page came up short
+// of the requested window — the signal that the rest of the viewer's history
+// lives beyond the model's retention floor and the request must fall back to
+// the legacy full-history read.
+func notificationsModelPageShort(rowCount int, limit uint64) bool {
+	return rowCount < int(limit)
+}
+
+// replyScopeApplies reports whether the DIRECT/THREAD reply-scope filter
+// applies to this read. The MENTIONS tab is exempt: its meaning is "kind-1
+// events that tag you", and most of those live inside other people's threads —
+// the scope filter (built for the ALL tab's reply stream) dropped nearly every
+// real mention, leaving the tab empty on nagg while the relay tier showed the
+// full set.
+func replyScopeApplies(tab, replyScope string) bool {
+	if tab == "MENTIONS" {
+		return false
+	}
+	return replyScope == "DIRECT" || replyScope == "THREAD"
+}
+
 // notificationsFeedReady reports whether the read-model can serve reads: the
 // head watermark is fresh AND the backward history walker has covered the
 // window users actually page. Cached briefly so the hot path doesn't query
@@ -362,11 +400,13 @@ func (s *Store) notificationsFromFeed(ctx context.Context, input ViewerFeedInput
 	}
 
 	outer := "WHERE (kind != 3 OR actor_kind_rank = 1)"
-	switch replyScope {
-	case "DIRECT":
-		outer += " AND (event_kind != 1 OR is_ref = 0 OR target_author = viewer)"
-	case "THREAD":
-		outer += " AND (event_kind != 1 OR is_ref = 0 OR in_viewer_tree = 1)"
+	if replyScopeApplies(tab, replyScope) {
+		switch replyScope {
+		case "DIRECT":
+			outer += " AND (event_kind != 1 OR is_ref = 0 OR target_author = viewer)"
+		case "THREAD":
+			outer += " AND (event_kind != 1 OR is_ref = 0 OR in_viewer_tree = 1)"
+		}
 	}
 
 	// Policy: actor_score >= actorThreshold OR viewer_score >= viewerThreshold.

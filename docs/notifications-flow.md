@@ -150,11 +150,17 @@ actors are in the viewer's follow set.
 
 - **Reply scope** (`DIRECT` | `THREAD`): for kind-1 replies, whether to show only
   direct replies to your posts (`DIRECT`) or replies anywhere in a thread you're
-  part of (`THREAD`). Applied as a join filter in the store query.
-- **Tabs:** `ALL` (the grouped mixture), `MENTIONS` (server-filtered to
-  `reason='mention'`; grouping is a no-op there — all singles), and `APP` (a
-  **client-only** tab for app announcements like the welcome card — never hits
-  the server).
+  part of (`THREAD`). Applied as a join filter in the store query — **on the ALL
+  tab only** (`replyScopeApplies`).
+- **Tabs:** `ALL` (the grouped mixture), `MENTIONS` (server-filtered to kind-1;
+  grouping is a no-op there — all singles), and `APP` (a **client-only** tab for
+  app announcements like the welcome card — never hits the server).
+
+> Gotcha: MENTIONS is **exempt** from the reply-scope filter. The tab means
+> "kind-1 events that tag you", and most real mentions live inside other
+> people's threads (`is_ref=1`, parent not yours) — the DIRECT/THREAD gates,
+> built for the ALL tab's reply stream, dropped nearly every one of them and
+> left the tab empty on nagg while the relay floor showed the full set.
 
 ---
 
@@ -176,6 +182,20 @@ actors are in the viewer's follow set.
 
 > Intent: never trust raw item count for "has more" once grouping is involved.
 > The client's "stop when a page adds nothing new" is the reliable signal.
+
+### The read-model floor
+
+The denormalized `viewer_feed` read-model holds only
+`notificationsFeedHistoryWindow` (14 days) of history. It therefore answers a
+request **only when it can fill the requested row window**
+(`notificationsModelPageShort`); a short page means the viewer's remaining
+notifications live beyond the model floor — a lightly-notified account, or a
+cursor paged past the floor — and `ViewerFeed` falls back to the **legacy
+full-history read** for that request. Engaged accounts saturate the window and
+never fall through, which is exactly the population the model exists to protect
+the legacy query from. Without this fallback the two paths flap (the readiness
+check is cached for 30s): the same page-0 alternated between the full history
+and a 2-item stub, and every `until` page came back empty.
 
 ---
 
@@ -236,7 +256,10 @@ any consumer that wants the unsummarised stream.
    them back into the main window — they'll flood it.
 2. **`limit` = items, not rows.** The grouped path fetches a *wide* candidate
    window (limit×6) and trims to `limit` items; don't cap the store fetch at the
-   raw `limit`.
+   raw `limit`. The store's window clamp (`viewerFeedWindowLimit`) admits up to
+   600 rows for exactly this reason — external page sizes are capped at 100 in
+   the API layers (`parseNotificationRequest` / `parseNotificationInput`), not
+   in the store.
 3. **Client decides "has more," not the server.** Stop on "no new group
    identities," not on item count or `hasNextPage`.
 4. **Cross-page dedupe is by group identity**, not event id.
@@ -245,6 +268,10 @@ any consumer that wants the unsummarised stream.
 6. **FOLLOWS is a graph filter** (0/0 thresholds), and the follow group uses the
    window count (not `FollowCounts`) under it.
 7. **reply/quote/mention never group.** They carry text.
+8. **The read-model serves only pages it can fill.** A short `viewer_feed` page
+   falls back to the legacy full-history read (`notificationsModelPageShort`) —
+   don't return the stub, and don't apply the reply-scope filter on MENTIONS
+   (`replyScopeApplies`).
 
 ---
 
