@@ -51,6 +51,62 @@ func TestBuildNotificationsFeedSQL_TagScanBoundedByCandidateSpan(t *testing.T) {
 	}
 }
 
+// The store's window clamp must admit the grouped handler's wide candidate
+// windows (bodyWindow tops out at 600). The old <=100 clamp silently shrank
+// the 300-row body window to 50, which buried the notification mixture and
+// made the saturation ("has more") signal unreachable.
+func TestViewerFeedWindowLimit(t *testing.T) {
+	cases := []struct {
+		in   uint64
+		want uint64
+	}{
+		{0, 50},
+		{12, 12},
+		{50, 50},
+		{300, 300},
+		{600, 600},
+		{601, 600},
+	}
+	for _, c := range cases {
+		if got := viewerFeedWindowLimit(c.in); got != c.want {
+			t.Errorf("viewerFeedWindowLimit(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// A short read-model page means the rest of the viewer's history lives beyond
+// the model's retention floor — the request must fall back to the legacy
+// full-history read instead of serving a truncated, unpageable page.
+func TestNotificationsModelPageShort(t *testing.T) {
+	if !notificationsModelPageShort(0, 50) || !notificationsModelPageShort(49, 50) {
+		t.Error("a page below the window must count as short")
+	}
+	if notificationsModelPageShort(50, 50) || notificationsModelPageShort(51, 50) {
+		t.Error("a filled window must not count as short")
+	}
+}
+
+// The MENTIONS tab is exempt from the DIRECT/THREAD reply-scope filter: its
+// meaning is "kind-1 events that tag you", and most of those live inside other
+// people's threads — the scope filter dropped nearly every real mention.
+func TestReplyScopeApplies(t *testing.T) {
+	cases := []struct {
+		tab, scope string
+		want       bool
+	}{
+		{"ALL", "DIRECT", true},
+		{"ALL", "THREAD", true},
+		{"ALL", "NONE", false},
+		{"MENTIONS", "DIRECT", false},
+		{"MENTIONS", "THREAD", false},
+	}
+	for _, c := range cases {
+		if got := replyScopeApplies(c.tab, c.scope); got != c.want {
+			t.Errorf("replyScopeApplies(%q, %q) = %v, want %v", c.tab, c.scope, got, c.want)
+		}
+	}
+}
+
 // The page read must overlay LIVE vertex scores over the baked actor_score:
 // history slices never re-run, so a baked-only filter freezes whatever the
 // graph knew at denormalization time and hides actors who score up later.

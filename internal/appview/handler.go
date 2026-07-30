@@ -1089,7 +1089,13 @@ func (h *Handler) parseNotificationRequest(r *http.Request) (chstore.ViewerFeedI
 	}
 	input.Since = raw.Since
 	input.Until = raw.Until
+	// Cap the user-supplied limit here: the store's window clamp now admits the
+	// grouped handler's wide internal windows (up to 600), so the API layer is
+	// what keeps external page sizes bounded.
 	if raw.Limit > 0 {
+		if raw.Limit > 100 {
+			raw.Limit = 100
+		}
 		input.Limit = uint64(raw.Limit)
 	}
 	return input, grouped, nil

@@ -3069,7 +3069,13 @@ func parseNotificationInput(raw map[string]any) (chstore.ViewerFeedInput, error)
 	}
 	input.Since = int64(intValue(raw["since"], 0))
 	input.Until = int64(intValue(raw["until"], 0))
+	// Cap the user-supplied limit here: the store's window clamp admits the
+	// grouped REST handler's wide internal windows, so the API layer bounds
+	// external page sizes.
 	if limit := intValue(raw["limit"], 50); limit > 0 {
+		if limit > 100 {
+			limit = 100
+		}
 		input.Limit = uint64(limit)
 	}
 	return input, nil

@@ -1393,9 +1393,7 @@ func (s *Store) ViewerFeed(ctx context.Context, input ViewerFeedInput) ([]Viewer
 	if input.Viewer == "" {
 		return []ViewerFeedRow{}, nil
 	}
-	if input.Limit == 0 || input.Limit > 100 {
-		input.Limit = 50
-	}
+	input.Limit = viewerFeedWindowLimit(input.Limit)
 	tab := strings.ToUpper(strings.TrimSpace(input.Tab))
 	if tab == "" {
 		tab = "ALL"
@@ -1413,8 +1411,22 @@ func (s *Store) ViewerFeed(ctx context.Context, input ViewerFeedInput) ([]Viewer
 	// a keyed range scan instead of the FINAL-join + tag-scan query below.
 	// While the model backfills after a fresh deploy the legacy query serves
 	// (a bootstrap condition, not a fallback: it self-clears within minutes).
+	//
+	// The model only holds notificationsFeedHistoryWindow of history, so it
+	// answers only when it can FILL the requested window: a short page means
+	// the viewer's remaining notifications live beyond the model floor (a
+	// lightly-notified account, or a cursor paged past the floor), and the
+	// legacy full-history read serves that request instead. Engaged accounts
+	// saturate the window and never fall through, which is exactly the
+	// population the model exists to protect the legacy query from.
 	if !s.notificationsLegacyRead && s.notificationsFeedReady(ctx) {
-		return s.notificationsFromFeed(ctx, input, tab, policy, replyScope)
+		rows, err := s.notificationsFromFeed(ctx, input, tab, policy, replyScope)
+		if err != nil {
+			return nil, err
+		}
+		if !notificationsModelPageShort(len(rows), input.Limit) {
+			return rows, nil
+		}
 	}
 
 	// Bound how many recent candidates we hydrate before the heavy FINAL joins
@@ -1499,7 +1511,7 @@ func (s *Store) ViewerFeed(ctx context.Context, input ViewerFeedInput) ([]Viewer
 	// not the global tag table.
 	replyReferenceJoin := ""
 	replyArgs := []any{}
-	if replyScope == "DIRECT" || replyScope == "THREAD" {
+	if replyScopeApplies(tab, replyScope) {
 		replyReferenceJoin = `
 			LEFT JOIN (
 				SELECT
@@ -1555,11 +1567,13 @@ func (s *Store) ViewerFeed(ctx context.Context, input ViewerFeedInput) ([]Viewer
 			) AS viewer_reply_refs ON viewer_reply_refs.event_id = e.id`
 		replyArgs = append(replyArgs, input.Viewer)
 	}
-	switch replyScope {
-	case "DIRECT":
-		where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR reply_parent.pubkey = n.viewer)"
-	case "THREAD":
-		where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR ifNull(viewer_reply_refs.has_viewer_reply_reference, 0) = 1)"
+	if replyScopeApplies(tab, replyScope) {
+		switch replyScope {
+		case "DIRECT":
+			where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR reply_parent.pubkey = n.viewer)"
+		case "THREAD":
+			where += " AND (e.kind != 1 OR ifNull(reply_meta.is_reply, 0) = 0 OR ifNull(viewer_reply_refs.has_viewer_reply_reference, 0) = 1)"
+		}
 	}
 
 	// Positional args in textual order:
