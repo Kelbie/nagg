@@ -59,6 +59,43 @@ func (c *capCounter) bucketKey(now time.Time) string {
 	return now.UTC().Truncate(c.rule.Window).Format(time.RFC3339)
 }
 
+// admit reports whether ev passes this cap rule evaluated at `at` — the wall
+// clock on the firehose path (ingestion time, so backdated created_at can't
+// dodge the cap) and the event's own created_at on the history-walk path (the
+// walk delivers years in hours; wall bucketing would collapse an author's
+// whole history into one window, while event-day bucketing mirrors what the
+// live firehose would have admitted at the time). Counts events it admits.
+func (c *capCounter) admit(ev *nostr.Event, at time.Time, exempt func(pubkey string) bool) bool {
+	if !kindIn(c.rule.Kinds, ev.Kind) {
+		return true
+	}
+	if c.rule.ExemptKnownViewers && exempt != nil && exempt(ev.PubKey) {
+		return true
+	}
+
+	bucket := c.bucketKey(at)
+	if c.bucket != bucket {
+		c.bucket = bucket
+		c.counts = make(map[string]int, 4096)
+		c.cappedAuthorsBucket = 0
+	}
+
+	count, tracked := c.counts[ev.PubKey]
+	if count >= c.rule.Max {
+		c.droppedSinceLog++
+		return false
+	}
+	if !tracked && len(c.counts) >= capCounterMaxEntries {
+		// Fail open past the bound (see capCounterMaxEntries).
+		return true
+	}
+	c.counts[ev.PubKey] = count + 1
+	if count+1 == c.rule.Max {
+		c.cappedAuthorsBucket++
+	}
+	return true
+}
+
 // overCap reports whether this event must be dropped by any declared cap
 // rule, and does the counting for events it lets through.
 func (p *Pipeline) overCap(event *nostr.Event) bool {
@@ -72,32 +109,8 @@ func (p *Pipeline) overCap(event *nostr.Event) bool {
 	now := nowFn()
 
 	for _, c := range p.caps {
-		if !kindIn(c.rule.Kinds, event.Kind) {
-			continue
-		}
-		if c.rule.ExemptKnownViewers && p.exempt != nil && p.exempt(event.PubKey) {
-			continue
-		}
-
-		bucket := c.bucketKey(now)
-		if c.bucket != bucket {
-			c.bucket = bucket
-			c.counts = make(map[string]int, 4096)
-			c.cappedAuthorsBucket = 0
-		}
-
-		count, tracked := c.counts[event.PubKey]
-		if count >= c.rule.Max {
-			c.droppedSinceLog++
+		if !c.admit(event, now, p.exempt) {
 			return true
-		}
-		if !tracked && len(c.counts) >= capCounterMaxEntries {
-			// Fail open past the bound (see capCounterMaxEntries).
-			continue
-		}
-		c.counts[event.PubKey] = count + 1
-		if count+1 == c.rule.Max {
-			c.cappedAuthorsBucket++
 		}
 	}
 	return false

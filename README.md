@@ -242,6 +242,7 @@ Useful configuration:
 NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social
 NAGG_KINDS=0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000
 NAGG_SINCE=24h
+NAGG_HISTORY_FLOOR=
 NAGG_BATCH_SIZE=1000
 NAGG_FLUSH_INTERVAL=5s
 NAGG_VERIFY_EVENTS=true
@@ -250,6 +251,16 @@ NAGG_ON_DEMAND_WAIT=0s
 ```
 
 The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`. Set `NAGG_KINDS` explicitly when you need a different relay subscription. The ingester treats this list as the retained kind allowlist: when it starts, any raw, tag, relay-provenance, derived, or viewer-ref rows for kinds outside the configured list are pruned before new relay subscriptions open. Set `NAGG_SINCE=0` to omit the `since` filter.
+
+`NAGG_HISTORY_FLOOR` (empty = disabled) is an absolute date — `YYYY-MM-DD`
+(midnight UTC) or full RFC3339. When set, the relay-history backfiller walks
+the full `NAGG_KINDS` set from every configured relay down to that date,
+through the same per-author caps and addressee gates as the live firehose.
+The walk is checkpointed and paced (500-event pages, 500ms apart, 200 pages
+per kind/relay per hourly pass), so a deep floor takes days of background
+walking by design — start modest. Moving the floor **further back** later
+resumes each walk from its checkpoint down to the new date; moving it forward
+or leaving it unchanged does nothing (already-stored deeper history is kept).
 
 ## Backfill The Derived Tables
 
@@ -324,6 +335,7 @@ Optional service variables:
 ```sh
 NAGG_RELAYS=wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social
 NAGG_KINDS=0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000
+NAGG_HISTORY_FLOOR=
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret>
 NAGG_VERTEX_RELAY=wss://relay.vertexlab.io
 NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500

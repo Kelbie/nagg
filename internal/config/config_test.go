@@ -247,3 +247,67 @@ func containsKind(kinds []int, want int) bool {
 }
 
 const testViewerPubkey = "50d94fc2d8580c682b071a542f8b1e31a200b0508bab95a33bef0855df281d63"
+
+func TestLoadHistoryFloorAddsFirehoseFloorRule(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_HISTORY_FLOOR", "2024-06-01")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var floorRule, k38000 bool
+	for _, rule := range cfg.Ingest.Backfills {
+		switch rule.Name {
+		case "firehose_floor":
+			floorRule = true
+			want := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC).Unix()
+			if rule.Floor != want {
+				t.Fatalf("floor = %d, want %d", rule.Floor, want)
+			}
+			if rule.Resync != 0 {
+				t.Fatalf("floor rule resync = %v, want 0 (live firehose owns the head)", rule.Resync)
+			}
+			if containsKind(rule.Kinds, 38000) {
+				t.Fatal("exhaustion-covered kind 38000 must be excluded from the floor rule")
+			}
+			if !containsKind(rule.Kinds, 1) || !containsKind(rule.Kinds, 7) {
+				t.Fatalf("floor rule kinds = %v, want the firehose set", rule.Kinds)
+			}
+		case "k38000_history":
+			k38000 = true
+			if rule.Floor != 0 {
+				t.Fatal("curated exhaustion rule must stay floorless")
+			}
+		}
+	}
+	if !floorRule || !k38000 {
+		t.Fatalf("backfills = %+v, want firehose_floor AND k38000_history", cfg.Ingest.Backfills)
+	}
+}
+
+func TestLoadHistoryFloorMalformedErrors(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_HISTORY_FLOOR", "garbage")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for a malformed floor")
+	}
+	if !strings.Contains(err.Error(), "NAGG_HISTORY_FLOOR") {
+		t.Fatalf("error = %v, want it to name NAGG_HISTORY_FLOOR", err)
+	}
+}
+
+func TestLoadHistoryFloorUnsetLeavesBackfillsAlone(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_HISTORY_FLOOR", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Ingest.Backfills) != 1 || cfg.Ingest.Backfills[0].Name != "k38000_history" {
+		t.Fatalf("backfills = %+v, want only k38000_history", cfg.Ingest.Backfills)
+	}
+}

@@ -170,6 +170,37 @@ func Default(capMax int) (*Registry, error) {
 	return New(relationships, projections, supersessions, lifetimes, caps, backfills, addresseeGates)
 }
 
+// HistoryFloorBackfill builds the deep-history walk rule for the firehose
+// kind set: walk every kind down to floor (unix seconds, NAGG_HISTORY_FLOOR).
+// Kinds already covered by an exhaustion backfill (Floor == 0) in existing are
+// excluded — those walks are strictly deeper than any floor walk. ok is false
+// when the floor is unset or no kinds remain. The literal is valid by
+// construction (lowercase-ident name, non-empty kinds, positive floor), so it
+// never needs to round-trip through Registry validation.
+func HistoryFloorBackfill(kinds []int, floor int64, existing []Backfill) (Backfill, bool) {
+	if floor <= 0 || len(kinds) == 0 {
+		return Backfill{}, false
+	}
+	covered := map[int]bool{}
+	for _, b := range existing {
+		if b.Floor == 0 {
+			for _, k := range b.Kinds {
+				covered[k] = true
+			}
+		}
+	}
+	out := make([]int, 0, len(kinds))
+	for _, k := range kinds {
+		if !covered[k] {
+			out = append(out, k)
+		}
+	}
+	if len(out) == 0 {
+		return Backfill{}, false
+	}
+	return Backfill{Name: "firehose_floor", Kinds: out, Floor: floor}, true
+}
+
 // MustDefault is Default for wiring paths without an error channel (config
 // construction): the default rule set is compile-time data validated by unit
 // tests, so a failure is a programming error worth crashing on.
