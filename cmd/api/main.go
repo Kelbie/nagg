@@ -474,7 +474,10 @@ func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg confi
 	// Relay-history backfill: walk the declared kinds out of relay history and
 	// keep them topped up (async; checkpointed in relay_backfill_state, so
 	// every pass is resumable and completed walks re-run only on their Resync).
-	backfiller := ingest.NewBackfiller(store, cfg.Firehose.Relays, cfg.Ingest.Backfills, slog.Default())
+	// Walked pages pass the same caps/gates as the live firehose — load-bearing
+	// for the NAGG_HISTORY_FLOOR walk, a no-op for curated exhaustion kinds.
+	backfiller := ingest.NewBackfiller(store, cfg.Firehose.Relays, cfg.Ingest.Backfills, slog.Default(),
+		ingest.WithBackfillFilter(cfg.Ingest.Caps, cfg.Ingest.AddresseeGates, exempt))
 	go func() {
 		defer safego.Recover("api.backfill")
 		backfiller.Run(ctx)

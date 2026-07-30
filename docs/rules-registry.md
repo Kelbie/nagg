@@ -125,9 +125,9 @@ relevance model (known viewers ∪ their follows, `docs/retention.md`).
 
 ## Backfills
 
-`Backfill{Kinds, Resync}`: events of `Kinds` are pulled out of relay history
-systematically instead of only observed live. The firehose only ever sees new
-publications, so long-lived, rarely-republished kinds (parameterized-
+`Backfill{Kinds, Resync, Floor}`: events of `Kinds` are pulled out of relay
+history systematically instead of only observed live. The firehose only ever
+sees new publications, so long-lived, rarely-republished kinds (parameterized-
 replaceable app data — kind 38000 was the motivating case: months of live
 listening captured 23 events while the configured relays held ~1.5k) never
 accumulate without one.
@@ -145,12 +145,29 @@ with `newest_synced`, catching events published while the service was down
 (the firehose subscription looks back at most `NAGG_SINCE`). `Resync == 0`
 means initial walk only.
 
-Backfilled inserts go through `Store.InsertEvents` directly: like every
-on-demand backfill they bypass the per-author caps (which target firehose
-flooding, not history), and transport-level id + signature verification
-already happened in `relayquery`. Declare a rule only for kinds served as a
-browsable network-wide corpus; high-volume social kinds stay live-plus-on-
-demand, their history deliberately bounded by cap and lifetime rules.
+`Floor` (unix seconds, 0 = walk to exhaustion) bounds the walk instead of
+relay exhaustion: pages stop once they reach the floor, and events older than
+it are dropped (`created_at == Floor` is kept). On completion the state
+records `oldest_synced = Floor` — both when the floor was reached and when
+the relay exhausted above it — which doubles as the resume sentinel: a floor
+that later moves **further back** makes `oldest_synced > Floor` true and the
+walk resumes from the checkpoint down to the new floor; an unchanged or
+forward-moved floor dispatches nothing. The `firehose_floor` rule is derived
+from `NAGG_HISTORY_FLOOR` + the firehose kind set by `HistoryFloorBackfill`
+(kinds already covered by an exhaustion rule are excluded — that walk is
+strictly deeper), with `Resync: 0` because the live firehose owns the head.
+
+Backfilled inserts go through `Store.InsertEvents` directly — never the
+pipeline — but pass the same declarative ingest rules when the executor is
+constructed with `WithBackfillFilter`: per-author caps bucketed by the
+**event's created_at day** (a walk delivers years in hours; wall-clock
+bucketing would collapse an author's whole history into one window) and
+addressee gates, with the pipeline's exemption source and fail-open
+semantics. Both rule kinds are kind-scoped, so curated exhaustion walks
+(kind 38000, matched by no cap or gate) are unaffected. Transport-level id +
+signature verification already happened in `relayquery`. Declare an
+exhaustion rule only for kinds served as a browsable network-wide corpus;
+high-volume social kinds are bounded by the floor, cap, and lifetime rules.
 
 ## The DVM plugin seam (`internal/dvm`)
 

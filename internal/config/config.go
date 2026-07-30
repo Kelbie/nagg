@@ -196,6 +196,17 @@ func Load() (Config, error) {
 	// derives the same schema; runtime providers are attached by cmd/api.
 	dvmRegistry := dvm.MustRegistry(vertex.NewPlugin())
 
+	// The firehose kind set is needed twice: the relay subscription and the
+	// NAGG_HISTORY_FLOOR deep-history backfill rule derived from it.
+	firehoseKinds := parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000"))
+
+	// NAGG_HISTORY_FLOOR: absolute date; when set, relay history for the FULL
+	// firehose kind set is walked down to it (see rules.HistoryFloorBackfill).
+	historyFloor, err := parseDate(os.Getenv("NAGG_HISTORY_FLOOR"))
+	if err != nil {
+		return Config{}, fmt.Errorf("NAGG_HISTORY_FLOOR: %w", err)
+	}
+
 	cfg := Config{
 		DVM: dvmRegistry,
 		ClickHouse: chstore.Config{
@@ -236,7 +247,7 @@ func Load() (Config, error) {
 			// Sanitized: the prod env value has been observed with hard line-wraps
 			// INSIDE urls ("wss://relay.h\n  odl.ar"), which dial-fail forever.
 			Relays:        relayquery.SanitizeRelays(splitCSV(env("NAGG_RELAYS", "wss://relay.damus.io,wss://nos.lol,wss://relay.snort.social"))),
-			Kinds:         parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000")),
+			Kinds:         firehoseKinds,
 			Since:         parseDurationPtr(env("NAGG_SINCE", "24h")),
 			RelayRetry:    parseDuration(env("NAGG_RELAY_RETRY", "30s")),
 			SeenCacheSize: parseInt(env("NAGG_SEEN_CACHE_SIZE", "200000")),
@@ -250,8 +261,10 @@ func Load() (Config, error) {
 			VerifyEvents:  parseBool(env("NAGG_VERIFY_EVENTS", "true")),
 			// Declarative relay-history backfills: kinds walked out of relay
 			// history and kept topped up, because a live firehose never
-			// surfaces old, rarely-republished events.
-			Backfills: ruleRegistry.Backfills(),
+			// surfaces old, rarely-republished events. NAGG_HISTORY_FLOOR
+			// additionally walks the full firehose kind set down to an
+			// absolute date, through the same caps/gates as the live firehose.
+			Backfills: historyFloorBackfills(ruleRegistry.Backfills(), firehoseKinds, historyFloor),
 			// Declarative per-author firehose caps for authors NOT relevant
 			// to any Sovran user (see internal/relevance). Measured 2026-07:
 			// 20/day removes ~90% of monthly post volume, all of it from
@@ -512,4 +525,33 @@ func parseFloat(value string) float64 {
 		return 0
 	}
 	return v
+}
+
+// parseDate parses an absolute date — "2006-01-02" (midnight UTC) or full
+// RFC3339 — into unix seconds. Empty means unset (0, nil error). Unlike the
+// other forgiving parse helpers this one errors on malformed input: a typo'd
+// history floor that silently parsed to "unset" would silently skip the walk.
+func parseDate(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	if t, err := time.Parse("2006-01-02", value); err == nil {
+		return t.Unix(), nil
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return 0, fmt.Errorf("want YYYY-MM-DD or RFC3339, got %q", value)
+	}
+	return t.Unix(), nil
+}
+
+// historyFloorBackfills appends the NAGG_HISTORY_FLOOR deep-history rule to
+// the registry's declared backfills; floor 0 (unset) leaves them untouched.
+func historyFloorBackfills(declared []rules.Backfill, kinds []int, floor int64) []rules.Backfill {
+	rule, ok := rules.HistoryFloorBackfill(kinds, floor, declared)
+	if !ok {
+		return declared
+	}
+	return append(append([]rules.Backfill(nil), declared...), rule)
 }

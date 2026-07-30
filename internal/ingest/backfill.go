@@ -35,18 +35,22 @@ import (
 // optional and approximate, so it cannot gate completeness. until/limit
 // pagination is the only mechanism NIP-01 guarantees.
 //
-// Inserts go through Store.InsertEvents directly — like every on-demand
-// backfill, walked history is definitionally relevant and bypasses the
-// per-author ingest caps (which target firehose flooding, not history).
-// Id + signature verification already happened in relayquery (validateEvent
-// drops anything invalid before it reaches this package).
+// Inserts go through Store.InsertEvents directly — never Pipeline.add — but
+// walked pages pass the same declarative ingest rules as the live firehose
+// when WithBackfillFilter is installed: per-author caps (bucketed by the
+// EVENT's created_at day, so history is admitted the way the firehose would
+// have admitted it at the time) and addressee gates. Both rule kinds are
+// kind-scoped, so curated exhaustion walks (kind 38000, matched by no cap or
+// gate) are unaffected. Id + signature verification already happened in
+// relayquery (validateEvent drops anything invalid before it reaches this
+// package).
 
 const (
 	backfillPageLimit = 500
 	// backfillMaxPages bounds one (kind, relay) walk per pass: 100k events,
 	// far above any expected corpus for a backfilled kind. Hitting it is
 	// logged and the checkpoint resumes the walk on the next pass.
-	backfillMaxPages = 200
+	backfillMaxPages  = 200
 	backfillQueryTime = 15 * time.Second
 	backfillPagePause = 500 * time.Millisecond
 	// backfillTick is how often Run re-checks for due top-ups; actual re-walk
@@ -73,13 +77,28 @@ type Backfiller struct {
 	relays  []string
 	rules   []rules.Backfill
 	logger  *slog.Logger
+	filter  *backfillFilter // nil = insert everything (see WithBackfillFilter)
 
 	now   func() time.Time // test seam; nil means time.Now
 	pause time.Duration    // test seam; page pause
 }
 
-func NewBackfiller(store BackfillStore, relays []string, backfills []rules.Backfill, logger *slog.Logger) *Backfiller {
-	return &Backfiller{
+// BackfillOption customizes a Backfiller beyond its required wiring.
+type BackfillOption func(*Backfiller)
+
+// WithBackfillFilter runs every walked page through the firehose ingest rules
+// before insert: per-author caps (bucketed by event day) and addressee gates,
+// with the live pipeline's exemption source. Both rule kinds are kind-scoped,
+// so curated exhaustion walks (e.g. kind 38000, matched by no cap or gate)
+// are unaffected; the filter only bites on firehose kinds.
+func WithBackfillFilter(caps []rules.Cap, gates []rules.AddresseeGate, exempt func(pubkey string) bool) BackfillOption {
+	return func(b *Backfiller) {
+		b.filter = &backfillFilter{caps: newCapCounters(caps), gates: gates, exempt: exempt}
+	}
+}
+
+func NewBackfiller(store BackfillStore, relays []string, backfills []rules.Backfill, logger *slog.Logger, opts ...BackfillOption) *Backfiller {
+	b := &Backfiller{
 		store:   store,
 		querier: relayquery.Client{Relays: relays, Health: relayquery.NewRelayHealth()},
 		relays:  relays,
@@ -88,6 +107,10 @@ func NewBackfiller(store BackfillStore, relays []string, backfills []rules.Backf
 		now:     time.Now,
 		pause:   backfillPagePause,
 	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // Run executes one pass immediately, then re-checks hourly for due work until
@@ -137,6 +160,14 @@ func (b *Backfiller) RunOnce(ctx context.Context) {
 				switch {
 				case !st.Completed:
 					b.walkDown(ctx, rule, st)
+				case rule.Floor > 0 && st.OldestSynced > rule.Floor:
+					// The floor moved further back since this walk completed
+					// (OldestSynced records the floor it stopped at): resume
+					// from the checkpoint down to the new floor. Cleared so a
+					// page-budget interruption checkpoints as incomplete and
+					// resumes through the normal case next pass.
+					st.Completed = false
+					b.walkDown(ctx, rule, st)
 				case rule.Resync > 0 && b.now().Sub(st.UpdatedAt) >= rule.Resync:
 					b.topUp(ctx, rule, st)
 				}
@@ -146,7 +177,10 @@ func (b *Backfiller) RunOnce(ctx context.Context) {
 }
 
 // walkDown runs (or resumes) the initial history walk: newest first, down to
-// relay exhaustion, checkpointing after every page.
+// relay exhaustion — or, for a floor rule (rule.Floor > 0), down to the floor
+// — checkpointing after every page. Floor completion records OldestSynced =
+// rule.Floor, the sentinel RunOnce compares against to detect a floor that
+// later moved further back.
 func (b *Backfiller) walkDown(ctx context.Context, rule rules.Backfill, st chstore.RelayBackfillState) {
 	nowUnix := b.now().Unix()
 	until := nowUnix + 60
@@ -180,14 +214,34 @@ func (b *Backfiller) walkDown(ctx context.Context, rule rules.Backfill, st chsto
 			st.Completed = true
 			break
 		}
-		if err := b.store.InsertEvents(ctx, records); err != nil {
-			b.logger.Warn("backfill: insert failed", "rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "error", err)
-			return
+		if rule.Floor > 0 {
+			records = keepAtOrAbove(records, rule.Floor)
 		}
-		total += len(records)
+		records = b.filterRecords(records)
+		// A page the floor cut or the filter emptied still advances the
+		// cursor (oldest comes from the RAW page) and never completes the
+		// walk — only a raw empty page means relay exhaustion.
+		if len(records) > 0 {
+			if err := b.store.InsertEvents(ctx, records); err != nil {
+				b.logger.Warn("backfill: insert failed", "rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "error", err)
+				return
+			}
+			total += len(records)
+		}
 		st.OldestSynced = oldest
+		if rule.Floor > 0 && oldest <= rule.Floor {
+			// Covered down to the floor (inclusive). OldestSynced records the
+			// floor itself, not the page's oldest: it is the resume point if
+			// the floor later moves further back, and page-oldest may sit far
+			// below the floor (one bogus-ancient stamp).
+			st.Completed = true
+			st.OldestSynced = rule.Floor
+		}
 		if err := b.checkpoint(ctx, st); err != nil {
 			return
+		}
+		if st.Completed {
+			break
 		}
 		if oldest >= until {
 			// A full page inside a single second cannot advance the inclusive
@@ -204,6 +258,12 @@ func (b *Backfiller) walkDown(ctx context.Context, rule rules.Backfill, st chsto
 		b.logger.Warn("backfill: walk page budget hit; resuming next pass",
 			"rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "pages", pages, "events", total)
 	}
+	if rule.Floor > 0 && st.Completed {
+		// Relay exhaustion above the floor also claims floor coverage: there
+		// is nothing older on this relay, and a floor that never moves again
+		// must not re-query an exhausted relay every hourly pass.
+		st.OldestSynced = rule.Floor
+	}
 	if err := b.checkpoint(ctx, st); err != nil {
 		return
 	}
@@ -218,9 +278,9 @@ func (b *Backfiller) walkDown(ctx context.Context, rule rules.Backfill, st chsto
 func (b *Backfiller) topUp(ctx context.Context, rule rules.Backfill, st chstore.RelayBackfillState) {
 	nowUnix := b.now().Unix()
 	until := nowUnix + 60
-	floor := st.NewestSynced
-	newest := floor
-	reachedFloor := false
+	overlap := st.NewestSynced
+	newest := overlap
+	reachedOverlap := false
 
 	total, pages := 0, 0
 	for ; pages < backfillMaxPages; pages++ {
@@ -230,10 +290,11 @@ func (b *Backfiller) topUp(ctx context.Context, rule rules.Backfill, st chstore.
 			return // updated_at untouched → due again next tick
 		}
 		if len(events) == 0 {
-			reachedFloor = true
+			reachedOverlap = true
 			break
 		}
 		records, oldest, pageNewest := toRecords(events, nowUnix+60)
+		records = b.filterRecords(records)
 		if len(records) > 0 {
 			if err := b.store.InsertEvents(ctx, records); err != nil {
 				b.logger.Warn("backfill: insert failed", "rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "error", err)
@@ -244,8 +305,8 @@ func (b *Backfiller) topUp(ctx context.Context, rule rules.Backfill, st chstore.
 				newest = pageNewest
 			}
 		}
-		if oldest <= floor {
-			reachedFloor = true
+		if oldest <= overlap {
+			reachedOverlap = true
 			break
 		}
 		if oldest >= until {
@@ -257,12 +318,12 @@ func (b *Backfiller) topUp(ctx context.Context, rule rules.Backfill, st chstore.
 			return
 		}
 	}
-	if !reachedFloor {
+	if !reachedOverlap {
 		// The page budget ran out above the synced range. Advance anyway —
 		// re-walking the same head every pass would never converge — but say
-		// so: the range (floor, oldest page reached) was not covered.
+		// so: the range (overlap, oldest page reached) was not covered.
 		b.logger.Warn("backfill: top-up page budget hit before overlap; gap not covered",
-			"rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "pages", pages, "floor", floor)
+			"rule", rule.Name, "kind", st.Kind, "relay", st.Relay, "pages", pages, "overlap", overlap)
 	}
 	st.NewestSynced = newest
 	if err := b.checkpoint(ctx, st); err != nil {
@@ -336,4 +397,30 @@ func toRecords(events []relayquery.Event, maxCreatedAt int64) (records []chstore
 		})
 	}
 	return records, oldest, newest
+}
+
+// keepAtOrAbove drops records older than floor (created_at < floor); the
+// floor itself is kept. In-place: records is page-local.
+func keepAtOrAbove(records []chstore.EventRecord, floor int64) []chstore.EventRecord {
+	kept := records[:0]
+	for _, rec := range records {
+		if int64(rec.Event.CreatedAt) >= floor {
+			kept = append(kept, rec)
+		}
+	}
+	return kept
+}
+
+// filterRecords applies the optional firehose-rule filter (caps + gates).
+func (b *Backfiller) filterRecords(records []chstore.EventRecord) []chstore.EventRecord {
+	if b.filter == nil {
+		return records
+	}
+	kept := records[:0]
+	for _, rec := range records {
+		if b.filter.keep(rec) {
+			kept = append(kept, rec)
+		}
+	}
+	return kept
 }

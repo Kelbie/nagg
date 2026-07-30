@@ -196,6 +196,13 @@ type Backfill struct {
 	// Resync is the interval between top-up walks once the initial history
 	// walk has completed. 0 disables re-syncing (initial walk only).
 	Resync time.Duration
+	// Floor bounds the initial walk: 0 walks to relay exhaustion; a positive
+	// unix timestamp stops the walk once a page reaches the floor (events with
+	// created_at < Floor are dropped; created_at == Floor is kept). Completion
+	// records OldestSynced = Floor in the walk state, so a floor that later
+	// moves FURTHER BACK resumes from the checkpoint down to the new floor; an
+	// unchanged or forward-moved floor is a no-op.
+	Floor int64
 }
 
 // Registry holds the full declared rule set. Construct with New, which
@@ -453,6 +460,9 @@ func validateBackfill(b Backfill) error {
 	}
 	if b.Resync < 0 {
 		return fmt.Errorf("negative resync")
+	}
+	if b.Floor < 0 {
+		return fmt.Errorf("negative floor")
 	}
 	return nil
 }

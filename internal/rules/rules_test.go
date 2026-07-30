@@ -195,6 +195,9 @@ func TestBackfillValidation(t *testing.T) {
 	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: []int{1}, Resync: -time.Hour}}, nil); err == nil {
 		t.Error("negative resync must fail")
 	}
+	if _, err := New(nil, nil, nil, nil, nil, []Backfill{{Name: "x", Kinds: []int{1}, Floor: -1}}, nil); err == nil {
+		t.Error("negative floor must fail")
+	}
 	dup := Backfill{Name: "x", Kinds: []int{1}}
 	if _, err := New(nil, nil, nil, nil, nil, []Backfill{dup, dup}, nil); err == nil {
 		t.Error("duplicate backfill names must fail")
@@ -205,6 +208,44 @@ func TestBackfillValidation(t *testing.T) {
 	}
 	if len(r.Backfills()) != 1 {
 		t.Fatalf("backfills = %d, want 1", len(r.Backfills()))
+	}
+}
+
+func TestHistoryFloorBackfill(t *testing.T) {
+	existing := []Backfill{{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour}}
+	kinds := []int{0, 1, 7, 38000}
+
+	rule, ok := HistoryFloorBackfill(kinds, 1_700_000_000, existing)
+	if !ok {
+		t.Fatal("floor rule must be produced for a set floor")
+	}
+	if rule.Name != "firehose_floor" || rule.Floor != 1_700_000_000 || rule.Resync != 0 {
+		t.Fatalf("rule = %+v", rule)
+	}
+	// Kind 38000 is covered by the exhaustion rule (strictly deeper than any
+	// floor walk) and must be excluded.
+	for _, k := range rule.Kinds {
+		if k == 38000 {
+			t.Fatal("exhaustion-covered kind must be excluded from the floor rule")
+		}
+	}
+	if len(rule.Kinds) != 3 {
+		t.Fatalf("kinds = %v, want the 3 uncovered kinds", rule.Kinds)
+	}
+
+	// The produced rule must survive registry validation round-tripping.
+	if _, err := New(nil, nil, nil, nil, nil, append(existing, rule), nil); err != nil {
+		t.Fatalf("floor rule failed registry validation: %v", err)
+	}
+
+	if _, ok := HistoryFloorBackfill(kinds, 0, existing); ok {
+		t.Fatal("unset floor must produce no rule")
+	}
+	if _, ok := HistoryFloorBackfill([]int{38000}, 1_700_000_000, existing); ok {
+		t.Fatal("fully-covered kind set must produce no rule")
+	}
+	if _, ok := HistoryFloorBackfill(nil, 1_700_000_000, existing); ok {
+		t.Fatal("empty kind set must produce no rule")
 	}
 }
 
