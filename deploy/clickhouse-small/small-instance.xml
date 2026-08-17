@@ -42,6 +42,15 @@
   therefore moves ClickHouse's internal ceiling with it, which is one knob
   instead of two that can disagree.
 
+  Result, with the matching Railway limit (1 GB / 1 vCPU):
+
+    GlobalThread             857    -> 256
+    jemalloc.allocated       462 MiB -> 336 MiB
+    billed memory            1.33 GB -> 0.73 GB
+    max_server_memory_usage  21.6 GB -> 787 MB   (follows the cgroup)
+
+  The remainder is floor: MemoryCode alone is 475 MiB of ClickHouse binary.
+
   A separate profile from deploy/clickhouse, not a copy of it. That one is tuned
   for a ~26 GB database whose merges flood the page cache, and its memory has
   twice been damaged by caps that were correct for a small instance. The two

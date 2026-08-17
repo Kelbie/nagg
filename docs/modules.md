@@ -139,6 +139,21 @@ the **host**, and Railway's host reports 24 cores and ~120 GB of RAM. Measured
 on first boot, ClickHouse was billing 1.33 GB — about 97% of the deployment's
 cost — to hold roughly a megabyte, while the nagg API beside it used 35 MB.
 
-Pair it with Railway resource limits, which also fix the API's self-sizing: with
-no cap, `automemlimit` reads the host cgroup and sets `GOMEMLIMIT` to ~20 GB, so
-Go's collector lets the heap run far past anything this workload needs.
+Pair it with Railway resource limits (Settings → Resource Limits, or
+`serviceInstanceLimitsUpdate`). Those are not just a ceiling — both processes
+size themselves from the cgroup, so the cap changes actual usage:
+`max_server_memory_usage_to_ram_ratio` resolves against the container, and the
+API's `automemlimit` sets `GOMEMLIMIT` from it (uncapped, it read ~20 GB).
+
+Measured on the mint deployment, before → after:
+
+| | ClickHouse | nagg-mint |
+| --- | --- | --- |
+| memory | 1.33 GB → **0.73 GB** | 0.035 GB → **0.015 GB** |
+| CPU | 0.054 → **0.031** vCPU | 0.002 → **0.000** vCPU |
+| threads | 857 → **256** | — |
+| `max_server_memory_usage` | 21.6 GB → **787 MB** | — |
+| Railway limit | 1 GB / 1 vCPU | 0.5 GB / 1 vCPU |
+
+The remaining ~0.7 GB is mostly floor: `MemoryCode` is 475 MB of ClickHouse
+binary. Anonymous heap is ~336 MB, so the 1 GB cap has real headroom.
