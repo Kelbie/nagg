@@ -1,3 +1,4 @@
+-- +module nostr
 -- Retention for viewer_refs (was unbounded: 115M rows / ~8 GiB on
 -- a volume that hit 1.88 GiB free — CH error 243 "Cannot reserve … not enough
 -- space" blocked the notifications_feed history writer).

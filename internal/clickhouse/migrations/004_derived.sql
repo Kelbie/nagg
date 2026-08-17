@@ -1,3 +1,4 @@
+-- +module nostr
 CREATE TABLE IF NOT EXISTS derived_tags
 (
     event_id FixedString(64),

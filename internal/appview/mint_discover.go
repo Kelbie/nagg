@@ -139,17 +139,25 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	// per operator. The DVM round-trips (which were even failing on credits) blew
 	// the client's timeout → "no mints available"; this keeps discovery as cheap
 	// as the reviews endpoint (cache-only, no live DVM).
+	//
+	// The kind-0 lookup runs in every deployment — a mint-only one has no
+	// firehose for kind 0, so profileInfos' on-demand relay fetch is exactly how
+	// operator profiles arrive. The other two read pubkey_stats and the Vertex
+	// cache, which the nostr module owns; without it they are skipped rather
+	// than issued and discarded (see WithSocialEnrichment).
 	profiles, perr := h.profileInfos(ctx, operatorPubkeys)
 	if perr != nil {
 		profiles = map[string]ProfileInfo{}
 	}
-	followCounts, ferr := h.store.BatchPubkeyStats(ctx, operatorPubkeys)
-	if ferr != nil {
-		followCounts = map[string]chstore.PubkeyStats{}
-	}
-	vertexProfiles, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys)
-	if verr != nil {
-		vertexProfiles = map[string]vertex.ProfileResult{}
+	followCounts := map[string]chstore.PubkeyStats{}
+	vertexProfiles := map[string]vertex.ProfileResult{}
+	if h.socialEnrichment {
+		if counts, ferr := h.store.BatchPubkeyStats(ctx, operatorPubkeys); ferr == nil {
+			followCounts = counts
+		}
+		if cached, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys); verr == nil {
+			vertexProfiles = cached
+		}
 	}
 
 	// 5) Build a row per mint, enriching from the batched maps (no per-mint CH/DVM).

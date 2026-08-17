@@ -1,3 +1,4 @@
+-- +module nostr
 -- Direct-reply edges and counts (NIP-10 / NIP-22).
 --
 -- The existing mv_note_reply_counts (002 + 005) counts ANY kind-1/1111 event that

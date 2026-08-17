@@ -1,3 +1,4 @@
+-- +module nostr
 -- Prune the notifications-feed tick's viewer_refs scan by arrival time.
 --
 -- viewer_refs is ORDER BY (viewer, created_at, event_id), so the tick's

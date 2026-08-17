@@ -250,7 +250,7 @@ NAGG_ON_DEMAND_USER_FEED=false
 NAGG_ON_DEMAND_WAIT=0s
 ```
 
-The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`. Set `NAGG_KINDS` explicitly when you need a different relay subscription. The ingester treats this list as the retained kind allowlist: when it starts, any raw, tag, relay-provenance, derived, or viewer-ref rows for kinds outside the configured list are pruned before new relay subscriptions open. Set `NAGG_SINCE=0` to omit the `since` filter.
+The default `NAGG_KINDS` is `0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000`. It is the **retained** kind allowlist: when the ingester starts, any raw, tag, relay-provenance, derived, or viewer-ref rows for kinds outside the configured list are pruned before new relay subscriptions open. `NAGG_FIREHOSE_KINDS` is the **subscribed** set and defaults to `NAGG_KINDS`; set it only when you want to keep a kind that arrives some other way (see [`docs/modules.md`](docs/modules.md)). Set `NAGG_SINCE=0` to omit the `since` filter.
 
 `NAGG_HISTORY_FLOOR` (empty = disabled) is an absolute date — `YYYY-MM-DD`
 (midnight UTC) or full RFC3339. When set, the relay-history backfiller walks
@@ -320,6 +320,12 @@ curl -X POST http://127.0.0.1:8080/nostr/events/aggregates \
 ## Deploy On Railway
 
 This repo includes a `Dockerfile` and `railway.toml` for the API service. Railway builds the Dockerfile, runs `./nagg-migrate` as the pre-deploy command, starts `./nagg-api`, and checks `GET /healthz` before making the deployment active.
+
+For a slice of nagg rather than all of it, set `NAGG_MODULES` — the deployment's
+enabled modules, from which the schema, relay kinds, mounted routes and running
+workers all follow. `NAGG_MODULES=mint` is the cashu mint observatory on a
+ClickHouse of eight tables; deploy it with `railway.mint.toml`. Unset means every
+module, i.e. the full app-view. See [`docs/modules.md`](docs/modules.md).
 
 Required service variables:
 

@@ -26,6 +26,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/mintinfo"
+	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/rollup"
 	"github.com/vertex-lab/nagg/internal/routstr"
@@ -46,6 +47,15 @@ func main() {
 		slog.Error("configuration failed", "error", err)
 		os.Exit(1)
 	}
+
+	// The module set decides the schema, the relay kinds, the mounted routes and
+	// the running workers, so it is the first thing worth seeing in the logs when
+	// a deployment behaves unexpectedly.
+	slog.Info("modules resolved",
+		"modules", cfg.Modules.String(),
+		"stored_kinds", cfg.StoredKinds,
+		"firehose_kinds", cfg.Firehose.Kinds,
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -111,6 +121,11 @@ func initializeAPI(ctx context.Context, cfg config.Config, logger *slog.Logger, 
 }
 
 func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config, logger *slog.Logger) (http.Handler, error) {
+	// The enabled modules gate every optional subsystem below: the GraphQL
+	// surface, the social-graph workers, and the mint observatory page.
+	nostrModule := cfg.Modules.Has(modules.Nostr)
+	mintModule := cfg.Modules.Has(modules.Mint)
+
 	// The Vertex plugin's declared usage policy: cache TTL + inbound-ref
 	// gate. All consumers (score sync, rank gating, profile refresh) derive
 	// from this single declaration.
@@ -182,9 +197,10 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	// Relevance tracker: records known Sovran viewers (via the appview touch
 	// seam below) and serves the exemption set the ingest post cap consults.
 	// Started regardless of the ingester flag so viewer touches are recorded
-	// even when ingestion runs in a separate process.
+	// even when ingestion runs in a separate process — but only for the nostr
+	// module, which owns known_viewers and the post cap the exemptions feed.
 	relevanceTracker := relevance.NewTracker(store, logger)
-	if workerSchemaReady {
+	if nostrModule && workerSchemaReady {
 		safego.Go("api.relevance", func() { relevanceTracker.Run(ctx) })
 	}
 
@@ -295,26 +311,40 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		graphqlapi.WithRequestTimeout(cfg.API.GraphQLTimeout),
 		graphqlapi.WithRelayHydrationMaxJobs(cfg.OnDemand.GraphQLMaxJobsPerRequest),
 	)
-	// Gate INSIDE the response cache so cache hits never queue.
-	gatedGQL := gate.Middleware(gqlHandler)
-	mux.HandleFunc("/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
-	mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
-	mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
+	// GraphQL belongs to the nostr module: it is the generic query surface over
+	// the event archive, and against a mint-only database almost every field
+	// resolves to a table that was never created. The mint routes are REST.
+	if nostrModule {
+		// Gate INSIDE the response cache so cache hits never queue.
+		gatedGQL := gate.Middleware(gqlHandler)
+		mux.HandleFunc("/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
+		mux.HandleFunc("/v1/graphql", cache.WrapGraphQL(gatedGQL, responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor))
+		mux.HandleFunc("/graphiql", graphqlapi.GraphiQLHandler("/graphql"))
+	}
 	// Ecosystem changelog page: a served HTML view over /nostr/mint/changes.
-	mux.HandleFunc("/mint-changes", appview.MintObservatoryHandler())
+	if mintModule {
+		mux.HandleFunc("/mint-changes", appview.MintObservatoryHandler())
+	}
 	// Reuse the GraphQL schema options so the REST ranked-feed route runs the
 	// exact same ranking pipeline (scoring + on-demand hydration) as the
 	// GraphQL rankedEvents resolver.
 	ranker := graphqlapi.NewRanker(store, schemaOpts...)
 	appviewOpts := []appview.Option{
+		appview.WithModules(cfg.Modules),
+		appview.WithSocialEnrichment(nostrModule),
 		appview.WithDVM(cfg.DVM),
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
 		appview.WithVertexProfileMinFollowers(int(vertexPolicy.MinInboundRefs)),
 		appview.WithViewerPubkey(cfg.Viewer.PubKey),
-		appview.WithViewerTouch(relevanceTracker.Touch),
 		appview.WithResponseCache(responseCache, cfg.Cache.DefaultTTL, cfg.Cache.StaleFor),
 		appview.WithRankedFeed(ranker),
 		appview.WithConcurrencyGate(gate),
+	}
+	// Viewer touches feed the nostr module's relevance tracker (known_viewers →
+	// ingest cap exemptions). Without that module the tracker never runs, so
+	// wiring the seam would only queue writes to a table that does not exist.
+	if nostrModule {
+		appviewOpts = append(appviewOpts, appview.WithViewerTouch(relevanceTracker.Touch))
 	}
 	// Route REST profile search through the same cache-backed provider as GraphQL.
 	// Injected unconditionally: with no Vertex key the provider returns
@@ -385,9 +415,9 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
 	appview.New(store, appviewOpts...).Register(mux)
-	healthStorageStats := newHealthStorageStatsCache(store, cfg.Firehose.Kinds, logger)
+	healthStorageStats := newHealthStorageStatsCache(store, cfg.StoredKinds, logger)
 	go healthStorageStats.Run(ctx)
-	mux.HandleFunc("/healthz", healthHandler(store, cfg.Firehose.Kinds, healthStorageStats.Snapshot))
+	mux.HandleFunc("/healthz", healthHandler(store, cfg.StoredKinds, healthStorageStats.Snapshot))
 
 	return mux, nil
 }
@@ -443,7 +473,7 @@ func apiUnavailable(w http.ResponseWriter) {
 }
 
 func startInProcessIngester(ctx context.Context, store *chstore.Store, cfg config.Config, exempt func(pubkey string) bool) {
-	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
+	if result, err := store.PruneRemovedEventKinds(ctx, cfg.StoredKinds); err != nil {
 		slog.Error("in-process ingester disabled: event kind retention failed", "error", err)
 		return
 	} else if result.Skipped {

@@ -1,3 +1,4 @@
+-- +module core
 -- Final system-log cleanup (~2.3 GB), after config.d/system-logs.xml landed.
 --
 -- Two groups, both inert:

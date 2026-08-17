@@ -1,3 +1,4 @@
+-- +module nostr
 -- One-time full population of pubkey_stats (010 created it rollup-fed only, so
 -- coverage was 16k of 551k profiled pubkeys — every uncovered pubkey read
 -- follower counts through the legacy global event_tags scan, which is both

@@ -1,3 +1,4 @@
+-- +module nostr
 -- RETIRED. The one-time like/repost historical backfill this file performed
 -- is now generic: when the registry (internal/rules) creates a rule's
 -- aggregate table for the first time, Migrate backfills it from raw history

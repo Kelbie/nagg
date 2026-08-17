@@ -1,3 +1,4 @@
+-- +module core
 -- Relay-history backfill watermarks (rules.Backfill, executed by
 -- ingest.Backfiller).
 --

@@ -1,3 +1,4 @@
+-- +module nostr
 -- RETIRED. The quote aggregate declared here (note_quote_counts +
 -- mv_note_quote_counts, NIP-18 'q' references) is now the registry rule k1_q
 -- (internal/rules), whose table, materialized view, and historical backfill

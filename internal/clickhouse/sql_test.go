@@ -70,7 +70,7 @@ func TestSplitSQLStatements(t *testing.T) {
 // embedded migration splits into non-empty statements that each begin with a
 // SQL keyword — i.e. no statement was broken apart mid-comment.
 func TestSplitSQLStatements_RealMigrationsParseToValidStatements(t *testing.T) {
-	for _, migration := range embeddedMigrations() {
+	for _, migration := range embeddedMigrations(nil) {
 		for _, stmt := range splitSQLStatements(migration) {
 			if stmt == "" {
 				t.Fatal("got an empty statement from a real migration")

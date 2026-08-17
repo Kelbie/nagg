@@ -1,3 +1,4 @@
+-- +module nostr
 -- Per-event rank-feature table — the single row the For-You / trending hot path
 -- scans. It replaces the per-request, per-term live aggregation
 -- (weightedRankBaseScores) and the in-memory base-pool cache with one indexed

@@ -1,3 +1,4 @@
+-- +module mint
 -- Mint-info snapshots (internal/mintinfo, executed by mintinfo.Snapshotter).
 --
 -- Two tables mirror the two facts the feature records: a SNAPSHOT is a distinct

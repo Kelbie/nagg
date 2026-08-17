@@ -8,7 +8,7 @@ import (
 
 // migrationFilePresent reports whether the embedded migrations include name.
 func migrationFilePresent(name string) bool {
-	for _, n := range migrationNames() {
+	for _, n := range migrationNames(nil) {
 		if n == name {
 			return true
 		}
@@ -22,7 +22,7 @@ var migrationFilenameRe = regexp.MustCompile(`^\d{3}_[a-z0-9_]+\.sql$`)
 // stray name (missing the zero-padded prefix, or a 4-digit one) would reorder
 // silently. Three digits is safe to 999 migrations.
 func TestMigrations_FilenamesAreNNNPrefixed(t *testing.T) {
-	names := migrationNames()
+	names := migrationNames(nil)
 	if len(names) == 0 {
 		t.Fatal("no embedded migrations discovered")
 	}
@@ -70,7 +70,7 @@ var insertTargetRe = regexp.MustCompile(`(?i)^INSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0
 // without IF NOT EXISTS, one-shot UPDATE/DELETE) fails here and must be reworked
 // or, for a genuinely convergent INSERT target, added to idempotentInsertTargets.
 func TestMigrations_OnlyIdempotentStatements(t *testing.T) {
-	for _, name := range migrationNames() {
+	for _, name := range migrationNames(nil) {
 		for _, raw := range splitSQLStatements(mustReadMigration(name)) {
 			stmt := stripLeadingComments(raw)
 			if stmt == "" {
@@ -124,7 +124,7 @@ func hasAnyStmtPrefix(s string, prefixes []string) bool {
 // ledger's own migration must exist, sort FIRST (Migrate applies it before
 // reading the ledger), and create the schema_migrations table.
 func TestMigrations_LedgerFileExists(t *testing.T) {
-	names := migrationNames()
+	names := migrationNames(nil)
 	if len(names) == 0 {
 		t.Fatal("no embedded migrations discovered")
 	}

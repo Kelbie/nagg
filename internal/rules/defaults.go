@@ -77,22 +77,7 @@ func Default(capMax int) (*Registry, error) {
 	// Latest-per-author projections: the kind-0 metadata table and the
 	// kind-3 reference-list table, declared instead of hand-written.
 	projections := []Projection{
-		{
-			Name:  "k0",
-			Kinds: []int{0},
-			Fields: []ProjField{
-				{Name: "name", JSONPath: "name"},
-				{Name: "display_name", JSONPath: "display_name"},
-				{Name: "picture", JSONPath: "picture"},
-				{Name: "about", JSONPath: "about"},
-				{Name: "nip05", JSONPath: "nip05"},
-				{Name: "lud16", JSONPath: "lud16"},
-				{Name: "lud06", JSONPath: "lud06"},
-				{Name: "banner", JSONPath: "banner"},
-				{Name: "website", JSONPath: "website"},
-				{Name: "raw_json", RawContent: true},
-			},
-		},
+		k0Projection(),
 		{
 			Name:   "k3",
 			Kinds:  []int{3},
@@ -168,6 +153,74 @@ func Default(capMax int) (*Registry, error) {
 	}
 
 	return New(relationships, projections, supersessions, lifetimes, caps, backfills, addresseeGates)
+}
+
+// k0Projection is the latest-kind-0-per-author extraction backing latest_k0 —
+// the table every profile read goes through (Store.LatestK0). Both rule sets
+// declare it, so it lives here rather than being copied: a field added for the
+// full app-view must not silently miss the mint deployment's operator profiles.
+func k0Projection() Projection {
+	return Projection{
+		Name:  "k0",
+		Kinds: []int{0},
+		Fields: []ProjField{
+			{Name: "name", JSONPath: "name"},
+			{Name: "display_name", JSONPath: "display_name"},
+			{Name: "picture", JSONPath: "picture"},
+			{Name: "about", JSONPath: "about"},
+			{Name: "nip05", JSONPath: "nip05"},
+			{Name: "lud16", JSONPath: "lud16"},
+			{Name: "lud06", JSONPath: "lud06"},
+			{Name: "banner", JSONPath: "banner"},
+			{Name: "website", JSONPath: "website"},
+			{Name: "raw_json", RawContent: true},
+		},
+	}
+}
+
+// Mint declares the rule set of a mint-only deployment (NAGG_MODULES=mint): the
+// cashu mint observatory and nothing else.
+//
+// What it keeps and why:
+//
+//   - the kind-0 projection, because /nostr/mint/reviews and /nostr/mint/discover
+//     bundle each reviewer's and operator's profile through Store.LatestK0. Those
+//     profiles arrive via on-demand relay fetches for the handful of pubkeys that
+//     actually appear, NOT from a global kind-0 firehose subscription.
+//   - NIP-01 replaceable pruning for kinds 0 and 38000, so re-seen versions of a
+//     profile or a mint recommendation don't accumulate.
+//   - the NIP-87 relay-history walk, because a live firehose alone captures
+//     almost no kind-38000 (measured 2026-07: 23 live vs ~1.5k on the relays).
+//
+// What it drops, and what that buys: no relationships, so GeneratedDDL emits no
+// aggregate tables, no materialized views and no event_refs — and with no
+// extractor rules, InsertEvents skips the event_refs batch entirely (see
+// Registry.IngestExtractorRules). No caps and no addressee gates either: at
+// kind-38000 volume there is nothing to ration.
+func Mint() (*Registry, error) {
+	projections := []Projection{k0Projection()}
+
+	supersessions := []Supersession{
+		{Name: "replaceable_latest", Kinds: []int{0}},
+		{Name: "param_replaceable_latest", Kinds: []int{38000}, PerDTag: true},
+	}
+
+	backfills := []Backfill{
+		{Name: "k38000_history", Kinds: []int{38000}, Resync: 24 * time.Hour},
+	}
+
+	return New(nil, projections, supersessions, nil, nil, backfills, nil)
+}
+
+// MustMint is Mint for wiring paths without an error channel, mirroring
+// MustDefault: the rule set is compile-time data validated by unit tests, so a
+// failure is a programming error worth crashing on.
+func MustMint() *Registry {
+	r, err := Mint()
+	if err != nil {
+		panic(fmt.Sprintf("rules: invalid mint rule set: %v", err))
+	}
+	return r
 }
 
 // HistoryFloorBackfill builds the deep-history walk rule for the firehose

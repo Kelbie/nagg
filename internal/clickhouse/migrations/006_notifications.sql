@@ -1,3 +1,4 @@
+-- +module nostr
 CREATE TABLE IF NOT EXISTS viewer_refs
 (
     viewer FixedString(64),

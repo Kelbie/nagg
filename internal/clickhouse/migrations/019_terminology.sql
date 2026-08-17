@@ -1,3 +1,4 @@
+-- +module nostr
 -- Terminology purge: the concept-named tables (note_reply_edges,
 -- note_engagement_real, note_rank_features, notification_candidates,
 -- notifications_feed, user_stats) were renamed to kind/reference vocabulary.

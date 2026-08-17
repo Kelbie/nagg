@@ -17,7 +17,7 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		t.Fatalf("rules.Default: %v", err)
 	}
 	generated := append(reg.GeneratedDDL(), vertex.NewPlugin().CacheDDL()...)
-	desired, err := parseDesiredSchema(append(embeddedMigrations(), generated...))
+	desired, err := parseDesiredSchema(append(embeddedMigrations(nil), generated...))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestComputeReconcilePlan_DropsExtrasAddsMissing(t *testing.T) {
 		"event_embeddings": {"id": {}},
 	}
 
-	plan := computeReconcilePlan(desired, actualTables, actualColumns)
+	plan := computeReconcilePlan(desired, DesiredSchema{}, actualTables, actualColumns)
 
 	if got := names(plan.dropTables); !equalSet(got, []string{"event_embeddings"}) {
 		t.Errorf("dropTables = %v, want [event_embeddings]", got)
@@ -218,7 +218,7 @@ func TestComputeReconcilePlan_NeverDropsClickHouseInternalTables(t *testing.T) {
 	}
 	actualColumns := map[string]map[string]struct{}{"note_like_counts": {"target_event_id": {}}}
 
-	plan := computeReconcilePlan(desired, actualTables, actualColumns)
+	plan := computeReconcilePlan(desired, DesiredSchema{}, actualTables, actualColumns)
 	if len(plan.dropTables) != 0 || len(plan.dropViews) != 0 {
 		t.Errorf("internal .-prefixed tables must never be dropped; got dropTables=%v dropViews=%v", plan.dropTables, plan.dropViews)
 	}
@@ -242,7 +242,7 @@ func TestComputeReconcilePlan_IdenticalTableNoChanges(t *testing.T) {
 		},
 	}
 
-	plan := computeReconcilePlan(desired, actualTables, actualColumns)
+	plan := computeReconcilePlan(desired, DesiredSchema{}, actualTables, actualColumns)
 	if len(plan.dropTables) != 0 || len(plan.dropViews) != 0 || len(plan.dropColumns) != 0 || len(plan.addColumns) != 0 {
 		t.Errorf("expected empty plan for identical schema, got %+v", plan)
 	}
@@ -257,7 +257,7 @@ func TestComputeReconcilePlan_DoesNotDropMissingTable(t *testing.T) {
 		},
 		views: map[string]struct{}{},
 	}
-	plan := computeReconcilePlan(desired, map[string]string{}, map[string]map[string]struct{}{})
+	plan := computeReconcilePlan(desired, DesiredSchema{}, map[string]string{}, map[string]map[string]struct{}{})
 	if len(plan.dropTables) != 0 || len(plan.addColumns) != 0 || len(plan.dropColumns) != 0 {
 		t.Errorf("expected empty plan when desired table absent from actual, got %+v", plan)
 	}
@@ -338,7 +338,7 @@ func TestDirectRepliesMigration_DeclaresEdgeTable(t *testing.T) {
 		}
 	}
 
-	desired, err := parseDesiredSchema(embeddedMigrations())
+	desired, err := parseDesiredSchema(embeddedMigrations(nil))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema returned error: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestDirectRepliesMigration_DeclaresEdgeTable(t *testing.T) {
 	}
 
 	if !migrationFilePresent("007_direct_replies.sql") {
-		t.Error("007_direct_replies.sql is not discovered by embeddedMigrations()")
+		t.Error("007_direct_replies.sql is not discovered by embeddedMigrations(nil)")
 	}
 }
 

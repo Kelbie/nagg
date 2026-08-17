@@ -21,6 +21,7 @@ import (
 	"github.com/nbd-wtf/go-nostr"
 
 	"github.com/vertex-lab/nagg/internal/dvm"
+	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/rules"
 )
 
@@ -31,13 +32,20 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// embeddedMigrations returns every migration SQL payload in filename order. The
-// zero-padded numeric prefix (001_, 002_, …) makes lexical sort == apply order
-// (safe up to 999 migrations). A read error is impossible at runtime — the
-// directory is embedded in the binary — so it signals a build/programming bug
-// and panics rather than widening every caller's signature.
-func embeddedMigrations() []string {
-	names := migrationNames()
+// moduleTagPrefix opens the mandatory first line of every migration file:
+//
+//	-- +module core
+//
+// The tag says which deployment slice owns the file (internal/modules), so a
+// mint-only deployment creates the mint and core tables and nothing else. It is
+// mandatory rather than defaulted: an untagged file silently landing in every
+// deployment is exactly the drift this mechanism exists to prevent.
+const moduleTagPrefix = "-- +module "
+
+// embeddedMigrations returns the SQL payloads owned by mods, in filename order.
+// A nil Set means every module — the pre-modules behavior.
+func embeddedMigrations(mods modules.Set) []string {
+	names := migrationNames(mods)
 	out := make([]string, 0, len(names))
 	for _, name := range names {
 		out = append(out, mustReadMigration(name))
@@ -45,20 +53,44 @@ func embeddedMigrations() []string {
 	return out
 }
 
-// migrationNames lists the embedded migration filenames in apply order.
-func migrationNames() []string {
+// migrationNames lists the embedded migration filenames owned by mods, in apply
+// order. The zero-padded numeric prefix (001_, 002_, …) makes lexical sort ==
+// apply order (safe up to 999 migrations). A read or tag error is impossible at
+// runtime — the directory is embedded in the binary and the tags are checked by
+// TestMigrationsDeclareAModule — so it signals a build/programming bug and
+// panics rather than widening every caller's signature.
+func migrationNames(mods modules.Set) []string {
 	entries, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {
 		panic(fmt.Sprintf("read embedded migrations dir: %v", err))
 	}
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
 		}
+		owner, err := migrationModule(mustReadMigration(e.Name()))
+		if err != nil {
+			panic(fmt.Sprintf("migration %s: %v", e.Name(), err))
+		}
+		if !mods.Has(owner) {
+			continue
+		}
+		names = append(names, e.Name())
 	}
 	sort.Strings(names)
 	return names
+}
+
+// migrationModule reads a migration's owning module from its mandatory first
+// line.
+func migrationModule(sql string) (modules.Module, error) {
+	line, _, _ := strings.Cut(sql, "\n")
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, moduleTagPrefix) {
+		return "", fmt.Errorf("first line must be %q<module>, got %q", moduleTagPrefix, line)
+	}
+	return modules.ParseTag(strings.TrimPrefix(line, moduleTagPrefix))
 }
 
 func mustReadMigration(name string) string {
@@ -92,6 +124,11 @@ type Config struct {
 	// DVM is the plugin registry whose cache-table DDL is applied and
 	// reconciled alongside the rule-generated schema. Nil means no plugins.
 	DVM *dvm.Registry
+	// Modules is the deployment's enabled slice set (internal/modules). It
+	// selects which migrations run, and it keeps the reconciler from dropping
+	// tables owned by a module this deployment does not run. The nil/zero value
+	// means every module — the pre-modules behavior.
+	Modules modules.Set
 }
 
 type Store struct {
@@ -100,6 +137,8 @@ type Store struct {
 	rules *rules.Registry
 	// dvm mirrors Config.DVM (empty when nil).
 	dvm *dvm.Registry
+	// modules mirrors Config.Modules (nil == every module).
+	modules modules.Set
 	// notificationsLegacyRead mirrors Config.NotificationsLegacyRead.
 	notificationsLegacyRead bool
 	// Cached viewer_feed readiness (see notificationsFeedReady).
@@ -274,6 +313,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		conn:                    retryConn{Conn: conn, readSettings: readSettings},
 		rules:                   reg,
 		dvm:                     plugins,
+		modules:                 cfg.Modules,
 		notificationsLegacyRead: cfg.NotificationsLegacyRead,
 	}, nil
 }
@@ -594,7 +634,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	// is still mandatory (migrations_test.go): the ledger is the fast-path, not
 	// the safety net, and deleting a row from schema_migrations deliberately
 	// re-runs that file.
-	for _, name := range migrationNames() {
+	for _, name := range migrationNames(s.modules) {
 		if _, done := applied[name]; done {
 			continue
 		}
@@ -719,6 +759,26 @@ func (s *Store) recordMigration(ctx context.Context, name string) error {
 // reconciler's desired set.
 func (s *Store) generatedDDL() []string {
 	return append(s.rules.GeneratedDDL(), s.dvm.CacheDDL()...)
+}
+
+// allModuleDDL is every CREATE any deployment could issue: every migration file
+// regardless of its module tag, plus the generated schema of BOTH rule
+// registries. It is never executed — the schema reconciler parses it to bound
+// its drop pass, so a deployment running one module cannot mistake another
+// module's tables for dead weight. Adding a rule registry means adding it here.
+func allModuleDDL(plugins *dvm.Registry) []string {
+	out := embeddedMigrations(nil)
+	// capMax only parameterizes the ingest cap rule, which generates no DDL.
+	if reg, err := rules.Default(0); err == nil {
+		out = append(out, reg.GeneratedDDL()...)
+	}
+	if reg, err := rules.Mint(); err == nil {
+		out = append(out, reg.GeneratedDDL()...)
+	}
+	if plugins != nil {
+		out = append(out, plugins.CacheDDL()...)
+	}
+	return out
 }
 
 func (s *Store) Backfill(ctx context.Context) error {

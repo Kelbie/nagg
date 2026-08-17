@@ -44,7 +44,7 @@ func main() {
 		slog.Error("clickhouse migration failed", "error", err)
 		os.Exit(1)
 	}
-	if result, err := store.PruneRemovedEventKinds(ctx, cfg.Firehose.Kinds); err != nil {
+	if result, err := store.PruneRemovedEventKinds(ctx, cfg.StoredKinds); err != nil {
 		slog.Warn("clickhouse event kind retention failed; continuing", "error", err)
 	} else if result.Skipped {
 		slog.Warn("clickhouse event kind retention skipped: no configured NAGG_KINDS")

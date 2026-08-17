@@ -1,3 +1,4 @@
+-- +module nostr
 -- The engagement aggregates that used to open this file (note_like_counts,
 -- note_repost_counts, note_zaps, note_zap_totals and their MVs, plus the
 -- legacy note_reply_counts) are RETIRED: kind-to-kind aggregations are now

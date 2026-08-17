@@ -55,7 +55,7 @@ func TestBuildEventAggregatesQuery(t *testing.T) {
 // production 500 (this exact bug shipped once: the query still said
 // `followers` after the pubkey_stats rename).
 func TestPubkeyStatsReadMatchesDeclaredColumns(t *testing.T) {
-	desired, err := parseDesiredSchema(embeddedMigrations())
+	desired, err := parseDesiredSchema(embeddedMigrations(nil))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestPubkeyStatsReadMatchesDeclaredColumns(t *testing.T) {
 // rename-missed-a-read bug (the query aliased RAW columns as gated_* and
 // referenced a nonexistent `actors`), caught live by the For-You feed.
 func TestRankFeaturesReadMatchesDeclaredColumns(t *testing.T) {
-	desired, err := parseDesiredSchema(embeddedMigrations())
+	desired, err := parseDesiredSchema(embeddedMigrations(nil))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestSyncCandidatesReadMatchesDeclaredColumns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rules.Default: %v", err)
 	}
-	desired, err := parseDesiredSchema(append(embeddedMigrations(), reg.GeneratedDDL()...))
+	desired, err := parseDesiredSchema(append(embeddedMigrations(nil), reg.GeneratedDDL()...))
 	if err != nil {
 		t.Fatalf("parseDesiredSchema: %v", err)
 	}

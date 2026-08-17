@@ -249,7 +249,17 @@ func stripPrefixFold(s, prefix string) string {
 //
 //	actualTables:  name -> engine (engine distinguishes MaterializedView/View from a table)
 //	actualColumns: table -> set of column names
-func computeReconcilePlan(desired DesiredSchema, actualTables map[string]string, actualColumns map[string]map[string]struct{}) ReconcilePlan {
+// computeReconcilePlan diffs the actual schema against desired — the schema THIS
+// deployment's enabled modules declare.
+//
+// anyModule is the schema EVERY module declares, and it exists solely to bound
+// the drop pass. Without it a mint-only process pointed at a full database would
+// see the entire Nostr app-view as "no longer declared" and strip it. A table is
+// only genuinely retired when no module claims it, so drops are computed against
+// anyModule while creates and column edits stay scoped to desired. Passing a
+// zero anyModule (single-module deployments, tests) reduces to the original
+// behavior: whatever desired omits is dropped.
+func computeReconcilePlan(desired, anyModule DesiredSchema, actualTables map[string]string, actualColumns map[string]map[string]struct{}) ReconcilePlan {
 	plan := ReconcilePlan{}
 
 	for name, engine := range actualTables {
@@ -260,12 +270,16 @@ func computeReconcilePlan(desired DesiredSchema, actualTables map[string]string,
 			continue
 		}
 		if isViewEngine(engine) {
-			if _, ok := desired.views[name]; !ok {
+			_, mine := desired.views[name]
+			_, foreign := anyModule.views[name]
+			if !mine && !foreign {
 				plan.dropViews = append(plan.dropViews, name)
 			}
 			continue
 		}
-		if _, ok := desired.tables[name]; !ok {
+		_, mine := desired.tables[name]
+		_, foreign := anyModule.tables[name]
+		if !mine && !foreign {
 			plan.dropTables = append(plan.dropTables, name)
 		}
 	}
@@ -312,13 +326,21 @@ func (s *Store) reconcileSchema(ctx context.Context, mode string) error {
 		return nil
 	}
 
-	desired, err := parseDesiredSchema(append(embeddedMigrations(), s.generatedDDL()...))
+	desired, err := parseDesiredSchema(append(embeddedMigrations(s.modules), s.generatedDDL()...))
 	if err != nil {
 		return fmt.Errorf("schema reconcile: parse desired schema: %w", err)
 	}
 	// GUARD: never drop everything because the parser produced nothing.
 	if len(desired.tables) == 0 {
 		return fmt.Errorf("refusing to reconcile: parsed 0 desired tables")
+	}
+
+	// The drop allow-list: everything ANY module declares, so a partial
+	// deployment can still retire genuinely dead tables without stripping the
+	// schema of a module it simply does not run.
+	anyModule, err := parseDesiredSchema(allModuleDDL(s.dvm))
+	if err != nil {
+		return fmt.Errorf("schema reconcile: parse all-module schema: %w", err)
 	}
 
 	actualTables, err := s.readActualTables(ctx)
@@ -330,11 +352,12 @@ func (s *Store) reconcileSchema(ctx context.Context, mode string) error {
 		return fmt.Errorf("schema reconcile: read actual columns: %w", err)
 	}
 
-	plan := computeReconcilePlan(desired, actualTables, actualColumns)
+	plan := computeReconcilePlan(desired, anyModule, actualTables, actualColumns)
 	plan = guardProtectedTables(plan)
 
 	slog.Warn("schema reconcile plan",
 		"mode", mode,
+		"modules", s.modules.String(),
 		"drop_tables_count", len(plan.dropTables),
 		"drop_views_count", len(plan.dropViews),
 		"drop_columns_count", len(plan.dropColumns),

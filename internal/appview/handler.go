@@ -22,6 +22,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/chgate"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/dvm"
+	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
@@ -98,6 +99,16 @@ type Handler struct {
 	// chgate shared with GraphQL and the background workers, not a REST-only
 	// semaphore. nil = unlimited.
 	gate *chgate.Gate
+	// modules gates which routes Register mounts. The nil/zero Set mounts
+	// everything, so a Handler built without WithModules behaves as it always
+	// did.
+	modules modules.Set
+	// socialEnrichment allows the Nostr-graph enrichment on /nostr/mint/discover
+	// (operator follower counts from pubkey_stats, cached Vertex scores). Those
+	// tables belong to the nostr module; in a mint-only deployment they do not
+	// exist, so the queries are skipped rather than issued and discarded.
+	// Defaulted on by New so an unconfigured Handler keeps the old behavior.
+	socialEnrichment bool
 }
 
 type VertexClient interface {
@@ -253,6 +264,25 @@ func WithAILineup(client RoutstrClient, vendors []string, pins map[string]map[st
 	}
 }
 
+// WithModules restricts the mounted REST surface to the routes the deployment's
+// enabled modules own (internal/modules). A mint-only deployment must not
+// advertise or serve /nostr/feed against a database that holds no feed.
+func WithModules(mods modules.Set) Option {
+	return func(h *Handler) {
+		h.modules = mods
+	}
+}
+
+// WithSocialEnrichment toggles the Nostr-graph enrichment on
+// /nostr/mint/discover — operator follower counts and cached Vertex scores.
+// Pass false when the nostr module is off: those tables don't exist, so the two
+// per-request queries can only fail.
+func WithSocialEnrichment(enabled bool) Option {
+	return func(h *Handler) {
+		h.socialEnrichment = enabled
+	}
+}
+
 // WithViewerTouch wires the known-viewer recording seam (see the viewerTouch
 // field for where it fires). The func must be non-blocking (relevance.Tracker
 // throttles and inserts asynchronously).
@@ -289,6 +319,7 @@ func New(store Store, opts ...Option) *Handler {
 		nip05Validator:            newNIP05Validator(true),
 		rateLimiter:               newRateLimiter(120, time.Minute),
 		vertexProfileMinFollowers: defaultVertexProfileMinFollowers,
+		socialEnrichment:          true,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -323,6 +354,9 @@ type route struct {
 	// heavy routes run multi-query ClickHouse aggregations; only these go
 	// through the concurrency limiter so a burst can't overwhelm CH.
 	heavy bool
+	// module owns the route: Register mounts it only when that module is
+	// enabled. modules.Core means "every deployment".
+	module modules.Module
 }
 
 // routes is the single source of truth for the REST surface. The advertised
@@ -331,39 +365,57 @@ type route struct {
 // silently drifted to under-report seven live routes.
 func (h *Handler) routes() []route {
 	return []route{
-		{"/nostr/capabilities", h.capabilities, false},
-		{"/nostr/feed", h.feed, true},
-		{"/nostr/feed/user", h.userFeed, true},
-		{"/nostr/feed/ranked", h.rankedFeed, true},
-		{"/nostr/notifications", h.notifications, true},
-		{"/nostr/events/aggregates", h.eventAggregates, false},
-		{"/nostr/thread", h.thread, true},
-		{"/nostr/follows", h.follows, false},
-		{"/nostr/events", h.events, false},
-		{"/nostr/events/query", h.eventsQuery, true},
-		{"/nostr/dm/envelopes", h.dmEnvelopes, true},
-		{"/nostr/dm/conversation", h.dmConversation, true},
-		{"/nostr/follow-status", h.followStatus, false},
-		{"/nostr/mint/reviews", h.mintReviews, true},
-		{"/nostr/mint/discover", h.discoverMints, true},
-		{"/nostr/mint/history", h.mintHistory, true},
-		{"/nostr/mint/changes", h.mintChanges, true},
-		{"/nostr/social-graph", h.socialGraph, true},
+		{"/nostr/capabilities", h.capabilities, false, modules.Core},
+		{"/nostr/feed", h.feed, true, modules.Nostr},
+		{"/nostr/feed/user", h.userFeed, true, modules.Nostr},
+		{"/nostr/feed/ranked", h.rankedFeed, true, modules.Nostr},
+		{"/nostr/notifications", h.notifications, true, modules.Nostr},
+		{"/nostr/events/aggregates", h.eventAggregates, false, modules.Nostr},
+		{"/nostr/thread", h.thread, true, modules.Nostr},
+		{"/nostr/follows", h.follows, false, modules.Nostr},
+		{"/nostr/events", h.events, false, modules.Nostr},
+		{"/nostr/events/query", h.eventsQuery, true, modules.Nostr},
+		{"/nostr/dm/envelopes", h.dmEnvelopes, true, modules.Nostr},
+		{"/nostr/dm/conversation", h.dmConversation, true, modules.Nostr},
+		{"/nostr/follow-status", h.followStatus, false, modules.Nostr},
+		{"/nostr/mint/reviews", h.mintReviews, true, modules.Mint},
+		{"/nostr/mint/discover", h.discoverMints, true, modules.Mint},
+		{"/nostr/mint/history", h.mintHistory, true, modules.Mint},
+		{"/nostr/mint/changes", h.mintChanges, true, modules.Mint},
+		{"/nostr/social-graph", h.socialGraph, true, modules.Nostr},
 		// Exact path; ServeMux routes it ahead of the /nostr/own/ subtree.
-		{"/nostr/own/profiles", h.ownProfiles, false},
-		{"/nostr/own/", h.ownHistory, true},
-		{"/nostr/notifications/seen", h.notificationsSeen, false},
-		{"/nostr/profiles", h.profiles, false},
-		{"/nostr/profile", h.profile, false},
-		{"/nostr/search", h.search, false},
-		{"/nostr/recommended", h.recommended, false},
-		{"/app/latest-version", h.latestVersion, false},
-		{"/app/ai-lineup", h.aiLineup, false},
+		{"/nostr/own/profiles", h.ownProfiles, false, modules.Nostr},
+		{"/nostr/own/", h.ownHistory, true, modules.Nostr},
+		{"/nostr/notifications/seen", h.notificationsSeen, false, modules.Nostr},
+		{"/nostr/profiles", h.profiles, false, modules.Nostr},
+		{"/nostr/profile", h.profile, false, modules.Nostr},
+		{"/nostr/search", h.search, false, modules.Nostr},
+		{"/nostr/recommended", h.recommended, false, modules.Nostr},
+		{"/app/latest-version", h.latestVersion, false, modules.App},
+		{"/app/ai-lineup", h.aiLineup, false, modules.App},
 	}
+}
+
+// mountedRoutes are the paths Register actually serves for this deployment —
+// the declared set filtered by the enabled modules. It is also what
+// /nostr/capabilities advertises, so a client feature-gating against a
+// mint-only host sees the truth.
+func (h *Handler) mountedRoutes() []string {
+	all := h.routes()
+	out := make([]string, 0, len(all))
+	for _, r := range all {
+		if h.modules.Has(r.module) {
+			out = append(out, r.path)
+		}
+	}
+	return out
 }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	for _, route := range h.routes() {
+		if !h.modules.Has(route.module) {
+			continue
+		}
 		next := route.handler
 		if route.heavy {
 			next = h.limitConcurrency(next)
@@ -385,7 +437,7 @@ func (h *Handler) limitConcurrency(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, capabilities.ServiceInfo())
+	writeJSON(w, capabilities.ServiceInfoFor(h.mountedRoutes()))
 }
 
 func (h *Handler) withMiddleware(next http.HandlerFunc) http.HandlerFunc {

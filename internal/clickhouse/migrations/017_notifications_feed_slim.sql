@@ -1,3 +1,4 @@
+-- +module nostr
 -- Rebuild viewer_feed WITHOUT denormalized event bodies.
 --
 -- The first shape stored content/tags_json/sig per (viewer, event, kind)

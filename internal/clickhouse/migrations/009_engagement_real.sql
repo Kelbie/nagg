@@ -1,3 +1,4 @@
+-- +module nostr
 -- Vertex-score-gated reference counts (bot-resistant).
 --
 -- Raw rule aggregates count every distinct actor. A gated count only

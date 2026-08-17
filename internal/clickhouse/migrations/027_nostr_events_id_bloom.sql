@@ -1,3 +1,4 @@
+-- +module core
 -- Make id IN (...) lookups on nostr_events granule-prunable.
 --
 -- id is the LAST component of ORDER BY (kind, created_at, pubkey, id), so

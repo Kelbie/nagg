@@ -1,3 +1,4 @@
+-- +module nostr
 -- viewer_refs gains an arrival-time column and the feeding view starts
 -- stamping it. The viewer_feed read-model rollup used to window on event
 -- created_at, which permanently skips history that arrives late (relay

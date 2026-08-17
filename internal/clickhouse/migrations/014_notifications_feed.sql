@@ -1,3 +1,4 @@
+-- +module nostr
 -- Denormalized notifications read-model (docs/notifications-performance.md §9).
 --
 -- The notifications read was the last per-request event_tags aggregation: reply

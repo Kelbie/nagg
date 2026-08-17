@@ -1,3 +1,4 @@
+-- +module core
 -- Applied-migrations ledger. Before this table existed, EVERY deploy re-ran
 -- every migration — including the full-table backfill INSERT…SELECTs over
 -- event_tags (2B+ rows) — twice (preDeploy + in-process), single-threaded.

@@ -85,14 +85,24 @@ var AppViewRoutes = []string{
 	"/app/ai-lineup",
 }
 
+// ServiceInfo advertises the full declared surface — every route a deployment
+// running every module serves.
 func ServiceInfo() map[string]any {
+	return ServiceInfoFor(AppViewRoutes)
+}
+
+// ServiceInfoFor advertises a specific route list. A deployment running a subset
+// of modules (NAGG_MODULES) mounts a subset of AppViewRoutes and must advertise
+// exactly what it mounts: clients feature-gate on this manifest, so promising a
+// route that 404s is worse than not promising it.
+func ServiceInfoFor(routes []string) map[string]any {
 	return map[string]any{
 		"graphqlSchemaVersion": GraphQLSchemaVersion,
 		"appViewVersion":       AppViewVersion,
 		"capabilities":         append([]string(nil), Names...),
 		"appViews": []map[string]any{{
 			"version": AppViewVersion,
-			"routes":  append([]string(nil), AppViewRoutes...),
+			"routes":  append([]string(nil), routes...),
 		}},
 	}
 }

@@ -1,3 +1,4 @@
+-- +module nostr
 -- Known viewers: pubkeys that have actually used a Sovran client against this
 -- app-view (observed as the viewer on notifications / DM / thread reads). This
 -- is the no-cost "is this a real Sovran user?" signal that the ingest post cap

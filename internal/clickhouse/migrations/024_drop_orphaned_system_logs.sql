@@ -1,3 +1,4 @@
+-- +module core
 -- Reclaim the orphaned `_0` system log tables (~20.2 GB, ~40% of the volume).
 --
 -- Migration 023 set TTLs with ALTER TABLE ... MODIFY TTL. That changed each

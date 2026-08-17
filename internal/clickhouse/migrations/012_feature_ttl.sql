@@ -1,3 +1,4 @@
+-- +module nostr
 -- Bound the rollup-maintained hot-path feature tables.
 --
 -- The rollup re-inserts its whole target set every tick, and old notes' rows

@@ -10,6 +10,19 @@ Everything capped or pruned is recoverable — the on-demand relay backfills
 (user feed, threads, DMs, profiles) fetch anything a user actually asks for and
 insert it back.
 
+## Layer 0 — the kind allowlist
+
+Before either layer, `PruneRemovedEventKinds` deletes every stored event whose
+kind is outside **`NAGG_KINDS`**. That is the *retained* set, and it is
+deliberately separate from `NAGG_FIREHOSE_KINDS`, the *subscribed* set, which
+defaults to it. A kind can be kept without being subscribed — that is how the
+mint deployment holds the kind-0 profiles it fetches on demand while
+subscribing only to kind 38000. Conflate them and every restart deletes those
+profiles; see [`modules.md`](modules.md).
+
+Because this prune is unconditional, a process must never be pointed at a
+database belonging to a differently-configured deployment.
+
 ## Who is exempt: the relevance model
 
 The recurring problem with any anti-spam cap is misclassifying real users —
@@ -76,7 +89,9 @@ fails **open**, like the caps; drops summarize in `ingest.unaddressed`.
 
 The registry's Lifetime rules (`rules.Default` in `internal/rules/defaults.go`)
 — the declarations are the policy. Absence of a rule for a kind means events
-of that kind live forever:
+of that kind live forever. A `NAGG_MODULES=mint` deployment runs `rules.Mint`
+instead, which declares no Lifetime rules at all (there is no kind-1 corpus to
+age out) and keeps only the supersession rules for kinds 0 and 38000:
 
 | Rule | Kinds | Keeps | Why |
 | --- | --- | --- | --- |

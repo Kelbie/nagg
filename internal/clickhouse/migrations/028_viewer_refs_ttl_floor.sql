@@ -1,3 +1,4 @@
+-- +module nostr
 -- Extend viewer_refs retention from 45 to 120 days so notification candidates
 -- survive the NAGG_HISTORY_FLOOR deep-history walk.
 --

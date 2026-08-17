@@ -1,3 +1,4 @@
+-- +module core
 CREATE TABLE IF NOT EXISTS nostr_events
 (
     id FixedString(64),

@@ -13,6 +13,13 @@ literals validated at startup — and everything else derives from them:
 - the REST envelope's `aggregates` map and GraphQL's rank metric names are
   the rules' names — declare a relationship and both surfaces serve it.
 
+There are two registries, selected by `NAGG_MODULES` (see
+[`modules.md`](modules.md)): `rules.Default` for a deployment running the `nostr`
+module, and `rules.Mint` — the kind-0 projection, replaceable pruning for kinds
+0 and 38000, and the NIP-87 history walk, with no relationships at all — for one
+that isn't. A new registry must also be added to `allModuleDDL`, or the schema
+reconciler will treat its tables as undeclared and drop them.
+
 The vocabulary is deliberately unopinionated: rules speak in event kinds, tag
 keys, and targets. What an app calls a "like count" is the unique-actor metric
 of the rule counting kind-7 events that `e`-reference an event.

@@ -1,0 +1,38 @@
+# The `nagg-mint` service: NAGG_MODULES=mint — the cashu mint observatory and
+# nothing else.
+#
+# It serves /nostr/mint/{reviews,discover,history,changes}, the /mint-changes
+# HTML changelog, and /nostr/capabilities. No feed, no threads, no
+# notifications, no DMs, no GraphQL: those routes are not mounted, so they 404
+# rather than 500 against tables that were never created.
+#
+# Why it is cheap. The full nagg archives ~17 event kinds network-wide and pays
+# for the ranking, enrichment and rollup machinery on top. This one subscribes
+# to kind 38000 (NIP-87 mint recommendations and reviews — a trickle) and stores
+# kind 0 only for the handful of reviewer/operator pubkeys those events name,
+# fetched on demand. Its ClickHouse holds eight tables, one materialized view
+# and the three (empty) Vertex cache tables; see docs/modules.md.
+#
+# Verified locally against ClickHouse 26.6.1: the relay-history walk pulled
+# 1,764 kind-38000 events and 27 lazily-fetched profiles within ~90s of boot,
+# while /nostr/feed and /graphql correctly 404.
+#
+# ⚠️ NEVER point this service at a ClickHouse holding Nostr data. Two mechanisms
+# assume the database matches the deployment:
+#
+#   * PruneRemovedEventKinds deletes every stored event whose kind is outside
+#     NAGG_KINDS — against a full database, that is almost all of it.
+#   * The migrate step's schema reconcile is bounded so it cannot drop another
+#     module's tables, but nothing bounds the prune.
+#
+# One deployment, one database. Same rule as railway.staging.toml, sharper teeth.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+preDeployCommand = ["./nagg-migrate"]
+healthcheckPath = "/livez"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

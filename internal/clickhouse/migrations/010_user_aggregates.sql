@@ -1,3 +1,4 @@
+-- +module nostr
 -- Per-pubkey aggregates: latest outbound kind-3 references, inbound fan-in, authored events.
 --
 -- These are computed live today in scattered places, and the follower count is

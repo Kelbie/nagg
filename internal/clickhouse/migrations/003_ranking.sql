@@ -1,3 +1,4 @@
+-- +module nostr
 -- RETIRED. The vertex_scores and vertex_search_cache tables declared here
 -- moved to the Vertex DVM plugin (internal/vertex/plugin.go CacheDDL), which
 -- the dvm registry applies at migrate time and the schema reconciler treats

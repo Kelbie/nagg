@@ -16,6 +16,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -23,11 +24,27 @@ import (
 
 type Config struct {
 	ClickHouse chstore.Config
+	// Modules is the deployment's enabled slice set (NAGG_MODULES). It is the
+	// single declaration every other default follows from: the rule registry,
+	// the relay kinds, the mounted HTTP routes, and which background workers
+	// start. Unset means every module — production's behavior, unchanged.
+	Modules modules.Set
 	// DVM is the plugin registry shared by the store (cache-table schema) and
 	// the API wiring (provider attachment, score-source validation).
-	DVM        *dvm.Registry
-	API        APIConfig
-	Firehose   firehose.Config
+	DVM      *dvm.Registry
+	API      APIConfig
+	Firehose firehose.Config
+	// StoredKinds is the set of event kinds this app-view KEEPS
+	// (NAGG_KINDS). It drives the retention prune — anything stored outside
+	// this set is deleted — plus /healthz's per-kind stats and the
+	// NAGG_HISTORY_FLOOR walk.
+	//
+	// It is deliberately separate from Firehose.Kinds (NAGG_FIREHOSE_KINDS),
+	// the kinds we SUBSCRIBE to live. A mint deployment stores kind 0 —
+	// reviewer and operator profiles, fetched on demand for the few pubkeys
+	// that appear — while subscribing only to kind 38000; with one shared knob
+	// the prune would delete those profiles on every restart.
+	StoredKinds []int
 	Ingest     ingest.Config
 	Vertex     VertexConfig
 	OnDemand   OnDemandConfig
@@ -42,9 +59,11 @@ type Config struct {
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
 	// syncer), so a single `nagg` service can do everything against one
-	// ClickHouse + Redis. Default on. Set false to split those workers back out
-	// into the standalone cmd/ingester / cmd/enricher binaries (e.g. to scale the
-	// API horizontally without N duplicate firehose consumers).
+	// ClickHouse + Redis. Defaults follow NAGG_MODULES — the ingester runs for
+	// the nostr and mint modules (both need relay data), the enricher only for
+	// nostr. Set false to split those workers back out into the standalone
+	// cmd/ingester / cmd/enricher binaries (e.g. to scale the API horizontally
+	// without N duplicate firehose consumers).
 	RunIngester bool
 	RunEnricher bool
 
@@ -52,12 +71,14 @@ type Config struct {
 	// vertex-real engagement counts, per-user stats, per-event rank features).
 	Rollup RollupConfig
 	// RunRollup hosts the rollup job in the API process (alongside the Vertex
-	// syncer + enricher). Default on.
+	// syncer + enricher). Defaults on for the nostr module — it maintains
+	// nostr-owned tables and has nothing to do in a mint deployment.
 	RunRollup bool
 
 	// RunMintInfo hosts the mint-info snapshotter (internal/mintinfo) in the API
-	// process. Default on. The read side (/nostr/mint/history) is always served;
-	// this only gates the background poller.
+	// process. Defaults on for the mint module. The read side
+	// (/nostr/mint/history) is served whenever that module is enabled; this only
+	// gates the background poller.
 	RunMintInfo bool
 }
 
@@ -183,22 +204,39 @@ type OnDemandConfig struct {
 }
 
 func Load() (Config, error) {
+	// NAGG_MODULES is the one declaration every default below follows from:
+	// which rule registry drives the schema, which kinds are stored and
+	// subscribed, and which background workers start. Unset means every module,
+	// so a deployment that has never heard of modules is unaffected.
+	mods, err := modules.Parse(os.Getenv("NAGG_MODULES"))
+	if err != nil {
+		return Config{}, fmt.Errorf("NAGG_MODULES: %w", err)
+	}
+	nostrModule := mods.Has(modules.Nostr)
+	mintModule := mods.Has(modules.Mint)
+
 	onDemandUserFeed := parseBool(env("NAGG_ON_DEMAND_USER_FEED", "true"))
 
 	// The declarative rule registry (internal/rules) drives the generated
 	// aggregate schema, the ingest event_refs fan-out, retention, and the
 	// per-author ingest caps. NAGG_POST_CAP_PER_DAY parameterizes the default
-	// cap rule; 0 disables capping.
-	ruleRegistry := rules.MustDefault(parseInt(env("NAGG_POST_CAP_PER_DAY", "20")))
+	// cap rule; 0 disables capping. Without the nostr module there is nothing
+	// to aggregate or cap, so the far smaller mint rule set applies instead.
+	ruleRegistry := rules.MustMint()
+	if nostrModule {
+		ruleRegistry = rules.MustDefault(parseInt(env("NAGG_POST_CAP_PER_DAY", "20")))
+	}
 
 	// The DVM plugin registry: static identity (name, kinds, cache DDL) is
 	// declared here so every process — api, ingester, migrate, backfill —
 	// derives the same schema; runtime providers are attached by cmd/api.
 	dvmRegistry := dvm.MustRegistry(vertex.NewPlugin())
 
-	// The firehose kind set is needed twice: the relay subscription and the
-	// NAGG_HISTORY_FLOOR deep-history backfill rule derived from it.
-	firehoseKinds := parseKinds(env("NAGG_KINDS", "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000"))
+	// Two kind sets, deliberately: what we KEEP and what we SUBSCRIBE to.
+	// See Config.StoredKinds — a mint deployment keeps on-demand-fetched kind-0
+	// profiles it never subscribes to, and one shared knob would prune them.
+	storedKinds := parseKinds(env("NAGG_KINDS", defaultStoredKinds(mods)))
+	firehoseKinds := parseKinds(env("NAGG_FIREHOSE_KINDS", defaultFirehoseKinds(mods, storedKinds)))
 
 	// NAGG_HISTORY_FLOOR: absolute date; when set, relay history for the FULL
 	// firehose kind set is walked down to it (see rules.HistoryFloorBackfill).
@@ -208,7 +246,9 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		DVM: dvmRegistry,
+		Modules:     mods,
+		StoredKinds: storedKinds,
+		DVM:         dvmRegistry,
 		ClickHouse: chstore.Config{
 			Addr:         env("NAGG_CLICKHOUSE_ADDR", "127.0.0.1:9000"),
 			Database:     env("NAGG_CLICKHOUSE_DATABASE", "default"),
@@ -218,6 +258,7 @@ func Load() (Config, error) {
 			MaxIdleConns: parseInt(env("NAGG_CLICKHOUSE_MAX_IDLE_CONNS", "10")),
 			Rules:        ruleRegistry,
 			DVM:          dvmRegistry,
+			Modules:      mods,
 			// Per-query memory ceiling (bytes) applied to every app-view read, as a
 			// runaway guard: an over-budget query is rejected by ClickHouse with a
 			// clean MEMORY_LIMIT_EXCEEDED (which the read-retry surfaces as one failed
@@ -286,7 +327,7 @@ func Load() (Config, error) {
 		},
 		Auditor: AuditorConfig{
 			URL:     env("NAGG_AUDITOR_URL", "https://api.audit.8333.space"),
-			Enabled: parseBool(env("NAGG_AUDITOR_ENABLED", "true")),
+			Enabled: parseBool(env("NAGG_AUDITOR_ENABLED", boolText(mintModule))),
 			Limit:   parseInt(env("NAGG_AUDITOR_LIMIT", "200")),
 		},
 		AppVersion: AppVersionConfig{
@@ -295,7 +336,7 @@ func Load() (Config, error) {
 		},
 		Routstr: RoutstrConfig{
 			URL:     env("NAGG_ROUTSTR_URL", "https://api.routstr.com"),
-			Enabled: parseBool(env("NAGG_ROUTSTR_ENABLED", "true")),
+			Enabled: parseBool(env("NAGG_ROUTSTR_ENABLED", boolText(mods.Has(modules.App)))),
 			Vendors: splitCSV(env("NAGG_AI_LINEUP_VENDORS", "openai,anthropic,x-ai,google")),
 			Pins:    os.Getenv("NAGG_AI_LINEUP_PINS"),
 		},
@@ -330,10 +371,14 @@ func Load() (Config, error) {
 			DefaultTTL:  parseDuration(env("NAGG_CACHE_DEFAULT_TTL", "30s")),
 			StaleFor:    parseDuration(env("NAGG_CACHE_STALE_FOR", "5m")),
 		},
-		RunIngester: parseBool(env("NAGG_RUN_INGESTER", "true")),
-		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", "true")),
-		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", "true")),
-		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", "true")),
+		// Worker defaults follow the enabled modules. The ingester serves both
+		// nostr (the full firehose) and mint (the kind-38000 slice plus its
+		// relay-history walk); the enricher and rollup only maintain
+		// nostr-owned tables; the snapshotter is the mint module's whole point.
+		RunIngester: parseBool(env("NAGG_RUN_INGESTER", boolText(nostrModule || mintModule))),
+		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
+		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
+		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
 		MintInfo: MintInfoConfig{
 			Interval: parseDuration(env("NAGG_MINT_INFO_INTERVAL", "1h")),
 			MinAge:   parseDuration(env("NAGG_MINT_INFO_MIN_AGE", "24h")),
@@ -436,6 +481,59 @@ func supportedEnrichTasks(tasks []string) []string {
 	}
 	return out
 }
+
+// nostrKinds is the full app-view's kind set: everything the social surfaces
+// read. It is spelled out rather than derived because it is a product decision
+// (which Nostr surfaces this app-view serves), not a consequence of the rules.
+const nostrKinds = "0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000"
+
+// mintStoredKinds is what a mint-only deployment KEEPS: NIP-87 mint
+// recommendations and reviews (38000), plus the kind-0 profiles of the
+// reviewers and operators those events name. The profiles arrive through
+// on-demand relay fetches for the handful of pubkeys that actually appear —
+// which is why they must be stored but must NOT be subscribed.
+const mintStoredKinds = "0,38000"
+
+// mintFirehoseKinds is what a mint-only deployment SUBSCRIBES to. Kind 38000 is
+// a trickle; a global kind-0 subscription is hundreds of thousands of events a
+// day for information the on-demand path fetches precisely.
+const mintFirehoseKinds = "38000"
+
+// defaultStoredKinds is the NAGG_KINDS default for a module set: the union of
+// what each enabled module needs kept.
+func defaultStoredKinds(mods modules.Set) string {
+	if mods.Has(modules.Nostr) {
+		// The nostr set already contains 38000 and 0, so it covers mint too.
+		return nostrKinds
+	}
+	if mods.Has(modules.Mint) {
+		return mintStoredKinds
+	}
+	return ""
+}
+
+// defaultFirehoseKinds is the NAGG_FIREHOSE_KINDS default. Every module except
+// mint subscribes to exactly what it stores; mint deliberately subscribes to
+// less, leaving kind 0 to the on-demand path.
+func defaultFirehoseKinds(mods modules.Set, storedKinds []int) string {
+	if !mods.Has(modules.Nostr) && mods.Has(modules.Mint) {
+		return mintFirehoseKinds
+	}
+	return joinKinds(storedKinds)
+}
+
+func joinKinds(kinds []int) string {
+	parts := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		parts = append(parts, strconv.Itoa(k))
+	}
+	return strings.Join(parts, ",")
+}
+
+// boolText renders a module-derived default for an env-var lookup, so the
+// override path (parseBool(env(KEY, default))) stays identical whether the
+// default is a literal or computed.
+func boolText(v bool) string { return strconv.FormatBool(v) }
 
 func env(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
