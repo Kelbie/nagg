@@ -67,12 +67,25 @@
     <max_thread_pool_size>256</max_thread_pool_size>            <!-- [10000] -->
     <max_thread_pool_free_size>64</max_thread_pool_free_size>   <!-- [1000] must be <= max_thread_pool_size -->
     <background_schedule_pool_size>16</background_schedule_pool_size>  <!-- [512] the big one -->
-    <background_pool_size>4</background_pool_size>                      <!-- [16] merges -->
-    <background_common_pool_size>4</background_common_pool_size>        <!-- [8] -->
     <background_fetches_pool_size>2</background_fetches_pool_size>      <!-- [16] no replicas here -->
     <background_move_pool_size>2</background_move_pool_size>            <!-- [8] no tiered storage here -->
     <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size> <!-- [16] no Kafka/Rabbit -->
     <max_concurrent_queries>16</max_concurrent_queries>                 <!-- [1000]; nagg's own gate is 4 -->
+
+    <!--
+      background_pool_size and background_common_pool_size are deliberately left
+      at their defaults (16 and 8).
+      background_pool_size is not a free-standing number: ClickHouse refuses to
+      start unless
+          background_pool_size * background_merges_mutations_concurrency_ratio
+      clears several <merge_tree> thresholds, the largest being
+      number_of_free_entries_in_pool_to_execute_optimize_entire_partition (25).
+      Setting it to 4 gave 4*2 = 8 and the server aborted at startup with
+      Code 36 from MergeTreeSettingsImpl::sanityCheck.
+      It could be lowered by also lowering those thresholds, but it is not where
+      the threads are — background_schedule_pool_size above is 32x larger — so
+      the coupling is not worth taking on.
+    -->
 
     <!--
       Cache ceilings. Not where the memory went, but there is no reason to leave
