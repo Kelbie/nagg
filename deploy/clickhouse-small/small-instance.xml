@@ -49,6 +49,17 @@
 -->
 <clickhouse>
     <!--
+      Log to stdout so failures reach `railway logs`.
+      This is load-bearing, not a nicety: without it ClickHouse writes only to
+      /var/log/clickhouse-server/*.log inside the container, and a container
+      that crash-loops on a config error takes the explanation with it. Two
+      blind restart loops were debugged the hard way before this line existed.
+    -->
+    <logger>
+        <console>1</console>
+    </logger>
+
+    <!--
       Thread pools. These are the 857 threads. Defaults in brackets, all
       host-derived; the values here are what a handful of small reads and
       kilobyte-sized merges actually need.
