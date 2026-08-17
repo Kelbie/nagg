@@ -124,3 +124,21 @@ measured 2026-07, months of live listening had 23 kind-38000 events against
 `railway.mint.toml` is the mint deployment's Railway config. One deployment, one
 database: a mint-mode process pointed at a database holding Nostr data will
 prune it away.
+
+### Sizing it
+
+There are two ClickHouse profiles, and they are not variations of each other:
+
+| profile | for | why |
+| --- | --- | --- |
+| `deploy/clickhouse` | the full app-view (~26 GB) | direct-I/O merges, week-long forensic logs. Its page cache is load-bearing — capping this instance's memory has broken production twice. |
+| `deploy/clickhouse-small` | a mint deployment (~1 MB) | absolute cache and thread-pool sizes instead of ratios of the host, self-logging switched off, `max_server_memory_usage` under the container cap. |
+
+The problem the small profile solves: ClickHouse sizes its caches and pools from
+the **host**, and Railway's host reports 24 cores and ~120 GB of RAM. Measured
+on first boot, ClickHouse was billing 1.33 GB — about 97% of the deployment's
+cost — to hold roughly a megabyte, while the nagg API beside it used 35 MB.
+
+Pair it with Railway resource limits, which also fix the API's self-sizing: with
+no cap, `automemlimit` reads the host cgroup and sets `GOMEMLIMIT` to ~20 GB, so
+Go's collector lets the heap run far past anything this workload needs.

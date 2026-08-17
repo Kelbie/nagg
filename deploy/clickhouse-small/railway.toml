@@ -1,0 +1,18 @@
+# Railway config for a small ClickHouse service.
+#
+# This file exists because Railway resolves a service's config file from the
+# REPO ROOT, not from its root directory: without it the service inherits the
+# top-level railway.toml — the nagg API's — and tries to run `./nagg-migrate`
+# and probe `/livez` inside a clickhouse-server container. Both fail, so the
+# deploy fails after a perfectly good image build.
+#
+# No healthcheck: ClickHouse's HTTP port is private here, and Railway's
+# healthcheck probes the public edge.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+preDeployCommand = []
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

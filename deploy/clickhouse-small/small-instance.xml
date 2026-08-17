@@ -1,0 +1,116 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse for a database that holds about a megabyte.
+
+  Measured on the mint deployment 2026-08-17, minutes after first boot:
+
+    db.default (every real table)        ~1 MB
+    MemoryResident                       0.97 GB
+    cgroup memory billed by Railway      1.33 GB
+    nagg-mint, the API next to it        0.035 GB
+
+  ClickHouse was 97% of the bill for 1 MB of data. None of that is data: the
+  server sizes its caches and thread pools from the HOST, and Railway's host
+  reports 24 cores and ~120 GB of RAM. The mark cache alone is allowed 5 GiB by
+  default, the compiled-expression cache had already reserved 128 MiB, and
+  asynchronous_metric_log had written 298k rows in half an hour — for a database
+  with three tables in it.
+
+  So this file does not "tune" anything. It tells a server that thinks it is on
+  a large machine how small its job actually is. Every value below is an
+  absolute, not a ratio of the host.
+
+  Deliberately NOT inherited from deploy/clickhouse: that profile's direct-I/O
+  merge threshold exists because a 26 GB database's merge pipeline was flooding
+  the page cache. At this size merges are trivial and the setting is noise.
+-->
+<clickhouse>
+    <!--
+      Absolute memory ceiling. A non-zero value here overrides
+      max_server_memory_usage_to_ram_ratio, which would otherwise resolve to
+      ~108 GB. Sized to sit under the Railway container limit so a runaway query
+      is rejected by ClickHouse with a clean MEMORY_LIMIT_EXCEEDED instead of
+      being cgroup-OOM-killed — the same reasoning as the app's
+      NAGG_CLICKHOUSE_MAX_QUERY_MEMORY_BYTES, one level down.
+    -->
+    <max_server_memory_usage>805306368</max_server_memory_usage> <!-- 768 MiB -->
+
+    <!--
+      Caches. The defaults (mark 5 GiB, uncompressed 8 GiB, compiled expressions
+      128 MiB) are sized for a working set thousands of times larger than this
+      whole database. They fill lazily, but they are exactly what makes an idle
+      instance's resident set creep upward.
+    -->
+    <mark_cache_size>67108864</mark_cache_size>                                       <!-- 64 MiB -->
+    <index_mark_cache_size>16777216</index_mark_cache_size>                           <!-- 16 MiB -->
+    <uncompressed_cache_size>16777216</uncompressed_cache_size>                       <!-- 16 MiB -->
+    <index_uncompressed_cache_size>16777216</index_uncompressed_cache_size>           <!-- 16 MiB -->
+    <primary_index_cache_size>16777216</primary_index_cache_size>                     <!-- 16 MiB -->
+    <query_condition_cache_size>16777216</query_condition_cache_size>                 <!-- 16 MiB -->
+    <vector_similarity_index_cache_size>16777216</vector_similarity_index_cache_size> <!-- 16 MiB -->
+    <compiled_expression_cache_size>8388608</compiled_expression_cache_size>          <!-- 8 MiB -->
+    <mmap_cache_size>32</mmap_cache_size>                                             <!-- entries, not bytes -->
+
+    <!--
+      Thread pools, all of which default to something derived from the host's 24
+      cores. Every reserved thread costs stack; a mint deployment answers a
+      handful of small reads and merges parts measured in kilobytes.
+    -->
+    <max_thread_pool_size>256</max_thread_pool_size>
+    <max_concurrent_queries>16</max_concurrent_queries>
+    <background_pool_size>4</background_pool_size>
+    <background_common_pool_size>4</background_common_pool_size>
+    <background_schedule_pool_size>8</background_schedule_pool_size>
+    <background_fetches_pool_size>2</background_fetches_pool_size>
+    <background_move_pool_size>2</background_move_pool_size>
+    <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
+
+    <!--
+      Self-observation. The samplers run every second by default, which on this
+      instance produced more rows per hour than the database contains. Slowing
+      them is pure CPU and write savings; nothing here reads them.
+    -->
+    <asynchronous_metrics_update_period_s>60</asynchronous_metrics_update_period_s>
+    <asynchronous_heavy_metrics_update_period_s>600</asynchronous_heavy_metrics_update_period_s>
+
+    <!--
+      System logs. deploy/clickhouse keeps a week of query_log/part_log because
+      that instance has a history of wedged mutations worth forensics. Here the
+      whole database is smaller than one hour of metric_log, and `railway logs`
+      already carries anything worth reading. Keep the two that answer "why is
+      this slow" and "what happened to that part", short; remove the rest.
+    -->
+    <text_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <asynchronous_insert_log remove="1"/>
+    <backup_log remove="1"/>
+    <blob_storage_log remove="1"/>
+    <filesystem_cache_log remove="1"/>
+    <s3queue_log remove="1"/>
+    <session_log remove="1"/>
+    <zookeeper_log remove="1"/>
+
+    <query_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </part_log>
+    <error_log>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </error_log>
+
+    <!--
+      Server log level. `information` narrates every merge and every query on a
+      database where none of that is interesting, and Railway meters log volume.
+    -->
+    <logger>
+        <level>warning</level>
+    </logger>
+</clickhouse>
