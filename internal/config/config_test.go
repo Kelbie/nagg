@@ -421,3 +421,45 @@ func TestLoadAuditorDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("overrides=%+v", a)
 	}
 }
+
+func TestLoadRoutstrConfig(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	t.Setenv("NAGG_ROUTSTR_FALLBACK_URLS", "")
+	for _, mode := range []string{"", "bearer", "x-cashu", "invalid"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("NAGG_ROUTSTR_AUTH_MODE", mode)
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(old) })
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := mode
+			if mode == "invalid" {
+				want = ""
+			}
+			if cfg.Routstr.AuthMode != want {
+				t.Fatalf("auth mode = %q", cfg.Routstr.AuthMode)
+			}
+			if mode == "invalid" && (!strings.Contains(logs.String(), "level=WARN") || strings.Count(logs.String(), "config.routstr_auth_mode.invalid") != 1) {
+				t.Fatalf("logs = %s", logs.String())
+			}
+			if mode != "invalid" && logs.Len() != 0 {
+				t.Fatalf("unexpected logs = %s", logs.String())
+			}
+			if got := strings.Join(cfg.Routstr.FallbackURLs, ","); got != "https://ai.redsh1ft.com,https://api.nonkycai.com,https://routstr.otrta.me,https://llm.satsandsports.cash,https://routstr.satoshisend.xyz" {
+				t.Fatalf("fallbacks = %s", got)
+			}
+		})
+	}
+	t.Setenv("NAGG_ROUTSTR_FALLBACK_URLS", " https://first.invalid, https://second.invalid ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cfg.Routstr.FallbackURLs, ",") != "https://first.invalid,https://second.invalid" {
+		t.Fatalf("custom fallbacks = %v", cfg.Routstr.FallbackURLs)
+	}
+}

@@ -105,7 +105,7 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/search` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
 | GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) |
 | GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) |
-| GET | `/app/ai-lineup` | no | curated AI lineup; no params (§8) |
+| GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) |
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
@@ -353,18 +353,92 @@ field. No parameters are required; a POST body (including the legacy
 `Cache-Control: public, max-age=60`.
 
 `GET /app/ai-lineup` takes no parameters and returns
-`{version, updatedAt, node: {baseUrl}, providers}`. `version` is the lineup
+`{version, updatedAt, node: {baseUrl, fallbackUsed, authMode?}, providers, pinsMissing}`. `version` is the lineup
 schema version (currently 1); `updatedAt` is its build time in Unix seconds.
 Each provider contains `id`, `vendor`, and `models`. Each model contains
 `tier` (`auto`, `pro`, or `max`), `id`, `name`, `created`, `contextLength`,
 `inputModalities`, optional `maxCompletionTokens`, and `pricing` with
 `prompt`, `completion`, `request`, `maxCost`, `maxPromptCost`, and
 `maxCompletionCost` in sats. Providers or tiers without eligible models are
-omitted. Returns 503 when Routstr is disabled/unconfigured, or 502 when its
-catalog is unavailable.
+omitted. Returns 503 when Routstr is disabled/unconfigured, or 502 only when no
+catalog has ever been fetched successfully and all configured nodes fail.
+
+`node.baseUrl` is the active node that supplied this catalog, never a separate
+lookup that can drift from its models. `node.fallbackUsed` is always a boolean.
+The client tries `NAGG_ROUTSTR_URL` first on every refresh, then
+`NAGG_ROUTSTR_FALLBACK_URLS` in order, adopting the first valid non-empty enabled
+catalog and logging `routstr.node.switched` once per change. The default fallback
+order is `https://ai.redsh1ft.com`, `https://api.nonkycai.com`,
+`https://routstr.otrta.me`, `https://llm.satsandsports.cash`,
+`https://routstr.satoshisend.xyz`. The catalog is fresh for 15 minutes. Failed
+refreshes retain the last good catalog and its node indefinitely (including
+beyond the former 24-hour stale limit); subsequent requests retry. Primary
+recovery switches back on the next successful refresh. Boot warm-up also uses
+this failover sequence. Successful catalog discovery does not verify paid chat.
+
+`NAGG_ROUTSTR_AUTH_MODE=bearer` advertises Bearer authentication;
+`NAGG_ROUTSTR_AUTH_MODE=x-cashu` advertises per-request `X-Cashu`. Empty omits
+`node.authMode`; invalid values log `config.routstr_auth_mode.invalid` and omit
+it. This is an operator declaration shared by all configured nodes, not
+protocol autodetection or an auth header sent by nagg. Configure nodes that
+support the advertised mode.
+
+`pinsMissing` is always an array (empty `[]` when all pins resolve), containing
+sorted `vendor/tier:id` strings for configured pins absent from the enabled,
+priced, non-alias catalog. Missing pins leave the derived tier in place.
+`ai_lineup.pin_missing` is a Warn event containing all missing pins, emitted at
+most once per successful catalog refresh, deduplicated by the catalog's internal
+`UpdatedAt` timestamp. Repeated reads or stale serves do not repeat the warning.
+Capability `app.aiLineup.pinsMissing` advertises this field.
 
 GET responses under `/app/*` (and `/v1/app/*`) use 60 seconds fresh / 24 hours
 stale in the server response cache, including future `/app/rates`. During the
 stale window, the previous payload can be served while background revalidation
 runs. Successful cached app responses send `Cache-Control: public, max-age=60`.
 POST bypasses the server response cache.
+
+
+### AI lineup operator checks
+
+After deploy, this must show a live node (confirm its catalog with the second
+command below):
+
+```sh
+curl -fsS https://nagg.up.railway.app/app/ai-lineup | jq '{node, pinsMissing}'
+```
+
+Run the following with the deployment's current `NAGG_AI_LINEUP_PINS` JSON in
+your shell (unset means no pins). It fetches the advertised active node, compares
+its enabled IDs with both lineup IDs and configured pin IDs, and prints a
+machine-readable diff. This reads public HTTP catalogs only.
+
+```sh
+pins_json=${NAGG_AI_LINEUP_PINS:-'{}'}
+lineup_json=$(curl -fsS https://nagg.up.railway.app/app/ai-lineup) &&
+node_url=$(printf '%s' "$lineup_json" | jq -er '.node.baseUrl') &&
+curl -fsS "${node_url%/}/v1/models" |
+jq --argjson lineup "$lineup_json" --argjson pins "$pins_json" '
+  [.data[] | select(.enabled != false) | .id] | unique as $enabled
+  | [$lineup.providers[].models[].id] | unique as $selected
+  | [$pins[][]] | unique as $pinned
+  | {node: $lineup.node, pinsMissing: $lineup.pinsMissing,
+     lineupNotEnabled: ($selected - $enabled),
+     pinsNotEnabled: ($pinned - $enabled),
+     enabledNotInLineup: ($enabled - $selected)}'
+```
+
+Start with pins unset and inspect the active node's `/v1/models` entries. Choose
+exact enabled `id` values with `sats_pricing`, text output, and suitable context,
+completion limits and cost; use `canonical_slug`'s vendor prefix (or the ID
+prefix when absent) as the vendor key. Do not pin rolling `~vendor` aliases.
+Pin only tiers that need a deliberate override, using the JSON shape
+`{vendor: {tier: exactCatalogID}}` with real strings copied from the catalog;
+`auto`, `pro`, and `max` are the only tier keys. Pins bypass automatic age/cost
+selection. Check availability on your configured fallback catalogs too: their
+inventories can differ. Set the resulting JSON as `NAGG_AI_LINEUP_PINS`, deploy,
+and re-run the diff after response-cache revalidation. Expect
+`lineupNotEnabled: []`, `pinsNotEnabled: []`, and `pinsMissing: []`.
+`enabledNotInLineup` is normally non-empty because the lineup is curated.
+Remove or replace a missing pin using current catalog IDs; never guess an ID.
+The HTTP response cache may briefly show the previous node/lineup while
+revalidating, so repeat a mismatched check after refresh.

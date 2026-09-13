@@ -96,7 +96,16 @@ fields absent; `auditor.refresh.failed` means neither roster was usable.
 no ClickHouse migrations, tables, or social workers: the mint rule registry,
 stored kinds, and firehose kinds stay the same. The version endpoint reads only
 configuration. AI lineup uses the Routstr HTTP client, enabled by default for
-`app` with its default URL; no extra credentials or database schema are needed.
+`app` with `NAGG_ROUTSTR_URL` as the primary and ordered
+`NAGG_ROUTSTR_FALLBACK_URLS` as failovers; no extra credentials or database schema
+are needed. Every refresh re-probes the primary; the response names the active
+node and reports `node.fallbackUsed`. `NAGG_ROUTSTR_AUTH_MODE` optionally
+advertises `bearer` or `x-cashu` for all configured nodes. Vendor/tier overrides
+use `NAGG_AI_LINEUP_PINS`; absent enabled IDs are reported in `pinsMissing` and
+warned once per successful catalog refresh. Catalogs are fresh for 15 minutes;
+if every node fails, the last catalog remains available regardless of age.
+See the [env defaults](../README.md#deploy-on-railway) and
+[operator checks](appview-api.md#ai-lineup-operator-checks).
 If Routstr is explicitly disabled, AI lineup returns 503.
 
 `NAGG_APP_LATEST_VERSION`, `NAGG_APP_UPDATE_MESSAGE`, and `NAGG_APP_MIN_VERSION`

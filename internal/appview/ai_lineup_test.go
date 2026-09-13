@@ -1,11 +1,19 @@
 package appview
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/vertex-lab/nagg/internal/capabilities"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,7 +55,7 @@ func testCatalog() []routstr.Model {
 }
 
 func TestBuildAILineupTiersByTurnCost(t *testing.T) {
-	resp := buildAILineup(testCatalog(), "https://api.routstr.com/", []string{"openai", "anthropic"}, nil, aiNow)
+	resp, _ := buildAILineup(testCatalog(), "https://api.routstr.com/", []string{"openai", "anthropic"}, nil, aiNow)
 
 	if resp.Node.BaseURL != "https://api.routstr.com" {
 		t.Fatalf("node base url = %q", resp.Node.BaseURL)
@@ -91,7 +99,7 @@ func TestBuildAILineupExcludesNonChatAndStale(t *testing.T) {
 	relic := chatModel("o1-relic", "openai/o1-relic", stale, 0.5, 2.0)
 
 	catalog := append(testCatalog(), embedding, imageGen, disabled, alias, tiny, relic)
-	resp := buildAILineup(catalog, "https://api.routstr.com", []string{"openai"}, nil, aiNow)
+	resp, _ := buildAILineup(catalog, "https://api.routstr.com", []string{"openai"}, nil, aiNow)
 
 	if len(resp.Providers) != 1 {
 		t.Fatalf("providers = %d, want 1", len(resp.Providers))
@@ -114,7 +122,7 @@ func TestBuildAILineupPinsOverrideDerived(t *testing.T) {
 	pins := map[string]map[string]string{
 		"anthropic": {"max": "claude-haiku", "pro": "no-such-model"},
 	}
-	resp := buildAILineup(testCatalog(), "https://api.routstr.com", []string{"anthropic"}, pins, aiNow)
+	resp, _ := buildAILineup(testCatalog(), "https://api.routstr.com", []string{"anthropic"}, pins, aiNow)
 
 	got := map[string]string{}
 	for _, m := range resp.Providers[0].Models {
@@ -135,7 +143,7 @@ func TestBuildAILineupDegradesWithFewModels(t *testing.T) {
 		chatModel("grok-a", "x-ai/grok-a", fresh, 0.001, 0.004),
 		chatModel("grok-b", "x-ai/grok-b", fresh, 0.01, 0.04),
 	}
-	resp := buildAILineup(catalog, "https://api.routstr.com", []string{"x-ai", "google"}, nil, aiNow)
+	resp, _ := buildAILineup(catalog, "https://api.routstr.com", []string{"x-ai", "google"}, nil, aiNow)
 
 	// google has no models → tab omitted entirely, not emitted empty.
 	if len(resp.Providers) != 1 {
@@ -159,8 +167,9 @@ type stubRoutstr struct {
 	err    error
 }
 
-func (s stubRoutstr) Models(context.Context) ([]routstr.Model, error) { return s.models, s.err }
-func (s stubRoutstr) BaseURL() string                                 { return "https://api.routstr.com" }
+func (s stubRoutstr) Catalog(context.Context) (routstr.Catalog, error) {
+	return routstr.Catalog{Models: s.models, BaseURL: "https://api.routstr.com", UpdatedAt: aiNow}, s.err
+}
 
 func TestAILineupRoute(t *testing.T) {
 	h := New(nil, WithAILineup(stubRoutstr{models: testCatalog()}, []string{"anthropic"}, nil))
@@ -205,5 +214,91 @@ func TestParseAILineupPins(t *testing.T) {
 	pins := ParseAILineupPins(`{"anthropic":{"max":"claude-opus"}}`)
 	if pins["anthropic"]["max"] != "claude-opus" {
 		t.Fatalf("pins = %v", pins)
+	}
+}
+
+func TestAILineupMissingPinsAndAuthMode(t *testing.T) {
+	var logs bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	disabled := chatModel("disabled", "anthropic/disabled", aiNow.Unix(), 1, 1)
+	disabled.Enabled = false
+	pins := map[string]map[string]string{"anthropic": {"auto": "disabled", "pro": "missing", "max": "claude-haiku"}}
+	client := &snapshotRoutstr{catalog: routstr.Catalog{Models: append(testCatalog(), disabled), BaseURL: "https://fixture.invalid", UpdatedAt: aiNow}}
+	h := New(nil, WithAILineup(client, []string{"anthropic"}, pins), WithAIAuthMode("bearer"))
+	for range 3 {
+		rec := httptest.NewRecorder()
+		h.aiLineup(rec, httptest.NewRequest(http.MethodGet, "/app/ai-lineup", nil))
+		var got AILineupResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Code != 200 || !reflect.DeepEqual(got.PinsMissing, []string{"anthropic/auto:disabled", "anthropic/pro:missing"}) || got.Node.AuthMode != "bearer" {
+			t.Fatalf("response: %s", rec.Body.String())
+		}
+	}
+	if strings.Count(logs.String(), "ai_lineup.pin_missing") != 1 || !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("logs: %s", logs.String())
+	}
+	client.catalog.UpdatedAt = aiNow.Add(time.Minute)
+	h.aiLineup(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/app/ai-lineup", nil))
+	if strings.Count(logs.String(), "ai_lineup.pin_missing") != 2 {
+		t.Fatalf("refresh logs: %s", logs.String())
+	}
+	h = New(nil, WithAILineup(client, []string{"anthropic"}, nil))
+	rec := httptest.NewRecorder()
+	h.aiLineup(rec, httptest.NewRequest(http.MethodGet, "/app/ai-lineup", nil))
+	if strings.Contains(rec.Body.String(), "authMode") || !strings.Contains(rec.Body.String(), `"pinsMissing":[]`) {
+		t.Fatalf("optional/empty fields: %s", rec.Body.String())
+	}
+}
+
+type snapshotRoutstr struct{ catalog routstr.Catalog }
+
+func (s *snapshotRoutstr) Catalog(context.Context) (routstr.Catalog, error) { return s.catalog, nil }
+
+func TestAILineupNodeFailover(t *testing.T) {
+	var primaryOK, fallbackOK atomic.Bool
+	fallbackOK.Store(true)
+	node := func(ok *atomic.Bool, id string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !ok.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			fmt.Fprintf(w, `{"data":[{"id":%q,"canonical_slug":"openai/fixture","enabled":true,"context_length":200000,"architecture":{"output_modalities":["text"]},"sats_pricing":{"completion":1,"max_cost":10}}]}`, id)
+		}))
+	}
+	primary := node(&primaryOK, "fixture-primary")
+	defer primary.Close()
+	fallback := node(&fallbackOK, "fixture-fallback")
+	defer fallback.Close()
+	c := routstr.NewHTTPClient(primary.URL, routstr.WithFallbackURLs([]string{fallback.URL}), routstr.WithTTL(0))
+	h := New(nil, WithAILineup(c, []string{"openai"}, nil), WithAIAuthMode("x-cashu"))
+	check := func(baseURL, id string, fallbackUsed bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.aiLineup(rec, httptest.NewRequest(http.MethodGet, "/app/ai-lineup", nil))
+		var got AILineupResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Code != 200 || got.Node.BaseURL != baseURL || got.Node.FallbackUsed != fallbackUsed || got.Node.AuthMode != "x-cashu" || len(got.Providers) != 1 || got.Providers[0].Models[0].ID != id {
+			t.Fatalf("response: %s", rec.Body.String())
+		}
+	}
+	check(fallback.URL, "fixture-fallback", true)
+	fallbackOK.Store(false)
+	check(fallback.URL, "fixture-fallback", true)
+	primaryOK.Store(true)
+	check(primary.URL, "fixture-primary", false)
+	primaryOK.Store(false)
+	check(primary.URL, "fixture-primary", false)
+}
+
+func TestCapabilitiesAILineupPinsMissing(t *testing.T) {
+	if !slices.Contains(capabilities.Names, "app.aiLineup.pinsMissing") {
+		t.Fatal("missing pinsMissing capability")
 	}
 }

@@ -341,6 +341,12 @@ App configuration and operational variables:
 | `NAGG_APP_LATEST_VERSION` | empty | Advertised version from GET/POST `/app/latest-version`; empty advertises no update. Requires the `app` module. |
 | `NAGG_APP_UPDATE_MESSAGE` | empty | Optional update message; omitted from JSON when empty. |
 | `NAGG_APP_MIN_VERSION` | empty | Optional minimum supported client version (`minVersion`); clients may use it for a blocking update gate. Omitted when empty. |
+| `NAGG_ROUTSTR_ENABLED` | `app` module enabled | Enable the HTTP catalog client for `/app/ai-lineup`; disabled returns 503. |
+| `NAGG_ROUTSTR_URL` | `https://api.routstr.com` | Primary node; retried first on each catalog refresh. |
+| `NAGG_ROUTSTR_FALLBACK_URLS` | `https://ai.redsh1ft.com,https://api.nonkycai.com,https://routstr.otrta.me,https://llm.satsandsports.cash,https://routstr.satoshisend.xyz` | Ordered comma-separated fallback nodes; first valid non-empty enabled catalog wins. Unset/empty uses defaults; `,` disables fallbacks. |
+| `NAGG_ROUTSTR_AUTH_MODE` | empty | Advertise `node.authMode`: `bearer` or `x-cashu`; empty omits it, invalid warns and omits it. Applies to both primary and fallback nodes; does not authenticate nagg's public catalog fetch. |
+| `NAGG_AI_LINEUP_VENDORS` | `openai,anthropic,x-ai,google` | Ordered vendor slugs to curate. |
+| `NAGG_AI_LINEUP_PINS` | empty | JSON vendor → tier (`auto`/`pro`/`max`) → exact catalog ID overrides. Missing/disabled IDs appear in `pinsMissing`; derived picks remain. See the [pin procedure](docs/appview-api.md#ai-lineup-operator-checks). |
 | `NAGG_LOG_LEVEL` | `info` | All five service binaries: `debug`, `info`, `warn`, or `error`. Invalid values fall back to `info` with one startup warning. |
 | `NAGG_RATE_LIMIT_PER_MIN` | `120` | REST requests per client IP per minute; invalid or non-positive values use `120`. |
 | `NAGG_AUDITOR_ENABLED` | `mint` module enabled | Runs the background auditor refresh for discovery and the mint-info work-list. |

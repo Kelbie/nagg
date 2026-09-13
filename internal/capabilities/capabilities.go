@@ -12,6 +12,7 @@ const (
 
 var Names = []string{
 	"appview.mint.discover.uptime",
+	"app.aiLineup.pinsMissing",
 	"app.latestVersion.minVersion",
 	"graphql.events",
 	"graphql.relayHydration",

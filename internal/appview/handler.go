@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nbd-wtf/go-nostr"
@@ -87,6 +88,9 @@ type Handler struct {
 	routstrClient             RoutstrClient
 	aiLineupVendors           []string
 	aiLineupPins              map[string]map[string]string
+	aiLineupAuthMode          string
+	aiLineupMu                sync.Mutex
+	aiLineupLoggedAt          time.Time
 	// viewerTouch records "this pubkey is a real Sovran viewer" (relevance
 	// tracking for the ingest post cap). Called ONLY on routes where the
 	// pubkey is semantically the requesting user — notifications, DM
@@ -253,6 +257,11 @@ func WithMintHistory(provider MintHistoryProvider) Option {
 	return func(h *Handler) {
 		h.mintInfo = provider
 	}
+}
+
+// WithAIAuthMode advertises the operator-configured node authentication mode.
+func WithAIAuthMode(mode string) Option {
+	return func(h *Handler) { h.aiLineupAuthMode = mode }
 }
 
 // WithAILineup wires the Routstr catalog client behind GET /app/ai-lineup,
