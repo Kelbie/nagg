@@ -33,6 +33,8 @@ const (
 	Mint Module = "mint"
 	// App is the client-config surface: /app/latest-version, /app/ai-lineup.
 	App Module = "app"
+	// Vertex serves client-signed DVM requests and shared reputation caches.
+	Vertex Module = "vertex"
 )
 
 // Core is the pseudo-module every deployment carries: the raw ingestion tables,
@@ -42,7 +44,7 @@ const (
 const Core Module = "core"
 
 // known is the closed set NAGG_MODULES may name, in canonical order.
-var known = []Module{Nostr, Mint, App}
+var known = []Module{Nostr, Mint, App, Vertex}
 
 // Set is an enabled-module set. The nil/zero Set means ALL modules, so a caller
 // that never configures modules keeps the pre-modules behavior.

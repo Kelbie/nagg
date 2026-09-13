@@ -463,3 +463,40 @@ func TestLoadRoutstrConfig(t *testing.T) {
 		t.Fatalf("custom fallbacks = %v", cfg.Routstr.FallbackURLs)
 	}
 }
+
+func TestVertexModuleDefaultsAndOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		modules  string
+		enabled  bool
+		batch    int
+		throttle time.Duration
+	}{
+		{"mint", false, 200, 0}, {"mint,app,vertex", true, 20, 2 * time.Second}, {"nostr", true, 200, 0}, {"vertex", true, 20, 2 * time.Second},
+	} {
+		t.Run(tc.modules, func(t *testing.T) {
+			t.Setenv("NAGG_MODULES", tc.modules)
+			for _, key := range []string{"NAGG_VERTEX_PRIVATE_KEY", "NAGG_VERTEX_RELAY_ENABLED", "NAGG_VERTEX_CLIENT_MAX_PER_MIN", "NAGG_VERTEX_ALLOW_PERSONALIZED", "NAGG_VERTEX_SYNC_BATCH", "NAGG_VERTEX_SYNC_THROTTLE"} {
+				t.Setenv(key, "")
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Vertex.RelayEnabled != tc.enabled || cfg.Vertex.SyncBatch != tc.batch || cfg.Vertex.SyncThrottle != tc.throttle || cfg.Vertex.ClientMaxPerMin != 10 || cfg.Vertex.AllowPersonalized {
+				t.Fatalf("unexpected defaults: %+v", cfg.Vertex)
+			}
+			t.Setenv("NAGG_VERTEX_RELAY_ENABLED", "false")
+			t.Setenv("NAGG_VERTEX_CLIENT_MAX_PER_MIN", "3")
+			t.Setenv("NAGG_VERTEX_ALLOW_PERSONALIZED", "true")
+			t.Setenv("NAGG_VERTEX_SYNC_BATCH", "4")
+			t.Setenv("NAGG_VERTEX_SYNC_THROTTLE", "5s")
+			cfg, err = Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Vertex.RelayEnabled || cfg.Vertex.ClientMaxPerMin != 3 || !cfg.Vertex.AllowPersonalized || cfg.Vertex.SyncBatch != 4 || cfg.Vertex.SyncThrottle != 5*time.Second {
+				t.Fatalf("overrides ignored: %+v", cfg.Vertex)
+			}
+		})
+	}
+}

@@ -221,3 +221,28 @@ func TestAppCacheHeaders(t *testing.T) {
 		})
 	}
 }
+
+func TestVertexSignedRequestsBypassResponseCache(t *testing.T) {
+	for _, path := range []string{"/nostr/vertex/relay", "/v1/nostr/vertex/relay", "/nostr/search?query=alice&svr=signed", "/nostr/profile?svr=signed", "/v1/nostr/search?svr="} {
+		mc := newMemCache()
+		calls := 0
+		handler := WrapREST(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("Cache-Control", "no-store")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}, mc, time.Minute, time.Hour)
+		for i := 0; i < 2; i++ {
+			w := httptest.NewRecorder()
+			handler(w, httptest.NewRequest(http.MethodGet, path, nil))
+			if w.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("lost no-store")
+			}
+		}
+		if calls != 2 || mc.sets != 0 || len(mc.m) != 0 {
+			t.Fatalf("%s calls=%d sets=%d", path, calls, mc.sets)
+		}
+	}
+	if fresh, stale := restCachePolicy("/nostr/vertex/relay", time.Minute, time.Hour); fresh != 0 || stale != 0 {
+		t.Fatalf("relay cache policy=%s/%s", fresh, stale)
+	}
+}

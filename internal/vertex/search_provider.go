@@ -57,6 +57,10 @@ func (p *SearchProvider) Search(ctx context.Context, args SearchArgs) ([]SearchR
 			return nil, false, err
 		}
 		if ok {
+			stamp := fetchedAt.Unix()
+			for i := range rows {
+				rows[i].FetchedAt = &stamp
+			}
 			if time.Since(fetchedAt) >= p.maxAge {
 				p.refreshAsync(args)
 			}
@@ -89,6 +93,10 @@ func (p *SearchProvider) refresh(ctx context.Context, args SearchArgs) ([]Search
 		rows, err := p.client.SearchRefresh(ctx, args)
 		if err != nil {
 			return nil, err
+		}
+		stamp := time.Now().Unix()
+		for i := range rows {
+			rows[i].FetchedAt = &stamp
 		}
 		if p.store != nil {
 			if err := p.store.SaveVertexSearch(ctx, args, rows); err != nil {

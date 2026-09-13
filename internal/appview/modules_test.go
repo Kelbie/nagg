@@ -111,3 +111,30 @@ func TestEveryRouteDeclaresAModule(t *testing.T) {
 		}
 	}
 }
+
+func TestVertexCapabilitiesRouteParity(t *testing.T) {
+	for _, mods := range []string{"vertex", "mint,app,vertex", "nostr", "nostr,vertex"} {
+		h := New(nil, WithModules(mustParseModules(t, mods)))
+		mux := http.NewServeMux()
+		h.Register(mux)
+		mounted := map[string]int{}
+		for _, path := range h.mountedRoutes() {
+			mounted[path]++
+		}
+		for _, path := range []string{"/nostr/profile", "/nostr/search", "/nostr/recommended", "/nostr/vertex/relay"} {
+			if mounted[path] != 1 {
+				t.Fatalf("%s mounts %s %d times", mods, path, mounted[path])
+			}
+			for _, prefix := range []string{"", "/v1"} {
+				if _, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, prefix+path, nil)); pattern == "" {
+					t.Fatalf("%s missing %s", mods, prefix+path)
+				}
+			}
+		}
+		if !h.modules.Has(modules.Nostr) {
+			if _, pattern := mux.Handler(httptest.NewRequest(http.MethodGet, "/nostr/feed", nil)); pattern != "" {
+				t.Fatalf("social route mounted for %s", mods)
+			}
+		}
+	}
+}

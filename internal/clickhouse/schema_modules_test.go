@@ -1,7 +1,11 @@
 package clickhouse
 
 import (
+	"github.com/vertex-lab/nagg/internal/dvm"
+	"github.com/vertex-lab/nagg/internal/vertex"
+	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/modules"
@@ -173,4 +177,54 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func TestVertexAdditionPreservesMintSchema(t *testing.T) {
+	plugins := dvm.MustRegistry(vertex.NewPlugin())
+	before := &Store{modules: mintModules(t), rules: rules.MustMint(), dvm: plugins}
+	mods, err := modules.Parse("mint,app,vertex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := &Store{modules: mods, rules: rules.MustMint(), dvm: plugins}
+	oldDDL := append(embeddedMigrations(before.modules), before.generatedDDL()...)
+	newDDL := append(embeddedMigrations(after.modules), after.generatedDDL()...)
+	if !reflect.DeepEqual(oldDDL, newDDL) {
+		t.Fatal("adding app,vertex changed mint DDL")
+	}
+	for _, name := range []string{"vertex_scores", "vertex_profile_cache", "vertex_search_cache"} {
+		count := 0
+		for _, stmt := range newDDL {
+			if strings.Contains(stmt, "CREATE TABLE IF NOT EXISTS "+name+"\n") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("%s declared %d times", name, count)
+		}
+	}
+	desired, err := parseDesiredSchema(newDDL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := parseDesiredSchema(allModuleDDL(plugins))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables := map[string]string{}
+	columns := map[string]map[string]struct{}{}
+	for table, cols := range desired.tables {
+		tables[table] = "ReplacingMergeTree"
+		columns[table] = map[string]struct{}{}
+		for col := range cols {
+			columns[table][col] = struct{}{}
+		}
+	}
+	for view := range desired.views {
+		tables[view] = "MaterializedView"
+	}
+	plan := computeReconcilePlan(desired, all, tables, columns)
+	if len(plan.dropTables)+len(plan.dropViews)+len(plan.dropColumns)+len(plan.addColumns) != 0 {
+		t.Fatalf("unexpected reconcile changes: %+v", plan)
+	}
 }

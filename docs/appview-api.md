@@ -77,35 +77,36 @@ Pubkey-keyed (profile-family routes):
 
 ## 3. Endpoint inventory
 
-| Method | Path | Heavy | Response |
-| --- | --- | --- | --- |
-| GET | `/nostr/capabilities` | no | service info; `appViewVersion: "v2"` |
-| GET,POST | `/nostr/feed` | yes | envelope + `hasMore` (§4) |
-| GET | `/nostr/feed/user` | yes | envelope + `hasMore` (§4) |
-| POST | `/nostr/feed/ranked` | yes | envelope + `hasMore` (§4; `orderBy: "rank"`) |
-| GET,POST | `/nostr/notifications` | yes | envelope + `entries` + `hasNext` (§4) |
-| GET | `/nostr/notifications/seen` | no | envelope holding the viewer's kind-30078 read-marker event; client parses `seenUntil` from its content |
-| POST | `/nostr/events/aggregates` | no | envelope, aggregates only (`order`/`events` empty). Body `{"ids": ["<id>", …]}`, ≤ 100. **Replaces `/nostr/notes/stats`.** |
-| GET | `/nostr/thread` | yes | envelope + `total` (§4); `order[0]` is the root id on every page, the rest is the server-ranked reply order |
-| GET | `/nostr/follows` | no | envelope; pubkey-keyed aggregates |
-| GET | `/nostr/events` | no | envelope; `order` = requested ids that resolved |
-| POST | `/nostr/events/query` | yes | envelope (bare when the queried kinds include 1059 — §5) |
-| GET,POST | `/nostr/dm/envelopes` | yes | bare envelope (§5) |
-| GET,POST | `/nostr/dm/conversation` | yes | bare envelope (§5) |
-| GET | `/nostr/follow-status` | no | envelope + `edges` (§4) |
-| GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) |
-| GET | `/nostr/mint/discover` | yes | **not an envelope** |
-| GET | `/nostr/mint/history` | yes | **not an envelope**: NUT-06 info snapshot history (§7) |
-| GET | `/nostr/mint/changes` | yes | **not an envelope**: ecosystem changes and roster stats; optional `limit` (§7) |
-| GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags |
-| GET | `/nostr/own/profiles` | no | envelope: kind-0 events + pubkey-keyed aggregates |
-| GET | `/nostr/own/{type}` | yes | envelope of the viewer's own action history |
-| GET | `/nostr/profiles` | no | envelope: kind-0 events for the requested pubkeys |
-| GET | `/nostr/profile` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
-| GET | `/nostr/search` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
-| GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) |
-| GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) |
-| GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) |
+| Method | Path | Heavy | Response | Module |
+| --- | --- | --- | --- | --- |
+| GET | `/nostr/capabilities` | no | service info; `appViewVersion: "v2"` | core |
+| GET,POST | `/nostr/feed` | yes | envelope + `hasMore` (§4) | nostr |
+| GET | `/nostr/feed/user` | yes | envelope + `hasMore` (§4) | nostr |
+| POST | `/nostr/feed/ranked` | yes | envelope + `hasMore` (§4; `orderBy: "rank"`) | nostr |
+| GET,POST | `/nostr/notifications` | yes | envelope + `entries` + `hasNext` (§4) | nostr |
+| GET | `/nostr/notifications/seen` | no | envelope holding the viewer's kind-30078 read-marker event; client parses `seenUntil` from its content | nostr |
+| POST | `/nostr/events/aggregates` | no | envelope, aggregates only (`order`/`events` empty). Body `{"ids": ["<id>", …]}`, ≤ 100. **Replaces `/nostr/notes/stats`.** | nostr |
+| GET | `/nostr/thread` | yes | envelope + `total` (§4); `order[0]` is the root id on every page, the rest is the server-ranked reply order | nostr |
+| GET | `/nostr/follows` | no | envelope; pubkey-keyed aggregates | nostr |
+| GET | `/nostr/events` | no | envelope; `order` = requested ids that resolved | nostr |
+| POST | `/nostr/events/query` | yes | envelope (bare when the queried kinds include 1059 — §5) | nostr |
+| GET,POST | `/nostr/dm/envelopes` | yes | bare envelope (§5) | nostr |
+| GET,POST | `/nostr/dm/conversation` | yes | bare envelope (§5) | nostr |
+| GET | `/nostr/follow-status` | no | envelope + `edges` (§4) | nostr |
+| GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) | mint |
+| GET | `/nostr/mint/discover` | yes | **not an envelope** | mint |
+| GET | `/nostr/mint/history` | yes | **not an envelope**: NUT-06 info snapshot history (§7) | mint |
+| GET | `/nostr/mint/changes` | yes | **not an envelope**: ecosystem changes and roster stats; optional `limit` (§7) | mint |
+| GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags | nostr |
+| GET | `/nostr/own/profiles` | no | envelope: kind-0 events + pubkey-keyed aggregates | nostr |
+| GET | `/nostr/own/{type}` | yes | envelope of the viewer's own action history | nostr |
+| GET | `/nostr/profiles` | no | envelope: kind-0 events for the requested pubkeys | nostr |
+| GET | `/nostr/profile` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) | vertex or nostr |
+| GET,POST | `/nostr/search` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) | vertex or nostr |
+| GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) | vertex or nostr |
+| POST | `/nostr/vertex/relay` | no | signed event relay, write-through cache, `{ok, kind, result, fetchedAt, cached}` | vertex or nostr |
+| GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) | app |
+| GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) | app |
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
@@ -216,17 +217,56 @@ mutual = `out && in`):
                                        // only anchor locally known profile events)
   "providers": {                       // provider-namespaced non-count data
     "<pubkey>": {
-      "vertex": { "rank": 1, "score": 87.2, "nodes": 210433, "references": ["<pubkey>", "…"] },
+      "vertex": { "vertexFetchedAt": 1710000000, "rank": 1, "score": 87.2, "nodes": 210433, "references": ["<pubkey>", "…"] },
       "nip05":  { "valid": true },
       "nagg":   { "firstEventAt": 1710000000 }
     }
   },
-  "fromCache": false
+  "fromCache": false,
+  "vertexFresh": true // search: Vertex cache age < seven-day Policy.CacheTTL
 }
 ```
 
 Provider payloads are float/context-shaped data from named providers (the DVM
 plugin seam, `internal/dvm`); counts stay in `aggregates`.
+
+**Client-signed Vertex refresh** — `POST /nostr/vertex/relay` accepts a signed
+5312/5313/5315 event as the JSON body, forwards it unchanged, verifies the
+response signature and correlation, and writes parsed profile/search results
+to the existing cache. Profile `result` is `ProfileResult`; search/recommend
+`result` is a `SearchResult` array. Recommendations are uncached (`cached:false`).
+Profile payload JSON also retains the signed response; the search table retains
+only parsed ranks because it has no raw-event column. Source-scoped/non-global
+profile results are also uncached to preserve global reputation.
+
+`GET /nostr/profile` and `GET|POST /nostr/search` accept optional
+`signedVertexRequest` via the **`svr` query parameter**, containing unpadded
+base64url-encoded signed event JSON. POST search's JSON body is
+`{query, limit?, sort?, source?}`; `svr` stays in the URL. The signed target or
+query/limit/sort/source must match the read. With `svr`, the refresh is
+synchronous within the 15-second DVM deadline and the response uses the fresh
+result directly. Without it, existing cache/fallback behavior applies.
+`providers[pk].vertex.vertexFetchedAt` is Unix seconds or null;
+`vertexFresh` on search is true for Vertex data younger than `Policy.CacheTTL`
+(seven days), including a successful empty signed search. Local-only fallback
+is false. Ordinary GET response caching still applies; signed reads bypass it.
+
+Signature/ID, kind, timestamp (±300s), bounded content/tags, and parameter
+validation failures return 400. Personalized Pagerank is rejected unless
+`NAGG_VERTEX_ALLOW_PERSONALIZED=true`. Relay and piggyback requests share the
+per-signing-pubkey limit (`NAGG_VERTEX_CLIENT_MAX_PER_MIN`, default 10/min);
+exceeding it returns 429. Kind-7000 errors return HTTP 200
+`{ok:false,reason:"insufficient_credits"|"rejected",message:"<sanitized>"}`;
+timeout returns 504 `{ok:false,reason:"timeout"}`. Other upstream/cache failures
+return 502 `{ok:false,reason:"unavailable"}`; relay disabled/unconfigured is 503.
+The relay cache policy is zero, and both relay and signed read responses are
+`Cache-Control: no-store` and bypass Redis/LRU entirely.
+
+The `vertex` module mounts these routes without social tables; profiles return
+cached Vertex plus available kind-0 data and omit social counts. No private
+key is required for client relay or cached reads. Read the
+[Vertex client relay guide](vertex-client-relay.md) for wire examples, credits,
+privacy, async cache visibility, and operator settings.
 
 ## 5. DM privacy: bare envelopes
 

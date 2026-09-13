@@ -20,6 +20,7 @@ Unset means every module — production's behavior, unchanged.
 | `core` | always on, never named: the ingestion tables (`nostr_events`, `event_tags`, `event_seen_relays`), the migration ledger, `relay_backfill_state`, the system-log bounds, `/nostr/capabilities` |
 | `nostr` | the social app-view — feed, thread, notifications, DMs, profiles, search, follows, social graph, ranking; the enricher, the rollup, retention, the relevance tracker; GraphQL |
 | `mint` | the cashu mint observatory — `/nostr/mint/{reviews,discover,history,changes}`, the `/mint-changes` page, the NUT-06 snapshotter, the auditor client |
+| `vertex` | client-signed Vertex DVM relay; shared profile/search/recommended reads (also owned by `nostr`); optional trickle sync; existing plugin caches |
 | `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr) |
 
 ## What each module changes
@@ -60,6 +61,7 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 | `NAGG_RUN_MINT_INFO` | `mint` |
 | `NAGG_AUDITOR_ENABLED` | `mint` |
 | `NAGG_ROUTSTR_ENABLED` | `app` |
+| `NAGG_VERTEX_RELAY_ENABLED` | `vertex` or `nostr` |
 
 ## Mint auditor refresh
 
@@ -158,7 +160,7 @@ Plus the three Vertex DVM cache tables (`vertex_scores`,
 `vertex_profile_cache`, `vertex_search_cache`), which every deployment creates:
 the plugin registry declares them statically so all four binaries derive the
 same schema, and `buildReadyAPI` reads the plugin's policy unconditionally.
-They stay empty without `NAGG_VERTEX_PRIVATE_KEY`, and keeping them means
+Client-signed requests can populate them without `NAGG_VERTEX_PRIVATE_KEY`; keeping them means
 `/nostr/mint/discover` can read cached operator reputation the moment social
 enrichment is switched on.
 
@@ -166,6 +168,32 @@ enrichment is switched on.
 NIP-87 events, because a live firehose alone captures almost none of them:
 measured 2026-07, months of live listening had 23 kind-38000 events against
 ~1.5k already sitting on the configured relay set.
+
+## Vertex on the mint deployment
+
+`NAGG_MODULES=mint,app,vertex` mounts `POST /nostr/vertex/relay`,
+`GET|POST /nostr/search`, `GET /nostr/profile`, and `GET /nostr/recommended`
+(and `/v1` aliases). `nostr` also mounts them, once even when both modules are
+named. Without `nostr`, profile and ranking envelopes skip social stats and
+retain ranked pubkeys even when kind-0 rows are absent.
+
+The vertex plugin owns `vertex_scores`, `vertex_profile_cache`, and
+`vertex_search_cache`. Its static registry is shared with mint and registered
+once for every binary. Adding `vertex` introduces no DDL, migrations, columns,
+or social workers: schema reconcile has the same desired schema and the same
+all-module drop boundary as the mint slice. A regression test pins the exact
+DDL and empty reconcile plan.
+
+Client relay is on by default for `vertex`/`nostr`, with
+`NAGG_VERTEX_CLIENT_MAX_PER_MIN=10` and
+`NAGG_VERTEX_ALLOW_PERSONALIZED=false`. `NAGG_VERTEX_PRIVATE_KEY` is optional.
+When set, the syncer runs every `NAGG_VERTEX_SYNC_INTERVAL` (30m), with
+`NAGG_VERTEX_SYNC_BATCH=20` and `NAGG_VERTEX_SYNC_THROTTLE=2s` by default for
+vertex without nostr (200/0s with nostr). Mint-mode candidates come from the
+existing score cache, not social tables. A credit-exhausted tick stops after
+one `vertex.sync.credits_exhausted` warning. Policy constants are seven days
+and 500 inbound refs. See [client relay](vertex-client-relay.md) for the credit
+model, protocol, privacy, caching limits, and exact operator settings.
 
 ## Adding a module
 

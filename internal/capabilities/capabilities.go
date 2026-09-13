@@ -11,6 +11,8 @@ const (
 )
 
 var Names = []string{
+	"appview.vertex.clientRelay",
+	"appview.vertex.fetchedAt",
 	"appview.mint.discover.uptime",
 	"app.aiLineup.pinsMissing",
 	"app.latestVersion.minVersion",
@@ -60,6 +62,7 @@ var Names = []string{
 // and it had silently drifted to under-report seven live routes.
 // appview's TestCapabilitiesRouteParity enforces the match.
 var AppViewRoutes = []string{
+	"/nostr/vertex/relay",
 	"/nostr/capabilities",
 	"/nostr/feed",
 	"/nostr/feed/user",

@@ -36,10 +36,13 @@ func newRateLimiter(limit int, window time.Duration) *rateLimiter {
 }
 
 func (l *rateLimiter) allow(r *http.Request) bool {
+	return l.allowKey(clientIP(r))
+}
+
+func (l *rateLimiter) allowKey(key string) bool {
 	if l == nil {
 		return true
 	}
-	key := clientIP(r)
 	now := time.Now()
 
 	l.mu.Lock()

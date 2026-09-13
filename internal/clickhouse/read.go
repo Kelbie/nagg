@@ -12,6 +12,7 @@ import (
 
 	ch "github.com/ClickHouse/clickhouse-go/v2"
 
+	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
@@ -1061,7 +1062,16 @@ func (s *Store) RecentAuthorPubkeysByFollowers(ctx context.Context, minFollowers
 	if limit <= 0 {
 		limit = 200
 	}
-	rows, err := s.conn.Query(ctx, recentAuthorsBySyncGateQuery, minFollowers, int64(staleAfter/time.Second), limit)
+	query := recentAuthorsBySyncGateQuery
+	if !s.modules.Has(modules.Nostr) {
+		// No social graph in the mint slice. Trickle-refresh only previously
+		// scored eligible targets, using the existing shared provider cache.
+		query = `SELECT pubkey FROM vertex_scores FINAL
+			WHERE source = 'vertex' AND followers >= ?
+			AND fetched_at < now() - toIntervalSecond(?)
+			ORDER BY fetched_at ASC, pubkey ASC LIMIT ?`
+	}
+	rows, err := s.conn.Query(ctx, query, minFollowers, int64(staleAfter/time.Second), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1095,11 +1105,12 @@ func (s *Store) ProfileFirstEventCreatedAt(ctx context.Context, pubkey string) (
 
 func (s *Store) CachedVertexProfile(ctx context.Context, pubkey string) (vertex.ProfileResult, bool, error) {
 	var payload string
+	var fetchedAt time.Time
 	if err := s.conn.QueryRow(ctx, `
-		SELECT payload
+		SELECT payload, fetched_at
 		FROM vertex_profile_cache FINAL
 		WHERE pubkey = ?
-	`, pubkey).Scan(&payload); err != nil {
+	`, pubkey).Scan(&payload, &fetchedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return vertex.ProfileResult{}, false, nil
 		}
@@ -1115,6 +1126,8 @@ func (s *Store) CachedVertexProfile(ctx context.Context, pubkey string) (vertex.
 	if profile.Npub == "" {
 		profile.Npub = vertex.Npub(profile.PubKey)
 	}
+	stamp := fetchedAt.Unix()
+	profile.FetchedAt = &stamp
 	return profile, true, nil
 }
 
@@ -1125,7 +1138,7 @@ func (s *Store) CachedVertexProfiles(ctx context.Context, pubkeys []string) (map
 		return out, nil
 	}
 	rows, err := s.conn.Query(ctx, `
-		SELECT pubkey, payload
+		SELECT pubkey, payload, fetched_at
 		FROM vertex_profile_cache FINAL
 		WHERE pubkey IN (?)
 	`, pubkeys)
@@ -1136,7 +1149,8 @@ func (s *Store) CachedVertexProfiles(ctx context.Context, pubkeys []string) (map
 	for rows.Next() {
 		var pubkey string
 		var payload string
-		if err := rows.Scan(&pubkey, &payload); err != nil {
+		var fetchedAt time.Time
+		if err := rows.Scan(&pubkey, &payload, &fetchedAt); err != nil {
 			return nil, err
 		}
 		var profile vertex.ProfileResult
@@ -1149,6 +1163,8 @@ func (s *Store) CachedVertexProfiles(ctx context.Context, pubkeys []string) (map
 		if profile.Npub == "" {
 			profile.Npub = vertex.Npub(profile.PubKey)
 		}
+		stamp := fetchedAt.Unix()
+		profile.FetchedAt = &stamp
 		out[pubkey] = profile
 	}
 	return out, rows.Err()

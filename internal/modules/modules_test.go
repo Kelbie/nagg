@@ -57,7 +57,7 @@ func TestZeroSetEnablesEverything(t *testing.T) {
 	if !set.IsAll() {
 		t.Fatal("zero Set must report IsAll")
 	}
-	if got, want := set.String(), "nostr,mint,app"; got != want {
+	if got, want := set.String(), "nostr,mint,app,vertex"; got != want {
 		t.Fatalf("zero Set String() = %q, want %q", got, want)
 	}
 }
@@ -73,12 +73,22 @@ func TestCoreAlwaysEnabled(t *testing.T) {
 }
 
 func TestParseTag(t *testing.T) {
-	for _, name := range []string{"core", "nostr", "mint", "app", " Mint "} {
+	for _, name := range []string{"core", "nostr", "mint", "app", "vertex", " Mint "} {
 		if _, err := ParseTag(name); err != nil {
 			t.Fatalf("ParseTag(%q) error: %v", name, err)
 		}
 	}
 	if _, err := ParseTag("feed"); err == nil {
 		t.Fatal("ParseTag accepted an unknown tag")
+	}
+}
+
+func TestVertexModuleDoesNotImplyNostr(t *testing.T) {
+	set, err := Parse("mint,app,vertex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !set.Has(Vertex) || !set.Has(Mint) || !set.Has(App) || set.Has(Nostr) {
+		t.Fatalf("wrong modules: %v", set)
 	}
 }
