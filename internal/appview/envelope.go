@@ -33,6 +33,12 @@ type Envelope struct {
 	Cursor     *string                                 `json:"cursor,omitempty"`
 }
 
+// FeedPageEnvelope reports page saturation before hydration or anchor deduplication.
+type FeedPageEnvelope struct {
+	Envelope
+	HasMore bool `json:"hasMore"`
+}
+
 // assembleEnvelope builds the response for an already-ordered set: it dedupes
 // the referenced events, pulls every quoted event, fetches the declared
 // aggregates for all embedded event ids, and appends each author's kind-0
@@ -147,7 +153,7 @@ func (h *Handler) latestK0Events(ctx context.Context, pubkeys []string) ([]FeedE
 // entries anchor on their referenced event (fetched and embedded alongside),
 // every entry's root is resolved and embedded, and the cursor encodes the
 // until|offset continuation.
-func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventView, orderBy string) (Envelope, error) {
+func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventView, orderBy string, limit uint64) (FeedPageEnvelope, error) {
 	originalIDs := make([]string, 0)
 	for _, event := range feedEvents {
 		if event.Kind == 6 || event.Kind == 16 {
@@ -158,7 +164,7 @@ func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventVi
 	}
 	originals, err := h.eventsByID(ctx, originalIDs)
 	if err != nil {
-		return Envelope{}, err
+		return FeedPageEnvelope{}, err
 	}
 
 	rootSources := make([]chstore.EventView, 0, len(feedEvents)+len(originals))
@@ -168,7 +174,7 @@ func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventVi
 	}
 	roots, err := h.rootEvents(ctx, rootSources)
 	if err != nil {
-		return Envelope{}, err
+		return FeedPageEnvelope{}, err
 	}
 
 	order := make([]string, 0, len(feedEvents))
@@ -200,15 +206,20 @@ func (h *Handler) feedEnvelope(ctx context.Context, feedEvents []chstore.EventVi
 	}
 
 	var cursor *string
-	if len(feedEvents) > 0 {
+	hasMore := limit > 0 && uint64(len(feedEvents)) >= limit
+	if hasMore {
 		c := fmt.Sprintf("%d|%d", oldest, len(feedEvents))
 		cursor = &c
 	}
-	return h.assembleEnvelope(ctx, order, orderBy, referenced, cursor)
+	envelope, err := h.assembleEnvelope(ctx, order, orderBy, referenced, cursor)
+	if err != nil {
+		return FeedPageEnvelope{}, err
+	}
+	return FeedPageEnvelope{Envelope: envelope, HasMore: hasMore}, nil
 }
 
-func (h *Handler) writeFeedEnvelope(w http.ResponseWriter, r *http.Request, events []chstore.EventView, orderBy string) {
-	response, err := h.feedEnvelope(r.Context(), events, orderBy)
+func (h *Handler) writeFeedEnvelope(w http.ResponseWriter, r *http.Request, events []chstore.EventView, orderBy string, limit uint64) {
+	response, err := h.feedEnvelope(r.Context(), events, orderBy, limit)
 	if err != nil {
 		writeError(w, err)
 		return

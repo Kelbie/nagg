@@ -80,9 +80,9 @@ Pubkey-keyed (profile-family routes):
 | Method | Path | Heavy | Response |
 | --- | --- | --- | --- |
 | GET | `/nostr/capabilities` | no | service info; `appViewVersion: "v2"` |
-| GET,POST | `/nostr/feed` | yes | envelope |
-| GET | `/nostr/feed/user` | yes | envelope |
-| POST | `/nostr/feed/ranked` | yes | envelope (`orderBy: "rank"`) |
+| GET,POST | `/nostr/feed` | yes | envelope + `hasMore` (§4) |
+| GET | `/nostr/feed/user` | yes | envelope + `hasMore` (§4) |
+| POST | `/nostr/feed/ranked` | yes | envelope + `hasMore` (§4; `orderBy: "rank"`) |
 | GET,POST | `/nostr/notifications` | yes | envelope + `entries` + `hasNext` (§4) |
 | GET | `/nostr/notifications/seen` | no | envelope holding the viewer's kind-30078 read-marker event; client parses `seenUntil` from its content |
 | POST | `/nostr/events/aggregates` | no | envelope, aggregates only (`order`/`events` empty). Body `{"ids": ["<id>", …]}`, ≤ 100. **Replaces `/nostr/notes/stats`.** |
@@ -132,6 +132,27 @@ caches) but are never ordered as replies of the root, and `total` counts
 direct replies only.
 
 ## 4. Route extensions
+
+**Feeds** — `/nostr/feed`, `/nostr/feed/user`, and `/nostr/feed/ranked`
+include a boolean `hasMore` (capability `appview.feed.hasMore`):
+
+```jsonc
+{
+  "hasMore": true,
+  "cursor": "1710000000|30" // present only when hasMore is true
+}
+```
+
+`hasMore` is a page-saturation hint: the number of fetched feed rows is at
+least the effective positive limit, before hydration or repost-anchor
+deduplication. No COUNT query is issued. A short or empty page has
+`hasMore: false` and no `cursor`; a full page may still be the last page and
+require an empty follow-up to discover the end. Clients that use a missing
+cursor as end-of-feed now stop one request earlier on short non-empty pages.
+
+The default limit is 30 for feed and ranked feed, and 50 for user feed.
+Explicit zero or oversized limits (>100) fall back to 30. Ranked feed uses
+the effective top-level `limit` from the shared ranker, not `target.limit`.
 
 **Notifications** — envelope plus:
 

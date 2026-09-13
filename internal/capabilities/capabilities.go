@@ -49,6 +49,7 @@ var Names = []string{
 	"appview.dmEnvelopes",
 	"appview.relayHydration",
 	"appview.thread.total",
+	"appview.feed.hasMore",
 	"appview.v2",
 }
 

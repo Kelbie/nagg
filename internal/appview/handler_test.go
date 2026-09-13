@@ -1868,18 +1868,19 @@ func TestRegisterAppliesRateLimit(t *testing.T) {
 
 type fakeRanker struct {
 	events []chstore.EventView
+	limit  uint64
 	err    error
 	calls  int
 	last   any
 }
 
-func (f *fakeRanker) RankedEventViews(_ context.Context, input any) ([]chstore.EventView, error) {
+func (f *fakeRanker) RankedEventViews(_ context.Context, input any) ([]chstore.EventView, uint64, error) {
 	f.calls++
 	f.last = input
 	if f.err != nil {
-		return nil, f.err
+		return nil, 0, f.err
 	}
-	return f.events, nil
+	return f.events, f.limit, nil
 }
 
 func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
@@ -1917,7 +1918,7 @@ func TestRankedFeedPreservesRankingOrderAndEnriches(t *testing.T) {
 			secondID: {LikeCount: 2},
 		},
 	}
-	ranker := &fakeRanker{events: []chstore.EventView{first, second}}
+	ranker := &fakeRanker{events: []chstore.EventView{first, second}, limit: 10}
 	handler := New(store, WithRankedFeed(ranker), WithNIP05Validation(false))
 
 	rec := httptest.NewRecorder()

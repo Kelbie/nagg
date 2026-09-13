@@ -1,10 +1,17 @@
 package appview
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/capabilities"
 )
+
+func TestCapabilitiesFeedHasMore(t *testing.T) {
+	if !slices.Contains(capabilities.Names, "appview.feed.hasMore") {
+		t.Fatal("missing appview.feed.hasMore capability")
+	}
+}
 
 // TestCapabilitiesRouteParity pins the advertised capabilities manifest to the
 // routes Register actually mounts. The manifest is what clients feature-gate
