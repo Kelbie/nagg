@@ -8,6 +8,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/safego"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -171,6 +172,14 @@ func serveSWR(
 	compute func(ctx context.Context) capturedResult,
 	cacheable func(capturedResult) bool,
 ) {
+	// App configuration is public. Apply its HTTP policy outside the captured
+	// handler so cache hits and stale responses carry it too.
+	write := func(status int, contentType string, body []byte, state string) {
+		if status == http.StatusOK && isAppPath(r.URL.Path) {
+			w.Header().Set("Cache-Control", "public, max-age="+strconv.FormatInt(int64(freshTTL/time.Second), 10))
+		}
+		writeResponse(w, status, contentType, body, state)
+	}
 	hardTTL := freshTTL + staleFor
 	now := time.Now()
 
@@ -184,14 +193,14 @@ func serveSWR(
 	}
 
 	if haveCached && !refresh && age <= freshTTL {
-		writeResponse(w, http.StatusOK, "application/json", cachedBody, "hit")
+		write(http.StatusOK, "application/json", cachedBody, "hit")
 		return
 	}
 
 	if haveCached && staleFor > 0 {
 		// Serve stale instantly and refresh in the background. This covers both an
 		// expired entry and an explicit refresh, so neither blocks the caller.
-		writeResponse(w, http.StatusOK, "application/json", cachedBody, "stale")
+		write(http.StatusOK, "application/json", cachedBody, "stale")
 		go func() {
 			defer safego.Recover("cache.revalidate")
 			_, _, _ = group.Do("revalidate:"+key, func() (any, error) {
@@ -217,7 +226,7 @@ func serveSWR(
 		return res, nil
 	})
 	res := v.(capturedResult)
-	writeResponse(w, res.status, res.contentType, res.body, "miss")
+	write(res.status, res.contentType, res.body, "miss")
 }
 
 func writeResponse(w http.ResponseWriter, status int, contentType string, body []byte, cacheState string) {
@@ -294,6 +303,8 @@ func graphqlCachePolicy(query string, defFresh, defStale time.Duration) (fresh, 
 // restCachePolicy picks (fresh, stale) based on the app-view route path.
 func restCachePolicy(path string, defFresh, defStale time.Duration) (fresh, stale time.Duration) {
 	switch {
+	case isAppPath(path):
+		return time.Minute, 24 * time.Hour
 	case strings.Contains(path, "/dm/"):
 		return 5 * time.Second, 0
 	case strings.HasSuffix(path, "/profile"), strings.HasSuffix(path, "/profiles"),
@@ -309,4 +320,8 @@ func restCachePolicy(path string, defFresh, defStale time.Duration) (fresh, stal
 	default:
 		return defFresh, defStale
 	}
+}
+
+func isAppPath(path string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(path, "/v1"), "/app/")
 }

@@ -11,6 +11,7 @@ const (
 )
 
 var Names = []string{
+	"app.latestVersion.minVersion",
 	"graphql.events",
 	"graphql.relayHydration",
 	"graphql.events.search",

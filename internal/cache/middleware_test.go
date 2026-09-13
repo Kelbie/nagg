@@ -175,3 +175,49 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met within timeout")
 }
+
+func TestAppCachePolicy(t *testing.T) {
+	for _, path := range []string{"/app/latest-version", "/app/ai-lineup", "/app/rates", "/v1/app/latest-version", "/v1/app/ai-lineup", "/v1/app/rates"} {
+		fresh, stale := restCachePolicy(path, time.Second, time.Second)
+		if fresh != time.Minute || stale != 24*time.Hour {
+			t.Fatalf("%s policy = (%s, %s)", path, fresh, stale)
+		}
+	}
+	if fresh, stale := restCachePolicy("/other", time.Second, 2*time.Second); fresh != time.Second || stale != 2*time.Second {
+		t.Fatalf("fallback policy = (%s, %s)", fresh, stale)
+	}
+}
+
+func TestAppCacheHeaders(t *testing.T) {
+	for _, state := range []string{"miss", "hit", "stale", "error"} {
+		t.Run(state, func(t *testing.T) {
+			c := newMemCache()
+			path := "/app/latest-version"
+			if state == "hit" || state == "stale" {
+				storedAt := time.Now()
+				if state == "stale" {
+					storedAt = storedAt.Add(-2 * time.Minute)
+				}
+				c.Set(context.Background(), RESTKey(http.MethodGet, path, "", ""), encodeEnvelope(storedAt, []byte(`{"version":"0.1.3"}`)), 25*time.Hour)
+			}
+			h := WrapREST(func(w http.ResponseWriter, r *http.Request) {
+				if state == "error" {
+					http.Error(w, "unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte(`{"version":"0.1.3"}`))
+			}, c, time.Second, time.Second)
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			if state == "error" {
+				if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Cache-Control") != "" {
+					t.Fatalf("error response: %d %v", rec.Code, rec.Header())
+				}
+				return
+			}
+			if rec.Header().Get("Cache-Control") != "public, max-age=60" || rec.Header().Get("X-Nagg-Cache") != state {
+				t.Fatalf("headers = %v", rec.Header())
+			}
+		})
+	}
+}

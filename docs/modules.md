@@ -61,6 +61,26 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 | `NAGG_AUDITOR_ENABLED` | `mint` |
 | `NAGG_ROUTSTR_ENABLED` | `app` |
 
+## App configuration and ops
+
+`NAGG_MODULES=mint,app` mounts both `/app/latest-version` (GET/POST) and
+`/app/ai-lineup` (GET), including their `/v1/app/*` aliases. Adding `app` adds
+no ClickHouse migrations, tables, or social workers: the mint rule registry,
+stored kinds, and firehose kinds stay the same. The version endpoint reads only
+configuration. AI lineup uses the Routstr HTTP client, enabled by default for
+`app` with its default URL; no extra credentials or database schema are needed.
+If Routstr is explicitly disabled, AI lineup returns 503.
+
+`NAGG_APP_LATEST_VERSION`, `NAGG_APP_UPDATE_MESSAGE`, and `NAGG_APP_MIN_VERSION`
+configure the version response (all default empty). GET `/app/*` responses use
+60 seconds fresh / 24 hours stale in the response cache. The latest-version
+response also sends `Cache-Control: public, max-age=60` for GET and POST.
+
+`NAGG_LOG_LEVEL` defaults to `info` in API, ingester, enricher, migrate, and
+backfill; use `debug` for per-request diagnostics or `warn`/`error` to reduce
+logs. `NAGG_RATE_LIMIT_PER_MIN` defaults to 120 REST requests per client IP.
+Both knobs apply independently of modules; see the [README env table](../README.md#deploy-on-railway).
+
 ## Stored kinds vs firehose kinds
 
 `NAGG_KINDS` and `NAGG_FIREHOSE_KINDS` are two different questions, and

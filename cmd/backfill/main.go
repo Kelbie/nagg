@@ -14,7 +14,7 @@ import (
 
 func main() {
 	runtimelimits.Apply()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: config.LogLevel()}))
 	slog.SetDefault(logger)
 
 	cfg, err := config.Load()

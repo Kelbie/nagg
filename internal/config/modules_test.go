@@ -136,3 +136,23 @@ func assertKinds(t *testing.T, label string, got, want []int) {
 		}
 	}
 }
+
+func TestMintAppModuleDefaults(t *testing.T) {
+	t.Setenv("NAGG_MODULES", "mint,app")
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKinds(t, "stored kinds", cfg.StoredKinds, []int{0, 38000})
+	assertKinds(t, "firehose kinds", cfg.Firehose.Kinds, []int{38000})
+	if cfg.RunEnricher || cfg.RunRollup || cfg.Modules.Has(modules.Nostr) {
+		t.Fatal("mint,app enables social workers")
+	}
+	if !cfg.RunIngester || !cfg.RunMintInfo || !cfg.Auditor.Enabled || !cfg.Routstr.Enabled || cfg.Routstr.URL == "" {
+		t.Fatal("mint,app must enable mint workers and the Routstr client")
+	}
+	if len(cfg.ClickHouse.Rules.Relationships()) != 0 || len(cfg.ClickHouse.Rules.Projections()) != 1 {
+		t.Fatal("mint,app must retain the mint rule set")
+	}
+}

@@ -14,7 +14,8 @@ kind-0 event; counts are whatever aggregation rules the registry declares
 (see `docs/rules-registry.md`). `appViewVersion` in `/nostr/capabilities` is
 `"v2"`; the capability token is `appview.v2`.
 
-Every route is mounted at both `/nostr/*` and `/v1/nostr/*` (identical handler,
+Nostr routes mount at both `/nostr/*` and `/v1/nostr/*`; app configuration
+routes mount at `/app/*` and `/v1/app/*` (identical handler,
 cache, and middleware). Heavy routes run multi-query ClickHouse aggregations and
 pass through a concurrency limiter; light routes do not. All responses are JSON.
 
@@ -95,6 +96,7 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) |
 | GET | `/nostr/mint/discover` | yes | **not an envelope** |
 | GET | `/nostr/mint/history` | yes | **not an envelope**: NUT-06 info snapshot history (§7) |
+| GET | `/nostr/mint/changes` | yes | **not an envelope**: ecosystem changes and roster stats; optional `limit` (§7) |
 | GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags |
 | GET | `/nostr/own/profiles` | no | envelope: kind-0 events + pubkey-keyed aggregates |
 | GET | `/nostr/own/{type}` | yes | envelope of the viewer's own action history |
@@ -102,7 +104,8 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/profile` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
 | GET | `/nostr/search` | no | envelope + `pubkeys`/`providers`/`fromCache` (§4) |
 | GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) |
-| GET | `/app/latest-version` | no | static app-version payload |
+| GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) |
+| GET | `/app/ai-lineup` | no | curated AI lineup; no params (§8) |
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
@@ -257,3 +260,49 @@ GraphQL `mintInfoHistory(input: {mintUrl, includeObservations})` field.
   "observations": null
 }
 ```
+
+`GET /nostr/mint/changes?limit=100` returns the ecosystem-wide changelog:
+`{trackedMints, reachableMints, totalChanges, changes}`. `limit` accepts 1–500;
+omitted, invalid, or out-of-range values use 100. `changes` is newest first;
+each entry has `mintUrl`, `name`, `at`, `previousLastSeenAt`, `hash`, `summary`
+and an RFC 6902 `patch`. `totalChanges` counts collected revisions before the
+limit is applied (from up to the 500 most recently changed mints), not an
+unbounded archive total. An empty feed has `changes: []`. Returns 503 when the
+mint-history provider is not configured.
+
+## 8. App configuration
+
+These routes require `NAGG_MODULES` to include `app`. They return standalone
+objects, not the Nostr envelope, and do not query ClickHouse.
+
+`GET|POST /app/latest-version` returns:
+
+```json
+{"version":"0.1.3","message":"Update available","minVersion":"0.1.2"}
+```
+
+`version` comes from `NAGG_APP_LATEST_VERSION` (empty by default).
+`message` and `minVersion` come from `NAGG_APP_UPDATE_MESSAGE` and
+`NAGG_APP_MIN_VERSION`; each is omitted when empty. `minVersion` is the
+minimum supported client version for clients implementing a blocking update
+gate; capability `app.latestVersion.minVersion` advertises support for this
+field. No parameters are required; a POST body (including the legacy
+`{"storage":{"version":"…"}}`) is accepted and ignored. Both methods send
+`Cache-Control: public, max-age=60`.
+
+`GET /app/ai-lineup` takes no parameters and returns
+`{version, updatedAt, node: {baseUrl}, providers}`. `version` is the lineup
+schema version (currently 1); `updatedAt` is its build time in Unix seconds.
+Each provider contains `id`, `vendor`, and `models`. Each model contains
+`tier` (`auto`, `pro`, or `max`), `id`, `name`, `created`, `contextLength`,
+`inputModalities`, optional `maxCompletionTokens`, and `pricing` with
+`prompt`, `completion`, `request`, `maxCost`, `maxPromptCost`, and
+`maxCompletionCost` in sats. Providers or tiers without eligible models are
+omitted. Returns 503 when Routstr is disabled/unconfigured, or 502 when its
+catalog is unavailable.
+
+GET responses under `/app/*` (and `/v1/app/*`) use 60 seconds fresh / 24 hours
+stale in the server response cache, including future `/app/rates`. During the
+stale window, the previous payload can be served while background revalidation
+runs. Successful cached app responses send `Cache-Control: public, max-age=60`.
+POST bypasses the server response cache.

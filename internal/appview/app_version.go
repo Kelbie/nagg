@@ -16,25 +16,31 @@ type LatestVersionRequest struct {
 
 // LatestVersionResponse mirrors sovran-schemas LatestVersionResponse.
 type LatestVersionResponse struct {
-	Version string `json:"version"`
-	Message string `json:"message,omitempty"`
+	Version    string `json:"version"`
+	Message    string `json:"message,omitempty"`
+	MinVersion string `json:"minVersion,omitempty"`
 }
 
-// latestVersion serves POST /app/latest-version so the app's update check no
-// longer needs api.sovran.money. The advertised version + optional message come
-// from config (NAGG_APP_LATEST_VERSION / NAGG_APP_UPDATE_MESSAGE).
+// latestVersion serves GET/POST /app/latest-version so the app's update check no
+// longer needs api.sovran.money. The version, message, and minimum version come
+// from config (NAGG_APP_LATEST_VERSION / NAGG_APP_UPDATE_MESSAGE / NAGG_APP_MIN_VERSION).
 func (h *Handler) latestVersion(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST /app/latest-version only", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "GET/POST /app/latest-version only", http.StatusMethodNotAllowed)
 		return
 	}
 	// Body is accepted for parity with api.sovran.money (the client sends its
 	// current version) but the response doesn't depend on it today.
-	var req LatestVersionRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if r.Method == http.MethodPost {
+		var req LatestVersionRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	w.Header().Set("Cache-Control", "public, max-age=60")
 
 	writeJSON(w, LatestVersionResponse{
-		Version: strings.TrimSpace(h.appLatestVersion),
-		Message: strings.TrimSpace(h.appUpdateMessage),
+		Version:    strings.TrimSpace(h.appLatestVersion),
+		Message:    strings.TrimSpace(h.appUpdateMessage),
+		MinVersion: strings.TrimSpace(h.appMinVersion),
 	})
 }
