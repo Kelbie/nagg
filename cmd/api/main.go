@@ -355,21 +355,18 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	if vertexClient != nil {
 		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
 	}
-	var auditorClient *auditor.HTTPClient
-	if cfg.Auditor.Enabled && cfg.Auditor.URL != "" {
-		auditorClient = auditor.NewHTTPClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
+	var auditorClient *auditor.Dual
+	if cfg.Auditor.Enabled {
+		var primary, fallback auditor.Client
+		if cfg.Auditor.UcashEnabled && cfg.Auditor.UcashURL != "" {
+			primary = auditor.NewUcashClient(cfg.Auditor.UcashURL, cfg.Auditor.UcashFnSuffix, cfg.Auditor.UcashUptimeEnabled)
+		}
+		if cfg.Auditor.URL != "" {
+			fallback = auditor.NewLegacyClient(cfg.Auditor.URL, auditor.WithLimit(cfg.Auditor.Limit))
+		}
+		auditorClient = auditor.NewDual(primary, fallback, cfg.Auditor.Refresh)
 		appviewOpts = append(appviewOpts, appview.WithAuditor(auditorClient))
-		slog.Info("mint auditor enabled", "url", cfg.Auditor.URL, "limit", cfg.Auditor.Limit)
-		// Warm the auditor cache in the background so the first /nostr/mint/discover
-		// request doesn't pay the cold upstream fetch.
-		go func() {
-			defer safego.Recover("api.worker")
-			warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-			defer cancel()
-			if _, err := auditorClient.Mints(warmCtx); err != nil {
-				slog.Warn("mint auditor warm-up failed", "error", err)
-			}
-		}()
+		safego.Go("api.auditor", func() { auditorClient.Run(ctx) })
 	}
 
 	// Mint-info snapshots: the read side (/nostr/mint/history + GraphQL) is always

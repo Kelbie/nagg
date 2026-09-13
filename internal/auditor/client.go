@@ -1,8 +1,6 @@
-// Package auditor is a thin, cached client for the upstream cashu mint auditor
-// (https://api.audit.8333.space). It powers nagg's /nostr/mint/discover so the
-// Sovran app can read mint audit data (state, operation counts, supported
-// units, NUT-06 info) through nagg instead of talking to api.sovran.money
-// directly — the same data api.sovran.money itself fetches from this auditor.
+// Package auditor integrates auditor.ucash.space with api.audit.8333.space as
+// fallback. Dual refreshes snapshots in the background for discovery and the
+// mint-info work-list; request paths never wait for either auditor.
 package auditor
 
 import (
@@ -21,6 +19,12 @@ import (
 // OperatorContact is the raw NUT-06 nostr contact (npub or hex), left
 // un-normalized so the caller owns nostr decoding; "" when the mint published none.
 type Mint struct {
+	id              int      // ucash identifier used only for background enrichment
+	Uptime24h       *float64 // percent, 0..100
+	AvgLatencyMs    *float64
+	LastError       string
+	UpdatedAt       int64
+	Source          string
 	URL             string
 	Name            string
 	State           string
@@ -41,16 +45,14 @@ type Mint struct {
 	Nuts json.RawMessage
 }
 
-// Client fetches the auditor's mint list. Implementations cache internally.
+// Client supplies a unified auditor roster. Dual is the cache-only consumer seam.
 type Client interface {
 	Mints(ctx context.Context) ([]Mint, error)
 }
 
-// HTTPClient is a cached HTTP client for the auditor. It serves a TTL-fresh
-// snapshot, refreshes in the background, and serves a stale snapshot (up to
-// StaleFor) when the upstream is briefly unavailable — mirroring how
-// api.sovran.money wraps the same upstream so behavior is unchanged.
-type HTTPClient struct {
+// LegacyClient is the original cached 8333 HTTP client. Dual bypasses this
+// cache when refreshing so only a successful fetch advances snapshot age.
+type LegacyClient struct {
 	baseURL  string
 	limit    int
 	ttl      time.Duration
@@ -62,12 +64,12 @@ type HTTPClient struct {
 	fetchedAt time.Time
 }
 
-// Option configures the HTTPClient.
-type Option func(*HTTPClient)
+// Option configures the LegacyClient.
+type Option func(*LegacyClient)
 
 // WithLimit sets how many mints to request from the auditor (default 200).
 func WithLimit(n int) Option {
-	return func(c *HTTPClient) {
+	return func(c *LegacyClient) {
 		if n > 0 {
 			c.limit = n
 		}
@@ -77,7 +79,7 @@ func WithLimit(n int) Option {
 // WithTTL sets the fresh window and the stale-serve window (default 1h / 24h),
 // matching api.sovran.money's audit.mints cache.
 func WithTTL(ttl, staleFor time.Duration) Option {
-	return func(c *HTTPClient) {
+	return func(c *LegacyClient) {
 		c.ttl = ttl
 		c.staleFor = staleFor
 	}
@@ -85,12 +87,12 @@ func WithTTL(ttl, staleFor time.Duration) Option {
 
 // WithHTTPClient overrides the underlying *http.Client (tests inject a stub).
 func WithHTTPClient(h *http.Client) Option {
-	return func(c *HTTPClient) { c.http = h }
+	return func(c *LegacyClient) { c.http = h }
 }
 
-// NewHTTPClient builds an auditor client for baseURL (e.g. https://api.audit.8333.space).
-func NewHTTPClient(baseURL string, opts ...Option) *HTTPClient {
-	c := &HTTPClient{
+// NewLegacyClient builds an auditor client for baseURL (e.g. https://api.audit.8333.space).
+func NewLegacyClient(baseURL string, opts ...Option) *LegacyClient {
+	c := &LegacyClient{
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		limit:    200,
 		ttl:      time.Hour,
@@ -105,10 +107,18 @@ func NewHTTPClient(baseURL string, opts ...Option) *HTTPClient {
 	return c
 }
 
+// HTTPClient preserves the original public type name.
+type HTTPClient = LegacyClient
+
+// NewHTTPClient preserves the original constructor.
+func NewHTTPClient(baseURL string, opts ...Option) *LegacyClient {
+	return NewLegacyClient(baseURL, opts...)
+}
+
 // Mints returns the cached mint list, refreshing when the TTL has elapsed. On a
 // refresh failure it returns the last good snapshot if still within StaleFor,
 // otherwise the error.
-func (c *HTTPClient) Mints(ctx context.Context) ([]Mint, error) {
+func (c *LegacyClient) Mints(ctx context.Context) ([]Mint, error) {
 	c.mu.Lock()
 	age := time.Since(c.fetchedAt)
 	fresh := c.cached != nil && age < c.ttl
@@ -135,7 +145,7 @@ func (c *HTTPClient) Mints(ctx context.Context) ([]Mint, error) {
 	return mints, nil
 }
 
-func (c *HTTPClient) fetch(ctx context.Context) ([]Mint, error) {
+func (c *LegacyClient) fetch(ctx context.Context) ([]Mint, error) {
 	url := fmt.Sprintf("%s/mints/?skip=0&limit=%d", c.baseURL, c.limit)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -179,6 +189,7 @@ func parseMints(body []byte) ([]Mint, error) {
 			continue
 		}
 		mint := Mint{
+			Source:  "8333",
 			URL:     m.URL,
 			Name:    m.Name,
 			State:   m.State,
@@ -186,19 +197,31 @@ func parseMints(body []byte) ([]Mint, error) {
 			NMelts:  m.NMelts,
 			NErrors: m.NErrors,
 		}
-		if info := parseInfo(m.Info); info != nil {
-			mint.Units = info.units()
-			mint.IconURL = info.IconURL
-			mint.Description = info.Description
-			mint.OperatorContact = info.nostrContact()
-			mint.Nuts = info.Nuts
-			if mint.Name == "" {
-				mint.Name = info.Name
-			}
-		}
+		applyInfo(&mint, m.Info)
 		out = append(out, mint)
 	}
 	return out, nil
+}
+
+// MintFromInfo extracts discovery metadata from a stored NUT-06 document.
+// It does not mark the mint as audited.
+func MintFromInfo(document []byte) Mint {
+	var mint Mint
+	applyInfo(&mint, string(document))
+	return mint
+}
+
+func applyInfo(mint *Mint, encoded string) {
+	if info := parseInfo(encoded); info != nil {
+		mint.Units = info.units()
+		mint.IconURL = info.IconURL
+		mint.Description = info.Description
+		mint.OperatorContact = info.nostrContact()
+		mint.Nuts = info.Nuts
+		if mint.Name == "" {
+			mint.Name = info.Name
+		}
+	}
 }
 
 // nut06Info is the subset of NUT-06 GetInfoResponse discovery needs. Nuts is

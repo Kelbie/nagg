@@ -32,7 +32,7 @@ type DiscoverMint struct {
 	// Deliberately untyped: the app reads whichever NUT entries it cares about
 	// (payment methods, state check, P2PK, websockets, …) without a nagg
 	// release, and previously had to fetch every mint's /v1/info itself to
-	// learn any of this. Absent when the auditor had no info for the mint.
+	// learn any of this. Also backfilled from stored info for review-only mints.
 	Nuts json.RawMessage `json:"nuts,omitempty"`
 
 	// Nostr reviews (NIP-87 kind-38000). AverageScore is null when no surviving
@@ -44,11 +44,15 @@ type DiscoverMint struct {
 	FavouriteCount int      `json:"favouriteCount"`
 
 	// Auditor data, present only when HasAudit is true.
-	HasAudit bool   `json:"hasAudit"`
-	State    string `json:"state,omitempty"`
-	NMints   int    `json:"nMints"`
-	NMelts   int    `json:"nMelts"`
-	NErrors  int    `json:"nErrors"`
+	Uptime24h      *float64 `json:"uptime24h,omitempty"`
+	AvgLatencyMs   *float64 `json:"avgLatencyMs,omitempty"`
+	AuditSource    string   `json:"auditSource,omitempty"`
+	AuditUpdatedAt int64    `json:"auditUpdatedAt,omitempty"`
+	HasAudit       bool     `json:"hasAudit"`
+	State          string   `json:"state,omitempty"`
+	NMints         int      `json:"nMints"`
+	NMelts         int      `json:"nMelts"`
+	NErrors        int      `json:"nErrors"`
 
 	// Operator Nostr account + Vertex social reputation, present when the mint
 	// published a NUT-06 nostr contact nagg could resolve.
@@ -118,6 +122,16 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		keys[k] = struct{}{}
 	}
 
+	// Filter before metadata/social reads and before applying limit.
+	if filter := strings.TrimSpace(r.URL.Query().Get("mint")); filter != "" {
+		match := normalizeMintURL(filter)
+		for key := range keys {
+			if key != match {
+				delete(keys, key)
+			}
+		}
+	}
+
 	// 4) Resolve operator pubkeys from the auditor NUT-06 nostr contact.
 	operatorByKey := make(map[string]string, len(keys))
 	operatorPubkeys := make([]string, 0, len(keys))
@@ -160,7 +174,7 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5) Build a row per mint, enriching from the batched maps (no per-mint CH/DVM).
+	// 5) Build rows; stored NUT-06 info fills metadata for review-only mints.
 	mints := make([]DiscoverMint, 0, len(keys))
 	for key := range keys {
 		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, followCounts, vertexProfiles)
@@ -171,6 +185,21 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	if mintsLimit > 0 && len(mints) > mintsLimit {
 		mints = mints[:mintsLimit]
 		profiles = pruneProfilesToMints(mints, profiles)
+	}
+
+	// Metadata does not affect ranking, so read snapshots only for returned rows.
+	if h.mintInfo != nil {
+		for i := range mints {
+			row := &mints[i]
+			if row.HasAudit {
+				continue
+			}
+			if document, err := h.mintInfo.LatestInfo(ctx, normalizeMintURL(row.MintURL)); err == nil {
+				info := auditor.MintFromInfo(document)
+				row.Name, row.IconURL, row.Description = info.Name, info.IconURL, info.Description
+				row.Nuts, row.SupportedUnits = info.Nuts, info.Units
+			}
+		}
 	}
 
 	writeJSON(w, DiscoverMintsResponse{Mints: mints, Profiles: profiles})
@@ -262,6 +291,9 @@ func clamp01(v float64) float64 {
 
 func discoverRankScore(m DiscoverMint) float64 {
 	uptime := auditUptime(m)
+	if m.Uptime24h != nil {
+		uptime = clamp01(*m.Uptime24h / 100)
+	}
 	score := scoreOrZero(m.AverageScore) / 5.0
 	// log10(1+n): ~100 reviews → 1.0; ~10k followers → 1.0.
 	reviewCount := clamp01(math.Log10(1+float64(m.ReviewCount)) / 2.0)
@@ -325,6 +357,10 @@ func buildDiscoverMint(
 		row.NMints = audit.NMints
 		row.NMelts = audit.NMelts
 		row.NErrors = audit.NErrors
+		row.Uptime24h = audit.Uptime24h
+		row.AvgLatencyMs = audit.AvgLatencyMs
+		row.AuditSource = audit.Source
+		row.AuditUpdatedAt = audit.UpdatedAt
 	}
 	if row.MintURL == "" {
 		row.MintURL = agg.display

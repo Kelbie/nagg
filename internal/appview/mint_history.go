@@ -2,6 +2,7 @@ package appview
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 // Satisfied by *mintinfo.Reader. Cashu-specific, like the sibling
 // reviews/discover surfaces under /nostr/mint/*.
 type MintHistoryProvider interface {
+	LatestInfo(ctx context.Context, mintURL string) (json.RawMessage, error)
 	History(ctx context.Context, mintURL string, includeObservations bool) (*mintinfo.History, bool, error)
 	GlobalChanges(ctx context.Context, limit int) (*mintinfo.GlobalChanges, error)
 }

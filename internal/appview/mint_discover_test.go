@@ -3,12 +3,15 @@ package appview
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/mintinfo"
 )
 
 type fakeAuditor struct {
@@ -132,5 +135,110 @@ func TestDiscoverMintsDegradesWithoutAuditor(t *testing.T) {
 	}
 	if len(resp.Mints) != 1 || resp.Mints[0].HasAudit {
 		t.Fatalf("expected 1 review-only mint without audit, got %+v", resp.Mints)
+	}
+}
+
+func TestDiscoverUptimeJSONAndMintFilter(t *testing.T) {
+	handler := New(mintReviewStore{}, WithNIP05Validation(false), WithAuditor(fakeAuditor{mints: []auditor.Mint{
+		{URL: "https://other", State: "OK", NMints: 100},
+		{URL: "https://mint.example/", State: "ERROR", Uptime24h: f(0), AvgLatencyMs: f(4446.2), Source: "ucash", UpdatedAt: 12345},
+	}}))
+	for _, query := range []string{"https://MINT.example", "https://mint.example/"} {
+		rec := httptest.NewRecorder()
+		handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?limit=1&mint="+url.QueryEscape(query), nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var response struct {
+			Mints []map[string]any `json:"mints"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if len(response.Mints) != 1 {
+			t.Fatalf("mints=%v", response.Mints)
+		}
+		m := response.Mints[0]
+		if m["uptime24h"] != float64(0) || m["avgLatencyMs"] != 4446.2 || m["auditSource"] != "ucash" || m["auditUpdatedAt"] != float64(12345) {
+			t.Fatalf("audit JSON=%v", m)
+		}
+	}
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?mint=https://missing", nil))
+	var response DiscoverMintsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Mints == nil || len(response.Mints) != 0 {
+		t.Fatalf("missing mint: %s", rec.Body.String())
+	}
+}
+
+func TestDiscoverRankPrefersUptime24h(t *testing.T) {
+	oldSuccess := DiscoverMint{MintURL: "https://old", HasAudit: true, State: "OK", NMints: 1000, Uptime24h: f(0)}
+	recentSuccess := DiscoverMint{MintURL: "https://recent", HasAudit: true, State: "OK", NErrors: 1000, Uptime24h: f(100)}
+	mints := []DiscoverMint{oldSuccess, recentSuccess}
+	sortDiscoverMints(mints)
+	if mints[0].MintURL != recentSuccess.MintURL {
+		t.Fatal("lifetime counters overrode measured uptime")
+	}
+	oldSuccess.Uptime24h = nil
+	if discoverRankScore(oldSuccess) != weightUptime {
+		t.Fatal("legacy uptime fallback lost")
+	}
+}
+
+type discoverHistory struct {
+	document json.RawMessage
+	calls    []string
+	err      error
+}
+
+func (p *discoverHistory) LatestInfo(_ context.Context, mint string) (json.RawMessage, error) {
+	p.calls = append(p.calls, mint)
+	return p.document, p.err
+}
+func (p *discoverHistory) History(context.Context, string, bool) (*mintinfo.History, bool, error) {
+	return nil, false, nil
+}
+func (p *discoverHistory) GlobalChanges(context.Context, int) (*mintinfo.GlobalChanges, error) {
+	return nil, nil
+}
+
+func TestDiscoverNIP87OnlyBackfill(t *testing.T) {
+	store := mintReviewStore{events: []chstore.EventView{
+		reviewEvent("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "https://mint/", "[4/5]", 100),
+		reviewEvent("2", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "https://audited", "[5/5]", 100),
+	}}
+	history := &discoverHistory{document: json.RawMessage(`{"name":"Latest name","icon_url":"https://icon","description":"Latest description","nuts":{"4":{"methods":[{"unit":"sat"}]},"5":{"methods":[{"unit":"usd"}]}}}`)}
+	handler := New(store, WithNIP05Validation(false), WithMintHistory(history), WithAuditor(fakeAuditor{mints: []auditor.Mint{{URL: "https://audited", Name: "Audit name"}}}))
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil))
+	var response DiscoverMintsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(history.calls) != 1 || history.calls[0] != normalizeMintURL("https://mint/") {
+		t.Fatalf("history calls=%v", history.calls)
+	}
+	if len(response.Mints) != 2 {
+		t.Fatalf("mints=%v", response.Mints)
+	}
+	for _, m := range response.Mints {
+		if m.MintURL == "https://audited" {
+			if m.Name != "Audit name" {
+				t.Fatal("overwrote auditor metadata")
+			}
+			continue
+		}
+		if m.HasAudit || m.AuditSource != "" || m.Uptime24h != nil || m.Name != "Latest name" || m.Description != "Latest description" || m.IconURL != "https://icon" || len(m.Nuts) == 0 || len(m.SupportedUnits) != 2 || m.ReviewCount != 1 {
+			t.Fatalf("backfilled row=%+v", m)
+		}
+	}
+	history.err = errors.New("snapshot unavailable")
+	rec = httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?mint=https://mint", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatal("history error failed discovery")
 	}
 }

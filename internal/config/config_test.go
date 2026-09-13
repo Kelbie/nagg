@@ -382,3 +382,42 @@ func TestLoadRateLimitPerMinute(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadAuditorDefaultsAndOverrides(t *testing.T) {
+	for _, key := range []string{"NAGG_AUDITOR_ENABLED", "NAGG_AUDITOR_UCASH_URL", "NAGG_AUDITOR_UCASH_FN_SUFFIX", "NAGG_AUDITOR_UCASH_ENABLED", "NAGG_AUDITOR_UCASH_UPTIME_ENABLED", "NAGG_AUDITOR_REFRESH", "NAGG_AUDITOR_URL", "NAGG_AUDITOR_LIMIT"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NAGG_MODULES", "mint")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Auditor
+	if !a.Enabled || !a.UcashEnabled || !a.UcashUptimeEnabled || a.UcashURL != "https://auditor.ucash.space" || a.UcashFnSuffix != "5929181479826419594" || a.Refresh != time.Hour || a.URL != "https://api.audit.8333.space" || a.Limit != 200 {
+		t.Fatalf("defaults=%+v", a)
+	}
+	t.Setenv("NAGG_MODULES", "app")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auditor.Enabled {
+		t.Fatal("auditor enabled without mint module")
+	}
+	t.Setenv("NAGG_AUDITOR_ENABLED", "true")
+	t.Setenv("NAGG_AUDITOR_UCASH_ENABLED", "false")
+	t.Setenv("NAGG_AUDITOR_UCASH_UPTIME_ENABLED", "false")
+	t.Setenv("NAGG_AUDITOR_UCASH_URL", "https://test")
+	t.Setenv("NAGG_AUDITOR_UCASH_FN_SUFFIX", "next")
+	t.Setenv("NAGG_AUDITOR_REFRESH", "30m")
+	t.Setenv("NAGG_AUDITOR_URL", "https://fallback")
+	t.Setenv("NAGG_AUDITOR_LIMIT", "123")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.Auditor
+	if !a.Enabled || a.UcashEnabled || a.UcashUptimeEnabled || a.UcashURL != "https://test" || a.UcashFnSuffix != "next" || a.Refresh != 30*time.Minute || a.URL != "https://fallback" || a.Limit != 123 {
+		t.Fatalf("overrides=%+v", a)
+	}
+}
