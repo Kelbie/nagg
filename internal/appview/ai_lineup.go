@@ -194,6 +194,11 @@ func qualifiesForAILineup(m routstr.Model) bool {
 	if strings.HasPrefix(m.ID, "~") || strings.HasPrefix(m.Vendor(), "~") {
 		return false
 	}
+	// OpenRouter-style ":batch" variants are asynchronous (minutes to hours)
+	// and must never be an interactive chat pick, however cheap they look.
+	if strings.HasSuffix(m.ID, ":batch") || strings.Contains(m.ID, ":batch:") {
+		return false
+	}
 	// Chat models bill completions; embedding rows price prompt-only.
 	if m.Pricing.Completion <= 0 || m.Pricing.MaxCost <= 0 {
 		return false

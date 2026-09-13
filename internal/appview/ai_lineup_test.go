@@ -302,3 +302,16 @@ func TestCapabilitiesAILineupPinsMissing(t *testing.T) {
 		t.Fatal("missing pinsMissing capability")
 	}
 }
+
+func TestQualifiesForAILineupRejectsBatchVariants(t *testing.T) {
+	base := routstr.Model{ID: "openai/gpt-5.2:batch", Enabled: true, ContextLength: 200000, OutputModalities: []string{"text"}}
+	base.Pricing.Completion = 0.001
+	base.Pricing.MaxCost = 1
+	if qualifiesForAILineup(base) {
+		t.Fatal("batch variant must not qualify")
+	}
+	base.ID = "openai/gpt-5.2"
+	if !qualifiesForAILineup(base) {
+		t.Fatal("interactive variant must qualify")
+	}
+}
