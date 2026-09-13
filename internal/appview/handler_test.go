@@ -41,6 +41,10 @@ func (s fakeStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chst
 	return nil, nil
 }
 
+func (s fakeStore) MintReviewEvents(context.Context, uint64) ([]chstore.EventView, error) {
+	return nil, nil
+}
+
 func (s fakeStore) EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error) {
 	return map[string]map[string]map[string]uint64{}, nil
 }

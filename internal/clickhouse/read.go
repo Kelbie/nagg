@@ -2033,12 +2033,42 @@ func (s *Store) EventByID(ctx context.Context, id string) (*EventView, error) {
 	return &events[0], nil
 }
 
+// QueryEvents is the general-purpose event read. Limit is clamped to the page
+// budget (1..500; anything else falls back to 50) because every caller here is
+// a paged product surface. Curated exhaustive scans that legitimately need the
+// whole set of a small kind go through a dedicated reader (MintReviewEvents)
+// instead of passing a big Limit — a 5000 here silently became 50.
 func (s *Store) QueryEvents(ctx context.Context, input EventQueryInput) ([]EventView, error) {
-	if input.Empty {
-		return []EventView{}, nil
-	}
 	if input.Limit == 0 || input.Limit > 500 {
 		input.Limit = 50
+	}
+	return s.queryEvents(ctx, input)
+}
+
+// mintReviewScanCap bounds MintReviewEvents. Cashu mint reviews (kind 38000,
+// k=38172) number in the low thousands network-wide, so this is generous.
+const mintReviewScanCap = 20000
+
+// MintReviewEvents returns every stored NIP-87 cashu mint review (kind 38000
+// tagged k=38172), newest first, up to limit (capped at mintReviewScanCap).
+// It is the discovery aggregate's scan: per-mint averages must be computed over
+// the FULL review set or a popular mint shows far fewer reviews on the discover
+// list than on its own reviews page, and mints whose reviews fall outside the
+// newest page vanish from discovery entirely.
+func (s *Store) MintReviewEvents(ctx context.Context, limit uint64) ([]EventView, error) {
+	if limit == 0 || limit > mintReviewScanCap {
+		limit = mintReviewScanCap
+	}
+	return s.queryEvents(ctx, EventQueryInput{
+		Kinds: []int{38000},
+		Tags:  []TagFilter{{Key: "k", Value: "38172"}},
+		Limit: limit,
+	})
+}
+
+func (s *Store) queryEvents(ctx context.Context, input EventQueryInput) ([]EventView, error) {
+	if input.Empty {
+		return []EventView{}, nil
 	}
 	if len(input.IDs) > 0 {
 		return s.queryEventsByIDFilter(ctx, input)

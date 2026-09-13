@@ -31,6 +31,9 @@ import (
 type Store interface {
 	FollowsFeed(context.Context, []string, int64, uint64, uint64, uint64) ([]chstore.EventView, error)
 	QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error)
+	// MintReviewEvents is the exhaustive NIP-87 cashu-review scan behind
+	// /nostr/mint/discover (see clickhouse.Store.MintReviewEvents).
+	MintReviewEvents(context.Context, uint64) ([]chstore.EventView, error)
 	EventAggregates(context.Context, []string) (map[string]map[string]map[string]uint64, error)
 	LatestK3Refs(context.Context, []string) (map[string]map[string]struct{}, error)
 	LatestK0(context.Context, []string) (map[string]chstore.K0Row, error)

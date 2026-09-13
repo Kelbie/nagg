@@ -75,6 +75,9 @@ type DiscoverMintsResponse struct {
 // aggregate scans. It must comfortably exceed the total cashu-mint review count
 // so per-mint aggregates match the dedicated reviews endpoint; cashu mint
 // reviews number in the low thousands globally, so this is generous and cheap.
+// It goes through Store.MintReviewEvents, NOT QueryEvents: the general reader
+// clamps any Limit above 500 down to 50, which silently reduced this scan to
+// the 50 newest reviews (23 mints listed, Minibits at 22 of its 91 reviews).
 const discoverReviewScanCap = 5000
 
 type mintReviewAgg struct {
@@ -208,11 +211,7 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 // mintReviewAggregates groups all cashu mint reviews by normalized URL and
 // computes the per-mint average / review count / favourite count.
 func (h *Handler) mintReviewAggregates(ctx context.Context, limit int) (map[string]mintReviewAgg, error) {
-	events, err := h.store.QueryEvents(ctx, chstore.EventQueryInput{
-		Kinds: []int{mintReviewKind},
-		Tags:  []chstore.TagFilter{{Key: "k", Value: cashuMintK}},
-		Limit: uint64(limit),
-	})
+	events, err := h.store.MintReviewEvents(ctx, uint64(limit))
 	if err != nil {
 		return nil, err
 	}

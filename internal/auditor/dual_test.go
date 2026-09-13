@@ -62,10 +62,77 @@ func TestDualFallbackAndRecovery(t *testing.T) {
 				t.Fatal(err)
 			}
 			mints, err = d.Mints(context.Background())
-			if err != nil || mints[0].Source != "ucash" || mints[0].URL != "https://primary" || fallbackCalls != 1 {
+			// Recovery UNIONS: the primary row leads with Source ucash, the
+			// legacy row is kept (Source 8333), and the fallback was fetched on
+			// every pass rather than only while the primary was down.
+			if err != nil || len(mints) != 2 || mints[0].Source != "ucash" || mints[0].URL != "https://primary" ||
+				mints[1].Source != "8333" || mints[1].URL != "https://fallback" || fallbackCalls != 2 {
 				t.Fatalf("recovery: %v %v calls=%d", mints, err, fallbackCalls)
 			}
 		})
+	}
+}
+
+func TestDualUnionsRostersAndDedupes(t *testing.T) {
+	uptime := 99.0
+	d := NewDual(
+		clientFunc(func(context.Context) ([]Mint, error) {
+			return []Mint{
+				{URL: "https://mint.minibits.cash/Bitcoin", Name: "Minibits (ucash)", Uptime24h: &uptime},
+				{URL: "https://mint.ucash.space", Name: "ucash"},
+			}, nil
+		}),
+		clientFunc(func(context.Context) ([]Mint, error) {
+			return []Mint{
+				{URL: "https://MINT.minibits.cash/bitcoin/", Name: "Minibits (legacy)", State: "OK"},
+				{URL: "https://mint.coinos.io", Name: "Coinos", State: "ERROR"},
+				{URL: "https://mint.coinos.io/", Name: "Coinos dup"},
+				{URL: "   ", Name: "blank"},
+			}, nil
+		}),
+		time.Hour,
+	)
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mints, err := d.Mints(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mints) != 3 {
+		t.Fatalf("mints=%+v want 3 (2 ucash + 1 legacy-only)", mints)
+	}
+	if mints[0].Name != "Minibits (ucash)" || mints[0].Source != "ucash" || mints[0].Uptime24h == nil {
+		t.Fatalf("ucash row must win the overlap: %+v", mints[0])
+	}
+	if mints[1].URL != "https://mint.ucash.space" || mints[1].Source != "ucash" {
+		t.Fatalf("second ucash row: %+v", mints[1])
+	}
+	if mints[2].URL != "https://mint.coinos.io" || mints[2].Source != "8333" || mints[2].State != "ERROR" {
+		t.Fatalf("legacy-only row: %+v", mints[2])
+	}
+	if d.source != "ucash+8333" {
+		t.Fatalf("source=%q", d.source)
+	}
+}
+
+func TestDualLegacyOutageKeepsUcashRoster(t *testing.T) {
+	d := NewDual(
+		clientFunc(func(context.Context) ([]Mint, error) { return []Mint{{URL: "https://primary"}}, nil }),
+		clientFunc(func(context.Context) ([]Mint, error) { return nil, errors.New("legacy down") }),
+		time.Hour,
+	)
+	if err := d.RunOnce(context.Background()); err != nil {
+		t.Fatalf("one auditor down must not fail the pass: %v", err)
+	}
+	mints, err := d.Mints(context.Background())
+	if err != nil || len(mints) != 1 || mints[0].Source != "ucash" || d.source != "ucash" {
+		t.Fatalf("mints=%v err=%v source=%q", mints, err, d.source)
+	}
+	d.fallback = clientFunc(func(context.Context) ([]Mint, error) { return nil, nil })
+	d.primary = clientFunc(func(context.Context) ([]Mint, error) { return nil, errors.New("both down") })
+	if err := d.RunOnce(context.Background()); err == nil {
+		t.Fatal("both auditors empty/failed must be an error")
 	}
 }
 

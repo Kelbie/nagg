@@ -295,7 +295,11 @@ and the mint/events-query paths do not backfill.
 
 `GET /nostr/mint/discover?limit=200[&mint=<url>]` returns
 `{mints: [...], profiles: {...}}`, **not an envelope**. It unions NIP-87 kind-38000
-reviews with the most recent auditor roster. `mint` is an optional URL-encoded,
+reviews (scored reviews and score-less recommendations alike) with the most
+recent auditor roster, itself the union of both auditors (see below). The review
+aggregate scans the full stored review set (capped at 5000 events), not a page,
+so per-mint counts match `/nostr/mint/reviews` and a mint whose only reviews are
+old still appears. `mint` is an optional URL-encoded,
 normalized exact-match filter (the existing mint URL normalization ignores host
 case and trailing slashes). It applies before `limit` and returns at most one
 row, or `mints: []` when unknown. It does not fetch a mint or auditor on demand.
@@ -310,7 +314,7 @@ Audit fields include `hasAudit`, `state`, `nMints`, `nMelts`, and `nErrors`, plu
 | --- | --- | --- |
 | `uptime24h` | number, optional | Measured 24h uptime percentage, 0–100. Zero is included; absent means unavailable or enrichment disabled. |
 | `avgLatencyMs` | number, optional | Auditor's lifetime average operation latency in milliseconds (`avg_latency_ms`), not its 24h latency. Zero is included. |
-| `auditSource` | string, optional | `ucash` or `8333`; absent for review-only rows. |
+| `auditSource` | string, optional | `ucash` or `8333` — which auditor supplied the row (ucash wins when both track the mint); absent for review-only rows. |
 | `auditUpdatedAt` | integer, optional | Upstream mint record's update time, Unix seconds; omitted when unknown (including legacy records). It is not nagg's refresh time. |
 
 Operator identity/social fields and the `profiles` map retain their existing
@@ -319,8 +323,9 @@ for name, icon, description, nuts, and units when available. This does not set
 `hasAudit` or invent audit measurements; a snapshot lookup failure leaves the
 review row usable.
 
-Auditor data refreshes at boot and in the background (default hourly), with
-ucash primary and 8333 fallback. Requests read the in-memory snapshot immediately;
+Auditor data refreshes at boot and in the background (default hourly) as the
+deduped union of ucash and 8333 (normalized URL key; one auditor failing
+degrades to the other). Requests read the in-memory snapshot immediately;
 no snapshot or one older than 24h means NIP-87-only discovery. The roster is
 published before optional uptime/metrics enrichment completes. Per-mint
 measurement failures omit those fields without discarding the roster. Standard

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +13,8 @@ var ErrUnavailable = errors.New("auditor: no snapshot within 24 hours")
 
 // Dual owns the snapshot and its age. Only Run/RunOnce perform network I/O.
 // Mints takes a short read lock, even while a refresh is blocked upstream.
+// The snapshot is the UNION of both auditors (see RunOnce).
+
 type Dual struct {
 	primary, fallback Client
 	refresh           time.Duration
@@ -67,34 +70,46 @@ func fetchMints(ctx context.Context, client Client) ([]Mint, error) {
 
 // RunOnce refreshes the roster, then enriches ucash data at a bounded pace.
 // A good roster is published before enrichment so boot warming is prompt.
+//
+// Both auditors are fetched on every pass and UNIONED: ucash tracks a small
+// curated set (nine mints at the time of writing) while the legacy 8333
+// auditor still lists ~65, so treating ucash as a replacement collapsed the
+// discovery roster to a fraction of what the app used to show. Rows are
+// deduped by normalized URL; when both auditors know a mint the ucash row wins
+// (it carries measured uptime and an upstream update time), otherwise the
+// legacy row rides through with Source "8333". One auditor failing degrades to
+// the other; only both failing is an error.
 func (d *Dual) RunOnce(ctx context.Context) error {
 	d.refreshMu.Lock()
 	defer d.refreshMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	mints, err := fetchMints(ctx, d.primary)
-	source := "ucash"
-	if err != nil || len(mints) == 0 {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		mints, err = fetchMints(ctx, d.fallback)
-		source = "8333"
-	}
-	if err != nil {
-		return err
-	}
-	if len(mints) == 0 {
-		return ErrUnavailable
-	}
+	primary, perr := fetchMints(ctx, d.primary)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	mints = cloneMints(mints)
-	for i := range mints {
-		mints[i].Source = source
+	fallback, ferr := fetchMints(ctx, d.fallback)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	if perr != nil && len(primary) == 0 {
+		primary = nil
+	}
+	if ferr != nil && len(fallback) == 0 {
+		fallback = nil
+	}
+	if len(primary) == 0 && len(fallback) == 0 {
+		if perr != nil {
+			return perr
+		}
+		if ferr != nil {
+			return ferr
+		}
+		return ErrUnavailable
+	}
+	mints := mergeRosters(primary, fallback)
+	source := rosterSource(len(primary) > 0, len(fallback) > 0)
 	at := time.Now()
 	d.mu.Lock()
 	oldSource := d.source
@@ -104,7 +119,7 @@ func (d *Dual) RunOnce(ctx context.Context) error {
 		slog.Info("auditor.source.changed", "from", oldSource, "source", source)
 	}
 	enriched := 0
-	if source == "ucash" {
+	if len(primary) > 0 {
 		if enricher, ok := d.primary.(interface {
 			enrich(context.Context, []Mint) int
 		}); ok {
@@ -114,8 +129,61 @@ func (d *Dual) RunOnce(ctx context.Context) error {
 			d.mu.Unlock()
 		}
 	}
-	slog.Info("auditor.refresh", "source", source, "mints", len(mints), "uptimeEnriched", enriched)
+	slog.Info("auditor.refresh", "source", source, "mints", len(mints), "ucash", len(primary), "legacy", len(fallback), "uptimeEnriched", enriched)
 	return nil
+}
+
+// rosterSource labels which auditors contributed to the current snapshot.
+func rosterSource(ucash, legacy bool) string {
+	switch {
+	case ucash && legacy:
+		return "ucash+8333"
+	case ucash:
+		return "ucash"
+	default:
+		return "8333"
+	}
+}
+
+// rosterKey is the dedup key shared with appview's discovery merge: lowercase,
+// trailing slash trimmed. It is a KEY, never a fetch target, so lowercasing the
+// path is fine here (unlike mintinfo.NormalizeMintURL).
+func rosterKey(url string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(url), "/"))
+}
+
+// mergeRosters unions the ucash and legacy rosters by rosterKey. ucash rows are
+// kept verbatim (Source "ucash"); legacy rows fill only the keys ucash lacks
+// (Source "8333"). Order: ucash rows first in their upstream order, then the
+// legacy-only rows in theirs, so the result is deterministic for a given input.
+func mergeRosters(primary, fallback []Mint) []Mint {
+	out := make([]Mint, 0, len(primary)+len(fallback))
+	seen := make(map[string]struct{}, len(primary)+len(fallback))
+	for _, m := range cloneMints(primary) {
+		key := rosterKey(m.URL)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		m.Source = "ucash"
+		out = append(out, m)
+	}
+	for _, m := range cloneMints(fallback) {
+		key := rosterKey(m.URL)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		m.Source = "8333"
+		out = append(out, m)
+	}
+	return out
 }
 
 func cloneMints(mints []Mint) []Mint {
