@@ -341,13 +341,26 @@ App configuration and operational variables:
 | `NAGG_APP_LATEST_VERSION` | empty | Advertised version from GET/POST `/app/latest-version`; empty advertises no update. Requires the `app` module. |
 | `NAGG_APP_UPDATE_MESSAGE` | empty | Optional update message; omitted from JSON when empty. |
 | `NAGG_APP_MIN_VERSION` | empty | Optional minimum supported client version (`minVersion`); clients may use it for a blocking update gate. Omitted when empty. |
+| `NAGG_RATES_ENABLED` | `app` module enabled | Run the in-memory BTC fiat worker for GET `/app/rates`. No ClickHouse storage. |
+| `NAGG_RATES_INTERVAL` | `1h` | Refresh immediately on startup, then at this positive duration. |
+| `NAGG_RATES_MAX_AGE` | `6h` | Maximum observation age admitted to consensus (positive duration). |
+| `NAGG_RATES_STALE_FOR` | `24h` | Maximum retained price age, measured from its observation timestamp (positive duration); expired currencies are omitted. |
+| `NAGG_RATES_RELAYS` | `NAGG_RELAYS` | Comma-separated relay URLs for signed kind-1 bot queries; independent of ingested/stored kinds. |
+| `NAGG_RATES_HTTP_ENABLED` | `true` | Enable mempool.space HTTP cross-checks and GBP fallback; one request per URL per pass, 8s timeout, 64 KiB cap. |
+| `NAGG_RATES_EXTRA_SOURCES` | empty | JSON array of additional source declarations; hex/npub keys normalized at load. Invalid JSON/entries warn and are ignored. See [source schema](docs/appview-api.md#btc-fiat-rates). |
 | `NAGG_LOG_LEVEL` | `info` | All five service binaries: `debug`, `info`, `warn`, or `error`. Invalid values fall back to `info` with one startup warning. |
 | `NAGG_RATE_LIMIT_PER_MIN` | `120` | REST requests per client IP per minute; invalid or non-positive values use `120`. |
 
 For the mint service's app endpoints, set `NAGG_MODULES=mint,app` and
 `NAGG_APP_LATEST_VERSION=0.1.3`. Adding `app` needs no additional ClickHouse
 schema or credentials; it enables the Routstr HTTP catalog client with its
-existing defaults. See [module behavior](docs/modules.md) and
+existing defaults, plus the in-memory rates worker. Rates require no extra
+variables when `app` is enabled; retaining the defaults above is recommended.
+On first boot, look for `rates.pass` with `warm=true`, four currencies, and
+per-source success/failure status. GBP currently has only the HTTP source, so
+`degraded=true` is expected even on a healthy pass. Repeated failures (three or
+more), missing currencies, or persistently old observation timestamps warrant
+checking relay reachability and the HTTP source. See [module behavior](docs/modules.md) and
 [app payloads and caching](docs/appview-api.md#8-app-configuration).
 
 Optional service variables:

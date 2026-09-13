@@ -11,6 +11,7 @@ const (
 )
 
 var Names = []string{
+	"app.rates",
 	"app.latestVersion.minVersion",
 	"graphql.events",
 	"graphql.relayHydration",
@@ -84,6 +85,7 @@ var AppViewRoutes = []string{
 	"/nostr/recommended",
 	"/app/latest-version",
 	"/app/ai-lineup",
+	"/app/rates",
 }
 
 // ServiceInfo advertises the full declared surface — every route a deployment
