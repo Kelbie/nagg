@@ -36,14 +36,17 @@ type RecommendedArgs struct {
 }
 
 type SearchResult struct {
-	PubKey string
-	Npub   string
-	Rank   *float64
-	Score  *float64
-	Nodes  *int
+	FetchedAt *int64 `json:"vertexFetchedAt,omitempty"`
+	PubKey    string
+	Npub      string
+	Rank      *float64
+	Score     *float64
+	Nodes     *int
 }
 
 type ProfileResult struct {
+	FetchedAt    *int64        `json:"vertexFetchedAt,omitempty"`
+	Response     *nostr.Event  `json:"response,omitempty"`
 	PubKey       string        `json:"pubkey"`
 	Npub         string        `json:"npub"`
 	Rank         float64       `json:"rank"`
@@ -63,6 +66,7 @@ type TopFollower struct {
 }
 
 type Client struct {
+	dial        relayDialer
 	privateKey  string
 	relay       string
 	profile     *cachedCall[string, ProfileResult]
@@ -79,9 +83,6 @@ type dvmRecord struct {
 }
 
 func New(cfg Config) (*Client, error) {
-	if strings.TrimSpace(cfg.PrivateKey) == "" {
-		return nil, ErrUnavailable
-	}
 	relay := strings.TrimSpace(cfg.Relay)
 	if relay == "" {
 		relay = "wss://relay.vertexlab.io"
@@ -89,6 +90,7 @@ func New(cfg Config) (*Client, error) {
 	c := &Client{
 		privateKey: strings.TrimSpace(cfg.PrivateKey),
 		relay:      relay,
+		dial:       dialRelay,
 	}
 	var err error
 	c.profile, err = newCachedCall(c.performProfile, func(pubkey string) string {
@@ -219,9 +221,9 @@ func runDVM[T any](
 	parse func(*nostr.Event) (T, error),
 ) (T, error) {
 	var zero T
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(RequestTimeout)*time.Millisecond)
-	defer cancel()
-
+	if c.privateKey == "" {
+		return zero, ErrUnavailable
+	}
 	request := nostr.Event{
 		CreatedAt: nostr.Now(),
 		Kind:      requestKind,
@@ -232,52 +234,70 @@ func runDVM[T any](
 		return zero, err
 	}
 
-	relay, err := nostr.RelayConnect(ctx, c.relay)
+	return runSignedDVM(ctx, c, request, responseKind, parse)
+}
+
+func runSignedDVM[T any](ctx context.Context, c *Client, request nostr.Event, responseKind int, parse func(*nostr.Event) (T, error)) (T, error) {
+	var zero T
+	if _, err := ValidateSignedRequest(request, time.Now()); err != nil {
+		return zero, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(RequestTimeout)*time.Millisecond)
+	defer cancel()
+	relay, err := c.dial(ctx, c.relay)
 	if err != nil {
 		return zero, err
 	}
 	defer relay.Close()
-
-	sub, err := relay.Subscribe(ctx, nostr.Filters{{
-		Kinds: []int{responseKind, NoticeKind},
-		Tags:  nostr.TagMap{"e": []string{request.ID}},
-	}}, nostr.WithLabel("nagg-dvm"))
+	sub, err := relay.Subscribe(ctx, nostr.Filters{{Kinds: []int{responseKind, NoticeKind}, Tags: nostr.TagMap{"e": []string{request.ID}}}})
 	if err != nil {
 		return zero, err
 	}
-	defer sub.Unsub()
-
+	defer sub.close()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
 	select {
-	case <-sub.EndOfStoredEvents:
-	case <-time.After(2 * time.Second):
+	case <-sub.eose:
+	case <-timer.C:
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	}
-
 	go func() {
-		defer safego.Recover("vertex.sync")
+		defer safego.Recover("vertex.publish")
 		publishCtx, publishCancel := context.WithTimeout(ctx, 7*time.Second)
 		defer publishCancel()
 		_ = relay.Publish(publishCtx, request)
 	}()
-
+responseLoop:
 	for {
 		select {
-		case event, ok := <-sub.Events:
+		case event, ok := <-sub.events:
 			if !ok {
-				return zero, fmt.Errorf("dvm subscription closed")
+				return zero, errors.New("dvm subscription closed")
 			}
-			if event.Kind == NoticeKind {
-				return zero, fmt.Errorf("DVM %d error: %s", requestKind, dvmNoticeMessage(event))
-			}
-			if event.Kind != responseKind {
+			if event == nil || event.ID != event.GetID() {
 				continue
 			}
-			return parse(event)
-		case reason := <-sub.ClosedReason:
-			return zero, fmt.Errorf("dvm subscription closed: %s", reason)
+			valid, err := event.CheckSignature()
+			if err != nil || !valid || !event.Tags.ContainsAny("e", []string{request.ID}) {
+				continue
+			}
+			if event.Kind == NoticeKind {
+				// Processing/success notices are not the final result.
+				for _, tag := range event.Tags {
+					if len(tag) >= 2 && tag[0] == "status" && (tag[1] == "processing" || tag[1] == "success") {
+						continue responseLoop
+					}
+				}
+				return zero, noticeError(event)
+			}
+			if event.Kind == responseKind {
+				return parse(event)
+			}
+		case <-sub.closed:
+			return zero, errors.New("dvm subscription closed")
 		case <-ctx.Done():
-			return zero, fmt.Errorf("DVM %d request timed out: %w", requestKind, ctx.Err())
+			return zero, ctx.Err()
 		}
 	}
 }
@@ -325,7 +345,10 @@ func parseProfileResult(event *nostr.Event) (ProfileResult, error) {
 	if !ok {
 		return ProfileResult{}, fmt.Errorf("profile response missing target pubkey")
 	}
+	stamp := time.Now().Unix()
 	result := ProfileResult{
+		FetchedAt: &stamp,
+		Response:  event,
 		PubKey:    pubkey,
 		Npub:      Npub(pubkey),
 		Rank:      rankValue(target.Rank),

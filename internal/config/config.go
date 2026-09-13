@@ -188,12 +188,15 @@ type CacheConfig struct {
 }
 
 type VertexConfig struct {
-	PrivateKey    string
-	Relay         string
-	ValidateNIP05 bool
-	SyncBatch     int
-	SyncInterval  time.Duration
-	SyncThrottle  time.Duration
+	RelayEnabled      bool
+	ClientMaxPerMin   int
+	AllowPersonalized bool
+	PrivateKey        string
+	Relay             string
+	ValidateNIP05     bool
+	SyncBatch         int
+	SyncInterval      time.Duration
+	SyncThrottle      time.Duration
 }
 
 type ViewerConfig struct {
@@ -251,7 +254,14 @@ func Load() (Config, error) {
 	// The DVM plugin registry: static identity (name, kinds, cache DDL) is
 	// declared here so every process — api, ingester, migrate, backfill —
 	// derives the same schema; runtime providers are attached by cmd/api.
+	// Shared schema ownership: mint already carries these caches. Register once,
+	// regardless of enabled modules; adding vertex never duplicates DDL.
 	dvmRegistry := dvm.MustRegistry(vertex.NewPlugin())
+	vertexModule := nostrModule || mods.Has(modules.Vertex)
+	vertexBatch, vertexThrottle := "200", "0s"
+	if mods.Has(modules.Vertex) && !nostrModule {
+		vertexBatch, vertexThrottle = "20", "2s"
+	}
 
 	// Two kind sets, deliberately: what we KEEP and what we SUBSCRIBE to.
 	// See Config.StoredKinds — a mint deployment keeps on-demand-fetched kind-0
@@ -340,12 +350,15 @@ func Load() (Config, error) {
 			AddresseeGates: ruleRegistry.AddresseeGates(),
 		},
 		Vertex: VertexConfig{
-			PrivateKey:    os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
-			Relay:         env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
-			ValidateNIP05: parseBool(env("NAGG_NIP05_VALIDATE", "true")),
-			SyncBatch:     parseInt(env("NAGG_VERTEX_SYNC_BATCH", "200")),
-			SyncInterval:  parseDuration(env("NAGG_VERTEX_SYNC_INTERVAL", "30m")),
-			SyncThrottle:  parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
+			RelayEnabled:      parseBool(env("NAGG_VERTEX_RELAY_ENABLED", boolText(vertexModule))),
+			ClientMaxPerMin:   parseInt(env("NAGG_VERTEX_CLIENT_MAX_PER_MIN", "10")),
+			AllowPersonalized: parseBool(env("NAGG_VERTEX_ALLOW_PERSONALIZED", "false")),
+			PrivateKey:        os.Getenv("NAGG_VERTEX_PRIVATE_KEY"),
+			Relay:             env("NAGG_VERTEX_RELAY", "wss://relay.vertexlab.io"),
+			ValidateNIP05:     parseBool(env("NAGG_NIP05_VALIDATE", "true")),
+			SyncBatch:         parseInt(env("NAGG_VERTEX_SYNC_BATCH", vertexBatch)),
+			SyncInterval:      parseDuration(env("NAGG_VERTEX_SYNC_INTERVAL", "30m")),
+			SyncThrottle:      parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", vertexThrottle)),
 		},
 		Auditor: AuditorConfig{
 			UcashURL:           env("NAGG_AUDITOR_UCASH_URL", "https://auditor.ucash.space"),
@@ -476,6 +489,8 @@ func (c Config) validate() error {
 		if _, err := hex.DecodeString(c.Vertex.PrivateKey); err != nil {
 			return fmt.Errorf("NAGG_VERTEX_PRIVATE_KEY: %w", err)
 		}
+	}
+	if c.Vertex.RelayEnabled || c.Vertex.PrivateKey != "" {
 		relayURL, err := url.Parse(c.Vertex.Relay)
 		if err != nil {
 			return fmt.Errorf("NAGG_VERTEX_RELAY: %w", err)
@@ -483,6 +498,9 @@ func (c Config) validate() error {
 		if relayURL.Scheme != "wss" && relayURL.Scheme != "ws" {
 			return errors.New("NAGG_VERTEX_RELAY must use ws or wss")
 		}
+	}
+	if c.Vertex.ClientMaxPerMin < 1 {
+		return errors.New("NAGG_VERTEX_CLIENT_MAX_PER_MIN must be positive")
 	}
 	if c.Vertex.SyncBatch < 1 {
 		return errors.New("NAGG_VERTEX_SYNC_BATCH must be positive")

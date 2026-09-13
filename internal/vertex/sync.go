@@ -2,6 +2,7 @@ package vertex
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 )
@@ -94,6 +95,10 @@ func (s *Syncer) RunOnce(ctx context.Context) (int, int, error) {
 		profile, err := s.client.ProfileRefresh(ctx, pubkey)
 		if err != nil {
 			failed++
+			if errors.Is(err, ErrInsufficientCredits) {
+				s.logger.Warn("vertex.sync.credits_exhausted")
+				return refreshed, failed, nil
+			}
 			s.logger.Warn("vertex profile sync refresh failed", "pubkey", pubkey, "error", err)
 			continue
 		}

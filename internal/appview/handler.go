@@ -61,6 +61,10 @@ type RankedFeedProvider interface {
 }
 
 type Handler struct {
+	vertexRelay               SignedVertexClient
+	vertexRelayEnabled        bool
+	vertexClientLimiter       *rateLimiter
+	vertexAllowPersonalized   bool
 	store                     Store
 	vertex                    VertexClient
 	dvm                       *dvm.Registry
@@ -401,24 +405,28 @@ func (h *Handler) routes() []route {
 		{"/nostr/own/", h.ownHistory, true, modules.Nostr},
 		{"/nostr/notifications/seen", h.notificationsSeen, false, modules.Nostr},
 		{"/nostr/profiles", h.profiles, false, modules.Nostr},
-		{"/nostr/profile", h.profile, false, modules.Nostr},
-		{"/nostr/search", h.search, false, modules.Nostr},
-		{"/nostr/recommended", h.recommended, false, modules.Nostr},
+		{"/nostr/profile", h.profile, false, modules.Vertex},
+		{"/nostr/search", h.search, false, modules.Vertex},
+		{"/nostr/recommended", h.recommended, false, modules.Vertex},
+		{"/nostr/vertex/relay", h.vertexRelayRequest, false, modules.Vertex},
 		{"/app/latest-version", h.latestVersion, false, modules.App},
 		{"/app/ai-lineup", h.aiLineup, false, modules.App},
 		{"/app/rates", h.appRates, false, modules.App},
 	}
 }
 
-// mountedRoutes are the paths Register actually serves for this deployment —
-// the declared set filtered by the enabled modules. It is also what
-// /nostr/capabilities advertises, so a client feature-gating against a
-// mint-only host sees the truth.
+// Nostr historically includes Vertex; either module owns these shared routes.
+func (h *Handler) routeEnabled(module modules.Module) bool {
+	return h.modules.Has(module) || (module == modules.Vertex && h.modules.Has(modules.Nostr))
+}
+
+// mountedRoutes are the paths Register actually serves for this deployment.
+// The capability manifest uses the same selection as route registration.
 func (h *Handler) mountedRoutes() []string {
 	all := h.routes()
 	out := make([]string, 0, len(all))
 	for _, r := range all {
-		if h.modules.Has(r.module) {
+		if h.routeEnabled(r.module) {
 			out = append(out, r.path)
 		}
 	}
@@ -427,7 +435,7 @@ func (h *Handler) mountedRoutes() []string {
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	for _, route := range h.routes() {
-		if !h.modules.Has(route.module) {
+		if !h.routeEnabled(route.module) {
 			continue
 		}
 		next := route.handler
@@ -530,6 +538,7 @@ type ProfileFields struct {
 // out of the generic aggregates because it is float/context-shaped provider
 // output, pending the DVM plugin seam.
 type ProvidersEnvelope struct {
+	VertexFresh bool `json:"vertexFresh"`
 	Envelope
 	Pubkeys   []string                  `json:"pubkeys"`
 	Providers map[string]map[string]any `json:"providers,omitempty"`
@@ -1657,6 +1666,9 @@ func (h *Handler) profiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Has("svr") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET /nostr/profile only", http.StatusMethodNotAllowed)
 		return
@@ -1667,16 +1679,42 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	h.tryBackfillProfileSummary(ctx, pubkey)
+	signed, err := signedVertexQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var freshProfile *vertex.ProfileResult
+	if signed != nil {
+		args, ok := h.validateVertex(w, *signed)
+		if !ok {
+			return
+		}
+		if signed.Kind != vertex.ProfileRequestKind || args.Target != pubkey {
+			http.Error(w, "signed Vertex target must match profile", http.StatusBadRequest)
+			return
+		}
+		result, ok := h.relayVertex(ctx, w, *signed, args)
+		if !ok {
+			return
+		}
+		freshProfile = result.Profile
+	}
+	if h.modules.Has(modules.Nostr) {
+		h.tryBackfillProfileSummary(ctx, pubkey)
+	}
 	profiles, err := h.store.LatestK0(ctx, []string{pubkey})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	counts, err := h.store.PubkeyStats(ctx, pubkey)
-	if err != nil {
-		writeError(w, err)
-		return
+	var counts chstore.PubkeyStats
+	if h.modules.Has(modules.Nostr) {
+		counts, err = h.store.PubkeyStats(ctx, pubkey)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	profile := profiles[pubkey]
 	createdAt, err := h.localProfileCreatedAt(ctx, pubkey, profile)
@@ -1684,7 +1722,13 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	dvmProfile, fromCache := h.vertexProfile(ctx, pubkey, counts.Followers)
+	var dvmProfile vertex.ProfileResult
+	var fromCache bool
+	if freshProfile != nil {
+		dvmProfile = *freshProfile
+	} else {
+		dvmProfile, fromCache = h.vertexProfile(ctx, pubkey, counts.Followers)
+	}
 
 	envelope := ProvidersEnvelope{
 		Envelope:  inlineEnvelope(nil, orderByCreatedAt, nil, nil),
@@ -1692,7 +1736,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		FromCache: fromCache,
 	}
 	followerPubkeys := make([]string, 0, len(dvmProfile.TopFollowers))
-	vertexPayload := map[string]any{"rank": dvmProfile.Rank}
+	vertexPayload := map[string]any{"rank": dvmProfile.Rank, "vertexFetchedAt": dvmProfile.FetchedAt}
 	if dvmProfile.Score != nil {
 		vertexPayload["score"] = *dvmProfile.Score
 	}
@@ -1705,7 +1749,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		followerPubkeys = append(followerPubkeys, fp)
-		payload := map[string]any{"rank": follower.Rank}
+		payload := map[string]any{"rank": follower.Rank, "vertexFetchedAt": dvmProfile.FetchedAt}
 		if follower.Score != nil {
 			payload["score"] = *follower.Score
 		}
@@ -1736,9 +1780,30 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "GET /nostr/search only", http.StatusMethodNotAllowed)
+	if r.URL.Query().Has("svr") {
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "GET or POST /nostr/search only", http.StatusMethodNotAllowed)
 		return
+	}
+	if r.Method == http.MethodPost {
+		var body struct {
+			Query  string `json:"query"`
+			Limit  int    `json:"limit"`
+			Sort   string `json:"sort"`
+			Source string `json:"source"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxVertexRequestBytes)).Decode(&body); err != nil {
+			http.Error(w, "invalid search body", http.StatusBadRequest)
+			return
+		}
+		q := r.URL.Query()
+		q.Set("query", body.Query)
+		q.Set("limit", strconv.Itoa(body.Limit))
+		q.Set("sort", body.Sort)
+		q.Set("source", body.Source)
+		r.URL.RawQuery = q.Encode()
 	}
 	query := strings.TrimSpace(r.URL.Query().Get("query"))
 	if len(query) < 3 {
@@ -1750,6 +1815,28 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	limit := limitClamp(intParam(r, "limit", 5), 5)
 	sortKey := r.URL.Query().Get("sort")
 
+	args := vertex.NormalizeSearchArgs(vertex.SearchArgs{Query: query, Limit: limit, Sort: sortKey, Source: r.URL.Query().Get("source")})
+	signed, err := signedVertexQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var signedResult *vertex.SignedResult
+	if signed != nil {
+		signedArgs, ok := h.validateVertex(w, *signed)
+		if !ok {
+			return
+		}
+		if signed.Kind != vertex.SearchRequestKind || signedArgs.Search != args {
+			http.Error(w, "signed Vertex arguments must match search", http.StatusBadRequest)
+			return
+		}
+		result, ok := h.relayVertex(r.Context(), w, *signed, signedArgs)
+		if !ok {
+			return
+		}
+		signedResult = &result
+	}
 	var results []vertex.SearchResult
 	fromCache := false
 	seen := make(map[string]struct{})
@@ -1761,12 +1848,15 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	// locally-indexed profiles below. Live DVM ranking is a quality boost, not a
 	// hard dependency.
 	vertexCount := 0
-	if h.profileSearcher != nil {
-		vertexRows, vertexFromCache, err := h.profileSearcher.Search(r.Context(), vertex.SearchArgs{
-			Query: query,
-			Limit: limit,
-			Sort:  sortKey,
-		})
+	if h.profileSearcher != nil || signedResult != nil {
+		var vertexRows []vertex.SearchResult
+		var vertexFromCache bool
+		var err error
+		if signedResult != nil {
+			vertexRows = signedResult.Results
+		} else {
+			vertexRows, vertexFromCache, err = h.profileSearcher.Search(r.Context(), args)
+		}
 		if err != nil {
 			slog.Warn("vertex profile search failed; falling back to local index",
 				"query_len", len(query), "sort", sortKey, "error", err)
@@ -1828,15 +1918,24 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 
 	// Seam observability: how the fetch→merge resolved (Vertex pagerank vs local
 	// index, cache vs live). query_len only — never the raw search term.
-	slog.Debug("appview.search",
-		"query_len", len(query), "sort", sortKey, "limit", limit,
-		"vertex_count", vertexCount, "local_count", len(results)-vertexCount,
-		"from_cache", fromCache)
+	if signed == nil {
+		slog.Debug("appview.search",
+			"query_len", len(query), "sort", sortKey, "limit", limit,
+			"vertex_count", vertexCount, "local_count", len(results)-vertexCount,
+			"from_cache", fromCache)
+	}
 
 	envelope, err := h.rankedPubkeysEnvelope(r.Context(), results, fromCache)
 	if err != nil {
 		writeError(w, err)
 		return
+	}
+	envelope.VertexFresh = signedResult != nil
+	cacheTTL := vertex.NewPlugin().Policy().CacheTTL
+	for _, row := range results {
+		if row.FetchedAt != nil && time.Since(time.Unix(*row.FetchedAt, 0)) < cacheTTL {
+			envelope.VertexFresh = true
+		}
 	}
 	writeJSON(w, envelope)
 }
@@ -1852,7 +1951,7 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 	}
 	for _, row := range results {
 		envelope.Pubkeys = append(envelope.Pubkeys, row.PubKey)
-		payload := map[string]any{}
+		payload := map[string]any{"vertexFetchedAt": row.FetchedAt}
 		if row.Rank != nil {
 			payload["rank"] = *row.Rank
 		}
@@ -1864,9 +1963,11 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 	if err := h.appendK0EventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
 		return ProvidersEnvelope{}, err
 	}
-	if counts, err := h.store.BatchPubkeyStats(ctx, envelope.Pubkeys); err == nil {
-		for _, pubkey := range envelope.Pubkeys {
-			pubkeyAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
+	if h.modules.Has(modules.Nostr) {
+		if counts, err := h.store.BatchPubkeyStats(ctx, envelope.Pubkeys); err == nil {
+			for _, pubkey := range envelope.Pubkeys {
+				pubkeyAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
+			}
 		}
 	}
 	eventByPubkey := make(map[string]string, len(envelope.Events))
@@ -2316,6 +2417,13 @@ type profileFieldsResult struct {
 }
 
 func (h *Handler) vertexProfile(ctx context.Context, pubkey string, followers uint64) (vertex.ProfileResult, bool) {
+	if !h.modules.Has(modules.Nostr) {
+		profile, ok, err := h.store.CachedVertexProfile(ctx, pubkey)
+		if err != nil {
+			return vertex.ProfileResult{}, false
+		}
+		return profile, ok
+	}
 	provider := vertex.NewScoreProvider(h.store, h.vertex, h.vertexProfileMinFollowers)
 	profile, ok, err := provider.AuthorProfileWithFollowers(ctx, pubkey, followers)
 	if err != nil {

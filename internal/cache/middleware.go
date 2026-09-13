@@ -137,7 +137,7 @@ func WrapREST(next http.HandlerFunc, c Cache, defaultTTL, staleFor time.Duration
 	var group singleflight.Group
 	cacheable := func(res capturedResult) bool { return res.status == http.StatusOK }
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if r.Method != http.MethodGet || r.URL.Query().Has("svr") || strings.HasSuffix(r.URL.Path, "/vertex/relay") {
 			next(w, r)
 			return
 		}
@@ -303,6 +303,8 @@ func graphqlCachePolicy(query string, defFresh, defStale time.Duration) (fresh, 
 // restCachePolicy picks (fresh, stale) based on the app-view route path.
 func restCachePolicy(path string, defFresh, defStale time.Duration) (fresh, stale time.Duration) {
 	switch {
+	case strings.HasSuffix(path, "/vertex/relay"):
+		return 0, 0
 	case isAppPath(path):
 		return time.Minute, 24 * time.Hour
 	case strings.Contains(path, "/dm/"):

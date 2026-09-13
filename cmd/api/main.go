@@ -140,7 +140,8 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	gate := chgate.New(cfg.API.MaxConcurrentRequests)
 
 	var vertexClient *vertex.Client
-	if cfg.Vertex.PrivateKey != "" {
+	vertexModule := nostrModule || cfg.Modules.Has(modules.Vertex)
+	if vertexModule && (cfg.Vertex.RelayEnabled || cfg.Vertex.PrivateKey != "") {
 		client, err := vertex.New(vertex.Config{
 			PrivateKey: cfg.Vertex.PrivateKey,
 			Relay:      cfg.Vertex.Relay,
@@ -149,14 +150,16 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			return nil, fmt.Errorf("vertex client failed: %w", err)
 		}
 		vertexClient = client
-		vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
-			MinFollowers: vertexPolicy.MinInboundRefs,
-			BatchSize:    cfg.Vertex.SyncBatch,
-			StaleAfter:   vertexPolicy.CacheTTL,
-			Interval:     cfg.Vertex.SyncInterval,
-			Throttle:     cfg.Vertex.SyncThrottle,
-		}, logger)
-		go vertexSyncer.Run(ctx)
+		if cfg.Vertex.PrivateKey != "" {
+			vertexSyncer := vertex.NewSyncer(store, vertexClient, vertex.SyncConfig{
+				MinFollowers: vertexPolicy.MinInboundRefs,
+				BatchSize:    cfg.Vertex.SyncBatch,
+				StaleAfter:   vertexPolicy.CacheTTL,
+				Interval:     cfg.Vertex.SyncInterval,
+				Throttle:     cfg.Vertex.SyncThrottle,
+			}, logger)
+			go vertexSyncer.Run(ctx)
+		}
 	}
 
 	// Optionally host the firehose ingester and the enrichment runner in-process
@@ -259,21 +262,19 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	// One cache-backed profile-search provider, shared by the GraphQL resolver and
 	// the REST /nostr/search handler so both serve identical Vertex-pagerank
 	// results from the same ClickHouse cache (and dedup live refreshes via the
-	// provider's singleflight). vertexClient is a *vertex.Client, which is a typed
-	// nil when no Vertex key is configured; assign through the interface so the
-	// provider sees a true nil and returns ErrUnavailable (callers fall back to the
-	// local index) instead of panicking on a nil-pointer method call.
+	// provider's singleflight). Only a server key enables automatic refresh;
+	// a client-signed relay alone leaves cache misses on the local fallback.
 	var searchRefresh vertex.SearchRefreshClient
-	if vertexClient != nil {
+	if vertexClient != nil && cfg.Vertex.PrivateKey != "" {
 		searchRefresh = vertexClient
 	}
 	searchProvider := vertex.NewSearchProvider(store, searchRefresh, vertex.SearchProviderConfig{
-		MaxAge: 7 * 24 * time.Hour,
+		MaxAge: vertexPolicy.CacheTTL,
 	}, logger)
 	// Attach the runtime capabilities to the Vertex DVM plugin (its static
 	// identity — name, kinds, cache DDL — was registered at config time so
 	// every process derives the same schema).
-	if plugin, ok := cfg.DVM.Plugin(vertex.PluginName).(*vertex.Plugin); ok {
+	if plugin, ok := cfg.DVM.Plugin(vertex.PluginName).(*vertex.Plugin); ok && vertexModule {
 		plugin.WithSearch(searchProvider)
 		if vertexClient != nil {
 			plugin.WithRecommend(vertexClient)
@@ -350,12 +351,16 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appviewOpts = append(appviewOpts, appview.WithViewerTouch(relevanceTracker.Touch))
 	}
 	// Route REST profile search through the same cache-backed provider as GraphQL.
-	// Injected unconditionally: with no Vertex key the provider returns
-	// ErrUnavailable on a cache miss and the search handler falls back to the local
-	// index, so it is safe even when vertexClient is nil.
-	appviewOpts = append(appviewOpts, appview.WithProfileSearch(searchProvider))
+	// With no server key, misses fall back to the local kind-0 index; signed
+	// refreshes arrive through the separate relay seam.
+	if vertexModule {
+		appviewOpts = append(appviewOpts, appview.WithProfileSearch(searchProvider))
+	}
 	if vertexClient != nil {
-		appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
+		appviewOpts = append(appviewOpts, appview.WithVertexRelay(vertexClient, cfg.Vertex.RelayEnabled, cfg.Vertex.ClientMaxPerMin, cfg.Vertex.AllowPersonalized))
+		if cfg.Vertex.PrivateKey != "" {
+			appviewOpts = append(appviewOpts, appview.WithVertex(vertexClient))
+		}
 	}
 	var auditorClient *auditor.Dual
 	if cfg.Auditor.Enabled {

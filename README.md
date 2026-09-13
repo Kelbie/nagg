@@ -291,7 +291,14 @@ The API listens on `:8080` by default and serves `POST /graphql`, `GET /graphiql
 
 Set `NAGG_VIEWER_PUBKEY` to a 64-hex pubkey when you want app-view viewer routes to work without an explicit viewer parameter. It is used as the fallback for `/nostr/feed`, `/nostr/feed/user`, `/nostr/follows`, and `/nostr/profile`; explicit invalid pubkeys still return `400`.
 
-The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local data when available; it only calls Vertex for pubkeys meeting the plugin's declared `MinInboundRefs` policy, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails. GraphQL ranking reads the columnar `vertex_scores` cache only; when the Vertex client is configured, the API service warms eligible recent authors in the background using that policy and `NAGG_VERTEX_SYNC_BATCH`. The old follower-threshold environment variables were removed; change the [DVM plugin policy declaration](docs/rules-registry.md#the-dvm-plugin-seam-internaldvm) instead.
+The `vertex` module (also included by `nostr`) serves client-signed Vertex DVM
+requests and shared profile/search caches without a server private key. Enable
+`NAGG_MODULES=mint,app,vertex` on the mint slice. The app keeps its key locally
+and sends a signed event to `POST /nostr/vertex/relay`, or piggybacks it on a
+profile/search read with `svr`. The optional `NAGG_VERTEX_PRIVATE_KEY` enables
+residual background sync and legacy server-key read fallbacks; it is not needed
+for client relay. Policy constants are seven days / 500 inbound refs. See
+[the relay protocol, credit model, and operator notes](docs/vertex-client-relay.md).
 
 ```sh
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret> \
@@ -356,6 +363,14 @@ App configuration and operational variables:
 | `NAGG_RATES_EXTRA_SOURCES` | empty | JSON array of additional source declarations; hex/npub keys normalized at load. Invalid JSON/entries warn and are ignored. See [source schema](docs/appview-api.md#btc-fiat-rates). |
 | `NAGG_LOG_LEVEL` | `info` | All five service binaries: `debug`, `info`, `warn`, or `error`. Invalid values fall back to `info` with one startup warning. |
 | `NAGG_RATE_LIMIT_PER_MIN` | `120` | REST requests per client IP per minute; invalid or non-positive values use `120`. |
+| `NAGG_VERTEX_RELAY_ENABLED` | `vertex` or `nostr` enabled | Enable client-signed relay and signed read refreshes; no private key required. |
+| `NAGG_VERTEX_CLIENT_MAX_PER_MIN` | `10` | Requests per signing pubkey per minute, shared by relay and piggyback paths. Must be positive. |
+| `NAGG_VERTEX_ALLOW_PERSONALIZED` | `false` | Allow ten-credit `personalizedPagerank` client requests. |
+| `NAGG_VERTEX_PRIVATE_KEY` | empty | Optional server key for residual sync/legacy live reads; never a user's key. |
+| `NAGG_VERTEX_RELAY` | `wss://relay.vertexlab.io` | Provider relay for signed DVM requests. |
+| `NAGG_VERTEX_SYNC_BATCH` | `20` for vertex without nostr; otherwise `200` | Maximum eligible profiles per sync tick, when a server key is set. |
+| `NAGG_VERTEX_SYNC_THROTTLE` | `2s` for vertex without nostr; otherwise `0s` | Minimum delay between background profile requests. |
+| `NAGG_VERTEX_SYNC_INTERVAL` | `30m` | Delay between background sync ticks; credit exhaustion ends the current tick. |
 | `NAGG_AUDITOR_ENABLED` | `mint` module enabled | Runs the background auditor refresh for discovery and the mint-info work-list. |
 | `NAGG_AUDITOR_UCASH_URL` | `https://auditor.ucash.space` | Primary auditor's Leptos server-function base URL. |
 | `NAGG_AUDITOR_UCASH_FN_SUFFIX` | `5929181479826419594` | Build suffix appended to server-function names; update after an upstream redeploy changes it. |

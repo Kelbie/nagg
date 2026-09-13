@@ -1,7 +1,10 @@
 package vertex
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,5 +47,25 @@ func TestSyncerRefreshesRecentAuthorScores(t *testing.T) {
 	}
 	if len(store.saved) != 1 || store.saved[0].PubKey != scoreProviderTestPubkey {
 		t.Fatalf("saved = %+v", store.saved)
+	}
+}
+
+type exhaustedSyncClient struct{ calls int }
+
+func (c *exhaustedSyncClient) ProfileRefresh(context.Context, string) (ProfileResult, error) {
+	c.calls++
+	return ProfileResult{}, ErrInsufficientCredits
+}
+func TestSyncerStopsTickOnInsufficientCredits(t *testing.T) {
+	store := &syncStore{pubkeys: []string{"one", "two", "three"}}
+	client := &exhaustedSyncClient{}
+	var log bytes.Buffer
+	syncer := NewSyncer(store, client, SyncConfig{BatchSize: 20}, slog.New(slog.NewTextHandler(&log, nil)))
+	refreshed, failed, err := syncer.RunOnce(context.Background())
+	if err != nil || refreshed != 0 || failed != 1 || client.calls != 1 || len(store.saved) != 0 {
+		t.Fatalf("refreshed=%d failed=%d calls=%d err=%v", refreshed, failed, client.calls, err)
+	}
+	if strings.Count(log.String(), "vertex.sync.credits_exhausted") != 1 {
+		t.Fatalf("log: %s", log.String())
 	}
 }
