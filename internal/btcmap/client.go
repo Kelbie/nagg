@@ -17,7 +17,7 @@ import (
 
 const DefaultURL = "https://api.btcmap.org"
 const fetchTimeout = 8 * time.Second
-const maxBodyBytes = 4 << 20
+const maxBodyBytes = 16 << 20 // the full BTC Map places list is ~5.3 MB today
 
 // Defaults cover the app's strict place schema and every field its detail
 // sheet reads. Upstream otherwise returns only id when fields is omitted.
