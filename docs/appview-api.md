@@ -436,9 +436,9 @@ most once per successful catalog refresh, deduplicated by the catalog's internal
 Capability `app.aiLineup.pinsMissing` advertises this field.
 
 GET responses under `/app/*` (and `/v1/app/*`) normally use 60 seconds fresh /
-24 hours stale in the server response cache, including `/app/rates`. BTC Map
-uses 1h fresh / 24h stale instead; wallpapers bypass this cache and enforce
-their own 24h snapshot expiry. During the stale window, the previous payload
+24 hours stale in the server response cache. BTC Map uses 1h fresh / 24h stale
+instead; wallpapers and rates bypass this cache and enforce their own snapshot
+expiry. During the stale window, the previous payload
 can be served while background revalidation runs. Successful cached app
 responses send `Cache-Control: public, max-age=60`, or `max-age=3600` for BTC Map.
 POST bypasses the server response cache.
@@ -517,19 +517,21 @@ and when the worker is disabled. Successful responses send
 `Cache-Control: public, max-age=60`.
 
 The worker admits observations at most `NAGG_RATES_MAX_AGE` old (6h), taking
-the latest five unique signed kind-1 notes per bot and one HTTP sample per
-source/currency. It checks the note's reciprocal sats price within 2%, drops
+the latest usable signed kind-1 note per bot and one HTTP sample per
+source/currency. Repeated notes from one publisher never add independent votes.
+It checks the note's reciprocal sats price within 2%, drops
 outliers beyond `max(3 × 1.4826 × MAD, 0.5% × median)`, and takes the median
-of survivors. A movement over 20% from the previous accepted value is rejected
+of survivors. If only two sources survive and disagree by more than 20% of the
+lower price, the refresh is rejected: neither source has independent support.
+A movement over 20% from the previous accepted value is rejected
 until that value is older than 24h, when re-anchoring is allowed.
 
 `samples` counts survivors; `sources` contains sorted unique provider IDs.
-Confidence is `high` for at least three survivors from at least two providers,
-`medium` for at least two survivors otherwise, and `single-source` for one.
+Confidence is `high` for at least three providers, `medium` for two, and
+`single-source` for one.
 `degraded` is true if any currency has only one provider, uses a retained/stale
 value, is unavailable, or any source has failed at least three passes in a row.
-Thus several notes from one bot can be `medium` but still degraded. GBP is
-HTTP-only by default, so overall degradation is expected today.
+GBP is HTTP-only by default, so overall degradation is expected today.
 
 Source health is keyed by `(id, currency)`; the four mempool entries share one
 HTTP request per pass. `ok` means the last pass supplied fresh usable data,
@@ -538,9 +540,8 @@ and `lastError` but retains the historical `lastErrorAt`; timestamps not yet
 recorded are null. Errors use fixed sanitized categories without upstream
 URLs, payloads, or raw exception messages. Failed or implausible refreshes
 retain the last good price up to `NAGG_RATES_STALE_FOR` (24h total observation
-age). This worker expiry is separate from the response cache described above:
-a previously cached JSON response can remain available during its stale window.
-Clients needing an age bound must inspect each rate's `at`.
+age). The server response cache is bypassed so it cannot extend that retention.
+Clients retaining responses locally must inspect each rate's `at`.
 
 Sources are literals in `internal/rates/source.go`; adding a supported bot is
 one literal. `NAGG_RATES_EXTRA_SOURCES` appends declarations of the same shape:
@@ -564,8 +565,8 @@ including extras. None of this feature reads or writes ClickHouse.
 
 These `app` module routes also mount under `/v1/app/*`. They work on a
 `NAGG_MODULES=mint,app` deployment without social event routes or new tables.
-`vertex` is a DVM plugin, not a valid `NAGG_MODULES` value in this branch; retain
-its existing plugin configuration separately.
+Add `vertex` (`NAGG_MODULES=mint,app,vertex`) to also enable client-signed
+reputation lookups; see [Vertex client relay](vertex-client-relay.md).
 
 `GET /app/wallpapers` (capability `app.wallpapers`) returns:
 

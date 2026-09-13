@@ -131,7 +131,7 @@ func TestRatesServiceNotesValidateFilterDedupeAndCap(t *testing.T) {
 	s.now = func() time.Time { return now }
 	s.RunOnce(context.Background())
 	snap, ok := s.Snapshot()
-	if !ok || snap.Rates["USD"].Samples != 5 || snap.Rates["USD"].Confidence != "medium" || !snap.Degraded {
+	if !ok || snap.Rates["USD"].Samples != 1 || snap.Rates["USD"].Confidence != "single-source" || !snap.Degraded {
 		t.Fatalf("got %+v", snap)
 	}
 	now = now.Add(7 * time.Hour)

@@ -19,6 +19,7 @@ func TestRatesAggregate(t *testing.T) {
 		{"10x outlier", []float64{100, 100, 101, 1000}, 100, 3, "high"},
 		{"single", []float64{100}, 100, 1, "single-source"},
 		{"two", []float64{100, 102}, 101, 2, "medium"},
+		{"two disagree", []float64{100, 1000}, 0, 0, ""},
 		{"zero MAD floor", []float64{100, 100, 100.4, 110}, 100, 3, "high"},
 		{"invalid prices", []float64{0, -1, math.NaN(), math.Inf(1)}, 0, 0, ""},
 	} {
@@ -55,12 +56,12 @@ func TestRatesAggregateAgeAndLimits(t *testing.T) {
 		})
 	}
 	var obs []Observation
-	// Oldest arrives first, and must not displace any of the five latest notes.
+	// Oldest arrives first, and must not displace the latest note.
 	for i := 6; i >= 0; i-- {
 		obs = append(obs, Observation{Price: 100, At: now.Add(-time.Duration(i) * time.Minute), Source: "bot", Kind: NostrNote})
 	}
 	r, ok := Aggregate(obs, now, 6*time.Hour, nil)
-	if !ok || r.Samples != 5 || len(r.Sources) != 1 || r.Confidence != "medium" || r.At != now.Unix() {
+	if !ok || r.Samples != 1 || len(r.Sources) != 1 || r.Confidence != "single-source" || r.At != now.Unix() {
 		t.Fatalf("got %+v", r)
 	}
 	for i := range obs {
@@ -69,6 +70,21 @@ func TestRatesAggregateAgeAndLimits(t *testing.T) {
 	r, _ = Aggregate(obs, now, 6*time.Hour, nil)
 	if r.Samples != 1 {
 		t.Fatalf("HTTP counted %d samples", r.Samples)
+	}
+}
+
+func TestRepeatedPublisherCannotOutvoteIndependentSources(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	obs := []Observation{
+		{Price: 100, At: now, Source: "first", Kind: HTTPJSON},
+		{Price: 101, At: now, Source: "second", Kind: NostrNote},
+	}
+	for i := 0; i < 5; i++ {
+		obs = append(obs, Observation{Price: 1000, At: now.Add(-time.Duration(i) * time.Minute), Source: "broken-bot", Kind: NostrNote})
+	}
+	rate, ok := Aggregate(obs, now, 6*time.Hour, nil)
+	if !ok || rate.Price != 100.5 || rate.Samples != 2 || len(rate.Sources) != 2 || rate.Confidence != "medium" {
+		t.Fatalf("repeated bot displaced independent observations: %+v, %v", rate, ok)
 	}
 }
 

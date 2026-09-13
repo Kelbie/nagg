@@ -141,9 +141,10 @@ func WrapREST(next http.HandlerFunc, c Cache, defaultTTL, staleFor time.Duration
 			next(w, r)
 			return
 		}
-		// Wallpapers already own a bounded in-memory snapshot. Caching it
-		// here would reset its age and could serve it beyond its 24h expiry.
-		if strings.TrimPrefix(r.URL.Path, "/v1") == "/app/wallpapers" {
+		// These workers already own bounded in-memory snapshots. Caching
+		// them here would reset their age and extend their expiry.
+		path := strings.TrimPrefix(r.URL.Path, "/v1")
+		if path == "/app/wallpapers" || path == "/app/rates" {
 			next(w, r)
 			return
 		}

@@ -22,21 +22,19 @@ func Aggregate(observations []Observation, now time.Time, maxAge time.Duration, 
 	}
 	obs := append([]Observation(nil), observations...)
 	sort.SliceStable(obs, func(i, j int) bool { return obs[i].At.After(obs[j].At) })
-	counts := map[string]int{}
+	seen := map[string]bool{}
 	var eligible []Observation
 	var prices []float64
 	for _, o := range obs {
 		if !validPrice(o.Price) || o.At.IsZero() || o.At.After(now) || now.Sub(o.At) > maxAge {
 			continue
 		}
-		limit := 1
-		if o.Kind == NostrNote {
-			limit = 5
-		}
-		if counts[o.Source] >= limit {
+		// A prolific publisher is still one source. Count only its newest
+		// observation so repeated notes cannot outvote independent providers.
+		if seen[o.Source] {
 			continue
 		}
-		counts[o.Source]++
+		seen[o.Source] = true
 		eligible = append(eligible, o)
 		prices = append(prices, o.Price)
 	}
@@ -65,6 +63,11 @@ func Aggregate(observations []Observation, now time.Time, maxAge time.Duration, 
 	if len(survivors) == 0 {
 		return Rate{}, false
 	}
+	// With only two providers MAD cannot identify which is wrong. Reject a
+	// large disagreement rather than inventing a midpoint between them.
+	if len(survivors) == 2 && math.Abs(survivors[0]-survivors[1])/math.Min(survivors[0], survivors[1]) > .2 {
+		return Rate{}, false
+	}
 	price := median(survivors)
 	if last != nil && validPrice(last.Price) && now.Sub(time.Unix(last.At, 0)) <= 24*time.Hour && math.Abs(price-last.Price)/last.Price > .2 {
 		return Rate{}, false
@@ -74,9 +77,9 @@ func Aggregate(observations []Observation, now time.Time, maxAge time.Duration, 
 		r.Sources = append(r.Sources, source)
 	}
 	sort.Strings(r.Sources)
-	if r.Samples >= 3 && len(sources) >= 2 {
+	if len(sources) >= 3 {
 		r.Confidence = "high"
-	} else if r.Samples >= 2 {
+	} else if len(sources) >= 2 {
 		r.Confidence = "medium"
 	}
 	return r, true

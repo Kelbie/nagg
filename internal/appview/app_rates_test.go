@@ -36,11 +36,11 @@ func TestRatesRouteWarmShapeAndCache(t *testing.T) {
 	}
 	s.RunOnce(context.Background())
 	for _, path := range []string{"/app/rates", "/v1/app/rates"} {
-		for _, state := range []string{"miss", "hit"} {
+		for i := 0; i < 2; i++ {
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-			if rec.Code != 200 || rec.Header().Get("Cache-Control") != "public, max-age=60" || rec.Header().Get("X-Nagg-Cache") != state {
-				t.Fatalf("%s %s: %d %v", path, state, rec.Code, rec.Header())
+			if rec.Code != 200 || rec.Header().Get("Cache-Control") != "public, max-age=60" || rec.Header().Get("X-Nagg-Cache") != "" {
+				t.Fatalf("%s read %d: %d %v", path, i, rec.Code, rec.Header())
 			}
 			var snap rates.Snapshot
 			if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
@@ -57,6 +57,33 @@ func TestRatesRouteWarmShapeAndCache(t *testing.T) {
 	}
 	if !slices.Contains(capabilities.Names, "app.rates") {
 		t.Fatal("missing capability")
+	}
+}
+
+type expiringRatesProvider struct{ available bool }
+
+func (p *expiringRatesProvider) Snapshot() (rates.Snapshot, bool) {
+	return rates.Snapshot{Rates: map[string]rates.Rate{"GBP": {Price: 57274}}}, p.available
+}
+
+func TestRatesExpiryCannotBeExtendedByResponseCache(t *testing.T) {
+	for _, path := range []string{"/app/rates", "/v1/app/rates"} {
+		t.Run(path, func(t *testing.T) {
+			provider := &expiringRatesProvider{available: true}
+			mux := http.NewServeMux()
+			New(nil, WithRates(provider), WithModules(mustParseModules(t, "app")), WithResponseCache(cache.NewMemory(1<<20), time.Minute, 24*time.Hour)).Register(mux)
+			warm := httptest.NewRecorder()
+			mux.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, path, nil))
+			if warm.Code != http.StatusOK {
+				t.Fatalf("warm status = %d", warm.Code)
+			}
+			provider.available = false
+			expired := httptest.NewRecorder()
+			mux.ServeHTTP(expired, httptest.NewRequest(http.MethodGet, path, nil))
+			if expired.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expired rate served from cache: %d %s", expired.Code, expired.Body)
+			}
+		})
 	}
 }
 
