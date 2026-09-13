@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -240,5 +241,53 @@ func TestDiscoverNIP87OnlyBackfill(t *testing.T) {
 	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?mint=https://mint", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatal("history error failed discovery")
+	}
+}
+
+// TestDiscoverScansFullReviewSet pins the regression where the discovery
+// aggregate went through QueryEvents, whose page clamp turned the 5000-wide
+// scan into the 50 newest reviews: mints reviewed earlier vanished and popular
+// mints under-counted. The scan must ask the dedicated reader for the full cap,
+// and every reviewed mint must surface regardless of how many rows precede it.
+func TestDiscoverScansFullReviewSet(t *testing.T) {
+	var scans []uint64
+	events := make([]chstore.EventView, 0, 120)
+	for i := 0; i < 120; i++ {
+		// 120 distinct reviewers of one popular mint, newest first...
+		events = append(events, reviewEvent(fmt.Sprintf("p%03d", i), fmt.Sprintf("%064d", i), "https://popular", "[5/5]", int64(10_000-i)))
+	}
+	// ...then an older review of a second mint that a 50-row page would never reach.
+	events = append(events, reviewEvent("old", fmt.Sprintf("%064d", 999), "https://older", "[4/5]", 1))
+	store := mintReviewStore{events: events, scanLimits: &scans}
+	handler := New(store, WithNIP05Validation(false))
+
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(scans) != 1 || scans[0] != discoverReviewScanCap {
+		t.Fatalf("scan widths=%v, want one scan of %d", scans, discoverReviewScanCap)
+	}
+	var resp DiscoverMintsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Mints) != 2 {
+		t.Fatalf("mints=%d, want 2", len(resp.Mints))
+	}
+	for _, m := range resp.Mints {
+		switch m.MintURL {
+		case "https://popular":
+			if m.ReviewCount != 120 {
+				t.Fatalf("popular reviewCount=%d, want 120", m.ReviewCount)
+			}
+		case "https://older":
+			if m.ReviewCount != 1 {
+				t.Fatalf("older reviewCount=%d, want 1", m.ReviewCount)
+			}
+		default:
+			t.Fatalf("unexpected mint %q", m.MintURL)
+		}
 	}
 }

@@ -380,10 +380,10 @@ App configuration and operational variables:
 | `NAGG_AUDITOR_ENABLED` | `mint` module enabled | Runs the background auditor refresh for discovery and the mint-info work-list. |
 | `NAGG_AUDITOR_UCASH_URL` | `https://auditor.ucash.space` | Primary auditor's Leptos server-function base URL. |
 | `NAGG_AUDITOR_UCASH_FN_SUFFIX` | `5929181479826419594` | Build suffix appended to server-function names; update after an upstream redeploy changes it. |
-| `NAGG_AUDITOR_UCASH_ENABLED` | `true` | Tries ucash first; `false` selects the legacy fallback directly. Gated by `NAGG_AUDITOR_ENABLED`. |
+| `NAGG_AUDITOR_UCASH_ENABLED` | `true` | Include ucash in the roster union; `false` uses the legacy auditor alone. Gated by `NAGG_AUDITOR_ENABLED`. |
 | `NAGG_AUDITOR_UCASH_UPTIME_ENABLED` | `true` | Background uptime and metrics enrichment, paced 200ms between requests; no effect when ucash is disabled. |
 | `NAGG_AUDITOR_REFRESH` | `1h` | Delay between background passes after immediate boot warming; non-positive values use `1h`. Last successful roster is usable for at most 24h. |
-| `NAGG_AUDITOR_URL` | `https://api.audit.8333.space` | Legacy fallback auditor base URL. |
+| `NAGG_AUDITOR_URL` | `https://api.audit.8333.space` | Legacy auditor base URL; its roster is unioned with ucash's (deduped by normalized URL). Empty disables it. |
 | `NAGG_AUDITOR_LIMIT` | `200` | Maximum legacy roster size; non-positive values use `200`. Ucash pages independently, up to 20 pages. |
 
 For the mint service's app endpoints, set `NAGG_MODULES=mint,app` and

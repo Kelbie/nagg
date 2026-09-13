@@ -166,7 +166,9 @@ func TestUcashEnrichmentFailureKeepsRoster(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	fallback := clientFunc(func(context.Context) ([]Mint, error) { t.Error("enrichment failure invoked fallback"); return nil, nil })
+	// The legacy auditor is fetched on every pass for the union; here it
+	// contributes nothing, so the roster must still be the ucash row alone.
+	fallback := clientFunc(func(context.Context) ([]Mint, error) { return nil, nil })
 	d := NewDual(NewUcashClient(server.URL, "hash", true), fallback, time.Hour)
 	if err := d.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)

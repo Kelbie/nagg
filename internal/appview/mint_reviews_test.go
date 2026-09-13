@@ -15,10 +15,20 @@ import (
 // call, so the handler's parse/dedupe/average logic can be tested without CH.
 type mintReviewStore struct {
 	fakeStore
-	events []chstore.EventView
+	events     []chstore.EventView
+	scanLimits *[]uint64
 }
 
 func (s mintReviewStore) QueryEvents(context.Context, chstore.EventQueryInput) ([]chstore.EventView, error) {
+	return s.events, nil
+}
+
+// MintReviewEvents records the requested scan width so discover tests can pin
+// that the aggregate asks for the full review set, not a page.
+func (s mintReviewStore) MintReviewEvents(_ context.Context, limit uint64) ([]chstore.EventView, error) {
+	if s.scanLimits != nil {
+		*s.scanLimits = append(*s.scanLimits, limit)
+	}
 	return s.events, nil
 }
 

@@ -69,10 +69,16 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 ## Mint auditor refresh
 
 The `mint` module enables `NAGG_AUDITOR_ENABLED` by default. Its background
-worker tries `auditor.ucash.space` first and falls back to `api.audit.8333.space`
-when the availability probe or roster fetch fails, returns HTML/non-JSON, or
-returns no mints. It retries the primary on every pass, so recovery switches
-back automatically. No schema changes or extra worker services are needed.
+worker fetches BOTH `auditor.ucash.space` and `api.audit.8333.space` on every
+pass and publishes their union, deduped by normalized mint URL (lowercase,
+trailing slash trimmed). When both auditors know a mint the ucash row wins (it
+carries measured uptime and an upstream update time); mints only the legacy
+auditor tracks ride through with `auditSource: "8333"`. One auditor failing
+(probe error, HTML/non-JSON, empty roster) degrades to the other; a pass fails
+only when neither produced a roster. ucash tracks a small curated set (nine
+mints in 2026-09) while the legacy auditor lists ~65, so treating ucash as a
+replacement collapsed discovery to a fraction of the mints the app used to
+show. No schema changes or extra worker services are needed.
 
 The worker warms at boot and waits `NAGG_AUDITOR_REFRESH` (default `1h`) between
 passes. Discovery and the mint-info work-list read the last successful in-memory
@@ -80,7 +86,7 @@ snapshot without auditor network requests. Before warming, or after 24h without
 a successful roster fetch, discovery uses NIP-87 data only. Optional Redis
 response caching still follows the app-view cache policy.
 
-`NAGG_AUDITOR_UCASH_ENABLED=false` uses only the legacy fallback;
+`NAGG_AUDITOR_UCASH_ENABLED=false` uses only the legacy auditor;
 `NAGG_AUDITOR_UCASH_UPTIME_ENABLED=false` skips the optional per-mint uptime and
 latency calls. With enrichment enabled, requests are paced 200ms apart and the
 roster is available before enrichment finishes. The Leptos function suffix is
@@ -88,11 +94,13 @@ configured through `NAGG_AUDITOR_UCASH_FN_SUFFIX`; an outdated suffix fails over
 instead of accepting the app's HTML as audit data. See the
 [README env table](../README.md#deploy-on-railway) for URLs and defaults.
 
-Watch `auditor.source.changed` (`from`, `source`) when the selected source
-changes, including the initial selection. Each successful pass emits
-`auditor.refresh` with `source`, `mints`, and `uptimeEnriched` (number of rows
-with a measured uptime). Individual enrichment failures leave those optional
-fields absent; `auditor.refresh.failed` means neither roster was usable.
+Watch `auditor.source.changed` (`from`, `source`) when the contributing set
+changes, including the initial selection; `source` is `ucash+8333`, `ucash`, or
+`8333`. Each successful pass emits `auditor.refresh` with `source`, `mints`
+(merged total), `ucash` and `legacy` (per-auditor row counts before the merge),
+and `uptimeEnriched` (number of rows with a measured uptime). Individual
+enrichment failures leave those optional fields absent; `auditor.refresh.failed`
+means neither roster was usable.
 
 ## App configuration and ops
 
