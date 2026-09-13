@@ -106,6 +106,27 @@ func NewReader(store GlobalStore, source Source) *Reader {
 	return &Reader{store: store, source: source}
 }
 
+// LatestInfo returns the most recent reachable stored document, even when
+// subsequent checks failed. Discovery needs the full document, not history diffs.
+func (r *Reader) LatestInfo(ctx context.Context, rawMintURL string) (json.RawMessage, error) {
+	norm := NormalizeMintURL(rawMintURL)
+	obs, err := r.store.MintObservations(ctx, norm)
+	if err != nil {
+		return nil, err
+	}
+	for i := len(obs) - 1; i >= 0; i-- {
+		if !obs[i].Reachable || obs[i].Hash == "" {
+			continue
+		}
+		snaps, err := r.store.MintSnapshots(ctx, norm, []string{obs[i].Hash})
+		if err != nil {
+			return nil, err
+		}
+		return snaps[obs[i].Hash].Document, nil
+	}
+	return nil, nil
+}
+
 // globalChangeMintCap bounds how many changed mints a single global feed read
 // fans out over. Far above any realistic count of mints that have ever revised.
 const globalChangeMintCap = 500

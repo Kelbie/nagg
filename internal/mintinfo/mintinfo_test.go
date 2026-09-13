@@ -423,3 +423,22 @@ func TestReaderUnknownMintNotFound(t *testing.T) {
 		t.Fatalf("unknown mint: found=%v err=%v, want not found", found, err)
 	}
 }
+
+func TestLatestInfoUsesLatestReachableSnapshot(t *testing.T) {
+	store := newFakeStore()
+	store.snaps["https://mint"] = map[string][]byte{"old": []byte(`{"name":"old"}`), "new": []byte(`{"name":"new"}`)}
+	store.obs = []Observation{
+		{MintURL: "https://mint", Hash: "old", Reachable: true},
+		{MintURL: "https://mint", Hash: "new", Reachable: true},
+		{MintURL: "https://mint", Reachable: false},
+	}
+	reader := NewReader(store, CashuNUT06)
+	document, err := reader.LatestInfo(context.Background(), "https://MINT/")
+	if err != nil || string(document) != `{"name":"new"}` {
+		t.Fatalf("latest=%s err=%v", document, err)
+	}
+	document, err = reader.LatestInfo(context.Background(), "https://missing")
+	if err != nil || document != nil {
+		t.Fatalf("missing=%s err=%v", document, err)
+	}
+}

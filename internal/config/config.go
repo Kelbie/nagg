@@ -123,12 +123,17 @@ type AppVersionConfig struct {
 }
 
 // AuditorConfig configures the upstream cashu mint auditor client that powers
-// /nostr/mint/discover. URL empty (or Enabled false) leaves discovery
-// Nostr-only (reviews + operator social, no audit state / supported units).
+// /nostr/mint/discover. Enabled gates both upstreams; ucash is the primary and
+// URL/Limit configure the legacy 8333 fallback.
 type AuditorConfig struct {
-	URL     string
-	Enabled bool
-	Limit   int
+	UcashURL           string
+	UcashFnSuffix      string
+	UcashEnabled       bool
+	UcashUptimeEnabled bool
+	Refresh            time.Duration
+	URL                string
+	Enabled            bool
+	Limit              int
 }
 
 // RoutstrConfig configures the Routstr node catalog client behind
@@ -331,9 +336,14 @@ func Load() (Config, error) {
 			SyncThrottle:  parseDuration(env("NAGG_VERTEX_SYNC_THROTTLE", "0s")),
 		},
 		Auditor: AuditorConfig{
-			URL:     env("NAGG_AUDITOR_URL", "https://api.audit.8333.space"),
-			Enabled: parseBool(env("NAGG_AUDITOR_ENABLED", boolText(mintModule))),
-			Limit:   parseInt(env("NAGG_AUDITOR_LIMIT", "200")),
+			UcashURL:           env("NAGG_AUDITOR_UCASH_URL", "https://auditor.ucash.space"),
+			UcashFnSuffix:      env("NAGG_AUDITOR_UCASH_FN_SUFFIX", "5929181479826419594"),
+			UcashEnabled:       parseBool(env("NAGG_AUDITOR_UCASH_ENABLED", "true")),
+			UcashUptimeEnabled: parseBool(env("NAGG_AUDITOR_UCASH_UPTIME_ENABLED", "true")),
+			Refresh:            parseDuration(env("NAGG_AUDITOR_REFRESH", "1h")),
+			URL:                env("NAGG_AUDITOR_URL", "https://api.audit.8333.space"),
+			Enabled:            parseBool(env("NAGG_AUDITOR_ENABLED", boolText(mintModule))),
+			Limit:              parseInt(env("NAGG_AUDITOR_LIMIT", "200")),
 		},
 		AppVersion: AppVersionConfig{
 			LatestVersion: env("NAGG_APP_LATEST_VERSION", ""),

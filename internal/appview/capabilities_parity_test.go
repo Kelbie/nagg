@@ -1,7 +1,9 @@
 package appview
 
 import (
+	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/vertex-lab/nagg/internal/capabilities"
@@ -37,4 +39,19 @@ func TestCapabilitiesRouteParity(t *testing.T) {
 			t.Errorf("capabilities.AppViewRoutes advertises %q but Register does not mount it", p)
 		}
 	}
+}
+
+func TestCapabilitiesDiscoverUptime(t *testing.T) {
+	rec := httptest.NewRecorder()
+	capabilities.WriteHeaders(rec)
+	if !strings.Contains(rec.Header().Get("X-Nagg-Capabilities"), "appview.mint.discover.uptime") {
+		t.Fatal("uptime capability missing from headers")
+	}
+	info := capabilities.ServiceInfo()
+	for _, name := range info["capabilities"].([]string) {
+		if name == "appview.mint.discover.uptime" {
+			return
+		}
+	}
+	t.Fatal("uptime capability missing from manifest")
 }
