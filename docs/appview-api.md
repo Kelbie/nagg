@@ -107,6 +107,9 @@ Pubkey-keyed (profile-family routes):
 | GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) |
 | GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) |
 | GET | `/app/rates` | no | in-memory BTC fiat prices and source health; no params (§8) |
+| GET | `/app/wallpapers` | no | `{wallpapers, albums, lastUpdated}`; signed admin catalog (§8) |
+| GET | `/app/btcmap/places` | no | BTC Map v4 place array; sync query params (§8) |
+| GET | `/app/btcmap/places/{id}` | no | BTC Map v4 place object, including requested `osm:*` fields (§8) |
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
@@ -392,10 +395,12 @@ most once per successful catalog refresh, deduplicated by the catalog's internal
 `UpdatedAt` timestamp. Repeated reads or stale serves do not repeat the warning.
 Capability `app.aiLineup.pinsMissing` advertises this field.
 
-GET responses under `/app/*` (and `/v1/app/*`) use 60 seconds fresh / 24 hours
-stale in the server response cache, including `/app/rates`. During the
-stale window, the previous payload can be served while background revalidation
-runs. Successful cached app responses send `Cache-Control: public, max-age=60`.
+GET responses under `/app/*` (and `/v1/app/*`) normally use 60 seconds fresh /
+24 hours stale in the server response cache, including `/app/rates`. BTC Map
+uses 1h fresh / 24h stale instead; wallpapers bypass this cache and enforce
+their own 24h snapshot expiry. During the stale window, the previous payload
+can be served while background revalidation runs. Successful cached app
+responses send `Cache-Control: public, max-age=60`, or `max-age=3600` for BTC Map.
 POST bypasses the server response cache.
 
 
@@ -513,3 +518,93 @@ are three uppercase letters. Duplicate `(id, currency)` entries are ignored
 (first wins). Invalid JSON or invalid entries emit startup warnings without
 their contents. Disabling `NAGG_RATES_HTTP_ENABLED` excludes all HTTP sources,
 including extras. None of this feature reads or writes ClickHouse.
+
+
+### Wallpapers and BTC Map
+
+These `app` module routes also mount under `/v1/app/*`. They work on a
+`NAGG_MODULES=mint,app` deployment without social event routes or new tables.
+`vertex` is a DVM plugin, not a valid `NAGG_MODULES` value in this branch; retain
+its existing plugin configuration separately.
+
+`GET /app/wallpapers` (capability `app.wallpapers`) returns:
+
+```json
+{
+  "wallpapers": [{
+    "eventId": "<event-id>", "themeName": "sunset", "displayName": "Sunset",
+    "blossomUrl": "https://example.com/sunset.jpg",
+    "thumbUrl": "https://example.com/sunset-thumb.jpg",
+    "sha256": "<sha256>", "fileSize": 12345, "dimensions": "1080x1920",
+    "albumSlug": "nature", "palette": {}, "dominantColors": [],
+    "gradientColors": [], "createdAt": 1789257600
+  }],
+  "albums": [{"slug": "nature", "displayName": "Nature", "description": "",
+    "sortOrder": 0, "topic": "Other", "coverThemeName": "sunset"}],
+  "lastUpdated": 1789257600000
+}
+```
+
+`createdAt` is event time in Unix seconds; `lastUpdated` is successful refresh
+time in Unix milliseconds. The default publisher is the app's Sovran support
+public key, configurable as hex or npub. The worker queries the latest
+kind-30078 `d=wallpaper-catalog` and up to 500 kind-1063 `t=wallpaper` events
+per relay. Signatures are checked by `relayquery`; author, kind, tags and future
+timestamps are checked again by the catalog builder. Files deduplicate by
+`theme_name`, newest first (lowest event ID breaks timestamp ties).
+
+File tags map as follows: `theme_name` → `themeName`, `title` → `displayName`
+(fallback theme name), `url` → `blossomUrl`, `thumb` → `thumbUrl` (fallback full
+URL), `x` → `sha256`, `size` → `fileSize`, `dim` → `dimensions`, and `l` with
+namespace `money.sovran.wallpaper` → `albumSlug` (fallback `uncategorized`).
+`palette`, `dominant_colors`, and `gradient_colors` contain JSON color metadata;
+invalid colors are omitted. Unknown tags and undeclared nested fields are
+never exposed. Invalid required file fields are skipped. Albums come from the
+latest catalog event's `content.albums`; if none are supplied, they are derived
+from wallpaper slugs. Optional `topic` defaults to `Other`. A malformed catalog
+or an empty wallpaper pass preserves the previous snapshot without extending
+its age.
+
+The worker runs immediately and every `NAGG_WALLPAPERS_INTERVAL` (default 1h).
+Cold, disabled, or 24h-expired catalogs return JSON 503. Successful responses
+send `Cache-Control: public, max-age=300`. The snapshot bypasses Redis/response
+caching so repeated reads cannot extend its stale deadline.
+
+`GET /app/btcmap/places` and `GET /app/btcmap/places/{id}` (capability
+`app.btcmap`) proxy the [BTC Map v4 places API](https://github.com/teambtcmap/btcmap-api/blob/master/docs/rest/v4/places.md).
+IDs accept digits or `node:`, `way:`, `relation:` followed by digits. Query
+parameters `fields`, `updated_since`, `include_deleted`, and `limit` pass
+through; other parameters are ignored (`refresh` remains a nagg cache hint).
+The app currently supplies no query parameters. The list therefore defaults
+to `fields=id,lat,lon,icon,comments,boosted_until,deleted_at,updated_at` and
+`include_deleted=false`. Detail defaults add contact, address, payment, OSM,
+and verification fields consumed by the app. An explicit `fields` overrides
+the defaults. Valid JSON arrays/objects pass through without an envelope,
+including colon-keyed `osm:*` fields.
+
+The HTTP client uses an 8s timeout, a 4 MiB **decoded response** limit, and no
+redirects. Upstream 400/404/429 remain 400/404/429; timeouts become 504; other
+upstream, malformed JSON, wrong envelope, and size-limit failures become 502.
+Disabled routes return 503. Errors expose fixed categories, never upstream
+bodies. The response cache uses 1h fresh plus 24h stale, only stores successful
+responses, and sends `Cache-Control: public, max-age=3600` on misses and hits.
+Both endpoints allow GET only (405 with `Allow: GET` otherwise).
+
+**Current full-list limitation:** a public upstream check during implementation
+returned 5,261,223 decoded bytes for the default list, exceeding the requested
+4 MiB cap. Such requests return 502. Bounded `limit`/`updated_since` requests
+work; moving the existing unpaginated app call requires increasing the cap or
+coordinating client pagination. No list is silently truncated.
+
+Operator configuration: no new variables are required when `app` is enabled.
+`NAGG_WALLPAPERS_ENABLED=true` and `NAGG_BTCMAP_ENABLED=true` explicitly enable
+the defaults. Keep `NAGG_WALLPAPERS_RELAYS` unset to inherit `NAGG_RELAYS`, or
+set it to relays carrying the admin events. Do not change stored/firehose kinds.
+
+After the orchestrator deploys:
+
+```sh
+curl -s https://nagg.up.railway.app/app/wallpapers | jq '.albums|length'
+curl -s 'https://nagg.up.railway.app/app/btcmap/places?limit=100' | jq 'length'
+curl -s 'https://nagg.up.railway.app/app/btcmap/places/23143' | jq '{id,lat,lon,icon}'
+```

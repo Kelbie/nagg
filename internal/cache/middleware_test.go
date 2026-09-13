@@ -177,6 +177,12 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 func TestAppCachePolicy(t *testing.T) {
+	for _, path := range []string{"/app/btcmap/places", "/app/btcmap/places/42", "/v1/app/btcmap/places", "/v1/app/btcmap/places/42"} {
+		fresh, stale := restCachePolicy(path, time.Second, time.Second)
+		if fresh != time.Hour || stale != 24*time.Hour {
+			t.Fatalf("Btcmap %s: fresh=%s stale=%s", path, fresh, stale)
+		}
+	}
 	for _, path := range []string{"/app/latest-version", "/app/ai-lineup", "/app/rates", "/v1/app/latest-version", "/v1/app/ai-lineup", "/v1/app/rates"} {
 		fresh, stale := restCachePolicy(path, time.Second, time.Second)
 		if fresh != time.Minute || stale != 24*time.Hour {
@@ -185,6 +191,36 @@ func TestAppCachePolicy(t *testing.T) {
 	}
 	if fresh, stale := restCachePolicy("/other", time.Second, 2*time.Second); fresh != time.Second || stale != 2*time.Second {
 		t.Fatalf("fallback policy = (%s, %s)", fresh, stale)
+	}
+}
+
+func TestBtcmapStaleCacheSurvivesUpstreamFailure(t *testing.T) {
+	for _, path := range []string{"/app/btcmap/places", "/v1/app/btcmap/places/42"} {
+		mc := newMemCache()
+		key := RESTKey(http.MethodGet, path, "", "")
+		body := []byte(`[{"id":42}]`)
+		mc.Set(context.Background(), key, encodeEnvelope(time.Now().Add(-2*time.Hour), body), 25*time.Hour)
+		done := make(chan struct{})
+		handler := WrapREST(func(w http.ResponseWriter, r *http.Request) {
+			defer close(done)
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":"Bad Gateway"}`))
+		}, mc, time.Second, time.Second)
+		rec := httptest.NewRecorder()
+		handler(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != 200 || rec.Header().Get("X-Nagg-Cache") != "stale" || rec.Header().Get("Cache-Control") != "public, max-age=3600" || rec.Body.String() != string(body) {
+			t.Fatalf("stale %s: %d %v %s", path, rec.Code, rec.Header(), rec.Body)
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("revalidation not attempted")
+		}
+		cached, _ := mc.Get(context.Background(), key)
+		_, cachedBody, _ := decodeEnvelope(cached)
+		if string(cachedBody) != string(body) {
+			t.Fatal("failure replaced good response")
+		}
 	}
 }
 
