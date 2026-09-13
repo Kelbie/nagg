@@ -16,6 +16,8 @@ var Names = []string{
 	"appview.mint.discover.uptime",
 	"app.aiLineup.pinsMissing",
 	"app.rates",
+	"app.wallpapers",
+	"app.btcmap",
 	"app.latestVersion.minVersion",
 	"graphql.events",
 	"graphql.relayHydration",
@@ -92,6 +94,9 @@ var AppViewRoutes = []string{
 	"/app/latest-version",
 	"/app/ai-lineup",
 	"/app/rates",
+	"/app/wallpapers",
+	"/app/btcmap/places",
+	"/app/btcmap/places/{id}",
 }
 
 // ServiceInfo advertises the full declared surface — every route a deployment

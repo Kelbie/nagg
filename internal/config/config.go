@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/vertex-lab/nagg/internal/btcmap"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/enrich"
@@ -22,6 +24,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
+	"github.com/vertex-lab/nagg/internal/wallpapers"
 )
 
 type Config struct {
@@ -58,6 +61,8 @@ type Config struct {
 	Routstr     RoutstrConfig
 	MintInfo    MintInfoConfig
 	Rates       RatesConfig
+	Wallpapers  WallpapersConfig
+	Btcmap      BtcmapConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -83,6 +88,17 @@ type Config struct {
 	// (/nostr/mint/history) is served whenever that module is enabled; this only
 	// gates the background poller.
 	RunMintInfo bool
+}
+
+type WallpapersConfig struct {
+	Enabled bool
+	Relays  []string
+	wallpapers.Config
+}
+
+type BtcmapConfig struct {
+	Enabled bool
+	URL     string
 }
 
 // RatesConfig gates and configures the in-memory BTC fiat worker.
@@ -422,6 +438,18 @@ func Load() (Config, error) {
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
 		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
 		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
+		Wallpapers: WallpapersConfig{
+			Enabled: parseBool(env("NAGG_WALLPAPERS_ENABLED", boolText(mods.Has(modules.App)))),
+			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_WALLPAPERS_RELAYS", ""))),
+			Config: wallpapers.Config{
+				Interval:    parseDuration(env("NAGG_WALLPAPERS_INTERVAL", "1h")),
+				AdminPubkey: parseWallpapersPubkey(env("NAGG_WALLPAPERS_ADMIN_PUBKEY", wallpapers.DefaultAdminPubkey)),
+			},
+		},
+		Btcmap: BtcmapConfig{
+			Enabled: parseBool(env("NAGG_BTCMAP_ENABLED", boolText(mods.Has(modules.App)))),
+			URL:     env("NAGG_BTCMAP_URL", btcmap.DefaultURL),
+		},
 		Rates: RatesConfig{
 			Enabled:     parseBool(env("NAGG_RATES_ENABLED", boolText(mods.Has(modules.App)))),
 			HTTPEnabled: parseBool(env("NAGG_RATES_HTTP_ENABLED", "true")),
@@ -449,6 +477,9 @@ func Load() (Config, error) {
 		},
 	}
 
+	if len(cfg.Wallpapers.Relays) == 0 {
+		cfg.Wallpapers.Relays = append([]string(nil), cfg.Firehose.Relays...)
+	}
 	cfg.Rates.Sources = rates.LoadSources(env("NAGG_RATES_EXTRA_SOURCES", ""), cfg.Rates.HTTPEnabled, slog.Default())
 	if len(cfg.Rates.Relays) == 0 {
 		cfg.Rates.Relays = append([]string(nil), cfg.Firehose.Relays...)
@@ -464,6 +495,16 @@ func Load() (Config, error) {
 }
 
 func (c Config) validate() error {
+	if c.Wallpapers.Interval <= 0 {
+		return errors.New("NAGG_WALLPAPERS_INTERVAL must be a positive duration")
+	}
+	if c.Wallpapers.AdminPubkey == "" {
+		return errors.New("NAGG_WALLPAPERS_ADMIN_PUBKEY must be a hex public key or npub")
+	}
+	u, err := url.Parse(c.Btcmap.URL)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("NAGG_BTCMAP_URL must be an HTTP(S) base URL without credentials, query or fragment")
+	}
 	if c.Rates.Interval <= 0 || c.Rates.MaxAge <= 0 || c.Rates.StaleFor <= 0 {
 		return errors.New("NAGG_RATES_INTERVAL, NAGG_RATES_MAX_AGE and NAGG_RATES_STALE_FOR must be positive durations")
 	}
@@ -749,4 +790,24 @@ func parseRoutstrAuthMode(value string) string {
 		slog.Warn("config.routstr_auth_mode.invalid", "env", "NAGG_ROUTSTR_AUTH_MODE")
 		return ""
 	}
+}
+
+func parseWallpapersPubkey(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "npub1") {
+		prefix, decoded, err := nip19.Decode(value)
+		if err != nil || prefix != "npub" {
+			return ""
+		}
+		var ok bool
+		value, ok = decoded.(string)
+		if !ok {
+			return ""
+		}
+	}
+	b, err := hex.DecodeString(value)
+	if err != nil || len(b) != 32 {
+		return ""
+	}
+	return strings.ToLower(value)
 }

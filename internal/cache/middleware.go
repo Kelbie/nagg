@@ -141,6 +141,12 @@ func WrapREST(next http.HandlerFunc, c Cache, defaultTTL, staleFor time.Duration
 			next(w, r)
 			return
 		}
+		// Wallpapers already own a bounded in-memory snapshot. Caching it
+		// here would reset its age and could serve it beyond its 24h expiry.
+		if strings.TrimPrefix(r.URL.Path, "/v1") == "/app/wallpapers" {
+			next(w, r)
+			return
+		}
 		viewer := ""
 		if pk := r.URL.Query().Get("pubkey"); isHex64(pk) {
 			viewer = strings.ToLower(pk)
@@ -305,6 +311,8 @@ func restCachePolicy(path string, defFresh, defStale time.Duration) (fresh, stal
 	switch {
 	case strings.HasSuffix(path, "/vertex/relay"):
 		return 0, 0
+	case strings.HasPrefix(strings.TrimPrefix(path, "/v1"), "/app/btcmap/"):
+		return time.Hour, 24 * time.Hour
 	case isAppPath(path):
 		return time.Minute, 24 * time.Hour
 	case strings.Contains(path, "/dm/"):

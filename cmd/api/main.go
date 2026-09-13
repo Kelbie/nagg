@@ -17,6 +17,7 @@ import (
 
 	"github.com/vertex-lab/nagg/internal/appview"
 	"github.com/vertex-lab/nagg/internal/auditor"
+	"github.com/vertex-lab/nagg/internal/btcmap"
 	"github.com/vertex-lab/nagg/internal/cache"
 	"github.com/vertex-lab/nagg/internal/chgate"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -35,6 +36,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/runtimelimits"
 	"github.com/vertex-lab/nagg/internal/safego"
 	"github.com/vertex-lab/nagg/internal/vertex"
+	"github.com/vertex-lab/nagg/internal/wallpapers"
 )
 
 const apiInitializationRetryDelay = 10 * time.Second
@@ -398,6 +400,14 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		safego.Go("api.mintinfo", func() { snapshotter.Run(ctx) })
 		slog.Info("mint info snapshotter enabled",
 			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
+	}
+	if cfg.Wallpapers.Enabled {
+		service := wallpapers.NewService(cfg.Wallpapers.Config, relayquery.Client{Relays: cfg.Wallpapers.Relays}, logger)
+		appviewOpts = append(appviewOpts, appview.WithWallpapers(service))
+		safego.Go("api.wallpapers", func() { service.Run(ctx) })
+	}
+	if cfg.Btcmap.Enabled {
+		appviewOpts = append(appviewOpts, appview.WithBtcmap(btcmap.NewClient(cfg.Btcmap.URL)))
 	}
 	if cfg.Rates.Enabled {
 		rateService := rates.NewService(cfg.Rates.Config, relayquery.Client{Relays: cfg.Rates.Relays}, rates.NewHTTPFetcher(), logger)

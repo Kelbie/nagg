@@ -361,6 +361,12 @@ App configuration and operational variables:
 | `NAGG_RATES_RELAYS` | `NAGG_RELAYS` | Comma-separated relay URLs for signed kind-1 bot queries; independent of ingested/stored kinds. |
 | `NAGG_RATES_HTTP_ENABLED` | `true` | Enable mempool.space HTTP cross-checks and GBP fallback; one request per URL per pass, 8s timeout, 64 KiB cap. |
 | `NAGG_RATES_EXTRA_SOURCES` | empty | JSON array of additional source declarations; hex/npub keys normalized at load. Invalid JSON/entries warn and are ignored. See [source schema](docs/appview-api.md#btc-fiat-rates). |
+| `NAGG_WALLPAPERS_ENABLED` | `app` module enabled | Run the in-memory signed wallpaper catalog worker; disabled/cold/expired returns 503. No ClickHouse storage. |
+| `NAGG_WALLPAPERS_RELAYS` | `NAGG_RELAYS` | Comma-separated relay URLs for admin kinds 30078 and 1063, independent of stored/subscribed kinds. |
+| `NAGG_WALLPAPERS_INTERVAL` | `1h` | Positive refresh interval; first pass runs at boot. Last successful catalog expires after 24h. |
+| `NAGG_WALLPAPERS_ADMIN_PUBKEY` | `1e53e900c3bbc5ead295215efe27b2c8d5fbd15fb3dd810da3063674cb7213b2` | Sovran support/admin public key from the app; accepts 64-hex or npub. Invalid values fail startup. |
+| `NAGG_BTCMAP_ENABLED` | `app` module enabled | Enable the public BTC Map places proxy; disabled returns 503. |
+| `NAGG_BTCMAP_URL` | `https://api.btcmap.org` | HTTP(S) base URL; proxy appends `/v4/places` or `/v4/places/{id}`. No credentials, query or fragment. 8s timeout, 4 MiB response cap. |
 | `NAGG_LOG_LEVEL` | `info` | All five service binaries: `debug`, `info`, `warn`, or `error`. Invalid values fall back to `info` with one startup warning. |
 | `NAGG_RATE_LIMIT_PER_MIN` | `120` | REST requests per client IP per minute; invalid or non-positive values use `120`. |
 | `NAGG_VERTEX_RELAY_ENABLED` | `vertex` or `nostr` enabled | Enable client-signed relay and signed read refreshes; no private key required. |

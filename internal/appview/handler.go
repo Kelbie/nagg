@@ -87,6 +87,8 @@ type Handler struct {
 	auditor                   AuditorClient
 	mintInfo                  MintHistoryProvider
 	rates                     RatesProvider
+	wallpapers                WallpapersProvider
+	btcmap                    BtcmapClient
 	appLatestVersion          string
 	appUpdateMessage          string
 	appMinVersion             string
@@ -412,6 +414,9 @@ func (h *Handler) routes() []route {
 		{"/app/latest-version", h.latestVersion, false, modules.App},
 		{"/app/ai-lineup", h.aiLineup, false, modules.App},
 		{"/app/rates", h.appRates, false, modules.App},
+		{"/app/wallpapers", h.appWallpapers, false, modules.App},
+		{"/app/btcmap/places", h.appBtcmap, false, modules.App},
+		{"/app/btcmap/places/{id}", h.appBtcmap, false, modules.App},
 	}
 }
 

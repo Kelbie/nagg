@@ -21,7 +21,7 @@ Unset means every module — production's behavior, unchanged.
 | `nostr` | the social app-view — feed, thread, notifications, DMs, profiles, search, follows, social graph, ranking; the enricher, the rollup, retention, the relevance tracker; GraphQL |
 | `mint` | the cashu mint observatory — `/nostr/mint/{reviews,discover,history,changes}`, the `/mint-changes` page, the NUT-06 snapshotter, the auditor client |
 | `vertex` | client-signed Vertex DVM relay; shared profile/search/recommended reads (also owned by `nostr`); optional trickle sync; existing plugin caches |
-| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr), `/app/rates` (BTC fiat) |
+| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr), `/app/rates` (BTC fiat), `/app/wallpapers`, `/app/btcmap/places` and `/app/btcmap/places/{id}` |
 
 ## What each module changes
 
@@ -63,6 +63,8 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 | `NAGG_ROUTSTR_ENABLED` | `app` |
 | `NAGG_RATES_ENABLED` | `app` |
 | `NAGG_VERTEX_RELAY_ENABLED` | `vertex` or `nostr` |
+| `NAGG_WALLPAPERS_ENABLED` | `app` |
+| `NAGG_BTCMAP_ENABLED` | `app` (request-time HTTP client, no periodic job) |
 
 ## Mint auditor refresh
 
@@ -95,7 +97,8 @@ fields absent; `auditor.refresh.failed` means neither roster was usable.
 ## App configuration and ops
 
 `NAGG_MODULES=mint,app` mounts both `/app/latest-version` (GET/POST) and
-`/app/ai-lineup` and `/app/rates` (GET), including their `/v1/app/*` aliases. Adding `app` adds
+`/app/ai-lineup`, `/app/rates`, `/app/wallpapers`, and `/app/btcmap/places`
+(list and individual place GETs), including their `/v1/app/*` aliases. Adding `app` adds
 no ClickHouse migrations, tables, or social workers: the mint rule registry,
 stored kinds, and firehose kinds stay the same. The version endpoint reads only
 configuration. AI lineup uses the Routstr HTTP client, enabled by default for
@@ -120,8 +123,25 @@ added through the source registry or `NAGG_RATES_EXTRA_SOURCES`. The endpoint
 returns 503 before warming or when all retained prices expire; disabling the
 worker also leaves it at 503. `rates.pass` logs per-source health every pass.
 
+The wallpaper worker queries signed kind-30078 (`d=wallpaper-catalog`) and
+kind-1063 (`t=wallpaper`) events from the configured admin directly through
+`relayquery`. It warms at boot and refreshes hourly; the in-memory catalog is
+usable for 24h after its last successful refresh. Empty or failed passes do not
+reset that deadline. The route returns 503 before warmup, when disabled, or
+when expired, and sends `Cache-Control: public, max-age=300` on success. It
+bypasses the response cache to preserve that deadline. `wallpapers.refresh`
+logs catalog counts; `wallpapers.refresh.failed` logs a fixed failure category.
+No `nostr` module, event-query route, schema change, or `NAGG_KINDS` change is
+needed.
+
+BTC Map uses a bounded HTTP client to `/v4/places` with app-compatible default
+fields and `include_deleted=false`. The existing response cache gives it 1h
+fresh / 24h stale, including versioned aliases. It needs no worker or Redis;
+the normal memory cache works when Redis is absent. See the
+[API details and size limit](appview-api.md#wallpapers-and-btc-map).
+
 `NAGG_APP_LATEST_VERSION`, `NAGG_APP_UPDATE_MESSAGE`, and `NAGG_APP_MIN_VERSION`
-configure the version response (all default empty). GET `/app/*` responses use
+configure the version response (all default empty). Other GET `/app/*` responses use
 60 seconds fresh / 24 hours stale in the response cache. The latest-version
 response also sends `Cache-Control: public, max-age=60` for GET and POST.
 
