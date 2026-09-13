@@ -53,9 +53,10 @@ type Store interface {
 // the GraphQL rankedEvents resolver. The REST handler decodes the request body
 // into the same map shape the GraphQL `rankedEvents(input: ...)` field accepts
 // and hands it to RankedEventViews, so both transports produce identical
-// ranking for identical input. When nil, the ranked-feed route returns 503.
+// ranking for identical input. It also returns the effective page limit used by
+// the ranker. When nil, the ranked-feed route returns 503.
 type RankedFeedProvider interface {
-	RankedEventViews(context.Context, any) ([]chstore.EventView, error)
+	RankedEventViews(context.Context, any) ([]chstore.EventView, uint64, error)
 }
 
 type Handler struct {
@@ -563,7 +564,7 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 
 	authors := h.authorsFromFeedRequest(r.Context(), req.Spec, req.UserPubKey, r)
 	if len(authors) == 0 {
-		h.writeFeedEnvelope(w, r, nil, orderByCreatedAt)
+		h.writeFeedEnvelope(w, r, nil, orderByCreatedAt, req.Limit)
 		return
 	}
 	var events []chstore.EventView
@@ -584,7 +585,11 @@ func (h *Handler) feed(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	h.writeFeedEnvelope(w, r, events, orderByCreatedAt)
+	// Match FollowsFeed's normalization so pagination reflects the queried page.
+	if req.Limit == 0 || req.Limit > 100 {
+		req.Limit = 30
+	}
+	h.writeFeedEnvelope(w, r, events, orderByCreatedAt, req.Limit)
 }
 
 // authorsFromFeedRequest resolves whose events the feed returns. An explicit
@@ -692,7 +697,12 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 				"before", coldCount, "ms", time.Since(backfillStart).Milliseconds())
 		}
 	}
-	h.writeFeedEnvelope(w, r, events, orderByCreatedAt)
+	// Omitted limits default to 50; explicit out-of-range limits use the
+	// store's existing fallback of 30.
+	if limit == 0 || limit > 100 {
+		limit = 30
+	}
+	h.writeFeedEnvelope(w, r, events, orderByCreatedAt, limit)
 }
 
 func (h *Handler) shouldBackfillUserFeed(events []chstore.EventView, until int64, limit uint64, offset uint64) bool {
@@ -735,12 +745,12 @@ func (h *Handler) rankedFeed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	events, err := h.ranker.RankedEventViews(r.Context(), input)
+	events, limit, err := h.ranker.RankedEventViews(r.Context(), input)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	h.writeFeedEnvelope(w, r, events, orderByRank)
+	h.writeFeedEnvelope(w, r, events, orderByRank, limit)
 }
 
 // NotificationActor is one participant in a grouped notification (a follower /

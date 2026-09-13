@@ -28,12 +28,14 @@ func NewRanker(store Store, opts ...Option) *Ranker {
 
 // RankedEventViews parses the raw ranked-events input (the exact same map shape
 // the GraphQL `rankedEvents(input: ...)` field accepts) and runs the shared
-// ranking core, returning the ordered events. The REST handler enriches these
-// into its FeedResponse; the GraphQL resolver wraps them in an event connection.
-func (r *Ranker) RankedEventViews(ctx context.Context, raw any) ([]chstore.EventView, error) {
+// ranking core, returning the ordered events and the effective page limit. The
+// REST handler enriches these into its FeedPageEnvelope; the GraphQL resolver
+// wraps them in an event connection.
+func (r *Ranker) RankedEventViews(ctx context.Context, raw any) ([]chstore.EventView, uint64, error) {
 	input, err := r.resolver.parseRankedEventsInput(ctx, raw)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return r.resolver.rankedEventViews(ctx, input)
+	events, err := r.resolver.rankedEventViews(ctx, input)
+	return events, uint64(input.Limit), err
 }
