@@ -22,7 +22,13 @@ func noticeError(event *nostr.Event) error {
 		if len(tag) >= 2 && tag[0] == "status" {
 			status := strings.ToLower(strings.Join(tag[1:], " ") + " " + dvmNoticeMessage(event))
 			status = strings.NewReplacer("_", " ", "-", " ").Replace(status)
-			if strings.Contains(status, "insufficient") && (strings.Contains(status, "credit") || strings.Contains(status, "balance")) {
+			// Vertex phrases this as "you don't have enough credits to fulfil the
+			// request" (observed 2026-09-13); older builds said "insufficient credits".
+			outOfFunds := strings.Contains(status, "insufficient") ||
+				strings.Contains(status, "not enough") ||
+				strings.Contains(status, "enough credit") ||
+				strings.Contains(status, "no credit")
+			if outOfFunds && (strings.Contains(status, "credit") || strings.Contains(status, "balance")) {
 				return ErrInsufficientCredits
 			}
 		}
