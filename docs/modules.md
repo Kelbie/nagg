@@ -20,7 +20,7 @@ Unset means every module — production's behavior, unchanged.
 | `core` | always on, never named: the ingestion tables (`nostr_events`, `event_tags`, `event_seen_relays`), the migration ledger, `relay_backfill_state`, the system-log bounds, `/nostr/capabilities` |
 | `nostr` | the social app-view — feed, thread, notifications, DMs, profiles, search, follows, social graph, ranking; the enricher, the rollup, retention, the relevance tracker; GraphQL |
 | `mint` | the cashu mint observatory — `/nostr/mint/{reviews,discover,history,changes}`, the `/mint-changes` page, the NUT-06 snapshotter, the auditor client |
-| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr) |
+| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr), `/app/rates` (BTC fiat) |
 
 ## What each module changes
 
@@ -60,6 +60,7 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 | `NAGG_RUN_MINT_INFO` | `mint` |
 | `NAGG_AUDITOR_ENABLED` | `mint` |
 | `NAGG_ROUTSTR_ENABLED` | `app` |
+| `NAGG_RATES_ENABLED` | `app` |
 
 ## Mint auditor refresh
 
@@ -92,7 +93,7 @@ fields absent; `auditor.refresh.failed` means neither roster was usable.
 ## App configuration and ops
 
 `NAGG_MODULES=mint,app` mounts both `/app/latest-version` (GET/POST) and
-`/app/ai-lineup` (GET), including their `/v1/app/*` aliases. Adding `app` adds
+`/app/ai-lineup` and `/app/rates` (GET), including their `/v1/app/*` aliases. Adding `app` adds
 no ClickHouse migrations, tables, or social workers: the mint rule registry,
 stored kinds, and firehose kinds stay the same. The version endpoint reads only
 configuration. AI lineup uses the Routstr HTTP client, enabled by default for
@@ -107,6 +108,15 @@ if every node fails, the last catalog remains available regardless of age.
 See the [env defaults](../README.md#deploy-on-railway) and
 [operator checks](appview-api.md#ai-lineup-operator-checks).
 If Routstr is explicitly disabled, AI lineup returns 503.
+
+The rates worker fetches signed price-bot notes directly from
+`NAGG_RATES_RELAYS` (default `NAGG_RELAYS`) and cross-checks with mempool.space
+HTTP prices. It runs immediately and hourly by default, stores only in memory,
+and never inserts relay notes into ClickHouse. There is no reason to change
+`NAGG_KINDS` or `NAGG_FIREHOSE_KINDS` for rates. GBP uses HTTP until a bot is
+added through the source registry or `NAGG_RATES_EXTRA_SOURCES`. The endpoint
+returns 503 before warming or when all retained prices expire; disabling the
+worker also leaves it at 503. `rates.pass` logs per-source health every pass.
 
 `NAGG_APP_LATEST_VERSION`, `NAGG_APP_UPDATE_MESSAGE`, and `NAGG_APP_MIN_VERSION`
 configure the version response (all default empty). GET `/app/*` responses use

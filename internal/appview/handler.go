@@ -82,6 +82,7 @@ type Handler struct {
 	ranker                    RankedFeedProvider
 	auditor                   AuditorClient
 	mintInfo                  MintHistoryProvider
+	rates                     RatesProvider
 	appLatestVersion          string
 	appUpdateMessage          string
 	appMinVersion             string
@@ -405,6 +406,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/recommended", h.recommended, false, modules.Nostr},
 		{"/app/latest-version", h.latestVersion, false, modules.App},
 		{"/app/ai-lineup", h.aiLineup, false, modules.App},
+		{"/app/rates", h.appRates, false, modules.App},
 	}
 }
 

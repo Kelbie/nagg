@@ -18,6 +18,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/modules"
+	"github.com/vertex-lab/nagg/internal/rates"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/rules"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -56,6 +57,7 @@ type Config struct {
 	AppVersion  AppVersionConfig
 	Routstr     RoutstrConfig
 	MintInfo    MintInfoConfig
+	Rates       RatesConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -81,6 +83,14 @@ type Config struct {
 	// (/nostr/mint/history) is served whenever that module is enabled; this only
 	// gates the background poller.
 	RunMintInfo bool
+}
+
+// RatesConfig gates and configures the in-memory BTC fiat worker.
+type RatesConfig struct {
+	Enabled     bool
+	HTTPEnabled bool
+	Relays      []string
+	rates.Config
 }
 
 // MintInfoConfig parameterizes the mint-info snapshotter (internal/mintinfo):
@@ -399,6 +409,16 @@ func Load() (Config, error) {
 		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
 		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
 		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
+		Rates: RatesConfig{
+			Enabled:     parseBool(env("NAGG_RATES_ENABLED", boolText(mods.Has(modules.App)))),
+			HTTPEnabled: parseBool(env("NAGG_RATES_HTTP_ENABLED", "true")),
+			Relays:      relayquery.SanitizeRelays(splitCSV(env("NAGG_RATES_RELAYS", ""))),
+			Config: rates.Config{
+				Interval: parseDuration(env("NAGG_RATES_INTERVAL", "1h")),
+				MaxAge:   parseDuration(env("NAGG_RATES_MAX_AGE", "6h")),
+				StaleFor: parseDuration(env("NAGG_RATES_STALE_FOR", "24h")),
+			},
+		},
 		MintInfo: MintInfoConfig{
 			Interval: parseDuration(env("NAGG_MINT_INFO_INTERVAL", "1h")),
 			MinAge:   parseDuration(env("NAGG_MINT_INFO_MIN_AGE", "24h")),
@@ -416,6 +436,10 @@ func Load() (Config, error) {
 		},
 	}
 
+	cfg.Rates.Sources = rates.LoadSources(env("NAGG_RATES_EXTRA_SOURCES", ""), cfg.Rates.HTTPEnabled, slog.Default())
+	if len(cfg.Rates.Relays) == 0 {
+		cfg.Rates.Relays = append([]string(nil), cfg.Firehose.Relays...)
+	}
 	if cfg.API.RateLimitPerMinute <= 0 {
 		cfg.API.RateLimitPerMinute = 120
 	}
@@ -427,6 +451,9 @@ func Load() (Config, error) {
 }
 
 func (c Config) validate() error {
+	if c.Rates.Interval <= 0 || c.Rates.MaxAge <= 0 || c.Rates.StaleFor <= 0 {
+		return errors.New("NAGG_RATES_INTERVAL, NAGG_RATES_MAX_AGE and NAGG_RATES_STALE_FOR must be positive durations")
+	}
 	if _, _, err := net.SplitHostPort(c.ClickHouse.Addr); err != nil {
 		return fmt.Errorf("NAGG_CLICKHOUSE_ADDR: %w", err)
 	}

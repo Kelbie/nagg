@@ -31,7 +31,7 @@ const (
 	// Mint is the cashu mint observatory: NUT-06 snapshots over time, the
 	// ecosystem changelog, the auditor merge, NIP-87 reviews and discovery.
 	Mint Module = "mint"
-	// App is the client-config surface: /app/latest-version, /app/ai-lineup.
+	// App is the client-config surface: /app/latest-version, /app/ai-lineup, /app/rates.
 	App Module = "app"
 )
 

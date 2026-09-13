@@ -27,6 +27,8 @@ import (
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/mintinfo"
 	"github.com/vertex-lab/nagg/internal/modules"
+	"github.com/vertex-lab/nagg/internal/rates"
+	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/relevance"
 	"github.com/vertex-lab/nagg/internal/rollup"
 	"github.com/vertex-lab/nagg/internal/routstr"
@@ -391,6 +393,11 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		safego.Go("api.mintinfo", func() { snapshotter.Run(ctx) })
 		slog.Info("mint info snapshotter enabled",
 			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
+	}
+	if cfg.Rates.Enabled {
+		rateService := rates.NewService(cfg.Rates.Config, relayquery.Client{Relays: cfg.Rates.Relays}, rates.NewHTTPFetcher(), logger)
+		appviewOpts = append(appviewOpts, appview.WithRates(rateService))
+		safego.Go("api.rates", func() { rateService.Run(ctx) })
 	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage, cfg.AppVersion.MinVersion))
 	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {

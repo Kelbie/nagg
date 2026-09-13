@@ -106,6 +106,7 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/recommended` | no | envelope + `pubkeys`/`providers` (§4) |
 | GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) |
 | GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) |
+| GET | `/app/rates` | no | in-memory BTC fiat prices and source health; no params (§8) |
 
 Request parameters are unchanged from v1 (feed `spec`/`limit`/`until`/`offset`,
 thread `id`/`sort`/`viewer`/…, notifications `viewer`/`tab`/`policy`/…).
@@ -392,7 +393,7 @@ most once per successful catalog refresh, deduplicated by the catalog's internal
 Capability `app.aiLineup.pinsMissing` advertises this field.
 
 GET responses under `/app/*` (and `/v1/app/*`) use 60 seconds fresh / 24 hours
-stale in the server response cache, including future `/app/rates`. During the
+stale in the server response cache, including `/app/rates`. During the
 stale window, the previous payload can be served while background revalidation
 runs. Successful cached app responses send `Cache-Control: public, max-age=60`.
 POST bypasses the server response cache.
@@ -442,3 +443,73 @@ and re-run the diff after response-cache revalidation. Expect
 Remove or replace a missing pin using current catalog IDs; never guess an ID.
 The HTTP response cache may briefly show the previous node/lineup while
 revalidating, so repeat a mismatched check after refresh.
+### BTC fiat rates
+
+`GET /app/rates` (also `/v1/app/rates`, capability `app.rates`) returns:
+
+```json
+{
+  "version": 1,
+  "base": "BTC",
+  "updatedAt": 1800000000,
+  "degraded": true,
+  "rates": {
+    "GBP": {"price": 57274, "at": 1800000000, "samples": 1, "sources": ["mempool"], "confidence": "single-source"}
+  },
+  "sources": [
+    {"id": "mempool", "kind": "http-json", "currency": "GBP", "ok": true, "lastSuccessAt": 1800000000, "lastErrorAt": null, "consecutiveFailures": 0, "lastError": ""}
+  ]
+}
+```
+
+The normal registry covers USD, EUR, GBP and CHF; the abbreviated example
+shows GBP alone. Prices are fiat units per BTC. `at` is the newest surviving
+observation timestamp; `updatedAt` is the newest accepted rate timestamp.
+Both are Unix seconds and are never advanced just because a failed refresh
+ran. Missing/expired currencies are omitted. No available currency returns
+503 `{"error":"rates warming"}`, including before the first successful pass
+and when the worker is disabled. Successful responses send
+`Cache-Control: public, max-age=60`.
+
+The worker admits observations at most `NAGG_RATES_MAX_AGE` old (6h), taking
+the latest five unique signed kind-1 notes per bot and one HTTP sample per
+source/currency. It checks the note's reciprocal sats price within 2%, drops
+outliers beyond `max(3 × 1.4826 × MAD, 0.5% × median)`, and takes the median
+of survivors. A movement over 20% from the previous accepted value is rejected
+until that value is older than 24h, when re-anchoring is allowed.
+
+`samples` counts survivors; `sources` contains sorted unique provider IDs.
+Confidence is `high` for at least three survivors from at least two providers,
+`medium` for at least two survivors otherwise, and `single-source` for one.
+`degraded` is true if any currency has only one provider, uses a retained/stale
+value, is unavailable, or any source has failed at least three passes in a row.
+Thus several notes from one bot can be `medium` but still degraded. GBP is
+HTTP-only by default, so overall degradation is expected today.
+
+Source health is keyed by `(id, currency)`; the four mempool entries share one
+HTTP request per pass. `ok` means the last pass supplied fresh usable data,
+before consensus filtering. A successful fetch clears the failure counter
+and `lastError` but retains the historical `lastErrorAt`; timestamps not yet
+recorded are null. Errors use fixed sanitized categories without upstream
+URLs, payloads, or raw exception messages. Failed or implausible refreshes
+retain the last good price up to `NAGG_RATES_STALE_FOR` (24h total observation
+age). This worker expiry is separate from the response cache described above:
+a previously cached JSON response can remain available during its stale window.
+Clients needing an age bound must inspect each rate's `at`.
+
+Sources are literals in `internal/rates/source.go`; adding a supported bot is
+one literal. `NAGG_RATES_EXTRA_SOURCES` appends declarations of the same shape:
+
+```json
+[{"id":"gbpbot","currency":"GBP","kind":"nostr-note","pubkey":"<hex or npub>","priority":0}]
+```
+
+HTTP declarations use `kind: "http-json"`, `url`, and `jsonKey` instead of
+`pubkey`. JSON prices must be positive finite numbers. The optional `time`
+field is Unix seconds; absent `time` uses fetch time. Future or expired
+timestamps are rejected. Lower `priority` fetches first; it does not weight
+consensus. IDs use 1–64 letters, digits, underscores or hyphens; currencies
+are three uppercase letters. Duplicate `(id, currency)` entries are ignored
+(first wins). Invalid JSON or invalid entries emit startup warnings without
+their contents. Disabling `NAGG_RATES_HTTP_ENABLED` excludes all HTTP sources,
+including extras. None of this feature reads or writes ClickHouse.
