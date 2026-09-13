@@ -11,6 +11,7 @@ const (
 )
 
 var Names = []string{
+	"app.aiLineup.pinsMissing",
 	"app.latestVersion.minVersion",
 	"graphql.events",
 	"graphql.relayHydration",

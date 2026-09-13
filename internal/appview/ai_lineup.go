@@ -3,6 +3,7 @@ package appview
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -14,8 +15,7 @@ import (
 // RoutstrClient supplies the upstream Routstr node's model catalog that
 // /app/ai-lineup curates. Satisfied by *routstr.HTTPClient.
 type RoutstrClient interface {
-	Models(ctx context.Context) ([]routstr.Model, error)
-	BaseURL() string
+	Catalog(ctx context.Context) (routstr.Catalog, error)
 }
 
 // AILineupResponse is the server-curated AI model lineup. The app renders its
@@ -24,16 +24,19 @@ type RoutstrClient interface {
 // for already-shipped builds by a nagg deploy alone. Old builds ignore
 // provider ids and fields they don't know.
 type AILineupResponse struct {
-	Version   int          `json:"version"`
-	UpdatedAt int64        `json:"updatedAt"`
-	Node      AINode       `json:"node"`
-	Providers []AIProvider `json:"providers"`
+	PinsMissing []string     `json:"pinsMissing"`
+	Version     int          `json:"version"`
+	UpdatedAt   int64        `json:"updatedAt"`
+	Node        AINode       `json:"node"`
+	Providers   []AIProvider `json:"providers"`
 }
 
 // AINode names the Routstr node the lineup was derived from; the app sends
 // its chat/wallet traffic there.
 type AINode struct {
-	BaseURL string `json:"baseUrl"`
+	BaseURL      string `json:"baseUrl"`
+	AuthMode     string `json:"authMode,omitempty"`
+	FallbackUsed bool   `json:"fallbackUsed"`
 }
 
 // AIProvider is one provider tab: ID is the app-facing tab id ("openai",
@@ -92,19 +95,30 @@ func (h *Handler) aiLineup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ai lineup not configured", http.StatusServiceUnavailable)
 		return
 	}
-	models, err := h.routstrClient.Models(r.Context())
+	catalog, err := h.routstrClient.Catalog(r.Context())
 	if err != nil {
 		http.Error(w, "ai lineup upstream unavailable", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, buildAILineup(models, h.routstrClient.BaseURL(), h.aiLineupVendors, h.aiLineupPins, time.Now()))
+	response, missing := buildAILineup(catalog.Models, catalog.BaseURL, h.aiLineupVendors, h.aiLineupPins, time.Now())
+	response.Node.AuthMode = h.aiLineupAuthMode
+	response.Node.FallbackUsed = catalog.FallbackUsed
+	h.aiLineupMu.Lock()
+	if catalog.UpdatedAt.After(h.aiLineupLoggedAt) {
+		h.aiLineupLoggedAt = catalog.UpdatedAt
+		if len(missing) > 0 {
+			slog.Warn("ai_lineup.pin_missing", "pins", missing, "catalog_updated_at", catalog.UpdatedAt)
+		}
+	}
+	h.aiLineupMu.Unlock()
+	writeJSON(w, response)
 }
 
-func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pins map[string]map[string]string, now time.Time) AILineupResponse {
+func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pins map[string]map[string]string, now time.Time) (AILineupResponse, []string) {
 	byVendor := make(map[string][]routstr.Model)
 	byID := make(map[string]routstr.Model, len(models))
 	for _, m := range models {
-		if m.Enabled {
+		if m.Enabled && !strings.HasPrefix(m.ID, "~") && !strings.HasPrefix(m.Vendor(), "~") {
 			byID[m.ID] = m
 		}
 		if !qualifiesForAILineup(m) {
@@ -114,6 +128,15 @@ func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pin
 		byVendor[v] = append(byVendor[v], m)
 	}
 
+	missingPins := make([]string, 0)
+	for vendor, tiers := range pins {
+		for tier, id := range tiers {
+			if _, ok := byID[id]; !ok {
+				missingPins = append(missingPins, vendor+"/"+tier+":"+id)
+			}
+		}
+	}
+	sort.Strings(missingPins)
 	providers := make([]AIProvider, 0, len(vendors))
 	for _, vendor := range vendors {
 		picks := pickAITiers(byVendor[vendor], now)
@@ -153,11 +176,12 @@ func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pin
 	}
 
 	return AILineupResponse{
-		Version:   1,
-		UpdatedAt: now.Unix(),
-		Node:      AINode{BaseURL: strings.TrimRight(nodeURL, "/")},
-		Providers: providers,
-	}
+		PinsMissing: missingPins,
+		Version:     1,
+		UpdatedAt:   now.Unix(),
+		Node:        AINode{BaseURL: strings.TrimRight(nodeURL, "/")},
+		Providers:   providers,
+	}, missingPins
 }
 
 // qualifiesForAILineup keeps enabled, priced, text-chat models with a usable
@@ -167,7 +191,7 @@ func qualifiesForAILineup(m routstr.Model) bool {
 	if !m.Enabled || m.ContextLength < minAIContextLength {
 		return false
 	}
-	if strings.HasPrefix(m.Vendor(), "~") {
+	if strings.HasPrefix(m.ID, "~") || strings.HasPrefix(m.Vendor(), "~") {
 		return false
 	}
 	// Chat models bill completions; embedding rows price prompt-only.

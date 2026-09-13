@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -58,55 +59,60 @@ func (m Model) Vendor() string {
 	return strings.ToLower(vendor)
 }
 
-// Client fetches a Routstr node's model catalog. Implementations cache internally.
+// Catalog keeps models and the node serving them in one atomic snapshot.
+// UpdatedAt changes only after a successful refresh. Treat Models as read-only.
+type Catalog struct {
+	Models       []Model
+	BaseURL      string
+	UpdatedAt    time.Time
+	FallbackUsed bool
+}
+
 type Client interface {
-	Models(ctx context.Context) ([]Model, error)
-	// BaseURL is the node the catalog came from; the app pays this node, so
-	// the lineup response must name it.
-	BaseURL() string
+	Catalog(context.Context) (Catalog, error)
+	ActiveBaseURL() string
 }
 
-// HTTPClient is a cached HTTP client for one Routstr node. It serves a
-// TTL-fresh snapshot and falls back to a stale snapshot (up to StaleFor) when
-// the node is briefly unavailable — same shape as the auditor client.
+// HTTPClient tries the primary first on every refresh, then ordered fallbacks.
+// A failed refresh preserves the last good snapshot, regardless of its age.
 type HTTPClient struct {
-	baseURL  string
-	ttl      time.Duration
-	staleFor time.Duration
-	http     *http.Client
-
-	mu        sync.Mutex
-	cached    []Model
-	fetchedAt time.Time
+	baseURL      string
+	fallbackURLs []string
+	ttl          time.Duration
+	http         *http.Client
+	mu           sync.Mutex
+	cached       Catalog
+	refreshing   chan struct{}
 }
 
-// Option configures the HTTPClient.
 type Option func(*HTTPClient)
 
-// WithTTL sets the fresh window and the stale-serve window (default 15m / 24h).
-// Model catalogs churn slowly; sats prices drift with the BTC/USD rate, so the
-// fresh window stays short enough for pricing to track.
-func WithTTL(ttl, staleFor time.Duration) Option {
+// WithTTL sets the fresh window (default 15m). Stale catalogs never expire
+// during an outage; a successful refresh replaces them.
+func WithTTL(ttl time.Duration) Option {
+	return func(c *HTTPClient) { c.ttl = ttl }
+}
+
+func WithFallbackURLs(urls []string) Option {
 	return func(c *HTTPClient) {
-		c.ttl = ttl
-		c.staleFor = staleFor
+		for _, baseURL := range urls {
+			baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+			if baseURL != "" && baseURL != c.baseURL {
+				c.fallbackURLs = append(c.fallbackURLs, baseURL)
+			}
+		}
 	}
 }
 
-// WithHTTPClient overrides the underlying *http.Client (tests inject a stub).
 func WithHTTPClient(h *http.Client) Option {
 	return func(c *HTTPClient) { c.http = h }
 }
 
-// NewHTTPClient builds a catalog client for baseURL (e.g. https://api.routstr.com).
 func NewHTTPClient(baseURL string, opts ...Option) *HTTPClient {
 	c := &HTTPClient{
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		ttl:      15 * time.Minute,
-		staleFor: 24 * time.Hour,
-		// Tight timeout so a slow/down node degrades the lineup to the last
-		// snapshot quickly instead of hanging past the request budget.
-		http: &http.Client{Timeout: 8 * time.Second},
+		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		ttl:     15 * time.Minute,
+		http:    &http.Client{Timeout: 8 * time.Second},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -114,39 +120,90 @@ func NewHTTPClient(baseURL string, opts ...Option) *HTTPClient {
 	return c
 }
 
+// BaseURL returns the configured primary, even while a fallback is active.
 func (c *HTTPClient) BaseURL() string { return c.baseURL }
 
-// Models returns the cached catalog, refreshing when the TTL has elapsed. On a
-// refresh failure it returns the last good snapshot if still within StaleFor,
-// otherwise the error.
-func (c *HTTPClient) Models(ctx context.Context) ([]Model, error) {
+// ActiveBaseURL returns the last successful node (the primary before warm-up).
+func (c *HTTPClient) ActiveBaseURL() string {
 	c.mu.Lock()
-	age := time.Since(c.fetchedAt)
-	fresh := c.cached != nil && age < c.ttl
-	cached := c.cached
-	c.mu.Unlock()
-
-	if fresh {
-		return cached, nil
+	defer c.mu.Unlock()
+	if c.cached.BaseURL != "" {
+		return c.cached.BaseURL
 	}
-
-	models, err := c.fetch(ctx)
-	if err != nil {
-		if cached != nil && age < c.staleFor {
-			return cached, nil
-		}
-		return nil, err
-	}
-
-	c.mu.Lock()
-	c.cached = models
-	c.fetchedAt = time.Now()
-	c.mu.Unlock()
-	return models, nil
+	return c.baseURL
 }
 
-func (c *HTTPClient) fetch(ctx context.Context) ([]Model, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/models", nil)
+func (c *HTTPClient) Models(ctx context.Context) ([]Model, error) {
+	catalog, err := c.Catalog(ctx)
+	return catalog.Models, err
+}
+
+func (c *HTTPClient) Catalog(ctx context.Context) (Catalog, error) {
+	c.mu.Lock()
+	cached := c.cached
+	if cached.Models != nil && time.Since(cached.UpdatedAt) < c.ttl {
+		c.mu.Unlock()
+		return cached, nil
+	}
+	if pending := c.refreshing; pending != nil {
+		c.mu.Unlock()
+		if cached.Models != nil {
+			return cached, nil
+		}
+		select {
+		case <-pending:
+			return c.Catalog(ctx)
+		case <-ctx.Done():
+			return Catalog{}, ctx.Err()
+		}
+	}
+	c.refreshing = make(chan struct{})
+	c.mu.Unlock()
+
+	var err error
+	var next Catalog
+	urls := append([]string{c.baseURL}, c.fallbackURLs...)
+	for i, baseURL := range urls {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+		var models []Model
+		// Share the remaining request budget so slow nodes cannot starve later fallbacks.
+		fetchCtx := ctx
+		cancel := func() {}
+		if deadline, ok := ctx.Deadline(); ok {
+			fetchCtx, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(urls)-i))
+		}
+		models, err = c.fetch(fetchCtx, baseURL)
+		cancel()
+		if err == nil {
+			next = Catalog{Models: models, BaseURL: baseURL, UpdatedAt: time.Now(), FallbackUsed: baseURL != c.baseURL}
+			break
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	defer func() { close(c.refreshing); c.refreshing = nil }()
+	if err == nil {
+		from := c.cached.BaseURL
+		if from == "" {
+			from = c.baseURL
+		}
+		if from != next.BaseURL {
+			slog.Info("routstr.node.switched", "from", from, "to", next.BaseURL)
+		}
+		c.cached = next
+	}
+	if c.cached.Models != nil {
+		return c.cached, nil
+	}
+	return Catalog{}, err
+}
+
+func (c *HTTPClient) fetch(ctx context.Context, baseURL string) ([]Model, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +219,16 @@ func (c *HTTPClient) fetch(ctx context.Context) ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseModels(body)
+	models, err := parseModels(body)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range models {
+		if m.Enabled {
+			return models, nil
+		}
+	}
+	return nil, fmt.Errorf("routstr: empty enabled catalog")
 }
 
 // rawModel is the upstream /v1/models entry subset nagg reads. Unknown fields
@@ -200,7 +266,7 @@ func parseModels(body []byte) ([]Model, error) {
 	}
 	out := make([]Model, 0, len(raw.Data))
 	for _, m := range raw.Data {
-		if strings.TrimSpace(m.ID) == "" || m.SatsPricing == nil {
+		if strings.TrimSpace(m.ID) == "" || m.SatsPricing == nil || strings.HasPrefix(m.ID, "~") || strings.HasPrefix(m.CanonicalSlug, "~") {
 			continue
 		}
 		out = append(out, Model{

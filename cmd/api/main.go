@@ -397,15 +397,15 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage, cfg.AppVersion.MinVersion))
 	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {
-		routstrClient := routstr.NewHTTPClient(cfg.Routstr.URL)
+		routstrClient := routstr.NewHTTPClient(cfg.Routstr.URL, routstr.WithFallbackURLs(cfg.Routstr.FallbackURLs))
 		pins := appview.ParseAILineupPins(cfg.Routstr.Pins)
-		appviewOpts = append(appviewOpts, appview.WithAILineup(routstrClient, cfg.Routstr.Vendors, pins))
+		appviewOpts = append(appviewOpts, appview.WithAILineup(routstrClient, cfg.Routstr.Vendors, pins), appview.WithAIAuthMode(cfg.Routstr.AuthMode))
 		slog.Info("ai lineup enabled", "url", cfg.Routstr.URL, "vendors", strings.Join(cfg.Routstr.Vendors, ","), "pinned_vendors", len(pins))
 		// Warm the catalog cache in the background so the first /app/ai-lineup
 		// request doesn't pay the cold upstream fetch.
 		go func() {
 			defer safego.Recover("api.worker")
-			warmCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			warmCtx, cancel := context.WithTimeout(ctx, time.Duration(1+len(cfg.Routstr.FallbackURLs))*8*time.Second)
 			defer cancel()
 			if _, err := routstrClient.Models(warmCtx); err != nil {
 				slog.Warn("ai lineup warm-up failed", "error", err)

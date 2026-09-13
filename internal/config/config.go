@@ -138,10 +138,12 @@ type AuditorConfig struct {
 // per-vendor tier overrides ({"anthropic":{"max":"claude-opus-4.7"}}), the
 // OTA lever for hardcoding a model onto old app builds.
 type RoutstrConfig struct {
-	URL     string
-	Enabled bool
-	Vendors []string
-	Pins    string
+	AuthMode     string
+	FallbackURLs []string
+	URL          string
+	Enabled      bool
+	Vendors      []string
+	Pins         string
 }
 
 type APIConfig struct {
@@ -341,10 +343,12 @@ func Load() (Config, error) {
 			MinVersion:    env("NAGG_APP_MIN_VERSION", ""),
 		},
 		Routstr: RoutstrConfig{
-			URL:     env("NAGG_ROUTSTR_URL", "https://api.routstr.com"),
-			Enabled: parseBool(env("NAGG_ROUTSTR_ENABLED", boolText(mods.Has(modules.App)))),
-			Vendors: splitCSV(env("NAGG_AI_LINEUP_VENDORS", "openai,anthropic,x-ai,google")),
-			Pins:    os.Getenv("NAGG_AI_LINEUP_PINS"),
+			AuthMode:     parseRoutstrAuthMode(env("NAGG_ROUTSTR_AUTH_MODE", "")),
+			FallbackURLs: splitCSV(env("NAGG_ROUTSTR_FALLBACK_URLS", "https://ai.redsh1ft.com,https://api.nonkycai.com,https://routstr.otrta.me,https://llm.satsandsports.cash,https://routstr.satoshisend.xyz")),
+			URL:          env("NAGG_ROUTSTR_URL", "https://api.routstr.com"),
+			Enabled:      parseBool(env("NAGG_ROUTSTR_ENABLED", boolText(mods.Has(modules.App)))),
+			Vendors:      splitCSV(env("NAGG_AI_LINEUP_VENDORS", "openai,anthropic,x-ai,google")),
+			Pins:         os.Getenv("NAGG_AI_LINEUP_PINS"),
 		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,
@@ -679,5 +683,15 @@ func LogLevel() slog.Level {
 	default:
 		slog.Warn("config.log_level.invalid", "env", "NAGG_LOG_LEVEL", "fallback", "info")
 		return slog.LevelInfo
+	}
+}
+
+func parseRoutstrAuthMode(value string) string {
+	switch value {
+	case "", "bearer", "x-cashu":
+		return value
+	default:
+		slog.Warn("config.routstr_auth_mode.invalid", "env", "NAGG_ROUTSTR_AUTH_MODE")
+		return ""
 	}
 }
