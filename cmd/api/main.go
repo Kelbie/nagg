@@ -39,7 +39,7 @@ const apiInitializationRetryDelay = 10 * time.Second
 
 func main() {
 	runtimelimits.Apply()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: config.LogLevel()}))
 	slog.SetDefault(logger)
 
 	cfg, err := config.Load()
@@ -331,6 +331,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	ranker := graphqlapi.NewRanker(store, schemaOpts...)
 	appviewOpts := []appview.Option{
 		appview.WithModules(cfg.Modules),
+		appview.WithRateLimit(cfg.API.RateLimitPerMinute, time.Minute),
 		appview.WithSocialEnrichment(nostrModule),
 		appview.WithDVM(cfg.DVM),
 		appview.WithNIP05Validation(cfg.Vertex.ValidateNIP05),
@@ -394,7 +395,7 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		slog.Info("mint info snapshotter enabled",
 			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
 	}
-	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage))
+	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage, cfg.AppVersion.MinVersion))
 	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {
 		routstrClient := routstr.NewHTTPClient(cfg.Routstr.URL)
 		pins := appview.ParseAILineupPins(cfg.Routstr.Pins)

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -309,5 +311,74 @@ func TestLoadHistoryFloorUnsetLeavesBackfillsAlone(t *testing.T) {
 	}
 	if len(cfg.Ingest.Backfills) != 1 || cfg.Ingest.Backfills[0].Name != "k38000_history" {
 		t.Fatalf("backfills = %+v, want only k38000_history", cfg.Ingest.Backfills)
+	}
+}
+
+func TestLoadAppVersion(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	for _, minVersion := range []string{"", "0.1.2"} {
+		t.Setenv("NAGG_APP_LATEST_VERSION", "0.1.3")
+		t.Setenv("NAGG_APP_UPDATE_MESSAGE", "Update now")
+		t.Setenv("NAGG_APP_MIN_VERSION", minVersion)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := AppVersionConfig{LatestVersion: "0.1.3", UpdateMessage: "Update now", MinVersion: minVersion}
+		if cfg.AppVersion != want {
+			t.Fatalf("AppVersion = %+v, want %+v", cfg.AppVersion, want)
+		}
+	}
+}
+
+func TestLogLevel(t *testing.T) {
+	for _, tc := range []struct {
+		input   string
+		want    slog.Level
+		warning bool
+	}{
+		{"", slog.LevelInfo, false}, {"debug", slog.LevelDebug, false},
+		{"info", slog.LevelInfo, false}, {"warn", slog.LevelWarn, false},
+		{"error", slog.LevelError, false}, {" WARN ", slog.LevelWarn, false},
+		{"invalid", slog.LevelInfo, true}, {"debug+1", slog.LevelInfo, true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Setenv("NAGG_LOG_LEVEL", tc.input)
+			var logs bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(old) })
+			if got := LogLevel(); got != tc.want {
+				t.Fatalf("level = %s, want %s", got, tc.want)
+			}
+			if tc.warning {
+				if strings.Count(logs.String(), "\n") != 1 || !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "config.log_level.invalid") {
+					t.Fatalf("expected one warning: %q", logs.String())
+				}
+			} else if logs.Len() != 0 {
+				t.Fatalf("unexpected log: %q", logs.String())
+			}
+		})
+	}
+}
+
+func TestLoadRateLimitPerMinute(t *testing.T) {
+	t.Setenv("NAGG_VERTEX_PRIVATE_KEY", "")
+	for _, tc := range []struct {
+		input string
+		want  int
+	}{
+		{"", 120}, {"300", 300}, {"1", 1}, {"0", 120}, {"-1", 120}, {"invalid", 120},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			t.Setenv("NAGG_RATE_LIMIT_PER_MIN", tc.input)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.API.RateLimitPerMinute != tc.want {
+				t.Fatalf("rate limit = %d, want %d", cfg.API.RateLimitPerMinute, tc.want)
+			}
+		})
 	}
 }

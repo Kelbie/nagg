@@ -82,6 +82,7 @@ type Handler struct {
 	mintInfo                  MintHistoryProvider
 	appLatestVersion          string
 	appUpdateMessage          string
+	appMinVersion             string
 	routstrClient             RoutstrClient
 	aiLineupVendors           []string
 	aiLineupPins              map[string]map[string]string
@@ -226,12 +227,13 @@ type AuditorClient interface {
 	Mints(context.Context) ([]auditor.Mint, error)
 }
 
-// WithAppVersion backs POST /app/latest-version, letting the app's update check
+// WithAppVersion backs GET/POST /app/latest-version, letting the app's update check
 // read through nagg. An empty version advertises "no update".
-func WithAppVersion(version, message string) Option {
+func WithAppVersion(version, message, minVersion string) Option {
 	return func(h *Handler) {
 		h.appLatestVersion = version
 		h.appUpdateMessage = message
+		h.appMinVersion = minVersion
 	}
 }
 
@@ -317,7 +319,7 @@ func New(store Store, opts ...Option) *Handler {
 	h := &Handler{
 		store:                     store,
 		nip05Validator:            newNIP05Validator(true),
-		rateLimiter:               newRateLimiter(120, time.Minute),
+		rateLimiter:               newRateLimiter(0, time.Minute),
 		vertexProfileMinFollowers: defaultVertexProfileMinFollowers,
 		socialEnrichment:          true,
 	}
@@ -677,7 +679,7 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 	}
 	if h.shouldBackfillUserFeed(events, until, limit, offset) {
 		coldCount := len(events)
-		slog.Info("profile.feed.cold", "pubkey", pubkey, "count", coldCount, "limit", limit)
+		slog.Debug("profile.feed.cold", "pubkey", pubkey, "count", coldCount, "limit", limit)
 		backfillStart := time.Now()
 		if h.tryBackfillUserFeed(r.Context(), pubkey, limit) {
 			events, err = h.store.FollowsFeed(r.Context(), []string{pubkey}, until, limit, offset, 0)
@@ -685,10 +687,10 @@ func (h *Handler) userFeed(w http.ResponseWriter, r *http.Request) {
 				writeError(w, err)
 				return
 			}
-			slog.Info("profile.feed.backfill", "pubkey", pubkey, "outcome", "waited",
+			slog.Debug("profile.feed.backfill", "pubkey", pubkey, "outcome", "waited",
 				"before", coldCount, "after", len(events), "ms", time.Since(backfillStart).Milliseconds())
 		} else {
-			slog.Info("profile.feed.backfill", "pubkey", pubkey, "outcome", "timeout",
+			slog.Debug("profile.feed.backfill", "pubkey", pubkey, "outcome", "timeout",
 				"before", coldCount, "ms", time.Since(backfillStart).Milliseconds())
 		}
 	}
@@ -1375,7 +1377,7 @@ func (h *Handler) threadOrdering(ctx context.Context, p threadOrderParams) (Orde
 	}
 	total := len(elements)
 	elements = pageElements(elements, p.offset, p.replyLimit)
-	slog.Info("appview.thread.order", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "total", total, "nested", dropped, "elements", len(elements))
+	slog.Debug("appview.thread.order", "root", p.rootID, "sort", p.sort, "scoped", p.viewer != "", "total", total, "nested", dropped, "elements", len(elements))
 	return OrderingManifest{OrderBy: orderByRank, Elements: elements}, total
 }
 

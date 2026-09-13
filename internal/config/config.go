@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -45,16 +46,16 @@ type Config struct {
 	// that appear — while subscribing only to kind 38000; with one shared knob
 	// the prune would delete those profiles on every restart.
 	StoredKinds []int
-	Ingest     ingest.Config
-	Vertex     VertexConfig
-	OnDemand   OnDemandConfig
-	Viewer     ViewerConfig
-	Enrich     EnrichConfig
-	Cache      CacheConfig
-	Auditor    AuditorConfig
-	AppVersion AppVersionConfig
-	Routstr    RoutstrConfig
-	MintInfo   MintInfoConfig
+	Ingest      ingest.Config
+	Vertex      VertexConfig
+	OnDemand    OnDemandConfig
+	Viewer      ViewerConfig
+	Enrich      EnrichConfig
+	Cache       CacheConfig
+	Auditor     AuditorConfig
+	AppVersion  AppVersionConfig
+	Routstr     RoutstrConfig
+	MintInfo    MintInfoConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -111,13 +112,14 @@ type RollupConfig struct {
 	RetentionDryRun bool
 }
 
-// AppVersionConfig backs POST /app/latest-version so the Sovran app's update
+// AppVersionConfig backs GET/POST /app/latest-version so the Sovran app's update
 // check reads through nagg instead of api.sovran.money. LatestVersion empty
 // means "no update advertised" (the client treats an empty/older-or-equal
 // version as up to date).
 type AppVersionConfig struct {
 	LatestVersion string
 	UpdateMessage string
+	MinVersion    string
 }
 
 // AuditorConfig configures the upstream cashu mint auditor client that powers
@@ -143,7 +145,9 @@ type RoutstrConfig struct {
 }
 
 type APIConfig struct {
-	GraphQLTimeout time.Duration
+	// RateLimitPerMinute bounds REST requests per client IP; defaults to 120.
+	RateLimitPerMinute int
+	GraphQLTimeout     time.Duration
 	// MaxConcurrentRequests bounds concurrent CH-heavy app-view requests (cache
 	// misses). 0 = unlimited. Protects a capacity-limited ClickHouse from being
 	// overwhelmed by a burst of concurrent heavy queries.
@@ -274,7 +278,8 @@ func Load() (Config, error) {
 			NotificationsLegacyRead: parseBool(env("NAGG_NOTIFICATIONS_LEGACY_READ", "false")),
 		},
 		API: APIConfig{
-			GraphQLTimeout: parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
+			RateLimitPerMinute: parseInt(env("NAGG_RATE_LIMIT_PER_MIN", "120")),
+			GraphQLTimeout:     parseDuration(env("NAGG_GRAPHQL_TIMEOUT", "30s")),
 			// Slots on the PROCESS-WIDE heavy-query gate (chgate): heavy REST,
 			// GraphQL, and the rollup all share it. The old ceiling of 2 matched a
 			// world where a single read could eat multiple GiB (an engaged account's
@@ -331,8 +336,9 @@ func Load() (Config, error) {
 			Limit:   parseInt(env("NAGG_AUDITOR_LIMIT", "200")),
 		},
 		AppVersion: AppVersionConfig{
-			LatestVersion: os.Getenv("NAGG_APP_LATEST_VERSION"),
-			UpdateMessage: os.Getenv("NAGG_APP_UPDATE_MESSAGE"),
+			LatestVersion: env("NAGG_APP_LATEST_VERSION", ""),
+			UpdateMessage: env("NAGG_APP_UPDATE_MESSAGE", ""),
+			MinVersion:    env("NAGG_APP_MIN_VERSION", ""),
 		},
 		Routstr: RoutstrConfig{
 			URL:     env("NAGG_ROUTSTR_URL", "https://api.routstr.com"),
@@ -394,6 +400,10 @@ func Load() (Config, error) {
 			RetentionInterval: parseDuration(env("NAGG_RETENTION_INTERVAL", "24h")),
 			RetentionDryRun:   parseBool(env("NAGG_RETENTION_DRY_RUN", "false")),
 		},
+	}
+
+	if cfg.API.RateLimitPerMinute <= 0 {
+		cfg.API.RateLimitPerMinute = 120
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -652,4 +662,22 @@ func historyFloorBackfills(declared []rules.Backfill, kinds []int, floor int64) 
 		return declared
 	}
 	return append(append([]rules.Backfill(nil), declared...), rule)
+}
+
+// LogLevel reads the logging threshold before Load and logger initialization.
+// Invalid values use info and emit one warning without logging the input.
+func LogLevel() slog.Level {
+	switch strings.ToLower(env("NAGG_LOG_LEVEL", "info")) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		slog.Warn("config.log_level.invalid", "env", "NAGG_LOG_LEVEL", "fallback", "info")
+		return slog.LevelInfo
+	}
 }

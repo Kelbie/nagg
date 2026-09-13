@@ -291,13 +291,11 @@ The API listens on `:8080` by default and serves `POST /graphql`, `GET /graphiql
 
 Set `NAGG_VIEWER_PUBKEY` to a 64-hex pubkey when you want app-view viewer routes to work without an explicit viewer parameter. It is used as the fallback for `/nostr/feed`, `/nostr/feed/user`, `/nostr/follows`, and `/nostr/profile`; explicit invalid pubkeys still return `400`.
 
-The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local data when available; it only calls Vertex for pubkeys with at least `NAGG_VERTEX_PROFILE_MIN_FOLLOWERS` local followers, default `500`, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails. GraphQL ranking reads the columnar `vertex_scores` cache only; when the Vertex client is configured, the API service warms recent high-follower authors in the background using `NAGG_VERTEX_RANK_MIN_FOLLOWERS` and `NAGG_VERTEX_SYNC_BATCH`.
+The Vertex DVM proxy routes (`/nostr/search`, `/nostr/recommended`) require a funded/authorized 64-hex `NAGG_VERTEX_PRIVATE_KEY`. `/nostr/profile` always returns local data when available; it only calls Vertex for pubkeys meeting the plugin's declared `MinInboundRefs` policy, and falls back to the permanent ClickHouse Vertex profile cache when live Vertex fails. GraphQL ranking reads the columnar `vertex_scores` cache only; when the Vertex client is configured, the API service warms eligible recent authors in the background using that policy and `NAGG_VERTEX_SYNC_BATCH`. The old follower-threshold environment variables were removed; change the [DVM plugin policy declaration](docs/rules-registry.md#the-dvm-plugin-seam-internaldvm) instead.
 
 ```sh
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret> \
 NAGG_VERTEX_RELAY=wss://relay.vertexlab.io \
-NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500 \
-NAGG_VERTEX_RANK_MIN_FOLLOWERS=500 \
 NAGG_VERTEX_SYNC_BATCH=200 \
 NAGG_VIEWER_PUBKEY=<64-hex-pubkey> \
 NAGG_NIP05_VALIDATE=true \
@@ -336,6 +334,22 @@ NAGG_CLICKHOUSE_USERNAME=<clickhouse-user>
 NAGG_CLICKHOUSE_PASSWORD=<clickhouse-password>
 ```
 
+App configuration and operational variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `NAGG_APP_LATEST_VERSION` | empty | Advertised version from GET/POST `/app/latest-version`; empty advertises no update. Requires the `app` module. |
+| `NAGG_APP_UPDATE_MESSAGE` | empty | Optional update message; omitted from JSON when empty. |
+| `NAGG_APP_MIN_VERSION` | empty | Optional minimum supported client version (`minVersion`); clients may use it for a blocking update gate. Omitted when empty. |
+| `NAGG_LOG_LEVEL` | `info` | All five service binaries: `debug`, `info`, `warn`, or `error`. Invalid values fall back to `info` with one startup warning. |
+| `NAGG_RATE_LIMIT_PER_MIN` | `120` | REST requests per client IP per minute; invalid or non-positive values use `120`. |
+
+For the mint service's app endpoints, set `NAGG_MODULES=mint,app` and
+`NAGG_APP_LATEST_VERSION=0.1.3`. Adding `app` needs no additional ClickHouse
+schema or credentials; it enables the Routstr HTTP catalog client with its
+existing defaults. See [module behavior](docs/modules.md) and
+[app payloads and caching](docs/appview-api.md#8-app-configuration).
+
 Optional service variables:
 
 ```sh
@@ -344,8 +358,6 @@ NAGG_KINDS=0,1,3,4,6,7,16,443,444,445,1059,1063,9735,10050,10051,30078,38000
 NAGG_HISTORY_FLOOR=
 NAGG_VERTEX_PRIVATE_KEY=<64-hex-secret>
 NAGG_VERTEX_RELAY=wss://relay.vertexlab.io
-NAGG_VERTEX_PROFILE_MIN_FOLLOWERS=500
-NAGG_VERTEX_RANK_MIN_FOLLOWERS=500
 NAGG_VERTEX_SYNC_BATCH=200
 NAGG_VIEWER_PUBKEY=<64-hex-pubkey>
 NAGG_NIP05_VALIDATE=true

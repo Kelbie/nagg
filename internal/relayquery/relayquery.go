@@ -77,7 +77,7 @@ func (c Client) Query(ctx context.Context, filter map[string]any, timeout time.D
 			c.Health.recordSuccess(res.relay)
 			out = append(out, res.events...)
 			if len(res.events) > 0 {
-				slog.Info("on-demand relay query returned events", "relay", res.relay, "events", len(res.events))
+				slog.Debug("on-demand relay query returned events", "relay", res.relay, "events", len(res.events))
 			}
 		case <-qctx.Done():
 			// The deadline elapsed: stop waiting on the remaining relays (usually
