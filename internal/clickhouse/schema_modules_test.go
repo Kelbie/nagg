@@ -75,6 +75,7 @@ func TestMintModuleDeclaresOnlyMintSchema(t *testing.T) {
 		"latest_k0",
 		"mint_info_observations",
 		"mint_info_snapshots",
+		"mint_quote_probes",
 		"nostr_events",
 		"relay_backfill_state",
 		"schema_migrations",

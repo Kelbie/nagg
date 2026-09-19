@@ -3,6 +3,7 @@ package appview
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"sort"
@@ -34,6 +35,10 @@ type DiscoverMint struct {
 	// release, and previously had to fetch every mint's /v1/info itself to
 	// learn any of this. Also backfilled from stored info for review-only mints.
 	Nuts json.RawMessage `json:"nuts,omitempty"`
+	// Testnut is true when nagg's weekly probe saw the mint mark a never-paid
+	// mint quote as paid — a fake payment backend (internal/mintprobe). False
+	// also covers mints not yet probed.
+	Testnut bool `json:"testnut"`
 
 	// Nostr reviews (NIP-87 kind-38000). AverageScore is null when no surviving
 	// review carried a [n/5]. ReviewCount is the deduped review total (one latest
@@ -80,6 +85,34 @@ type DiscoverMintsResponse struct {
 // the 50 newest reviews (23 mints listed, Minibits at 22 of its 91 reviews).
 const discoverReviewScanCap = 5000
 
+// TestnutProvider lists the mints the unpaid-quote probe classified as
+// testnuts (satisfied by *clickhouse.Store).
+type TestnutProvider interface {
+	TestnutMintURLs(ctx context.Context) ([]string, error)
+}
+
+// testnutFilter is the discover `testnut` query: "" returns every mint, "true"
+// only testnuts, "false" only non-testnuts.
+type testnutFilter int
+
+const (
+	testnutAny testnutFilter = iota
+	testnutOnly
+	testnutExclude
+)
+
+func parseTestnutFilter(raw string) (testnutFilter, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return testnutAny, nil
+	case "true":
+		return testnutOnly, nil
+	case "false":
+		return testnutExclude, nil
+	}
+	return testnutAny, errors.New("testnut must be true or false")
+}
+
 type mintReviewAgg struct {
 	display    string
 	avg        *float64
@@ -98,6 +131,11 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	// (otherwise a popular mint shows far fewer reviews here than on its own
 	// reviews page).
 	mintsLimit := intParam(r, "limit", 200)
+	testnutMode, err := parseTestnutFilter(r.URL.Query().Get("testnut"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// 1) Nostr reviews (kind-38000) → per-mint aggregate, over a wide scan.
 	aggByKey, err := h.mintReviewAggregates(ctx, discoverReviewScanCap)
@@ -130,6 +168,29 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		match := normalizeMintURL(filter)
 		for key := range keys {
 			if key != match {
+				delete(keys, key)
+			}
+		}
+	}
+
+	// Testnut verdicts, keyed like the union. A lookup failure degrades to
+	// "no testnuts" for the unfiltered feed, but fails a filtered request
+	// rather than silently answering it wrong.
+	testnutKeys := map[string]struct{}{}
+	if h.testnuts != nil {
+		urls, terr := h.testnuts.TestnutMintURLs(ctx)
+		if terr != nil && testnutMode != testnutAny {
+			writeError(w, terr)
+			return
+		}
+		for _, u := range urls {
+			testnutKeys[normalizeMintURL(u)] = struct{}{}
+		}
+	}
+	if testnutMode != testnutAny {
+		for key := range keys {
+			_, testnut := testnutKeys[key]
+			if testnut != (testnutMode == testnutOnly) {
 				delete(keys, key)
 			}
 		}
@@ -181,6 +242,7 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	mints := make([]DiscoverMint, 0, len(keys))
 	for key := range keys {
 		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, followCounts, vertexProfiles)
+		_, row.Testnut = testnutKeys[key]
 		mints = append(mints, row)
 	}
 

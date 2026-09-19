@@ -89,6 +89,7 @@ type Handler struct {
 	ranker                    RankedFeedProvider
 	auditor                   AuditorClient
 	mintInfo                  MintHistoryProvider
+	testnuts                  TestnutProvider
 	rates                     RatesProvider
 	wallpapers                WallpapersProvider
 	btcmap                    BtcmapClient
@@ -266,6 +267,15 @@ func WithAuditor(client AuditorClient) Option {
 func WithMintHistory(provider MintHistoryProvider) Option {
 	return func(h *Handler) {
 		h.mintInfo = provider
+	}
+}
+
+// WithTestnutMints wires the unpaid-quote probe verdicts behind the
+// /nostr/mint/discover `testnut` field and filter. Without it every mint
+// reports testnut=false.
+func WithTestnutMints(provider TestnutProvider) Option {
+	return func(h *Handler) {
+		h.testnuts = provider
 	}
 }
 

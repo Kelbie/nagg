@@ -184,13 +184,13 @@ NAGG_FIREHOSE_KINDS=38000     # subscribe to the trickle only
 
 ## The mint deployment's whole ClickHouse
 
-Eight tables and one materialized view, pinned by
+Nine tables and one materialized view, pinned by
 `TestMintModuleDeclaresOnlyMintSchema`:
 
 ```
 schema_migrations   nostr_events   event_tags   event_seen_relays
 relay_backfill_state
-mint_info_snapshots   mint_info_observations
+mint_info_snapshots   mint_info_observations   mint_quote_probes
 latest_k0   (+ mv_latest_k0)
 ```
 

@@ -10,7 +10,7 @@
 # for the ranking, enrichment and rollup machinery on top. This one subscribes
 # to kind 38000 (NIP-87 mint recommendations and reviews — a trickle) and stores
 # kind 0 only for the handful of reviewer/operator pubkeys those events name,
-# fetched on demand. Its ClickHouse holds eight tables, one materialized view
+# fetched on demand. Its ClickHouse holds nine tables, one materialized view
 # and the three (empty) Vertex cache tables; see docs/modules.md.
 #
 # Verified locally against ClickHouse 26.6.1: the relay-history walk pulled

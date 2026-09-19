@@ -291,3 +291,70 @@ func TestDiscoverScansFullReviewSet(t *testing.T) {
 		}
 	}
 }
+
+type fakeTestnuts struct {
+	urls []string
+	err  error
+}
+
+func (f fakeTestnuts) TestnutMintURLs(context.Context) ([]string, error) { return f.urls, f.err }
+
+func TestDiscoverTestnutFlagAndFilter(t *testing.T) {
+	auditorClient := WithAuditor(fakeAuditor{mints: []auditor.Mint{
+		{URL: "https://real.example", State: "OK", NMints: 10},
+		{URL: "https://nofee.testnut.example", State: "OK", NMints: 5},
+		{URL: "https://unprobed.example", State: "OK", NMints: 1},
+	}})
+	// The probe stores its own URL normalization (host case kept in path only);
+	// discover must still match it.
+	handler := New(mintReviewStore{}, WithNIP05Validation(false), auditorClient,
+		WithTestnutMints(fakeTestnuts{urls: []string{"https://NoFee.Testnut.example/"}}))
+
+	discover := func(query string) (int, map[string]bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover"+query, nil))
+		if rec.Code != http.StatusOK {
+			return rec.Code, nil
+		}
+		var resp DiscoverMintsResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]bool{}
+		for _, m := range resp.Mints {
+			out[m.MintURL] = m.Testnut
+		}
+		return rec.Code, out
+	}
+
+	if _, all := discover(""); len(all) != 3 || !all["https://nofee.testnut.example"] || all["https://real.example"] || all["https://unprobed.example"] {
+		t.Fatalf("unfiltered = %v", all)
+	}
+	if _, only := discover("?testnut=true"); len(only) != 1 || !only["https://nofee.testnut.example"] {
+		t.Fatalf("testnut=true = %v", only)
+	}
+	if _, none := discover("?testnut=false"); len(none) != 2 || none["https://real.example"] || none["https://unprobed.example"] {
+		t.Fatalf("testnut=false = %v", none)
+	}
+	if code, _ := discover("?testnut=maybe"); code != http.StatusBadRequest {
+		t.Fatalf("invalid testnut status = %d, want 400", code)
+	}
+}
+
+func TestDiscoverTestnutLookupFailure(t *testing.T) {
+	handler := New(mintReviewStore{}, WithNIP05Validation(false),
+		WithAuditor(fakeAuditor{mints: []auditor.Mint{{URL: "https://m1", State: "OK"}}}),
+		WithTestnutMints(fakeTestnuts{err: errors.New("clickhouse down")}))
+
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unfiltered should degrade, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?testnut=false", nil))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("filtered request must not answer without verdicts: %s", rec.Body.String())
+	}
+}

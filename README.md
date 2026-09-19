@@ -209,6 +209,19 @@ between polls, the anti-spam gate), `NAGG_MINT_INFO_THROTTLE` (1.5s between
 fetches), and `NAGG_MINT_INFO_TIMEOUT` (8s per fetch). The work-list is the
 auditor's mints ∪ the NIP-87 kind-38000 recommendations.
 
+The same work-list feeds the **unpaid-quote prober** (`internal/mintprobe`):
+once a week per mint it requests a NUT-04 mint quote for every advertised
+method/unit at the method's minimum amount, never pays it, re-reads its state,
+and — if the mint marks it paid anyway — asks the mint to sign outputs. A mint
+whose latest verdict for any method is paid is a testnut; `discover` reports it
+as `testnut` and filters on `?testnut=true|false`. Configure it with
+`NAGG_RUN_MINT_PROBE` (default on for the mint module), `NAGG_MINT_PROBE_INTERVAL`
+(1h), `NAGG_MINT_PROBE_MIN_AGE` (168h — once a week per mint),
+`NAGG_MINT_PROBE_THROTTLE` (5s between mints), `NAGG_MINT_PROBE_TIMEOUT` (10s per
+request), `NAGG_MINT_PROBE_PAID_POLLS` (3) and `NAGG_MINT_PROBE_PAID_WAIT` (2s)
+— how many times, how far apart, an unpaid quote is re-read before it counts as
+unpaid.
+
 ## Prerequisites
 
 ### ClickHouse
@@ -329,7 +342,7 @@ This repo includes a `Dockerfile` and `railway.toml` for the API service. Railwa
 For a slice of nagg rather than all of it, set `NAGG_MODULES` — the deployment's
 enabled modules, from which the schema, relay kinds, mounted routes and running
 workers all follow. `NAGG_MODULES=mint` is the cashu mint observatory on a
-ClickHouse of eight tables; deploy it with `railway.mint.toml`. Unset means every
+ClickHouse of nine tables; deploy it with `railway.mint.toml`. Unset means every
 module, i.e. the full app-view. See [`docs/modules.md`](docs/modules.md).
 
 Required service variables:

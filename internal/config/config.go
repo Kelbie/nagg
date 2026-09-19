@@ -60,6 +60,7 @@ type Config struct {
 	AppVersion  AppVersionConfig
 	Routstr     RoutstrConfig
 	MintInfo    MintInfoConfig
+	MintProbe   MintProbeConfig
 	Rates       RatesConfig
 	Wallpapers  WallpapersConfig
 	Btcmap      BtcmapConfig
@@ -88,6 +89,11 @@ type Config struct {
 	// (/nostr/mint/history) is served whenever that module is enabled; this only
 	// gates the background poller.
 	RunMintInfo bool
+
+	// RunMintProbe hosts the weekly unpaid-quote prober (internal/mintprobe) in
+	// the API process. Defaults on for the mint module; its verdicts feed the
+	// /nostr/mint/discover testnut flag.
+	RunMintProbe bool
 }
 
 type WallpapersConfig struct {
@@ -118,6 +124,19 @@ type MintInfoConfig struct {
 	MinAge   time.Duration
 	Throttle time.Duration
 	Timeout  time.Duration
+}
+
+// MintProbeConfig parameterizes the unpaid-quote prober (internal/mintprobe):
+// how often it re-checks for due mints, the per-mint minimum between probes,
+// the delay between mints in one pass, the per-request HTTP budget, and how
+// many times (PaidWait apart) an unpaid quote's state is re-read.
+type MintProbeConfig struct {
+	Interval  time.Duration
+	MinAge    time.Duration
+	Throttle  time.Duration
+	Timeout   time.Duration
+	PaidPolls int
+	PaidWait  time.Duration
 }
 
 // RollupConfig parameterizes the periodic rollup job. MinActorScore is the Vertex
@@ -434,10 +453,11 @@ func Load() (Config, error) {
 		// nostr (the full firehose) and mint (the kind-38000 slice plus its
 		// relay-history walk); the enricher and rollup only maintain
 		// nostr-owned tables; the snapshotter is the mint module's whole point.
-		RunIngester: parseBool(env("NAGG_RUN_INGESTER", boolText(nostrModule || mintModule))),
-		RunEnricher: parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
-		RunRollup:   parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
-		RunMintInfo: parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
+		RunIngester:  parseBool(env("NAGG_RUN_INGESTER", boolText(nostrModule || mintModule))),
+		RunEnricher:  parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
+		RunRollup:    parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
+		RunMintInfo:  parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
+		RunMintProbe: parseBool(env("NAGG_RUN_MINT_PROBE", boolText(mintModule))),
 		Wallpapers: WallpapersConfig{
 			Enabled: parseBool(env("NAGG_WALLPAPERS_ENABLED", boolText(mods.Has(modules.App)))),
 			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_WALLPAPERS_RELAYS", ""))),
@@ -465,6 +485,14 @@ func Load() (Config, error) {
 			MinAge:   parseDuration(env("NAGG_MINT_INFO_MIN_AGE", "24h")),
 			Throttle: parseDuration(env("NAGG_MINT_INFO_THROTTLE", "1.5s")),
 			Timeout:  parseDuration(env("NAGG_MINT_INFO_TIMEOUT", "8s")),
+		},
+		MintProbe: MintProbeConfig{
+			Interval:  parseDuration(env("NAGG_MINT_PROBE_INTERVAL", "1h")),
+			MinAge:    parseDuration(env("NAGG_MINT_PROBE_MIN_AGE", "168h")),
+			Throttle:  parseDuration(env("NAGG_MINT_PROBE_THROTTLE", "5s")),
+			Timeout:   parseDuration(env("NAGG_MINT_PROBE_TIMEOUT", "10s")),
+			PaidPolls: parseInt(env("NAGG_MINT_PROBE_PAID_POLLS", "3")),
+			PaidWait:  parseDuration(env("NAGG_MINT_PROBE_PAID_WAIT", "2s")),
 		},
 		Rollup: RollupConfig{
 			Interval:          parseDuration(env("NAGG_ROLLUP_INTERVAL", "15m")),

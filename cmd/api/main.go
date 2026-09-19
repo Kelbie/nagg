@@ -27,6 +27,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/mintinfo"
+	"github.com/vertex-lab/nagg/internal/mintprobe"
 	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/rates"
 	"github.com/vertex-lab/nagg/internal/relayquery"
@@ -400,6 +401,27 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		safego.Go("api.mintinfo", func() { snapshotter.Run(ctx) })
 		slog.Info("mint info snapshotter enabled",
 			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
+	}
+	// Unpaid-quote probes: the verdicts are always read (the discover testnut
+	// flag); the weekly prober is gated by NAGG_RUN_MINT_PROBE and the worker
+	// schema. It shares the snapshotter's work-list and /v1/info fetcher.
+	appviewOpts = append(appviewOpts, appview.WithTestnutMints(store))
+	if cfg.RunMintProbe && workerSchemaReady {
+		var auditorLister mintinfo.AuditorClient
+		if auditorClient != nil {
+			auditorLister = auditorClient
+		}
+		workList := mintinfo.NewWorkList(auditorLister, store, logger)
+		fetcher := mintinfo.NewHTTPFetcher(mintinfo.CashuNUT06, cfg.MintProbe.Timeout, logger)
+		prober := mintprobe.NewHTTPProber(cfg.MintProbe.Timeout, cfg.MintProbe.PaidPolls, cfg.MintProbe.PaidWait)
+		runner := mintprobe.NewRunner(store, workList, fetcher, prober, mintprobe.Config{
+			Interval: cfg.MintProbe.Interval,
+			MinAge:   cfg.MintProbe.MinAge,
+			Throttle: cfg.MintProbe.Throttle,
+		}, logger)
+		safego.Go("api.mintprobe", func() { runner.Run(ctx) })
+		slog.Info("mint quote prober enabled",
+			"interval", cfg.MintProbe.Interval, "min_age", cfg.MintProbe.MinAge, "throttle", cfg.MintProbe.Throttle)
 	}
 	if cfg.Wallpapers.Enabled {
 		service := wallpapers.NewService(cfg.Wallpapers.Config, relayquery.Client{Relays: cfg.Wallpapers.Relays}, logger)
