@@ -227,3 +227,7 @@ vars are gone; change the declaration instead.
   HTTP config, not a Nostr primitive — so it sits here with the auditor, with its
   own tables (`mint_info_snapshots`, `mint_info_observations`) and a declarative
   `mintinfo.Source` (info path + volatile keys) rather than a registry rule.
+- **Unpaid-quote probes** (`internal/mintprobe`): a weekly prober that requests
+  a NUT-04 mint quote per advertised method, never pays it, and records whether
+  the mint marked it paid and signed outputs anyway (`mint_quote_probes`). Its
+  verdicts are the `/nostr/mint/discover` testnut flag.

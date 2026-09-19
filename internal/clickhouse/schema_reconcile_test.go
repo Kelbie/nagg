@@ -44,6 +44,7 @@ func TestParseDesiredSchema_RealMigrations(t *testing.T) {
 		"relay_backfill_state",
 		"mint_info_snapshots",
 		"mint_info_observations",
+		"mint_quote_probes",
 		// registry-generated
 		"vertex_scores",
 		"vertex_profile_cache",

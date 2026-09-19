@@ -293,7 +293,7 @@ and the mint/events-query paths do not backfill.
 
 ## Mint discovery
 
-`GET /nostr/mint/discover?limit=200[&mint=<url>]` returns
+`GET /nostr/mint/discover?limit=200[&mint=<url>][&testnut=true|false]` returns
 `{mints: [...], profiles: {...}}`, **not an envelope**. It unions NIP-87 kind-38000
 reviews (scored reviews and score-less recommendations alike) with the most
 recent auditor roster, itself the union of both auditors (see below). The review
@@ -303,7 +303,9 @@ old still appears. `mint` is an optional URL-encoded,
 normalized exact-match filter (the existing mint URL normalization ignores host
 case and trailing slashes). It applies before `limit` and returns at most one
 row, or `mints: []` when unknown. It does not fetch a mint or auditor on demand.
-The `/v1/nostr/mint/discover` alias supports the same query.
+`testnut=true` returns only testnut mints, `testnut=false` only the rest;
+omitted returns both, and any other value is a 400. Like `mint`, it applies
+before `limit`. The `/v1/nostr/mint/discover` alias supports the same query.
 
 Each row includes `mintUrl`, optional `name`, `iconUrl`, `description`,
 `supportedUnits` (union of NUT-04/05 method units), and the raw NUT-06 `nuts` map.
@@ -315,6 +317,7 @@ Audit fields include `hasAudit`, `state`, `nMints`, `nMelts`, and `nErrors`, plu
 | `uptime24h` | number, optional | Measured 24h uptime percentage, 0–100. Zero is included; absent means unavailable or enrichment disabled. |
 | `avgLatencyMs` | number, optional | Auditor's lifetime average operation latency in milliseconds (`avg_latency_ms`), not its 24h latency. Zero is included. |
 | `auditSource` | string, optional | `ucash` or `8333` — which auditor supplied the row (ucash wins when both track the mint); absent for review-only rows. |
+| `testnut` | boolean | The weekly unpaid-quote probe (`internal/mintprobe`) saw this mint mark a never-paid NUT-04 quote as paid — a fake payment backend. `false` also covers mints not yet probed (a new mint is probed on the next hourly pass). A week where the mint is down or refuses the quote leaves the previous verdict standing. |
 | `auditUpdatedAt` | integer, optional | Upstream mint record's update time, Unix seconds; omitted when unknown (including legacy records). It is not nagg's refresh time. |
 
 Operator identity/social fields and the `profiles` map retain their existing

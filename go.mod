@@ -5,6 +5,7 @@ go 1.26.3
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.40.3
 	github.com/KimMachineGun/automemlimit v0.7.5
+	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/gorilla/websocket v1.5.3
 	github.com/gowebpki/jcs v1.0.1
 	github.com/graphql-go/graphql v0.8.1
@@ -20,7 +21,6 @@ require (
 	github.com/ClickHouse/ch-go v0.68.0 // indirect
 	github.com/ImVexed/fasturl v0.0.0-20230304231329-4e41488060f3 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
-	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.5 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/bytedance/sonic v1.13.1 // indirect
