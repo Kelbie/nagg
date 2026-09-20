@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -292,12 +293,29 @@ func TestDiscoverScansFullReviewSet(t *testing.T) {
 	}
 }
 
+// fakeTestnuts serves probe verdicts: urls probed as testnuts, real probed as
+// honest mints.
 type fakeTestnuts struct {
 	urls []string
+	real []string
 	err  error
 }
 
-func (f fakeTestnuts) TestnutMintURLs(context.Context) ([]string, error) { return f.urls, f.err }
+var fakeProbedAt = time.Unix(1_790_000_000, 0).UTC()
+
+func (f fakeTestnuts) MintProbeVerdicts(context.Context) (map[string]chstore.MintProbeVerdict, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	out := map[string]chstore.MintProbeVerdict{}
+	for _, u := range f.urls {
+		out[u] = chstore.MintProbeVerdict{Testnut: true, ProbedAt: fakeProbedAt}
+	}
+	for _, u := range f.real {
+		out[u] = chstore.MintProbeVerdict{ProbedAt: fakeProbedAt}
+	}
+	return out, nil
+}
 
 func TestDiscoverTestnutFlagAndFilter(t *testing.T) {
 	auditorClient := WithAuditor(fakeAuditor{mints: []auditor.Mint{

@@ -85,10 +85,28 @@ type DiscoverMintsResponse struct {
 // the 50 newest reviews (23 mints listed, Minibits at 22 of its 91 reviews).
 const discoverReviewScanCap = 5000
 
-// TestnutProvider lists the mints the unpaid-quote probe classified as
-// testnuts (satisfied by *clickhouse.Store).
+// TestnutProvider reads the unpaid-quote probe's standing verdict per mint
+// (satisfied by *clickhouse.Store). A mint with no verdict yet is absent.
 type TestnutProvider interface {
-	TestnutMintURLs(ctx context.Context) ([]string, error)
+	MintProbeVerdicts(ctx context.Context) (map[string]chstore.MintProbeVerdict, error)
+}
+
+// probeVerdicts re-keys the probe verdicts by normalizeMintURL, the key the
+// mint surfaces match on (the probe stores its own path-preserving form).
+// Without a provider there are no verdicts.
+func (h *Handler) probeVerdicts(ctx context.Context) (map[string]chstore.MintProbeVerdict, error) {
+	if h.testnuts == nil {
+		return map[string]chstore.MintProbeVerdict{}, nil
+	}
+	stored, err := h.testnuts.MintProbeVerdicts(ctx)
+	if err != nil {
+		return map[string]chstore.MintProbeVerdict{}, err
+	}
+	out := make(map[string]chstore.MintProbeVerdict, len(stored))
+	for u, verdict := range stored {
+		out[normalizeMintURL(u)] = verdict
+	}
+	return out, nil
 }
 
 // testnutFilter is the discover `testnut` query: "" returns every mint, "true"
@@ -176,21 +194,14 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	// Testnut verdicts, keyed like the union. A lookup failure degrades to
 	// "no testnuts" for the unfiltered feed, but fails a filtered request
 	// rather than silently answering it wrong.
-	testnutKeys := map[string]struct{}{}
-	if h.testnuts != nil {
-		urls, terr := h.testnuts.TestnutMintURLs(ctx)
-		if terr != nil && testnutMode != testnutAny {
-			writeError(w, terr)
-			return
-		}
-		for _, u := range urls {
-			testnutKeys[normalizeMintURL(u)] = struct{}{}
-		}
+	verdicts, terr := h.probeVerdicts(ctx)
+	if terr != nil && testnutMode != testnutAny {
+		writeError(w, terr)
+		return
 	}
 	if testnutMode != testnutAny {
 		for key := range keys {
-			_, testnut := testnutKeys[key]
-			if testnut != (testnutMode == testnutOnly) {
+			if verdicts[key].Testnut != (testnutMode == testnutOnly) {
 				delete(keys, key)
 			}
 		}
@@ -242,7 +253,7 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	mints := make([]DiscoverMint, 0, len(keys))
 	for key := range keys {
 		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, followCounts, vertexProfiles)
-		_, row.Testnut = testnutKeys[key]
+		row.Testnut = verdicts[key].Testnut
 		mints = append(mints, row)
 	}
 

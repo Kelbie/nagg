@@ -230,4 +230,4 @@ vars are gone; change the declaration instead.
 - **Unpaid-quote probes** (`internal/mintprobe`): a weekly prober that requests
   a NUT-04 mint quote per advertised method, never pays it, and records whether
   the mint marked it paid and signed outputs anyway (`mint_quote_probes`). Its
-  verdicts are the `/nostr/mint/discover` testnut flag.
+  verdicts are the `/nostr/mint/discover` and `/nostr/mint/info` testnut flag.

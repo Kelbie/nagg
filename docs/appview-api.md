@@ -95,6 +95,7 @@ Pubkey-keyed (profile-family routes):
 | GET | `/nostr/follow-status` | no | envelope + `edges` (§4) | nostr |
 | GET | `/nostr/mint/reviews` | yes | **not an envelope** (mint objects, not events) | mint |
 | GET | `/nostr/mint/discover` | yes | **not an envelope** | mint |
+| GET | `/nostr/mint/info` | yes | **not an envelope**: per-mint metadata + testnut verdict for the caller's own mint list (§6) | mint |
 | GET | `/nostr/mint/history` | yes | **not an envelope**: NUT-06 info snapshot history (§7) | mint |
 | GET | `/nostr/mint/changes` | yes | **not an envelope**: ecosystem changes and roster stats; optional `limit` (§7) | mint |
 | GET | `/nostr/social-graph` | yes | envelope: the viewer's latest kind-3 / 10002 / 10000 events; derive follows, relays, mutes from their tags | nostr |
@@ -339,6 +340,27 @@ uses `uptime24h / 100` when available, otherwise the historical operation-succes
 ratio. Review score/count and operator followers retain their existing weights.
 The capability manifest and headers advertise `appview.mint.discover.uptime`;
 individual rows can still lack measurements.
+
+### Mint info (caller's own mints)
+
+`GET /nostr/mint/info?u=<mintUrl>[&u=<mintUrl>...]` returns `{mints: [...]}`,
+**not an envelope**: one row per distinct requested mint (URL-normalized like
+`discover`), in request order, at most 50 per request (more, or none, is a 400).
+It is the wallet-side twin of `discover`: a wallet classifies the mints it
+already holds, including ones outside the discovery roster, without walking the
+feed. It reads only what nagg has stored and never fetches a mint on demand.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `mintUrl` | string | The requested URL, echoed so the caller keys on its own form. |
+| `known` | boolean | `false` when nagg has never seen the mint (no auditor row, stored info, or probe verdict); every other field is then empty. |
+| `name`, `iconUrl`, `description`, `supportedUnits`, `nuts` | optional | Same distilled NUT-06 fields as a `discover` row: the auditor's when it tracks the mint, else the latest stored info snapshot. |
+| `testnut` | boolean | Same verdict as `discover`. It is only a verdict when `probedAt` is present; `false` without `probedAt` means "not probed yet". |
+| `probedAt` | integer, optional | Newest probe verdict's time, Unix seconds; omitted until the mint has one. |
+
+Callers cache these verdicts, so a failed verdict lookup fails the whole
+request instead of answering `testnut: false`. Only mints on the probe
+work-list (auditor rosters + NIP-87 recommendations) ever get a verdict.
 
 ## 7. Mint info snapshot history
 
