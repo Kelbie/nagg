@@ -195,7 +195,9 @@ server-side joins stay generic through primitive relations like
 
 A few cashu-specific surfaces sit alongside the generic core under
 `/nostr/mint/*` (the generic event/aggregate schema stays protocol-neutral):
-`reviews` and `discover`, plus **`GET /nostr/mint/history?u=<mintUrl>`** — the
+`reviews`, `discover`, and **`GET /nostr/mint/info?u=<mintUrl>&u=…`** (metadata
+plus the `testnut` probe verdict for a wallet's own mint list), plus
+**`GET /nostr/mint/history?u=<mintUrl>`** — the
 NUT-06 info snapshot history. It returns the initial full document then one
 entry per change as an RFC 6902 JSON Patch (with a human `summary`), collapsing
 unchanged checks into `lastCheckedAt`/`checkCount`/`unchangedSince`; add

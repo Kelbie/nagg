@@ -67,34 +67,46 @@ func (s *Store) LastMintProbes(ctx context.Context) (map[string]time.Time, error
 	return out, rows.Err()
 }
 
-// TestnutMintURLs returns the mints whose latest verdict for at least one
-// method/unit was paid: an unpaid quote the mint marked paid. Only verdict rows
-// count, so a week where the mint was down or refused the quote neither sets
-// nor clears the flag.
-func (s *Store) TestnutMintURLs(ctx context.Context) ([]string, error) {
+// MintProbeVerdict is a mint's standing unpaid-quote verdict.
+type MintProbeVerdict struct {
+	// Testnut is true when the latest verdict for at least one method/unit was
+	// paid: an unpaid quote the mint marked paid.
+	Testnut bool
+	// ProbedAt is the newest verdict's time.
+	ProbedAt time.Time
+}
+
+// MintProbeVerdicts returns every mint that has a probe verdict, keyed by the
+// stored mint URL. Only verdict rows count, so a week where the mint was down
+// or refused the quote neither sets nor clears the flag, and a mint with no
+// verdict yet is absent.
+func (s *Store) MintProbeVerdicts(ctx context.Context) (map[string]MintProbeVerdict, error) {
 	rows, err := s.conn.Query(ctx, `
-		SELECT mint_url
+		SELECT mint_url, max(last_paid) AS testnut, max(last_at) AS probed_at
 		FROM (
-			SELECT mint_url, argMax(paid, probed_at) AS last_paid
+			SELECT mint_url, argMax(paid, probed_at) AS last_paid, max(probed_at) AS last_at
 			FROM mint_quote_probes
 			WHERE status IN ('unpaid', 'paid_not_issued', 'issued')
 			GROUP BY mint_url, method, unit
 		)
 		GROUP BY mint_url
-		HAVING max(last_paid) = 1
 	`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var out []string
+	out := map[string]MintProbeVerdict{}
 	for rows.Next() {
-		var url string
-		if err := rows.Scan(&url); err != nil {
+		var (
+			url     string
+			testnut uint8
+			at      time.Time
+		)
+		if err := rows.Scan(&url, &testnut, &at); err != nil {
 			return nil, err
 		}
-		out = append(out, url)
+		out[url] = MintProbeVerdict{Testnut: testnut == 1, ProbedAt: at}
 	}
 	return out, rows.Err()
 }

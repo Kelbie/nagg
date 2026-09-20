@@ -29,6 +29,7 @@ func TestMintModuleMountsOnlyMintRoutes(t *testing.T) {
 		"/nostr/mint/changes",
 		"/nostr/mint/discover",
 		"/nostr/mint/history",
+		"/nostr/mint/info",
 		"/nostr/mint/reviews",
 	}
 	got := h.mountedRoutes()

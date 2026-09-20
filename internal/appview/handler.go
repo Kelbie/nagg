@@ -271,8 +271,8 @@ func WithMintHistory(provider MintHistoryProvider) Option {
 }
 
 // WithTestnutMints wires the unpaid-quote probe verdicts behind the
-// /nostr/mint/discover `testnut` field and filter. Without it every mint
-// reports testnut=false.
+// /nostr/mint/discover `testnut` field and filter and the /nostr/mint/info
+// verdicts. Without it every mint reports testnut=false, never probed.
 func WithTestnutMints(provider TestnutProvider) Option {
 	return func(h *Handler) {
 		h.testnuts = provider
@@ -412,6 +412,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/follow-status", h.followStatus, false, modules.Nostr},
 		{"/nostr/mint/reviews", h.mintReviews, true, modules.Mint},
 		{"/nostr/mint/discover", h.discoverMints, true, modules.Mint},
+		{"/nostr/mint/info", h.mintInfos, true, modules.Mint},
 		{"/nostr/mint/history", h.mintHistory, true, modules.Mint},
 		{"/nostr/mint/changes", h.mintChanges, true, modules.Mint},
 		{"/nostr/social-graph", h.socialGraph, true, modules.Nostr},
