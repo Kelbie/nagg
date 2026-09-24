@@ -367,7 +367,7 @@ App configuration and operational variables:
 | `NAGG_ROUTSTR_URL` | `https://api.routstr.com` | Primary node; retried first on each catalog refresh. |
 | `NAGG_ROUTSTR_FALLBACK_URLS` | `https://ai.redsh1ft.com,https://api.nonkycai.com,https://routstr.otrta.me,https://llm.satsandsports.cash,https://routstr.satoshisend.xyz` | Ordered comma-separated fallback nodes; first valid non-empty enabled catalog wins. Unset/empty uses defaults; `,` disables fallbacks. |
 | `NAGG_ROUTSTR_AUTH_MODE` | empty | Advertise `node.authMode`: `bearer` or `x-cashu`; empty omits it, invalid warns and omits it. Applies to both primary and fallback nodes; does not authenticate nagg's public catalog fetch. |
-| `NAGG_AI_LINEUP_VENDORS` | `openai,anthropic,x-ai,google` | Ordered vendor slugs to curate. |
+| `NAGG_AI_LINEUP_VENDORS` | `openai,anthropic,x-ai,google` | Vendor slugs to offer FIRST. Not a whitelist: every other vendor the catalog qualifies follows them, ordered by how many current models it has, capped at 12. |
 | `NAGG_AI_LINEUP_PINS` | empty | JSON vendor → tier (`auto`/`pro`/`max`) → exact catalog ID overrides. Missing/disabled IDs appear in `pinsMissing`; derived picks remain. See the [pin procedure](docs/appview-api.md#ai-lineup-operator-checks). |
 | `NAGG_RATES_ENABLED` | `app` module enabled | Run the in-memory BTC fiat worker for GET `/app/rates`. No ClickHouse storage. |
 | `NAGG_RATES_INTERVAL` | `1h` | Refresh immediately on startup, then at this positive duration. |

@@ -74,6 +74,17 @@ type AIModel struct {
 // max = most capable/expensive.
 var aiLineupTiers = [3]string{"auto", "pro", "max"}
 
+// maxAILineupProviders bounds how many vendor tabs the lineup offers. The
+// qualification rules already exclude toys, embeddings and batch variants;
+// what remains is real but long (a live catalog has around twenty-five vendors
+// that can fill a full ladder). Twelve is where a tab strip stops being a list
+// of choices and starts being a directory.
+const maxAILineupProviders = 12
+
+// minAIModelsPerProvider is the floor for a vendor the operator did not name.
+// Below three qualifying models a tab is one model wearing three tier labels.
+const minAIModelsPerProvider = 3
+
 // vendorToProviderID maps catalog vendor slugs to the app's provider tab ids.
 // Vendors without an entry pass their slug through (forward-compatible: old
 // builds skip unknown ids, new builds can add tabs without a nagg change).
@@ -144,8 +155,8 @@ func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pin
 		}
 	}
 	sort.Strings(missingPins)
-	providers := make([]AIProvider, 0, len(vendors))
-	for _, vendor := range vendors {
+	providers := make([]AIProvider, 0, maxAILineupProviders)
+	for _, vendor := range rankAILineupVendors(byVendor, vendors, now) {
 		picks := pickAITiers(byVendor[vendor], now)
 		// Pins override the derived pick per tier; a pin only applies when the
 		// pinned id exists enabled in the catalog, so a typo'd or retired pin
@@ -190,6 +201,65 @@ func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pin
 		Node:        AINode{BaseURL: strings.TrimRight(nodeURL, "/")},
 		Providers:   providers,
 	}, missingPins
+}
+
+// rankAILineupVendors decides which vendors get a tab, and in what order.
+//
+// The configured vendors lead — they are the names the app ships icons for,
+// and the first of them is the app's boot default — and every other vendor the
+// catalog qualifies follows them, ordered by how many CURRENT models it has.
+// Freshness rather than raw count on purpose: a vendor with forty retired
+// listings makes a worse tab than one with six models from this year, and the
+// tier picks already run inside the same window.
+//
+// NAGG_AI_LINEUP_VENDORS is therefore a priority order, not a whitelist. It
+// used to be the whole list, which meant a node serving fifty vendors showed
+// four, and no nagg deploy could widen that without also naming every vendor
+// by hand.
+func rankAILineupVendors(byVendor map[string][]routstr.Model, configured []string, now time.Time) []string {
+	cutoff := now.Add(-aiLineupFreshWindow).Unix()
+	fresh := func(vendor string) int {
+		n := 0
+		for _, m := range byVendor[vendor] {
+			if m.Created >= cutoff {
+				n++
+			}
+		}
+		return n
+	}
+
+	ordered := make([]string, 0, maxAILineupProviders)
+	seen := make(map[string]bool, len(byVendor))
+	for _, vendor := range configured {
+		if seen[vendor] || len(byVendor[vendor]) == 0 {
+			continue
+		}
+		seen[vendor] = true
+		ordered = append(ordered, vendor)
+	}
+
+	rest := make([]string, 0, len(byVendor))
+	for vendor, models := range byVendor {
+		if seen[vendor] || len(models) < minAIModelsPerProvider {
+			continue
+		}
+		rest = append(rest, vendor)
+	}
+	sort.Slice(rest, func(i, j int) bool {
+		fi, fj := fresh(rest[i]), fresh(rest[j])
+		if fi != fj {
+			return fi > fj
+		}
+		// Alphabetical on a tie so the menu order is stable between deploys
+		// rather than following Go's randomised map iteration.
+		return rest[i] < rest[j]
+	})
+
+	ordered = append(ordered, rest...)
+	if len(ordered) > maxAILineupProviders {
+		ordered = ordered[:maxAILineupProviders]
+	}
+	return ordered
 }
 
 // qualifiesForAILineup keeps enabled, priced, text-chat models with a usable

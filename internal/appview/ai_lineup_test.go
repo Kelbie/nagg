@@ -101,8 +101,10 @@ func TestBuildAILineupExcludesNonChatAndStale(t *testing.T) {
 	catalog := append(testCatalog(), embedding, imageGen, disabled, alias, tiny, relic)
 	resp, _ := buildAILineup(catalog, "https://api.routstr.com", []string{"openai"}, nil, aiNow)
 
-	if len(resp.Providers) != 1 {
-		t.Fatalf("providers = %d, want 1", len(resp.Providers))
+	// The configured vendor leads; the rest of the catalog follows it now that
+	// NAGG_AI_LINEUP_VENDORS is a priority order rather than a whitelist.
+	if len(resp.Providers) == 0 || resp.Providers[0].Vendor != "openai" {
+		t.Fatalf("providers = %+v, want openai first", resp.Providers)
 	}
 	for _, m := range resp.Providers[0].Models {
 		switch m.ID {
@@ -183,7 +185,7 @@ func TestAILineupRoute(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Version != 1 || len(resp.Providers) != 1 || resp.Providers[0].ID != "claude" {
+	if resp.Version != 1 || len(resp.Providers) == 0 || resp.Providers[0].ID != "claude" {
 		t.Fatalf("unexpected response: %+v", resp)
 	}
 
@@ -373,5 +375,70 @@ func TestVendorPrefersSlugOverUpstream(t *testing.T) {
 	m.UpstreamProviderID = "openrouter"
 	if got := m.Vendor(); got != "openai" {
 		t.Fatalf("Vendor() = %q, want openai", got)
+	}
+}
+
+// The vendor list used to BE the menu: a node serving fifty vendors showed
+// four, and widening it meant naming every vendor by hand in an env var. It is
+// a priority order now — the configured names lead, the catalog supplies the
+// rest — so these are the rules that decide who else gets a tab.
+func TestBuildAILineupRanksUnconfiguredVendors(t *testing.T) {
+	fresh := aiNow.Add(-30 * 24 * time.Hour).Unix()
+	stale := aiNow.Add(-3 * 365 * 24 * time.Hour).Unix()
+
+	catalog := testCatalog()
+	// Five current models: the strongest unconfigured vendor.
+	for i := 0; i < 5; i++ {
+		catalog = append(catalog, chatModel(
+			fmt.Sprintf("qwen-%d", i), fmt.Sprintf("qwen/qwen-%d", i), fresh, 0.0001, 0.0004))
+	}
+	// Four models, all retired: real, but nobody's current choice.
+	for i := 0; i < 4; i++ {
+		catalog = append(catalog, chatModel(
+			fmt.Sprintf("relic-%d", i), fmt.Sprintf("oldvendor/relic-%d", i), stale, 0.0001, 0.0004))
+	}
+	// Two models: cannot fill a ladder, so no tab.
+	for i := 0; i < 2; i++ {
+		catalog = append(catalog, chatModel(
+			fmt.Sprintf("tiny-%d", i), fmt.Sprintf("tinyvendor/tiny-%d", i), fresh, 0.0001, 0.0004))
+	}
+
+	resp, _ := buildAILineup(catalog, "https://api.routstr.com", []string{"openai"}, nil, aiNow)
+
+	ids := make([]string, 0, len(resp.Providers))
+	for _, p := range resp.Providers {
+		ids = append(ids, p.Vendor)
+	}
+	if len(ids) == 0 || ids[0] != "openai" {
+		t.Fatalf("vendors = %v, want the configured vendor first", ids)
+	}
+	if !slices.Contains(ids, "qwen") {
+		t.Fatalf("vendors = %v, want qwen offered", ids)
+	}
+	if slices.Contains(ids, "tinyvendor") {
+		t.Fatalf("vendors = %v, want a two-model vendor excluded", ids)
+	}
+	if slices.Index(ids, "qwen") > slices.Index(ids, "anthropic") &&
+		slices.Index(ids, "anthropic") >= 0 {
+		// qwen has five current models against anthropic's three.
+		t.Fatalf("vendors = %v, want qwen ahead of anthropic on current models", ids)
+	}
+	if slices.Index(ids, "oldvendor") >= 0 && slices.Index(ids, "oldvendor") < slices.Index(ids, "qwen") {
+		t.Fatalf("vendors = %v, want a retired-only vendor behind a current one", ids)
+	}
+}
+
+func TestBuildAILineupCapsProviderCount(t *testing.T) {
+	fresh := aiNow.Add(-30 * 24 * time.Hour).Unix()
+	catalog := testCatalog()
+	for v := 0; v < 30; v++ {
+		for i := 0; i < 4; i++ {
+			catalog = append(catalog, chatModel(
+				fmt.Sprintf("v%d-m%d", v, i), fmt.Sprintf("vendor%d/m%d", v, i), fresh, 0.0001, 0.0004))
+		}
+	}
+	resp, _ := buildAILineup(catalog, "https://api.routstr.com", []string{"openai"}, nil, aiNow)
+	if len(resp.Providers) > maxAILineupProviders {
+		t.Fatalf("providers = %d, want at most %d", len(resp.Providers), maxAILineupProviders)
 	}
 }
