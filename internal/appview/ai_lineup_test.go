@@ -315,3 +315,63 @@ func TestQualifiesForAILineupRejectsBatchVariants(t *testing.T) {
 		t.Fatal("interactive variant must qualify")
 	}
 }
+
+// upstreamModel is a row shaped like a node's non-OpenRouter upstream: no
+// canonical_slug and an unqualified id, which is how the live catalog lists
+// its Tinfoil entries.
+func upstreamModel(id, upstream string, created int64, prompt, completion float64) routstr.Model {
+	m := chatModel(id, "", created, prompt, completion)
+	m.UpstreamProviderID = upstream
+	return m
+}
+
+func TestBuildAILineupBucketsUnqualifiedIdsByUpstream(t *testing.T) {
+	fresh := aiNow.Add(-30 * 24 * time.Hour).Unix()
+	catalog := append(testCatalog(),
+		upstreamModel("tinfoil-gemma4-31b", "tinfoil", fresh, 0.0004, 0.0012),
+		upstreamModel("tinfoil-glm-5-2", "tinfoil", fresh, 0.0018, 0.0063),
+		upstreamModel("tinfoil-glm-5-3", "tinfoil", fresh, 0.0021, 0.0069),
+	)
+
+	resp, _ := buildAILineup(catalog, "https://node.example/", []string{"openai", "tinfoil"}, nil, aiNow)
+
+	var tinfoil *AIProvider
+	for i := range resp.Providers {
+		if resp.Providers[i].Vendor == "tinfoil" {
+			tinfoil = &resp.Providers[i]
+		}
+	}
+	if tinfoil == nil {
+		t.Fatal("tinfoil rows did not bucket into one provider: without the upstream fallback each id becomes its own vendor and no ladder can form")
+	}
+	// Three models in one bucket is what makes a full auto/pro/max ladder
+	// possible; one-model buckets collapse to auto only.
+	if len(tinfoil.Models) != 3 {
+		t.Fatalf("tiers = %d, want 3 (auto/pro/max)", len(tinfoil.Models))
+	}
+	for _, m := range tinfoil.Models {
+		if m.UpstreamID != "tinfoil" {
+			t.Fatalf("model %s upstreamId = %q, want tinfoil", m.ID, m.UpstreamID)
+		}
+	}
+	// A slug-qualified row must still bucket by its vendor, not its upstream.
+	for _, p := range resp.Providers {
+		if p.Vendor == "openai" {
+			for _, m := range p.Models {
+				if m.UpstreamID != "" {
+					t.Fatalf("openai model %s carried upstreamId %q from a catalog that never set one", m.ID, m.UpstreamID)
+				}
+			}
+		}
+	}
+}
+
+func TestVendorPrefersSlugOverUpstream(t *testing.T) {
+	// A node reporting an upstream must not override a real vendor slug:
+	// every OpenRouter-fronted model would otherwise collapse into one tab.
+	m := chatModel("gpt-mini", "openai/gpt-mini", 0, 0.1, 0.1)
+	m.UpstreamProviderID = "openrouter"
+	if got := m.Vendor(); got != "openai" {
+		t.Fatalf("Vendor() = %q, want openai", got)
+	}
+}

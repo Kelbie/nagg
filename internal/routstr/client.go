@@ -34,6 +34,13 @@ type Model struct {
 	OutputModalities    []string
 	MaxCompletionTokens int
 	Pricing             Pricing
+	// UpstreamProviderID is the node's own id for the account it forwards this
+	// model to ("openrouter", "tinfoil", "generic", …). One node commonly
+	// fronts several, and they fail independently: a node whose OpenRouter
+	// credit is exhausted still serves a perfect catalog and still answers
+	// every OpenRouter completion with 402, while its other upstreams are
+	// fine. It is also the only honest signal that a model runs in a TEE.
+	UpstreamProviderID string
 }
 
 // Pricing is the model's sats_pricing subset the app needs: per-token prompt/
@@ -50,12 +57,21 @@ type Pricing struct {
 
 // Vendor returns the model-vendor slug ("anthropic", "openai", "x-ai", …):
 // the canonical_slug prefix when present, else the id's prefix.
+//
+// Rows that carry neither — no canonical_slug and an unqualified id, which is
+// how nodes list their non-OpenRouter upstreams — fall back to the upstream id.
+// Without that fallback each such row becomes its own single-model vendor
+// bucket (id "tinfoil-glm-5-2" → vendor "tinfoil-glm-5-2"), so it can never be
+// curated into an auto/pro/max ladder no matter what the vendor allowlist says.
 func (m Model) Vendor() string {
 	slug := m.CanonicalSlug
 	if slug == "" {
 		slug = m.ID
 	}
-	vendor, _, _ := strings.Cut(slug, "/")
+	vendor, _, hadSeparator := strings.Cut(slug, "/")
+	if !hadSeparator && m.CanonicalSlug == "" && m.UpstreamProviderID != "" {
+		return strings.ToLower(m.UpstreamProviderID)
+	}
 	return strings.ToLower(vendor)
 }
 
@@ -240,7 +256,9 @@ type rawModel struct {
 	ContextLength int    `json:"context_length"`
 	CanonicalSlug string `json:"canonical_slug"`
 	Enabled       *bool  `json:"enabled"`
-	Architecture  struct {
+
+	UpstreamProviderID string `json:"upstream_provider_id"`
+	Architecture       struct {
 		InputModalities  []string `json:"input_modalities"`
 		OutputModalities []string `json:"output_modalities"`
 	} `json:"architecture"`
@@ -279,6 +297,7 @@ func parseModels(body []byte) ([]Model, error) {
 			InputModalities:     m.Architecture.InputModalities,
 			OutputModalities:    m.Architecture.OutputModalities,
 			MaxCompletionTokens: m.TopProvider.MaxCompletionTokens,
+			UpstreamProviderID:  m.UpstreamProviderID,
 			Pricing: Pricing{
 				Prompt:            m.SatsPricing.Prompt,
 				Completion:        m.SatsPricing.Completion,

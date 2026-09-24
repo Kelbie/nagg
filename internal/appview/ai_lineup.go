@@ -61,6 +61,13 @@ type AIModel struct {
 	MaxCompletionTokens int             `json:"maxCompletionTokens,omitempty"`
 	InputModalities     []string        `json:"inputModalities"`
 	Pricing             routstr.Pricing `json:"pricing"`
+	// UpstreamID is the node's id for the account serving this model. Models
+	// sharing one are one failure domain: when a node's upstream credit runs
+	// out every model behind it answers 402 while the node itself stays
+	// healthy, so a client that retries a sibling from the same upstream is
+	// only paying to be refused again. Omitted when the node does not report
+	// it, which old nodes do not.
+	UpstreamID string `json:"upstreamId,omitempty"`
 }
 
 // aiLineupTiers is the app's tier order: auto = cheapest, pro = middle,
@@ -163,6 +170,7 @@ func buildAILineup(models []routstr.Model, nodeURL string, vendors []string, pin
 				MaxCompletionTokens: m.MaxCompletionTokens,
 				InputModalities:     m.InputModalities,
 				Pricing:             m.Pricing,
+				UpstreamID:          m.UpstreamProviderID,
 			})
 		}
 		if len(entries) == 0 {

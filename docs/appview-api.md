@@ -431,10 +431,22 @@ field. No parameters are required; a POST body (including the legacy
 schema version (currently 1); `updatedAt` is its build time in Unix seconds.
 Each provider contains `id`, `vendor`, and `models`. Each model contains
 `tier` (`auto`, `pro`, or `max`), `id`, `name`, `created`, `contextLength`,
-`inputModalities`, optional `maxCompletionTokens`, and `pricing` with
-`prompt`, `completion`, `request`, `maxCost`, `maxPromptCost`, and
-`maxCompletionCost` in sats. Providers or tiers without eligible models are
-omitted. Returns 503 when Routstr is disabled/unconfigured, or 502 only when no
+`inputModalities`, optional `maxCompletionTokens`, optional `upstreamId`, and
+`pricing` with `prompt`, `completion`, `request`, `maxCost`, `maxPromptCost`,
+and `maxCompletionCost` in sats. Providers or tiers without eligible models are
+omitted.
+
+`upstreamId` is the node's own id for the account serving that model
+(`openrouter`, `tinfoil`, `generic`, …); it is omitted when the node does not
+report `upstream_provider_id`. One node commonly fronts several upstreams and
+they fail independently, so models sharing an `upstreamId` are one failure
+domain: when a node's credit with one upstream runs out, every model behind it
+answers 402 while the node's catalog, wallet and other upstreams stay healthy.
+A client retrying a sibling from the same `upstreamId` is paying to be refused
+again. Vendor bucketing uses `canonical_slug` first and falls back to the
+upstream id only for rows carrying neither a slug nor a qualified id — without
+that fallback each such row forms its own single-model vendor and can never be
+curated into an auto/pro/max ladder. Returns 503 when Routstr is disabled/unconfigured, or 502 only when no
 catalog has ever been fetched successfully and all configured nodes fail.
 
 `node.baseUrl` is the active node that supplied this catalog, never a separate
