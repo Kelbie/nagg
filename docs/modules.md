@@ -21,7 +21,7 @@ Unset means every module — production's behavior, unchanged.
 | `nostr` | the social app-view — feed, thread, notifications, DMs, profiles, search, follows, social graph, ranking; the enricher, the rollup, retention, the relevance tracker; GraphQL |
 | `mint` | the cashu mint observatory — `/nostr/mint/{reviews,discover,history,changes}`, the `/mint-changes` page, the NUT-06 snapshotter, the auditor client |
 | `vertex` | client-signed Vertex DVM relay; shared profile/search/recommended reads (also owned by `nostr`); optional trickle sync; existing plugin caches |
-| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr), `/app/rates` (BTC fiat), `/app/wallpapers`, `/app/btcmap/places` and `/app/btcmap/places/{id}` |
+| `app` | the client-config surface — `/app/latest-version`, `/app/ai-lineup` (Routstr), `/app/ai-providers` (Routstr provider directory), `/app/rates` (BTC fiat), `/app/wallpapers`, `/app/btcmap/places` and `/app/btcmap/places/{id}` |
 
 ## What each module changes
 
@@ -105,7 +105,8 @@ means neither roster was usable.
 ## App configuration and ops
 
 `NAGG_MODULES=mint,app` mounts both `/app/latest-version` (GET/POST) and
-`/app/ai-lineup`, `/app/rates`, `/app/wallpapers`, and `/app/btcmap/places`
+`/app/ai-lineup`, `/app/ai-providers`, `/app/rates`, `/app/wallpapers`, and
+`/app/btcmap/places`
 (list and individual place GETs), including their `/v1/app/*` aliases. Adding `app` adds
 no ClickHouse migrations, tables, or social workers: the mint rule registry,
 stored kinds, and firehose kinds stay the same. The version endpoint reads only

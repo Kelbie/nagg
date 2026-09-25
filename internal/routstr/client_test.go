@@ -197,3 +197,50 @@ func TestRoutstrSlowPrimaryLeavesBudgetForFallback(t *testing.T) {
 		t.Fatalf("fallback starved: %+v, %v", got, err)
 	}
 }
+
+// TestEncryptedPrefersTheNodesOwnUpstreamID pins how /app/ai-providers counts
+// sealed models. Both signals exist in the wild and they disagree: on the live
+// redsh1ft catalog the "tinfoil-" id prefix matches 9 rows while the node's own
+// upstream_provider_id marks 13 — the four extra are Tinfoil-routed models the
+// node simply did not prefix. The upstream id is the node's routing
+// declaration, so it wins; the prefix only covers older nodes that report no
+// upstream at all.
+func TestEncryptedPrefersTheNodesOwnUpstreamID(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		model Model
+		want  bool
+	}{
+		{"upstream tinfoil, unprefixed id", Model{ID: "glm-5-3", UpstreamProviderID: "tinfoil"}, true},
+		{"upstream tinfoil, prefixed id", Model{ID: "tinfoil-glm-5-3", UpstreamProviderID: "tinfoil"}, true},
+		{"upstream openrouter beats a misleading id", Model{ID: "tinfoil-lookalike", UpstreamProviderID: "openrouter"}, false},
+		{"upstream generic", Model{ID: "glm-5-3", UpstreamProviderID: "generic"}, false},
+		{"no upstream, prefixed id", Model{ID: "tinfoil-glm-5-3"}, true},
+		{"no upstream, unprefixed id", Model{ID: "glm-5-3"}, false},
+		{"no upstream, name only coincidence", Model{ID: "tinfoilhat"}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.model.Encrypted(); got != tt.want {
+				t.Fatalf("Encrypted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseModelsIsTheSharedParser: the provider directory reads the very same
+// /v1/models bodies as the lineup, and must not grow a second parser that
+// disagrees about which rows are models.
+func TestParseModelsIsTheSharedParser(t *testing.T) {
+	body := []byte(`{"data":[
+		{"id":"keep","enabled":true,"upstream_provider_id":"tinfoil","sats_pricing":{"completion":1,"max_cost":10}},
+		{"id":"~rolling","enabled":true,"sats_pricing":{"completion":1,"max_cost":10}},
+		{"id":"unpriced","enabled":true}
+	]}`)
+	models, err := ParseModels(body)
+	if err != nil {
+		t.Fatalf("ParseModels: %v", err)
+	}
+	if len(models) != 1 || models[0].ID != "keep" || !models[0].Encrypted() {
+		t.Fatalf("ParseModels = %+v, want only the priced non-alias row", models)
+	}
+}

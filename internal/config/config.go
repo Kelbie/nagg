@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/vertex-lab/nagg/internal/aiproviders"
 	"github.com/vertex-lab/nagg/internal/btcmap"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/dvm"
@@ -59,6 +60,7 @@ type Config struct {
 	Auditor     AuditorConfig
 	AppVersion  AppVersionConfig
 	Routstr     RoutstrConfig
+	AIProviders AIProvidersConfig
 	MintInfo    MintInfoConfig
 	MintProbe   MintProbeConfig
 	Rates       RatesConfig
@@ -194,6 +196,22 @@ type RoutstrConfig struct {
 	Enabled      bool
 	Vendors      []string
 	Pins         string
+}
+
+// AIProvidersConfig configures the server-curated AI provider directory behind
+// GET /app/ai-providers (internal/aiproviders). Enabled false leaves the route
+// 503 and the app keeps discovering providers client-side — an unset config
+// costs that one route and nothing else, exactly as an empty NAGG_ROUTSTR_URL
+// leaves /app/ai-lineup 503 rather than failing the build.
+//
+// Seeds defaults to the Routstr node and its fallbacks: those nodes are
+// providers in their own right and the first directories asked, so discovery
+// still returns something with every relay unreachable.
+type AIProvidersConfig struct {
+	Enabled bool
+	Relays  []string
+	Seeds   []string
+	aiproviders.Config
 }
 
 type APIConfig struct {
@@ -418,6 +436,20 @@ func Load() (Config, error) {
 			Vendors:      splitCSV(env("NAGG_AI_LINEUP_VENDORS", "openai,anthropic,x-ai,google")),
 			Pins:         os.Getenv("NAGG_AI_LINEUP_PINS"),
 		},
+		AIProviders: AIProvidersConfig{
+			Enabled: parseBool(env("NAGG_AI_PROVIDERS_ENABLED", boolText(mods.Has(modules.App)))),
+			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_AI_PROVIDERS_RELAYS", "wss://relay.routstr.com,wss://relay.damus.io,wss://nos.lol"))),
+			Seeds:   splitCSV(env("NAGG_AI_PROVIDERS_SEEDS", "")),
+			Config: aiproviders.Config{
+				Interval:            parseDuration(env("NAGG_AI_PROVIDERS_INTERVAL", "5m")),
+				Timeout:             parseDuration(env("NAGG_AI_PROVIDERS_TIMEOUT", "10s")),
+				Concurrency:         parseInt(env("NAGG_AI_PROVIDERS_CONCURRENCY", "6")),
+				MaxAge:              parseDuration(env("NAGG_AI_PROVIDERS_MAX_AGE", "2h")),
+				CatalogMinAge:       parseDuration(env("NAGG_AI_PROVIDERS_CATALOG_MIN_AGE", "30m")),
+				MaxProviders:        parseInt(env("NAGG_AI_PROVIDERS_LIMIT", "100")),
+				MaxDirectorySources: parseInt(env("NAGG_AI_PROVIDERS_DIRECTORY_SOURCES", "8")),
+			},
+		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,
 			GraphQLHydration:         parseBool(env("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", "false")),
@@ -511,6 +543,16 @@ func Load() (Config, error) {
 	cfg.Rates.Sources = rates.LoadSources(env("NAGG_RATES_EXTRA_SOURCES", ""), cfg.Rates.HTTPEnabled, slog.Default())
 	if len(cfg.Rates.Relays) == 0 {
 		cfg.Rates.Relays = append([]string(nil), cfg.Firehose.Relays...)
+	}
+	// The provider directory seeds itself from the AI nodes nagg is already
+	// configured to pay. They are providers in their own right, and asking
+	// their /v1/providers/ lists is what keeps discovery working when the
+	// relays are unreachable.
+	if len(cfg.AIProviders.Seeds) == 0 {
+		cfg.AIProviders.Seeds = append([]string{cfg.Routstr.URL}, cfg.Routstr.FallbackURLs...)
+	}
+	if len(cfg.AIProviders.Relays) == 0 {
+		cfg.AIProviders.Relays = append([]string(nil), cfg.Firehose.Relays...)
 	}
 	if cfg.API.RateLimitPerMinute <= 0 {
 		cfg.API.RateLimitPerMinute = 120

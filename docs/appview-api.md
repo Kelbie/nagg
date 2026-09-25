@@ -108,6 +108,7 @@ Pubkey-keyed (profile-family routes):
 | POST | `/nostr/vertex/relay` | no | signed event relay, write-through cache, `{ok, kind, result, fetchedAt, cached}` | vertex or nostr |
 | GET,POST | `/app/latest-version` | no | app version, optional message and `minVersion`; no required params (§8) | app |
 | GET | `/app/ai-lineup` | no | curated AI lineup, active node/auth mode, missing pins; no params (§8) | app |
+| GET | `/app/ai-providers` | no | server-curated AI provider directory with health, model counts and operator reach; no params (§8) | app |
 | GET | `/app/rates` | no | in-memory BTC fiat prices and source health; no params (§8) | app |
 | GET | `/app/wallpapers` | no | `{wallpapers, albums, lastUpdated}`; signed admin catalog (§8) | app |
 | GET | `/app/btcmap/places` | no | BTC Map v4 place array; sync query params (§8) | app |
@@ -461,6 +462,83 @@ refreshes retain the last good catalog and its node indefinitely (including
 beyond the former 24-hour stale limit); subsequent requests retry. Primary
 recovery switches back on the next successful refresh. Boot warm-up also uses
 this failover sequence. Successful catalog discovery does not verify paid chat.
+
+### AI provider directory
+
+`GET /app/ai-providers` takes no parameters and returns
+`{providers, checkedAt, ttlSeconds}`. It is the SIBLING of `/app/ai-lineup`,
+not a replacement: that route curates the *models* of one chosen node, this one
+lists the *providers* to choose between. The app used to discover them itself
+on every cold start — a relay round-trip plus a per-node probe fan-out before it
+could draw a picker — which is work a server does once for every client.
+
+Each provider carries `baseUrl`, `name`, `followers`, `modelCount`,
+`encryptedModelCount`, `mints`, `status`, and optionally `pubkey`, `checkedAt`
+and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
+trailing `/v1`) so two spellings of one node cannot render as two rows.
+`mints` is always a list — empty means the provider publishes none, which the
+payment path reads as "any mint".
+
+`status` is `online`, `offline` or `unknown`. `unknown` means nagg has not
+established this provider's state: it was discovered after the last sweep, or
+its last probe is older than `NAGG_AI_PROVIDERS_MAX_AGE`. It is deliberately
+distinguishable from `offline` — an unprobed provider is worth showing above
+one nagg has watched fail, and the aging rule is what takes the directory to
+`unknown` if the sweep worker dies rather than leaving a stale `online`
+standing. A provider that fails its probe is marked `offline` and KEPT, with
+the model counts it last served: dropping the row would read to the app as
+"this provider does not exist".
+
+`checkedAt` on a provider is when THAT provider's status was last established,
+omitted while the status is `unknown`; the top-level `checkedAt` is when the
+sweep ran. `latencyMs` is the last successful probe's round trip, omitted when
+there has never been one. `ttlSeconds` is `NAGG_AI_PROVIDERS_INTERVAL` in
+seconds — a shorter client TTL only re-fetches the same answer.
+
+`encryptedModelCount` is how many of the provider's models route through a
+Tinfoil enclave. It is a COUNT, never a boolean, because "this provider is
+E2EE" is not a true property: a live node badged E2EE serves 582 models of
+which 13 are sealed, and most sealed entries have an identically named
+plaintext twin in the same catalog. Encryption is per-model routing. The count
+comes from the catalog's `upstream_provider_id` — the node's own routing
+declaration, set on every row of the live catalog, which catches four
+Tinfoil-routed models whose ids carry no `tinfoil-` prefix — falling back to
+the `tinfoil-` id prefix only for older nodes that report no upstream.
+
+Providers are sorted server-side, best first, so every client renders the same
+picker: `online` before `unknown` before `offline`; then providers with sealed
+models; then `followers` descending; then `baseUrl` ascending, a total order so
+equal rows never swap places between two requests.
+
+Discovery and the sweep run in nagg, not in the app. Providers announce
+themselves on Nostr as kind-38421 addressable events (both shapes are read: `u`
+tags carrying endpoints, and JSON content holding a directory), and nagg merges
+that registry with the `GET /v1/providers/` directories of the nodes it already
+knows — the seeds first, then providers already known online, capped by
+`NAGG_AI_PROVIDERS_DIRECTORY_SOURCES`. Later sources fill gaps rather than
+overwrite, except a node's own `/v1/info`, which overrides third-party claims
+about its name, operator key and accepted mints.
+
+Each sweep probes every known provider with bounded concurrency
+(`NAGG_AI_PROVIDERS_CONCURRENCY`). The cheap request is `/v1/info` — a few
+hundred bytes that also carry the node's own name, npub and mints — and the
+expensive one is `/v1/models`, which is the only source of the model counts
+(three quarters of a megabyte on the largest live node). So `/v1/info` carries
+status on most sweeps and the catalog is re-read at most once per
+`NAGG_AI_PROVIDERS_CATALOG_MIN_AGE`. Older nodes answer `/v1/info` with 404;
+that is a node saying nothing rather than a node being down, so it is asked
+once and the catalog read becomes its status probe.
+
+`followers` is the operator's Nostr follower count from nagg's own social graph
+(`pubkey_stats`, the same source `/nostr/mint/discover` ranks mint operators
+by), resolved in one batched query per sweep. A deployment without the `nostr`
+module has no such graph and every provider reports 0 rather than nagg adding a
+second, contradictory source.
+
+Returns 503 when `NAGG_AI_PROVIDERS_ENABLED=false`, and also while the first
+sweep is still warming — never an empty `providers` list, which the app would
+read as "there are no providers". In both cases the app falls back to
+discovering providers client-side.
 
 `NAGG_ROUTSTR_AUTH_MODE=bearer` advertises Bearer authentication;
 `NAGG_ROUTSTR_AUTH_MODE=x-cashu` advertises per-request `X-Cashu`. Empty omits

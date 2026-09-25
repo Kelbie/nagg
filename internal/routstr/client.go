@@ -75,6 +75,31 @@ func (m Model) Vendor() string {
 	return strings.ToLower(vendor)
 }
 
+// tinfoilUpstreamID is the upstream a Routstr node forwards to when the model
+// runs inside a Tinfoil enclave.
+const tinfoilUpstreamID = "tinfoil"
+
+// Encrypted reports whether this model is served through a Tinfoil enclave, so
+// the prompt is sealed to the hardware rather than readable by the node.
+//
+// It is a property of the MODEL, never of the node serving it. A live node
+// badged "E2EE" serves 582 models of which 13 route to Tinfoil; most sealed
+// entries even have an identically named plaintext twin in the same catalog.
+// Any caller tempted to lift this to "this provider is E2EE" is asserting
+// something the catalog contradicts.
+//
+// UpstreamProviderID is the node's own routing declaration and is the honest
+// signal — on the live catalog it is set on every row, and it catches four
+// Tinfoil models whose ids carry no "tinfoil-" prefix at all. The prefix is
+// only a naming convention, so it is the fallback for the older nodes that
+// report no upstream.
+func (m Model) Encrypted() bool {
+	if m.UpstreamProviderID != "" {
+		return strings.EqualFold(m.UpstreamProviderID, tinfoilUpstreamID)
+	}
+	return strings.HasPrefix(strings.ToLower(m.ID), tinfoilUpstreamID+"-")
+}
+
 // Catalog keeps models and the node serving them in one atomic snapshot.
 // UpdatedAt changes only after a successful refresh. Treat Models as read-only.
 type Catalog struct {
@@ -274,6 +299,13 @@ type rawModel struct {
 		MaxCompletionCost float64 `json:"max_completion_cost"`
 	} `json:"sats_pricing"`
 }
+
+// ParseModels decodes a node's OpenAI-style /v1/models body into flattened
+// Models, applying the same exclusions the cached client applies. Exported so
+// every reader of that body — the lineup's cached client here, the provider
+// directory's health sweep in internal/aiproviders — shares one parser, and a
+// node-format change is fixed in one place instead of two.
+func ParseModels(body []byte) ([]Model, error) { return parseModels(body) }
 
 func parseModels(body []byte) ([]Model, error) {
 	var raw struct {

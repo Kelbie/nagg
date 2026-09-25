@@ -369,6 +369,16 @@ App configuration and operational variables:
 | `NAGG_ROUTSTR_AUTH_MODE` | empty | Advertise `node.authMode`: `bearer` or `x-cashu`; empty omits it, invalid warns and omits it. Applies to both primary and fallback nodes; does not authenticate nagg's public catalog fetch. |
 | `NAGG_AI_LINEUP_VENDORS` | `openai,anthropic,x-ai,google` | Vendor slugs to offer FIRST. Not a whitelist: every other vendor the catalog qualifies follows them, ordered by how many current models it has, capped at 12. |
 | `NAGG_AI_LINEUP_PINS` | empty | JSON vendor → tier (`auto`/`pro`/`max`) → exact catalog ID overrides. Missing/disabled IDs appear in `pinsMissing`; derived picks remain. See the [pin procedure](docs/appview-api.md#ai-lineup-operator-checks). |
+| `NAGG_AI_PROVIDERS_ENABLED` | `app` module enabled | Run the AI provider directory sweep behind `/app/ai-providers`; disabled returns 503 and the app discovers providers client-side. No ClickHouse storage. |
+| `NAGG_AI_PROVIDERS_RELAYS` | `wss://relay.routstr.com,wss://relay.damus.io,wss://nos.lol` | Comma-separated relays queried for kind-38421 provider announcements, independent of stored/subscribed kinds. |
+| `NAGG_AI_PROVIDERS_SEEDS` | `NAGG_ROUTSTR_URL` + `NAGG_ROUTSTR_FALLBACK_URLS` | Comma-separated node base URLs that seed the directory and are the first `/v1/providers/` sources asked. Keeps discovery working with every relay down. |
+| `NAGG_AI_PROVIDERS_INTERVAL` | `5m` | Sweep period, and the `ttlSeconds` the app is told to respect. |
+| `NAGG_AI_PROVIDERS_TIMEOUT` | `10s` | Per-request budget for one probe. |
+| `NAGG_AI_PROVIDERS_CONCURRENCY` | `6` | Simultaneous probes. Providers are third-party nodes; a sweep must not look like a burst. |
+| `NAGG_AI_PROVIDERS_CATALOG_MIN_AGE` | `30m` | Minimum gap between full `/v1/models` reads of one provider; `/v1/info` carries status between them. |
+| `NAGG_AI_PROVIDERS_MAX_AGE` | `2h` | How long a probe result stands. Past it a provider reports `unknown` instead of asserting a stale `online`/`offline`. Raised to `2 ×` catalog min-age if set lower. |
+| `NAGG_AI_PROVIDERS_LIMIT` | `100` | Cap on directory size. Announcements are unauthenticated and free to publish. |
+| `NAGG_AI_PROVIDERS_DIRECTORY_SOURCES` | `8` | Cap on nodes asked for their `/v1/providers/` list per sweep: seeds first, then providers already known online. |
 | `NAGG_RATES_ENABLED` | `app` module enabled | Run the in-memory BTC fiat worker for GET `/app/rates`. No ClickHouse storage. |
 | `NAGG_RATES_INTERVAL` | `1h` | Refresh immediately on startup, then at this positive duration. |
 | `NAGG_RATES_MAX_AGE` | `6h` | Maximum observation age admitted to consensus (positive duration). |

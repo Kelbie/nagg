@@ -183,7 +183,7 @@ func TestAppCachePolicy(t *testing.T) {
 			t.Fatalf("Btcmap %s: fresh=%s stale=%s", path, fresh, stale)
 		}
 	}
-	for _, path := range []string{"/app/latest-version", "/app/ai-lineup", "/app/rates", "/v1/app/latest-version", "/v1/app/ai-lineup", "/v1/app/rates"} {
+	for _, path := range []string{"/app/latest-version", "/app/ai-lineup", "/app/ai-providers", "/app/rates", "/v1/app/latest-version", "/v1/app/ai-lineup", "/v1/app/ai-providers", "/v1/app/rates"} {
 		fresh, stale := restCachePolicy(path, time.Second, time.Second)
 		if fresh != time.Minute || stale != 24*time.Hour {
 			t.Fatalf("%s policy = (%s, %s)", path, fresh, stale)

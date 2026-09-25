@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vertex-lab/nagg/internal/aiproviders"
 	"github.com/vertex-lab/nagg/internal/appview"
 	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/btcmap"
@@ -453,6 +454,26 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 			}
 		}()
 	}
+	// The provider directory: discovery, the health sweep and the follower
+	// counts all happen HERE, once, instead of in every app on every cold
+	// start. Disabled config leaves /app/ai-providers 503 and nothing else
+	// changes.
+	if cfg.AIProviders.Enabled {
+		var followers aiproviders.FollowerCounter
+		// Operator reach comes from nagg's own social graph (pubkey_stats),
+		// the same source /nostr/mint/discover ranks mint operators by. A
+		// deployment without the nostr module has no such graph, so it gets
+		// none rather than a second, contradictory source.
+		if nostrModule {
+			followers = pubkeyFollowers{store: store}
+		}
+		directory := aiproviders.NewService(cfg.AIProviders.Config, relayquery.Client{Relays: cfg.AIProviders.Relays}, followers, logger)
+		appviewOpts = append(appviewOpts, appview.WithAIProviders(directory))
+		safego.Go("api.ai_providers", func() { directory.Run(ctx) })
+		slog.Info("ai providers enabled",
+			"relays", len(cfg.AIProviders.Relays), "seeds", len(cfg.AIProviders.Seeds),
+			"interval", cfg.AIProviders.Interval, "followers", followers != nil)
+	}
 	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
 	}
@@ -462,6 +483,23 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	mux.HandleFunc("/healthz", healthHandler(store, cfg.StoredKinds, healthStorageStats.Snapshot))
 
 	return mux, nil
+}
+
+// pubkeyFollowers adapts the ClickHouse social-graph read to the provider
+// directory's narrow need: follower counts only, batched, for the operator
+// pubkeys the directory found.
+type pubkeyFollowers struct{ store *chstore.Store }
+
+func (p pubkeyFollowers) Followers(ctx context.Context, pubkeys []string) (map[string]uint64, error) {
+	stats, err := p.store.BatchPubkeyStats(ctx, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]uint64, len(stats))
+	for pubkey, row := range stats {
+		out[pubkey] = row.Followers
+	}
+	return out, nil
 }
 
 type apiRuntime struct {

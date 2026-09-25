@@ -97,6 +97,7 @@ type Handler struct {
 	appUpdateMessage          string
 	appMinVersion             string
 	routstrClient             RoutstrClient
+	aiProviderDir             AIProvidersDirectory
 	aiLineupVendors           []string
 	aiLineupPins              map[string]map[string]string
 	aiLineupAuthMode          string
@@ -427,6 +428,7 @@ func (h *Handler) routes() []route {
 		{"/nostr/vertex/relay", h.vertexRelayRequest, false, modules.Vertex},
 		{"/app/latest-version", h.latestVersion, false, modules.App},
 		{"/app/ai-lineup", h.aiLineup, false, modules.App},
+		{"/app/ai-providers", h.aiProviders, false, modules.App},
 		{"/app/rates", h.appRates, false, modules.App},
 		{"/app/wallpapers", h.appWallpapers, false, modules.App},
 		{"/app/btcmap/places", h.appBtcmap, false, modules.App},
