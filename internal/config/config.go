@@ -209,8 +209,11 @@ type RoutstrConfig struct {
 // still returns something with every relay unreachable.
 type AIProvidersConfig struct {
 	Enabled bool
-	Relays  []string
-	Seeds   []string
+	// Relays and Seeds live on the embedded aiproviders.Config, NOT here.
+	// Duplicating them at this level compiles and reads fine, and then silently
+	// hands NewService an empty Config while every caller of cfg.Seeds sees the
+	// populated outer copy: the route served "warming" forever against a
+	// directory that had never been given a single node to look at.
 	aiproviders.Config
 }
 
@@ -438,9 +441,9 @@ func Load() (Config, error) {
 		},
 		AIProviders: AIProvidersConfig{
 			Enabled: parseBool(env("NAGG_AI_PROVIDERS_ENABLED", boolText(mods.Has(modules.App)))),
-			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_AI_PROVIDERS_RELAYS", "wss://relay.routstr.com,wss://relay.damus.io,wss://nos.lol"))),
-			Seeds:   splitCSV(env("NAGG_AI_PROVIDERS_SEEDS", "")),
 			Config: aiproviders.Config{
+				Relays:              relayquery.SanitizeRelays(splitCSV(env("NAGG_AI_PROVIDERS_RELAYS", "wss://relay.routstr.com,wss://relay.damus.io,wss://nos.lol"))),
+				Seeds:               splitCSV(env("NAGG_AI_PROVIDERS_SEEDS", "")),
 				Interval:            parseDuration(env("NAGG_AI_PROVIDERS_INTERVAL", "5m")),
 				Timeout:             parseDuration(env("NAGG_AI_PROVIDERS_TIMEOUT", "10s")),
 				Concurrency:         parseInt(env("NAGG_AI_PROVIDERS_CONCURRENCY", "6")),
