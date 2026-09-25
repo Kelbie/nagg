@@ -75,29 +75,51 @@ func (m Model) Vendor() string {
 	return strings.ToLower(vendor)
 }
 
-// tinfoilUpstreamID is the upstream a Routstr node forwards to when the model
-// runs inside a Tinfoil enclave.
+// tinfoilModelPrefix is what a Routstr CLIENT gates sealed transport on.
+// @routstr/sdk: `isTinfoilModel(modelId) = modelId.startsWith("tinfoil-")`,
+// and `getTinfoilUpstreamModelId` strips exactly this prefix — so
+// "tinfoil-glm-5-3" is the sealed route to the same model "glm-5-3" serves in
+// the clear. Matched byte for byte, case included: a node publishing
+// "Tinfoil-foo" would be sent in the clear by the SDK, so nagg must not claim
+// otherwise.
+const tinfoilModelPrefix = "tinfoil-"
+
+// tinfoilUpstreamID is the upstream a Routstr node declares when it forwards a
+// model to a Tinfoil enclave.
 const tinfoilUpstreamID = "tinfoil"
 
-// Encrypted reports whether this model is served through a Tinfoil enclave, so
-// the prompt is sealed to the hardware rather than readable by the node.
+// Encrypted reports whether a CLIENT will seal its prompt to the enclave for
+// this model — end-to-end, with the node unable to read it.
+//
+// This is the id prefix and nothing else, because the prefix is the whole of
+// what the SDK checks before switching on sealed transport. The node's
+// `upstream_provider_id` is a different claim: see TEEHosted.
 //
 // It is a property of the MODEL, never of the node serving it. A live node
-// badged "E2EE" serves 582 models of which 13 route to Tinfoil; most sealed
-// entries even have an identically named plaintext twin in the same catalog.
-// Any caller tempted to lift this to "this provider is E2EE" is asserting
+// badged "E2EE" serves 564 priced models of which 9 are client-sealable; most
+// of those have an identically named plaintext twin in the same catalog. Any
+// caller tempted to lift this to "this provider is E2EE" is asserting
 // something the catalog contradicts.
-//
-// UpstreamProviderID is the node's own routing declaration and is the honest
-// signal — on the live catalog it is set on every row, and it catches four
-// Tinfoil models whose ids carry no "tinfoil-" prefix at all. The prefix is
-// only a naming convention, so it is the fallback for the older nodes that
-// report no upstream.
 func (m Model) Encrypted() bool {
-	if m.UpstreamProviderID != "" {
-		return strings.EqualFold(m.UpstreamProviderID, tinfoilUpstreamID)
-	}
-	return strings.HasPrefix(strings.ToLower(m.ID), tinfoilUpstreamID+"-")
+	return strings.HasPrefix(m.ID, tinfoilModelPrefix)
+}
+
+// TEEHosted reports whether the NODE says it forwards this model to a Tinfoil
+// enclave. That is a weaker promise than Encrypted and must never be sold as
+// the same one: for a model the node declares as tinfoil but does not prefix,
+// the client sends the prompt in the clear and the node decrypts, reads and
+// forwards it. The prompt is exposed to the operator; only the operator's own
+// hop to the enclave is protected.
+//
+// The gap is not hypothetical and it is not safe-looking. On the live
+// redsh1ft catalog 13 rows declare a tinfoil upstream while 9 carry the
+// prefix, and three of the four in the gap are NAMED "Private (E2EE) …". The
+// name is the node's marketing; the prefix is what the client actually does.
+//
+// A prefixed model is enclave-hosted by construction, so this is a superset of
+// Encrypted — including on older nodes that report no upstream at all.
+func (m Model) TEEHosted() bool {
+	return strings.EqualFold(m.UpstreamProviderID, tinfoilUpstreamID) || m.Encrypted()
 }
 
 // Catalog keeps models and the node serving them in one atomic snapshot.

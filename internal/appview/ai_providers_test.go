@@ -37,8 +37,9 @@ func fixtureDirectory() aiproviders.Directory {
 				Name:                "redsh1ft",
 				Pubkey:              "aa3f3bf381ac923afcf5a3c16fb2957de94057de84df0c3e84a44c57fa031482",
 				Followers:           1234,
-				ModelCount:          582,
+				ModelCount:          564,
 				EncryptedModelCount: 9,
+				TEEModelCount:       13,
 				Mints:               []string{"https://mint.minibits.cash/Bitcoin"},
 				Status:              aiproviders.StatusOnline,
 				CheckedAt:           checkedAt(0),
@@ -86,6 +87,7 @@ func TestAIProvidersRouteContract(t *testing.T) {
 			Followers           uint64   `json:"followers"`
 			ModelCount          int      `json:"modelCount"`
 			EncryptedModelCount int      `json:"encryptedModelCount"`
+			TEEModelCount       int      `json:"teeModelCount"`
 			Mints               []string `json:"mints"`
 			Status              string   `json:"status"`
 			CheckedAt           string   `json:"checkedAt"`
@@ -108,10 +110,14 @@ func TestAIProvidersRouteContract(t *testing.T) {
 	if first.BaseURL != "https://ai.redsh1ft.com" || first.Name != "redsh1ft" || first.Followers != 1234 {
 		t.Fatalf("first provider = %+v", first)
 	}
-	// A count, never a flag: on this node 9 of 582 models are sealed and the
-	// rest are plaintext, so "is this provider E2EE" has no true answer.
-	if first.ModelCount != 582 || first.EncryptedModelCount != 9 {
-		t.Fatalf("counts = %d/%d, want 582/9", first.ModelCount, first.EncryptedModelCount)
+	// A count, never a flag: on this node 9 of 564 priced models are sealed
+	// and the rest are plaintext, so "is this provider E2EE" has no true
+	// answer. The two counts are separate claims and must stay separate on the
+	// wire — encryptedModelCount is what a client will seal (the same test the
+	// model picker badges on), teeModelCount is only what the node declares,
+	// and the four in the gap are sent in the clear.
+	if first.ModelCount != 564 || first.EncryptedModelCount != 9 || first.TEEModelCount != 13 {
+		t.Fatalf("counts = %d/%d/%d, want 564/9/13", first.ModelCount, first.EncryptedModelCount, first.TEEModelCount)
 	}
 	if first.Status != "online" || first.CheckedAt != "2026-09-25T06:00:00Z" || first.LatencyMs != 340 {
 		t.Fatalf("online row = %+v", first)

@@ -33,11 +33,16 @@ const (
 // Provider is one row of the directory.
 //
 // EncryptedModelCount is a COUNT, never a boolean. "This provider is E2EE" is
-// not a true property: on a live node badged E2EE, 9 of 582 models are sealed
-// and the rest are plaintext, and most sealed models have an identically named
-// unsealed twin in the same catalog. Encryption is per-model routing, so the
-// honest thing to publish is how many of a provider's models are sealed and
-// let the app say "9 private models" rather than "private".
+// not a true property: on a live node badged E2EE, 9 of its 564 priced models
+// are client-sealable and the rest are plaintext, and most sealed models have
+// an identically named unsealed twin in the same catalog. Encryption is
+// per-model routing, so the honest thing to publish is how many of a
+// provider's models are sealed and let the app say "9 private models" rather
+// than "private".
+//
+// It counts models the CLIENT will seal (routstr.Model.Encrypted), which is
+// the same test the app's model picker badges on, so the directory and the
+// picker can never disagree about a provider's number.
 type Provider struct {
 	BaseURL string `json:"baseUrl"`
 	Name    string `json:"name"`
@@ -46,11 +51,18 @@ type Provider struct {
 	Pubkey string `json:"pubkey,omitempty"`
 	// Followers is the operator's Nostr follower count from nagg's own social
 	// graph. 0 also covers "no pubkey" and "graph not available here".
-	Followers           uint64   `json:"followers"`
-	ModelCount          int      `json:"modelCount"`
-	EncryptedModelCount int      `json:"encryptedModelCount"`
-	Mints               []string `json:"mints"`
-	Status              string   `json:"status"`
+	Followers           uint64 `json:"followers"`
+	ModelCount          int    `json:"modelCount"`
+	EncryptedModelCount int    `json:"encryptedModelCount"`
+	// TEEModelCount is how many models the NODE declares it forwards to a
+	// Tinfoil enclave. It is a superset of EncryptedModelCount and a WEAKER
+	// promise: the models in the gap are sent in the clear, so the node reads
+	// the prompt before forwarding it. Published because it is real
+	// information about where inference runs, and named so it can never be
+	// mistaken for the end-to-end claim.
+	TEEModelCount int      `json:"teeModelCount"`
+	Mints         []string `json:"mints"`
+	Status        string   `json:"status"`
 	// CheckedAt is when THIS provider's status was last established. Omitted
 	// while the status is unknown, because nothing has been established yet.
 	CheckedAt *time.Time `json:"checkedAt,omitempty"`

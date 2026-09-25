@@ -198,30 +198,54 @@ func TestRoutstrSlowPrimaryLeavesBudgetForFallback(t *testing.T) {
 	}
 }
 
-// TestEncryptedPrefersTheNodesOwnUpstreamID pins how /app/ai-providers counts
-// sealed models. Both signals exist in the wild and they disagree: on the live
-// redsh1ft catalog the "tinfoil-" id prefix matches 9 rows while the node's own
-// upstream_provider_id marks 13 — the four extra are Tinfoil-routed models the
-// node simply did not prefix. The upstream id is the node's routing
-// declaration, so it wins; the prefix only covers older nodes that report no
-// upstream at all.
-func TestEncryptedPrefersTheNodesOwnUpstreamID(t *testing.T) {
+// TestEncryptedIsTheClientsPrefixNotTheNodesClaim pins the rule /app/ai-providers
+// counts end-to-end encryption by, and the trap it exists to avoid.
+//
+// A Routstr client gates sealed transport on the id prefix alone —
+// @routstr/sdk: `isTinfoilModel(modelId) = modelId.startsWith("tinfoil-")` —
+// so the prefix IS the end-to-end claim. The node's upstream_provider_id is a
+// different and weaker one: for a row the node calls tinfoil but does not
+// prefix, the client sends the prompt in the clear and the node decrypts,
+// reads and forwards it.
+//
+// Counting the upstream id would have the provider list claim 13 while the
+// model picker badges 9, and the four in the gap are exactly the ones where
+// the promise is false.
+func TestEncryptedIsTheClientsPrefixNotTheNodesClaim(t *testing.T) {
 	for _, tt := range []struct {
-		name  string
-		model Model
-		want  bool
+		name      string
+		model     Model
+		encrypted bool
+		tee       bool
 	}{
-		{"upstream tinfoil, unprefixed id", Model{ID: "glm-5-3", UpstreamProviderID: "tinfoil"}, true},
-		{"upstream tinfoil, prefixed id", Model{ID: "tinfoil-glm-5-3", UpstreamProviderID: "tinfoil"}, true},
-		{"upstream openrouter beats a misleading id", Model{ID: "tinfoil-lookalike", UpstreamProviderID: "openrouter"}, false},
-		{"upstream generic", Model{ID: "glm-5-3", UpstreamProviderID: "generic"}, false},
-		{"no upstream, prefixed id", Model{ID: "tinfoil-glm-5-3"}, true},
-		{"no upstream, unprefixed id", Model{ID: "glm-5-3"}, false},
-		{"no upstream, name only coincidence", Model{ID: "tinfoilhat"}, false},
+		{"prefixed and declared", Model{ID: "tinfoil-glm-5-3", UpstreamProviderID: "tinfoil"}, true, true},
+		// The trap, live on redsh1ft: the node declares a tinfoil upstream AND
+		// names the row "Private (E2EE) GLM 5.3", but without the prefix the
+		// client never seals it. The name is the node's marketing; the prefix
+		// is what the client does.
+		{"declared and NAMED private, but unprefixed", Model{ID: "glm-5-3", Name: "Private (E2EE) GLM 5.3", UpstreamProviderID: "tinfoil"}, false, true},
+		{"declared, unprefixed, unremarkable name", Model{ID: "kimi-k3", UpstreamProviderID: "tinfoil"}, false, true},
+		// A prefixed row on an older node that reports no upstream is still
+		// sealed by the client, and is enclave-hosted by construction.
+		{"prefixed, no upstream reported", Model{ID: "tinfoil-glm-5-3"}, true, true},
+		{"plain model", Model{ID: "glm-5-3", UpstreamProviderID: "openrouter"}, false, false},
+		{"upstream generic", Model{ID: "glm-5-3", UpstreamProviderID: "generic"}, false, false},
+		{"prefix-lookalike without the separator", Model{ID: "tinfoilhat", UpstreamProviderID: "openrouter"}, false, false},
+		// The SDK's startsWith is case-sensitive, so a differently cased
+		// prefix is sent in the clear. nagg must not claim otherwise.
+		{"wrong case is not the prefix", Model{ID: "Tinfoil-glm-5-3", UpstreamProviderID: "openrouter"}, false, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.model.Encrypted(); got != tt.want {
-				t.Fatalf("Encrypted() = %v, want %v", got, tt.want)
+			if got := tt.model.Encrypted(); got != tt.encrypted {
+				t.Fatalf("Encrypted() = %v, want %v", got, tt.encrypted)
+			}
+			if got := tt.model.TEEHosted(); got != tt.tee {
+				t.Fatalf("TEEHosted() = %v, want %v", got, tt.tee)
+			}
+			// The end-to-end claim can never exceed the hosting claim: an app
+			// that badges Encrypted is always within what TEEHosted allows.
+			if tt.model.Encrypted() && !tt.model.TEEHosted() {
+				t.Fatal("Encrypted without TEEHosted: the counts would not nest")
 			}
 		})
 	}
@@ -240,7 +264,7 @@ func TestParseModelsIsTheSharedParser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseModels: %v", err)
 	}
-	if len(models) != 1 || models[0].ID != "keep" || !models[0].Encrypted() {
-		t.Fatalf("ParseModels = %+v, want only the priced non-alias row", models)
+	if len(models) != 1 || models[0].ID != "keep" || models[0].Encrypted() || !models[0].TEEHosted() {
+		t.Fatalf("ParseModels = %+v, want only the priced non-alias row, TEE-hosted but not client-sealed", models)
 	}
 }

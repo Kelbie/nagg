@@ -24,21 +24,26 @@ func insecureClient() *http.Client {
 	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 }
 
-// catalogBody is a node's /v1/models answer: n models, the first `sealed` of
-// them routed to a Tinfoil enclave.
-func catalogBody(n, sealed int) string {
+// catalogBody is a node's /v1/models answer: n models, of which the first
+// `sealed` carry the "tinfoil-" prefix a client seals on, and the next
+// `teeOnly` declare a tinfoil upstream WITHOUT the prefix — the live shape
+// that makes the two counts differ.
+func catalogBody(n, sealed, teeOnly int) string {
 	body := `{"data":[`
 	for i := 0; i < n; i++ {
-		upstream := "openrouter"
-		if i < sealed {
+		id, upstream := fmt.Sprintf("model-%d", i), "openrouter"
+		switch {
+		case i < sealed:
+			id, upstream = fmt.Sprintf("tinfoil-model-%d", i), "tinfoil"
+		case i < sealed+teeOnly:
 			upstream = "tinfoil"
 		}
 		if i > 0 {
 			body += ","
 		}
 		body += fmt.Sprintf(
-			`{"id":"model-%d","canonical_slug":"openai/model-%d","enabled":true,"context_length":200000,"upstream_provider_id":%q,"architecture":{"output_modalities":["text"]},"sats_pricing":{"completion":1,"max_cost":10}}`,
-			i, i, upstream)
+			`{"id":%q,"enabled":true,"context_length":200000,"upstream_provider_id":%q,"architecture":{"output_modalities":["text"]},"sats_pricing":{"completion":1,"max_cost":10}}`,
+			id, upstream)
 	}
 	return body + `]}`
 }
@@ -47,15 +52,16 @@ func catalogBody(n, sealed int) string {
 // simulate an outage rather than a removal.
 type node struct {
 	*httptest.Server
-	up     atomic.Bool
-	name   string
-	models int
-	sealed int
+	up      atomic.Bool
+	name    string
+	models  int
+	sealed  int
+	teeOnly int
 }
 
-func newNode(t *testing.T, name string, models, sealed int) *node {
+func newNode(t *testing.T, name string, models, sealed, teeOnly int) *node {
 	t.Helper()
-	n := &node{name: name, models: models, sealed: sealed}
+	n := &node{name: name, models: models, sealed: sealed, teeOnly: teeOnly}
 	n.up.Store(true)
 	n.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !n.up.Load() {
@@ -70,7 +76,7 @@ func newNode(t *testing.T, name string, models, sealed int) *node {
 		case "/v1/info":
 			fmt.Fprintf(w, `{"name":%q,"mints":["https://mint.example/Bitcoin"]}`, n.name)
 		case "/v1/models":
-			fmt.Fprint(w, catalogBody(n.models, n.sealed))
+			fmt.Fprint(w, catalogBody(n.models, n.sealed, n.teeOnly))
 		default:
 			http.NotFound(w, r)
 		}
@@ -104,16 +110,21 @@ func TestSortIsServerSideAndTotal(t *testing.T) {
 		{BaseURL: "https://z-offline", Status: StatusOffline, Followers: 9999, EncryptedModelCount: 5},
 		{BaseURL: "https://b-online-plain", Status: StatusOnline, Followers: 500},
 		{BaseURL: "https://a-online-plain", Status: StatusOnline, Followers: 500},
-		{BaseURL: "https://c-online-sealed", Status: StatusOnline, Followers: 1, EncryptedModelCount: 9},
+		{BaseURL: "https://c-online-sealed", Status: StatusOnline, Followers: 1, EncryptedModelCount: 9, TEEModelCount: 13},
+		// Declared enclave hosting with nothing the client will seal. The
+		// boost is for end-to-end encryption, so this row must rank purely on
+		// followers alongside the plaintext providers.
+		{BaseURL: "https://f-online-tee-only", Status: StatusOnline, Followers: 600, TEEModelCount: 13},
 		{BaseURL: "https://d-unknown", Status: StatusUnknown, Followers: 100_000},
 		{BaseURL: "https://e-online-popular", Status: StatusOnline, Followers: 800},
 	}
 	Sort(providers)
 
 	want := []string{
-		"https://c-online-sealed",  // online + sealed beats every plaintext peer
-		"https://e-online-popular", // then followers, descending
-		"https://a-online-plain",   // equal followers → base URL, a total order
+		"https://c-online-sealed",   // online + sealed beats every plaintext peer
+		"https://e-online-popular",  // then followers, descending
+		"https://f-online-tee-only", // a TEE claim alone earns no boost
+		"https://a-online-plain",    // equal followers → base URL, a total order
 		"https://b-online-plain",
 		"https://d-unknown", // unknown outranks offline however popular it is
 		"https://z-offline",
@@ -197,8 +208,8 @@ func TestUnknownIsDistinctFromOffline(t *testing.T) {
 // app as "this provider does not exist", when what nagg knows is "it did not
 // answer".
 func TestFailedProbeKeepsProviderListed(t *testing.T) {
-	good := newNode(t, "steady", 4, 0)
-	flaky := newNode(t, "flaky", 582, 13)
+	good := newNode(t, "steady", 4, 0, 0)
+	flaky := newNode(t, "flaky", 564, 9, 4)
 
 	s := newTestService(t, Config{
 		Seeds:         []string{good.URL, flaky.URL},
@@ -214,8 +225,11 @@ func TestFailedProbeKeepsProviderListed(t *testing.T) {
 		t.Fatalf("first sweep: ok=%v providers=%d", ok, len(directory.Providers))
 	}
 	before, _ := byURL(directory, flaky.URL)
-	if before.Status != StatusOnline || before.ModelCount != 582 || before.EncryptedModelCount != 13 {
-		t.Fatalf("flaky before outage = %+v, want online 582/13", before)
+	// The live redsh1ft shape: 564 priced models, 9 the client will seal, 13
+	// the node declares as enclave-hosted. The two counts must not collapse
+	// into one, or the directory claims 13 while the picker badges 9.
+	if before.Status != StatusOnline || before.ModelCount != 564 || before.EncryptedModelCount != 9 || before.TEEModelCount != 13 {
+		t.Fatalf("flaky before outage = %+v, want online 564 models / 9 sealed / 13 TEE", before)
 	}
 	if before.Name != "flaky" || len(before.Mints) != 1 {
 		t.Fatalf("node /v1/info did not fill name and mints: %+v", before)
@@ -234,11 +248,10 @@ func TestFailedProbeKeepsProviderListed(t *testing.T) {
 	}
 	// Counts survive the outage: what a provider serves when it is up is still
 	// the best answer to "how big is it" while it is down.
-	if after.ModelCount != 582 || after.EncryptedModelCount != 13 {
+	if after.ModelCount != 564 || after.EncryptedModelCount != 9 || after.TEEModelCount != 13 {
 		t.Fatalf("outage erased the catalog counts: %+v", after)
 	}
-	// The healthy node must outrank it, and sealed models must have been
-	// counted from the node's own upstream ids rather than guessed.
+	// The healthy node must outrank it.
 	if directory.Providers[0].BaseURL != good.URL {
 		t.Fatalf("offline provider ranked above the healthy one: %v", urls(directory.Providers))
 	}
@@ -355,8 +368,8 @@ func (s stubFollowers) Followers(_ context.Context, _ []string) (map[string]uint
 }
 
 func TestFollowerCountsRankAndDegrade(t *testing.T) {
-	quiet := newNode(t, "quiet", 2, 0)
-	loud := newNode(t, "loud", 2, 0)
+	quiet := newNode(t, "quiet", 2, 0, 0)
+	loud := newNode(t, "loud", 2, 0, 0)
 	cfg := Config{Seeds: []string{quiet.URL, loud.URL}, Timeout: 2 * time.Second}
 
 	s := newTestService(t, cfg, nil, stubFollowers{counts: map[string]uint64{}})
@@ -394,7 +407,7 @@ func TestCatalogReadIsRateLimited(t *testing.T) {
 			fmt.Fprint(w, `{"name":"chatty","mints":[]}`)
 		case "/v1/models":
 			catalogHits.Add(1)
-			fmt.Fprint(w, catalogBody(3, 1))
+			fmt.Fprint(w, catalogBody(3, 1, 0))
 		default:
 			http.NotFound(w, r)
 		}
@@ -428,7 +441,7 @@ func TestNodeWithoutInfoRouteStaysOnline(t *testing.T) {
 			http.Error(w, `{"detail":"Not found"}`, http.StatusNotFound)
 			return
 		}
-		fmt.Fprint(w, catalogBody(5, 2))
+		fmt.Fprint(w, catalogBody(5, 2, 1))
 	}))
 	defer server.Close()
 
@@ -438,8 +451,8 @@ func TestNodeWithoutInfoRouteStaysOnline(t *testing.T) {
 
 	directory, _ := s.Directory()
 	row := directory.Providers[0]
-	if row.Status != StatusOnline || row.ModelCount != 5 || row.EncryptedModelCount != 2 {
-		t.Fatalf("legacy node = %+v, want online with counts from the catalog", row)
+	if row.Status != StatusOnline || row.ModelCount != 5 || row.EncryptedModelCount != 2 || row.TEEModelCount != 3 {
+		t.Fatalf("legacy node = %+v, want online with both counts from the catalog", row)
 	}
 	if infoHits.Load() != 1 {
 		t.Fatalf("/v1/info asked %d times; a node that 404s it should be asked once", infoHits.Load())

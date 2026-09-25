@@ -113,11 +113,13 @@ type record struct {
 	reachable bool
 	latency   time.Duration
 
-	// modelCount/encrypted are carried forward from the last SUCCESSFUL catalog
-	// read, including across probe failures: what a provider serves when it is
-	// up is still the best answer to "how big is it" while it is down.
+	// modelCount/encrypted/tee are carried forward from the last SUCCESSFUL
+	// catalog read, including across probe failures: what a provider serves
+	// when it is up is still the best answer to "how big is it" while it is
+	// down.
 	modelCount int
 	encrypted  int
+	tee        int
 	countsAt   time.Time
 
 	// infoUnsupported records that this node answered /v1/info with a non-2xx
@@ -254,6 +256,7 @@ func (rec *record) render(now time.Time, maxAge time.Duration) Provider {
 		Followers:           rec.followers,
 		ModelCount:          rec.modelCount,
 		EncryptedModelCount: rec.encrypted,
+		TEEModelCount:       rec.tee,
 		Mints:               rec.mints,
 		Status:              StatusUnknown,
 	}
@@ -451,7 +454,7 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 
 	catalogDue := countsAt.IsZero() || s.now().Sub(countsAt) >= s.cfg.CatalogMinAge
 	models := -1
-	encrypted := 0
+	encrypted, tee := 0, 0
 	if catalogDue || !reachable {
 		body, took, ok := s.get(ctx, rec.baseURL+"/v1/models")
 		if ok {
@@ -459,7 +462,7 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 			// /app/ai-lineup reads the same bodies with, so both endpoints
 			// agree on which rows are models and which upstream serves them.
 			if parsed, err := routstr.ParseModels(body); err == nil {
-				models, encrypted = len(parsed), countEncrypted(parsed)
+				models, encrypted, tee = len(parsed), countEncrypted(parsed), countTEEHosted(parsed)
 			}
 			if !reachable {
 				reachable, latency = true, took
@@ -479,20 +482,34 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 		rec.latency = latency
 	}
 	if models >= 0 {
-		rec.modelCount, rec.encrypted, rec.countsAt = models, encrypted, probedAt
+		rec.modelCount, rec.encrypted, rec.tee, rec.countsAt = models, encrypted, tee, probedAt
 	}
 	if info != nil {
 		applyInfo(rec, info)
 	}
 }
 
-// countEncrypted counts the models a node serves through a Tinfoil enclave.
+// countEncrypted counts the models a CLIENT will seal to an enclave — the
+// end-to-end claim, and the only one the app may badge as such.
 //
 // It counts MODELS, not providers, on purpose — see Provider.EncryptedModelCount.
 func countEncrypted(models []routstr.Model) int {
 	n := 0
 	for _, m := range models {
 		if m.Encrypted() {
+			n++
+		}
+	}
+	return n
+}
+
+// countTEEHosted counts the models the NODE declares it forwards to an
+// enclave. Always >= countEncrypted; the difference is the set where the node
+// still sees the prompt.
+func countTEEHosted(models []routstr.Model) int {
+	n := 0
+	for _, m := range models {
+		if m.TEEHosted() {
 			n++
 		}
 	}

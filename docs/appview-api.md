@@ -473,8 +473,8 @@ on every cold start — a relay round-trip plus a per-node probe fan-out before 
 could draw a picker — which is work a server does once for every client.
 
 Each provider carries `baseUrl`, `name`, `followers`, `modelCount`,
-`encryptedModelCount`, `mints`, `status`, and optionally `pubkey`, `checkedAt`
-and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
+`encryptedModelCount`, `teeModelCount`, `mints`, `status`, and optionally
+`pubkey`, `checkedAt` and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
 trailing `/v1`) so two spellings of one node cannot render as two rows.
 `mints` is always a list — empty means the provider publishes none, which the
 payment path reads as "any mint".
@@ -495,20 +495,43 @@ sweep ran. `latencyMs` is the last successful probe's round trip, omitted when
 there has never been one. `ttlSeconds` is `NAGG_AI_PROVIDERS_INTERVAL` in
 seconds — a shorter client TTL only re-fetches the same answer.
 
-`encryptedModelCount` is how many of the provider's models route through a
-Tinfoil enclave. It is a COUNT, never a boolean, because "this provider is
-E2EE" is not a true property: a live node badged E2EE serves 582 models of
-which 13 are sealed, and most sealed entries have an identically named
-plaintext twin in the same catalog. Encryption is per-model routing. The count
-comes from the catalog's `upstream_provider_id` — the node's own routing
-declaration, set on every row of the live catalog, which catches four
-Tinfoil-routed models whose ids carry no `tinfoil-` prefix — falling back to
-the `tinfoil-` id prefix only for older nodes that report no upstream.
+`encryptedModelCount` is how many of the provider's models a CLIENT will seal
+to an enclave, end to end, with the node unable to read the prompt. It is a
+COUNT, never a boolean, because "this provider is E2EE" is not a true property:
+a live node badged E2EE serves 564 priced models of which 9 are client-sealable,
+and most of those have an identically named plaintext twin in the same catalog
+(`tinfoil-glm-5-3` alongside `glm-5-3`). Encryption is per-model routing.
+
+The count is the `tinfoil-` id prefix, matched byte for byte, because that
+prefix is the whole of what a Routstr client checks before switching on sealed
+transport — `@routstr/sdk`: `isTinfoilModel(modelId) = modelId.startsWith("tinfoil-")`,
+with `getTinfoilUpstreamModelId` stripping exactly that prefix, so the prefixed
+entry is the sealed route to the model its unprefixed twin serves in the clear.
+A differently cased prefix does not count: the SDK's check is case-sensitive,
+so such a model is sent in the clear.
+
+`teeModelCount` is the SEPARATE and weaker claim: how many models the node
+itself declares it forwards to a Tinfoil enclave (`upstream_provider_id`). It
+is always `>= encryptedModelCount`, and the models in the gap are sent to the
+node in the clear — the node decrypts, reads and forwards them, so only the
+node's own hop to the enclave is protected. On the live redsh1ft catalog that
+gap is 4 models, and three of the four are NAMED "Private (E2EE) …". The name
+is the node's marketing; the prefix is what the client does.
+
+The two must never be merged. Counting the upstream id into
+`encryptedModelCount` would have this route claim 13 while the app's model
+picker badges 9, and the four in the gap are exactly the ones where the
+end-to-end promise is false. Only `encryptedModelCount` may be surfaced as
+"end-to-end encrypted"; `teeModelCount` is published because where inference
+runs is real information, and named so it cannot be mistaken for the stronger
+claim.
 
 Providers are sorted server-side, best first, so every client renders the same
-picker: `online` before `unknown` before `offline`; then providers with sealed
-models; then `followers` descending; then `baseUrl` ascending, a total order so
-equal rows never swap places between two requests.
+picker: `online` before `unknown` before `offline`; then providers with
+`encryptedModelCount > 0`; then `followers` descending; then `baseUrl`
+ascending, a total order so equal rows never swap places between two requests.
+The boost keys on `encryptedModelCount`, not `teeModelCount`: a declared
+enclave upstream with nothing the client will seal earns no ranking credit.
 
 Discovery and the sweep run in nagg, not in the app. Providers announce
 themselves on Nostr as kind-38421 addressable events (both shapes are read: `u`
