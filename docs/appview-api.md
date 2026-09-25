@@ -322,8 +322,26 @@ Audit fields include `hasAudit`, `state`, `nMints`, `nMelts`, and `nErrors`, plu
 | `testnut` | boolean | The weekly unpaid-quote probe (`internal/mintprobe`) saw this mint mark a never-paid NUT-04 quote as paid — a fake payment backend. `false` also covers mints not yet probed (a new mint is probed on the next hourly pass). A week where the mint is down or refuses the quote leaves the previous verdict standing. |
 | `auditUpdatedAt` | integer, optional | Upstream mint record's update time, Unix seconds; omitted when unknown (including legacy records). It is not nagg's refresh time. |
 
-Operator identity/social fields and the `profiles` map retain their existing
-behavior. Review-only mints use the latest reachable stored mint-info snapshot
+Operator reach comes from the shared resolver described under
+[AI provider directory](#ai-provider-directory) — `followers`/`follows`, plus
+`followersKnown` and `followersSource`. `followersKnown` is the field that
+matters: false means nagg could not establish the operator's reach and the `0`
+in `followers` is a placeholder, not a count. Every row on this endpoint
+reported `followers: 0` in production because the two were spelled alike and
+the only source consulted (`pubkey_stats`) is empty without the `nostr` module.
+`followers` stays a plain number rather than becoming nullable, because clients
+already read it; `followersKnown` is additive. A mint publishing no NUT-06
+nostr contact reports a KNOWN zero — there is nobody to count.
+
+`vertexRank`/`vertexScore` come from the local Vertex DVM profile cache, which
+is read in every deployment. Those three cache tables are declared by the DVM
+plugin registry regardless of module set and fill from client-signed profile
+reads without a server key, so they are no longer gated behind
+`WithSocialEnrichment` alongside `pubkey_stats` — that gating is what left them
+empty on a deployment documented as supporting them. They stay `0`/`null` until
+something populates the cache.
+
+The `profiles` map retains its existing behavior. Review-only mints use the latest reachable stored mint-info snapshot
 for name, icon, description, nuts, and units when available. This does not set
 `hasAudit` or invent audit measurements; a snapshot lookup failure leaves the
 review row usable.
@@ -339,6 +357,9 @@ REST response caching still applies when Redis is configured.
 Ranking keeps auditor `OK` rows first. Within each tier, its uptime component
 uses `uptime24h / 100` when available, otherwise the historical operation-success
 ratio. Review score/count and operator followers retain their existing weights.
+Unresolved reach contributes nothing to the blend, the same as a measured zero:
+the blend is additive over evidence and absent evidence adds nothing, while
+`followersKnown` publishes which of the two a `0` is.
 The capability manifest and headers advertise `appview.mint.discover.uptime`;
 individual rows can still lack measurements.
 
@@ -474,7 +495,7 @@ could draw a picker — which is work a server does once for every client.
 
 Each provider carries `baseUrl`, `name`, `followers`, `modelCount`,
 `encryptedModelCount`, `teeModelCount`, `mints`, `status`, and optionally
-`pubkey`, `checkedAt` and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
+`pubkey`, `followersSource`, `checkedAt` and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
 trailing `/v1`) so two spellings of one node cannot render as two rows.
 `mints` is always a list — empty means the provider publishes none, which the
 payment path reads as "any mint".
@@ -528,8 +549,12 @@ claim.
 
 Providers are sorted server-side, best first, so every client renders the same
 picker: `online` before `unknown` before `offline`; then providers with
-`encryptedModelCount > 0`; then `followers` descending; then `baseUrl`
-ascending, a total order so equal rows never swap places between two requests.
+`encryptedModelCount > 0`; then operator reach — a known positive count, then
+an unresolved one, then a known zero — and finally `baseUrl` ascending, a total
+order so equal rows never swap places between two requests. Unresolved sits
+above a measured zero on purpose: "nagg did not manage to ask" is not evidence
+of nobody, and demoting it would punish a provider for nagg's own gap. The same
+ladder (`socialgraph.CompareBest`) is what ranks operators everywhere.
 The boost keys on `encryptedModelCount`, not `teeModelCount`: a declared
 enclave upstream with nothing the client will seal earns no ranking credit.
 
@@ -552,11 +577,35 @@ status on most sweeps and the catalog is re-read at most once per
 that is a node saying nothing rather than a node being down, so it is asked
 once and the catalog read becomes its status probe.
 
-`followers` is the operator's Nostr follower count from nagg's own social graph
-(`pubkey_stats`, the same source `/nostr/mint/discover` ranks mint operators
-by), resolved in one batched query per sweep. A deployment without the `nostr`
-module has no such graph and every provider reports 0 rather than nagg adding a
-second, contradictory source.
+`followers` is the operator's Nostr reach, or **null** when nagg could not
+establish it. Null and 0 are different facts — a provider whose operator nobody
+follows is not a provider nagg failed to look up — and the sort keys on the
+difference. A provider publishing no operator pubkey reports 0, not null: there
+is nobody to count, which is itself an established fact. `followersSource` names
+which source answered and is omitted when `followers` is null.
+
+Reach is resolved by one shared path, [`internal/socialgraph`](../internal/socialgraph),
+which `/nostr/mint/discover` reads too, so the two endpoints cannot answer the
+same question differently. They used to: both derived it from `pubkey_stats`
+alone, which a mint deployment never populates, and both published the
+emptiness as the number 0 on every row. Sources are tried in order, and the
+first that answers wins:
+
+| `followersSource` | source | exact? | availability |
+| --- | --- | --- | --- |
+| `graph` | `pubkey_stats`, nagg's own kind-3 rollup | yes | needs the `nostr` module's firehose |
+| `vertex` | the local Vertex DVM profile cache | yes | tables exist everywhere; fill from client-signed reads or a server-key syncer |
+| `relays` | a live kind-3 scan of the relays nagg already dials | **no — a lower bound** | always |
+
+A `relays` count is the number of distinct authors whose contact list names the
+target, counted over `NAGG_SOCIAL_REACH_RELAYS`. Relays cap results, the relay
+set is partial, and a slow relay is dropped, so it is a floor: render it as
+"174+", never as an exact count. It needs no credentials and no Vertex credits.
+
+Resolution is asynchronous by necessity — a relay scan takes seconds per pubkey,
+which no request may pay. A read answers from cache and queues what it does not
+know, so a newly discovered operator reports `null` until a later pass resolves
+it. A failed lookup never overwrites a count already established.
 
 Returns 503 when `NAGG_AI_PROVIDERS_ENABLED=false`, and also while the first
 sweep is still warming — never an empty `providers` list, which the app would

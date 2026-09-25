@@ -24,6 +24,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/rates"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/rules"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 	"github.com/vertex-lab/nagg/internal/vertex"
 	"github.com/vertex-lab/nagg/internal/wallpapers"
 )
@@ -61,6 +62,7 @@ type Config struct {
 	AppVersion  AppVersionConfig
 	Routstr     RoutstrConfig
 	AIProviders AIProvidersConfig
+	SocialGraph SocialGraphConfig
 	MintInfo    MintInfoConfig
 	MintProbe   MintProbeConfig
 	Rates       RatesConfig
@@ -215,6 +217,20 @@ type AIProvidersConfig struct {
 	// populated outer copy: the route served "warming" forever against a
 	// directory that had never been given a single node to look at.
 	aiproviders.Config
+}
+
+// SocialGraphConfig configures the shared operator-reach resolver
+// (internal/socialgraph) behind the `followers` fields of
+// /nostr/mint/discover and /app/ai-providers.
+//
+// Relays empty disables the relay fallback, leaving only the exact sources —
+// which on a deployment without the nostr module means nothing can answer and
+// every operator's reach is reported as unresolved. That is the honest
+// degradation; the dishonest one, reporting 0, is what this config replaced.
+type SocialGraphConfig struct {
+	Enabled bool
+	Relays  []string
+	socialgraph.Config
 }
 
 type APIConfig struct {
@@ -453,6 +469,17 @@ func Load() (Config, error) {
 				MaxDirectorySources: parseInt(env("NAGG_AI_PROVIDERS_DIRECTORY_SOURCES", "8")),
 			},
 		},
+		SocialGraph: SocialGraphConfig{
+			Enabled: parseBool(env("NAGG_SOCIAL_REACH_ENABLED", boolText(mintModule || mods.Has(modules.App)))),
+			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_SOCIAL_REACH_RELAYS", ""))),
+			Config: socialgraph.Config{
+				TTL:         parseDuration(env("NAGG_SOCIAL_REACH_TTL", "6h")),
+				Interval:    parseDuration(env("NAGG_SOCIAL_REACH_INTERVAL", "1m")),
+				Concurrency: parseInt(env("NAGG_SOCIAL_REACH_CONCURRENCY", "4")),
+				ScanTimeout: parseDuration(env("NAGG_SOCIAL_REACH_SCAN_TIMEOUT", "20s")),
+				MaxTracked:  parseInt(env("NAGG_SOCIAL_REACH_MAX_TRACKED", "500")),
+			},
+		},
 		OnDemand: OnDemandConfig{
 			UserFeed:                 onDemandUserFeed,
 			GraphQLHydration:         parseBool(env("NAGG_ON_DEMAND_GRAPHQL_HYDRATION", "false")),
@@ -556,6 +583,11 @@ func Load() (Config, error) {
 	}
 	if len(cfg.AIProviders.Relays) == 0 {
 		cfg.AIProviders.Relays = append([]string(nil), cfg.Firehose.Relays...)
+	}
+	// The reach scan reuses the relays nagg already dials. Counting kind-3
+	// contact lists needs no extra relay set and no credentials.
+	if len(cfg.SocialGraph.Relays) == 0 {
+		cfg.SocialGraph.Relays = append([]string(nil), cfg.Firehose.Relays...)
 	}
 	if cfg.API.RateLimitPerMinute <= 0 {
 		cfg.API.RateLimitPerMinute = 120

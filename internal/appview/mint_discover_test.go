@@ -14,6 +14,8 @@ import (
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
 	"github.com/vertex-lab/nagg/internal/mintinfo"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 type fakeAuditor struct {
@@ -21,6 +23,17 @@ type fakeAuditor struct {
 }
 
 func (f fakeAuditor) Mints(context.Context) ([]auditor.Mint, error) { return f.mints, nil }
+
+// stubReach stands in for the shared operator-reach resolver.
+type stubReach map[string]socialgraph.Reach
+
+func (s stubReach) Reach(_ context.Context, pubkeys []string) (map[string]socialgraph.Reach, error) {
+	out := make(map[string]socialgraph.Reach, len(pubkeys))
+	for _, pubkey := range pubkeys {
+		out[pubkey] = s[pubkey] // absent → the zero Reach, i.e. Unknown
+	}
+	return out, nil
+}
 
 func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 	const opPk = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
@@ -42,7 +55,8 @@ func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 		Units: []string{"sat", "usd"}, IconURL: "https://m1/icon.png",
 		OperatorContact: opPk,
 	}}}
-	handler := New(store, WithNIP05Validation(false), WithAuditor(auditorClient))
+	handler := New(store, WithNIP05Validation(false), WithAuditor(auditorClient),
+		WithSocialReach(stubReach{opPk: socialgraph.FromGraph(1234, 56)}))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil)
@@ -74,6 +88,9 @@ func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 	if m.OperatorPubkey != opPk || m.Followers != 1234 || m.Follows != 56 {
 		t.Fatalf("operator social wrong: pubkey=%s followers=%d follows=%d", m.OperatorPubkey, m.Followers, m.Follows)
 	}
+	if !m.FollowersKnown || m.FollowersSource != socialgraph.SourceGraph {
+		t.Fatalf("a resolved count must say so: known=%v source=%q", m.FollowersKnown, m.FollowersSource)
+	}
 	if got, ok := resp.Profiles[opPk]; !ok || got.Name != "Op Account" {
 		t.Fatalf("operator profile = %+v ok=%v, want Op Account", got, ok)
 	}
@@ -81,11 +98,15 @@ func TestDiscoverMintsMergesAuditorReviewsAndOperator(t *testing.T) {
 
 func f(v float64) *float64 { return &v }
 
+func vertexProfile(pubkey string, rank, score float64) vertex.ProfileResult {
+	return vertex.ProfileResult{PubKey: pubkey, Rank: rank, Score: &score}
+}
+
 func TestSortDiscoverMintsGreenFirstThenWeighted(t *testing.T) {
 	greenStrong := DiscoverMint{
 		MintURL: "https://green-strong", HasAudit: true, State: "OK",
 		NMints: 900, NMelts: 900, NErrors: 10, // ~99% uptime
-		AverageScore: f(4.8), ReviewCount: 40, Followers: 5000,
+		AverageScore: f(4.8), ReviewCount: 40, Followers: 5000, FollowersKnown: true,
 	}
 	greenWeak := DiscoverMint{
 		MintURL: "https://green-weak", HasAudit: true, State: "OK",
@@ -95,7 +116,7 @@ func TestSortDiscoverMintsGreenFirstThenWeighted(t *testing.T) {
 	errorBusy := DiscoverMint{
 		MintURL: "https://error-busy", HasAudit: true, State: "ERROR",
 		NMints: 10, NMelts: 10, NErrors: 500, // error-heavy
-		AverageScore: f(5.0), ReviewCount: 200, Followers: 99999,
+		AverageScore: f(5.0), ReviewCount: 200, Followers: 99999, FollowersKnown: true,
 	}
 	noAudit := DiscoverMint{
 		MintURL: "https://no-audit", HasAudit: false,
@@ -374,5 +395,83 @@ func TestDiscoverTestnutLookupFailure(t *testing.T) {
 	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover?testnut=false", nil))
 	if rec.Code == http.StatusOK {
 		t.Fatalf("filtered request must not answer without verdicts: %s", rec.Body.String())
+	}
+}
+
+// TestDiscoverDistinguishesUnresolvedReachFromZero is the regression test for
+// the defect that made every row on this endpoint — and on /app/ai-providers —
+// report 0 followers in production. pubkey_stats is empty on a mint
+// deployment (it stores kinds 0 and 38000, so there are no contact lists to
+// roll up), and the emptiness was published as a measurement.
+func TestDiscoverDistinguishesUnresolvedReachFromZero(t *testing.T) {
+	const resolved = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const unresolved = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	auditorClient := fakeAuditor{mints: []auditor.Mint{
+		{URL: "https://known", State: "OK", OperatorContact: resolved},
+		{URL: "https://unknown", State: "OK", OperatorContact: unresolved},
+		{URL: "https://anonymous", State: "OK"},
+	}}
+	// The resolver answers for one operator, has not got to the second, and is
+	// never asked about the third.
+	handler := New(mintReviewStore{}, WithNIP05Validation(false), WithAuditor(auditorClient),
+		WithSocialReach(stubReach{resolved: socialgraph.FromRelays(174)}))
+
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil))
+	var resp DiscoverMintsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byURL := map[string]DiscoverMint{}
+	for _, m := range resp.Mints {
+		byURL[m.MintURL] = m
+	}
+
+	known := byURL["https://known"]
+	if known.Followers != 174 || !known.FollowersKnown || known.FollowersSource != socialgraph.SourceRelays {
+		t.Fatalf("resolved operator = %d/%v/%q, want 174 from the relay scan", known.Followers, known.FollowersKnown, known.FollowersSource)
+	}
+
+	// The one the resolver has not answered: still 0 on the wire for
+	// compatibility, but flagged as not a count and naming no source.
+	missing := byURL["https://unknown"]
+	if missing.Followers != 0 || missing.FollowersKnown || missing.FollowersSource != "" {
+		t.Fatalf("unresolved operator = %d/%v/%q, want an explicit non-count", missing.Followers, missing.FollowersKnown, missing.FollowersSource)
+	}
+
+	// A mint publishing no operator contact has nobody to count. That IS a
+	// measurement, and it must not look like the unresolved case above.
+	anonymous := byURL["https://anonymous"]
+	if anonymous.OperatorPubkey != "" || !anonymous.FollowersKnown || anonymous.Followers != 0 {
+		t.Fatalf("mint without an operator = %+v, want a known zero", anonymous)
+	}
+}
+
+// TestDiscoverReadsVertexCacheWithoutTheNostrModule pins the gating fix. The
+// three Vertex cache tables are declared in EVERY deployment and fill from
+// client-signed profile reads without a server key, so reading them must not
+// be gated behind the nostr module the way pubkey_stats correctly is. Gating
+// them together is what left vertexRank and vertexScore empty on a deployment
+// documented as supporting them.
+func TestDiscoverReadsVertexCacheWithoutTheNostrModule(t *testing.T) {
+	const opPk = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	store := mintReviewStore{fakeStore: fakeStore{
+		cachedVertexOK: true,
+		cachedVertex:   vertexProfile(opPk, 0.42, 0.77),
+	}}
+	handler := New(store, WithNIP05Validation(false), WithSocialEnrichment(false),
+		WithAuditor(fakeAuditor{mints: []auditor.Mint{{URL: "https://m1", State: "OK", OperatorContact: opPk}}}))
+
+	rec := httptest.NewRecorder()
+	handler.discoverMints(rec, httptest.NewRequest(http.MethodGet, "/nostr/mint/discover", nil))
+	var resp DiscoverMintsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Mints) != 1 {
+		t.Fatalf("mints = %d", len(resp.Mints))
+	}
+	if got := resp.Mints[0]; got.VertexRank != 0.42 || got.VertexScore == nil || *got.VertexScore != 0.77 {
+		t.Fatalf("vertex reputation = %v/%v with social enrichment off; the cache must still be read", got.VertexRank, got.VertexScore)
 	}
 }

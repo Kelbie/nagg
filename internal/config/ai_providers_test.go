@@ -90,3 +90,48 @@ func TestAIProvidersDisabledOutsideTheAppModule(t *testing.T) {
 		t.Fatal("a mint-only deployment enabled the provider directory")
 	}
 }
+
+// TestSocialReachConfigReachesTheService guards the same scar as the test
+// above: SocialGraphConfig embeds socialgraph.Config, and anything declared
+// twice would hand NewService an empty value while every caller read the
+// populated outer copy.
+func TestSocialReachConfigReachesTheService(t *testing.T) {
+	for _, key := range []string{
+		"NAGG_SOCIAL_REACH_ENABLED", "NAGG_SOCIAL_REACH_RELAYS", "NAGG_SOCIAL_REACH_TTL",
+		"NAGG_SOCIAL_REACH_INTERVAL", "NAGG_SOCIAL_REACH_CONCURRENCY",
+		"NAGG_SOCIAL_REACH_SCAN_TIMEOUT", "NAGG_SOCIAL_REACH_MAX_TRACKED", "NAGG_VERTEX_PRIVATE_KEY",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NAGG_MODULES", "mint,app,vertex")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.SocialGraph.Enabled {
+		t.Fatal("a deployment serving mint discovery or the app surface needs operator reach")
+	}
+	// The scan reuses the relays nagg already dials; it needs no extra relay
+	// set and no credentials.
+	if !slices.Equal(cfg.SocialGraph.Relays, cfg.Firehose.Relays) {
+		t.Fatalf("relays = %v, want the firehose relay set %v", cfg.SocialGraph.Relays, cfg.Firehose.Relays)
+	}
+	inner := cfg.SocialGraph.Config
+	if inner.TTL != 6*time.Hour || inner.Interval != time.Minute || inner.Concurrency != 4 {
+		t.Fatalf("resolver config = %+v", inner)
+	}
+	if inner.ScanTimeout != 20*time.Second || inner.MaxTracked != 500 {
+		t.Fatalf("resolver bounds = %+v", inner)
+	}
+
+	t.Setenv("NAGG_SOCIAL_REACH_ENABLED", "false")
+	t.Setenv("NAGG_SOCIAL_REACH_TTL", "1h")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SocialGraph.Enabled || cfg.SocialGraph.Config.TTL != time.Hour {
+		t.Fatalf("overrides = %v / %s", cfg.SocialGraph.Enabled, cfg.SocialGraph.Config.TTL)
+	}
+}

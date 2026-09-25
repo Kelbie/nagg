@@ -14,6 +14,7 @@ import (
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/vertex-lab/nagg/internal/relayquery"
 	"github.com/vertex-lab/nagg/internal/routstr"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 )
 
 // RelayFetcher is the Nostr read seam, satisfied by relayquery.Client — the
@@ -23,13 +24,13 @@ type RelayFetcher interface {
 	Query(context.Context, map[string]any, time.Duration) ([]relayquery.Event, error)
 }
 
-// FollowerCounter resolves operator follower counts from nagg's own social
-// graph (clickhouse.Store.BatchPubkeyStats, the same source
-// /nostr/mint/discover ranks mint operators by). A deployment without the
-// nostr module has no such graph; it passes nil and every provider reports 0
-// followers rather than the service inventing a second source.
+// FollowerCounter resolves operator reach through the ONE shared enrichment
+// path (internal/socialgraph), which /nostr/mint/discover reads too, so the
+// two endpoints cannot answer the same question differently. It is
+// non-blocking: a pubkey it has not resolved yet comes back Unknown and is
+// queued, never reported as zero.
 type FollowerCounter interface {
-	Followers(ctx context.Context, pubkeys []string) (map[string]uint64, error)
+	Reach(ctx context.Context, pubkeys []string) (map[string]socialgraph.Reach, error)
 }
 
 // Config parameterizes discovery and the health sweep.
@@ -126,7 +127,10 @@ type record struct {
 	// status (older nodes 404 it). Its status probe is the catalog read from
 	// then on, so the sweep stops paying for a request that can only fail.
 	infoUnsupported bool
-	followers       uint64
+	// reach is Unknown until a source answers. It is never overwritten with an
+	// Unknown: a resolver that stops answering must not erase a count it
+	// already established.
+	reach socialgraph.Reach
 }
 
 // Service discovers Routstr providers, sweeps their health, and serves the
@@ -253,12 +257,22 @@ func (rec *record) render(now time.Time, maxAge time.Duration) Provider {
 		BaseURL:             rec.baseURL,
 		Name:                displayName(rec.name, rec.baseURL),
 		Pubkey:              rec.pubkey,
-		Followers:           rec.followers,
 		ModelCount:          rec.modelCount,
 		EncryptedModelCount: rec.encrypted,
 		TEEModelCount:       rec.tee,
 		Mints:               rec.mints,
 		Status:              StatusUnknown,
+	}
+	// A provider publishing no operator pubkey has nobody to count: a real
+	// zero, not an unresolved one.
+	reach := rec.reach
+	if rec.pubkey == "" {
+		reach = socialgraph.None()
+	}
+	if reach.Known {
+		followers := reach.Followers
+		p.Followers = &followers
+		p.FollowersSource = reach.Source
 	}
 	if p.Mints == nil {
 		// An empty list, never null: the payment path reads "no mints
@@ -583,9 +597,9 @@ func (s *Service) get(ctx context.Context, url string) ([]byte, time.Duration, b
 
 // --- social ------------------------------------------------------------------
 
-// refreshFollowers resolves operator reach from nagg's own graph — the same
-// pubkey_stats read that ranks mint operators on /nostr/mint/discover — in one
-// batched query rather than a lookup per provider.
+// refreshFollowers resolves operator reach through the shared resolver in one
+// batched call rather than a lookup per provider. The call never blocks on a
+// relay: unresolved pubkeys are queued there and answered on a later sweep.
 func (s *Service) refreshFollowers(ctx context.Context) {
 	if s.followers == nil || ctx.Err() != nil {
 		return
@@ -607,19 +621,21 @@ func (s *Service) refreshFollowers(ctx context.Context) {
 	if len(pubkeys) == 0 {
 		return
 	}
-	counts, err := s.followers.Followers(ctx, pubkeys)
+	counts, err := s.followers.Reach(ctx, pubkeys)
 	if err != nil {
-		// A deployment without the nostr module has no graph to read. That is a
-		// missing signal, not a broken directory: every row keeps its last
-		// known count and the sweep goes on.
+		// A missing signal, not a broken directory: every row keeps whatever
+		// reach it already had and the sweep goes on.
 		s.logger.Warn("ai_providers.followers_failed", "pubkeys", len(pubkeys))
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, rec := range s.records {
-		if n, ok := counts[rec.pubkey]; ok {
-			rec.followers = n
+		// Only an ANSWER updates the record. An Unknown means the resolver has
+		// not got to this pubkey yet, and overwriting a good count with it
+		// would make the directory flicker between a number and null.
+		if reach, ok := counts[rec.pubkey]; ok && reach.Known {
+			rec.reach = reach
 		}
 	}
 }

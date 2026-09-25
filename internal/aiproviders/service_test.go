@@ -12,6 +12,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/vertex-lab/nagg/internal/relayquery"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 )
 
 var providersNow = time.Unix(1_790_000_000, 0).UTC() // fixed "now" for deterministic statuses
@@ -93,6 +94,9 @@ func newTestService(t *testing.T, cfg Config, relays RelayFetcher, followers Fol
 	return s
 }
 
+func followers(n uint64) *uint64 { return &n }
+
+// graph/relays build a published row's reach fields the way render does.
 func byURL(d Directory, url string) (Provider, bool) {
 	for _, p := range d.Providers {
 		if p.BaseURL == url {
@@ -107,16 +111,16 @@ func byURL(d Directory, url string) (Provider, bool) {
 // tiebreak so two equal rows never swap between requests.
 func TestSortIsServerSideAndTotal(t *testing.T) {
 	providers := []Provider{
-		{BaseURL: "https://z-offline", Status: StatusOffline, Followers: 9999, EncryptedModelCount: 5},
-		{BaseURL: "https://b-online-plain", Status: StatusOnline, Followers: 500},
-		{BaseURL: "https://a-online-plain", Status: StatusOnline, Followers: 500},
-		{BaseURL: "https://c-online-sealed", Status: StatusOnline, Followers: 1, EncryptedModelCount: 9, TEEModelCount: 13},
+		{BaseURL: "https://z-offline", Status: StatusOffline, Followers: followers(9999), EncryptedModelCount: 5},
+		{BaseURL: "https://b-online-plain", Status: StatusOnline, Followers: followers(500)},
+		{BaseURL: "https://a-online-plain", Status: StatusOnline, Followers: followers(500)},
+		{BaseURL: "https://c-online-sealed", Status: StatusOnline, Followers: followers(1), EncryptedModelCount: 9, TEEModelCount: 13},
 		// Declared enclave hosting with nothing the client will seal. The
 		// boost is for end-to-end encryption, so this row must rank purely on
 		// followers alongside the plaintext providers.
-		{BaseURL: "https://f-online-tee-only", Status: StatusOnline, Followers: 600, TEEModelCount: 13},
-		{BaseURL: "https://d-unknown", Status: StatusUnknown, Followers: 100_000},
-		{BaseURL: "https://e-online-popular", Status: StatusOnline, Followers: 800},
+		{BaseURL: "https://f-online-tee-only", Status: StatusOnline, Followers: followers(600), TEEModelCount: 13},
+		{BaseURL: "https://d-unknown", Status: StatusUnknown, Followers: followers(100_000)},
+		{BaseURL: "https://e-online-popular", Status: StatusOnline, Followers: followers(800)},
 	}
 	Sort(providers)
 
@@ -357,13 +361,13 @@ func TestRelayFailureLeavesSeedsStanding(t *testing.T) {
 	}
 }
 
-// stubFollowers stands in for the ClickHouse social-graph read.
+// stubFollowers stands in for the shared reach resolver.
 type stubFollowers struct {
-	counts map[string]uint64
+	counts map[string]socialgraph.Reach
 	err    error
 }
 
-func (s stubFollowers) Followers(_ context.Context, _ []string) (map[string]uint64, error) {
+func (s stubFollowers) Reach(_ context.Context, _ []string) (map[string]socialgraph.Reach, error) {
 	return s.counts, s.err
 }
 
@@ -372,26 +376,37 @@ func TestFollowerCountsRankAndDegrade(t *testing.T) {
 	loud := newNode(t, "loud", 2, 0, 0)
 	cfg := Config{Seeds: []string{quiet.URL, loud.URL}, Timeout: 2 * time.Second}
 
-	s := newTestService(t, cfg, nil, stubFollowers{counts: map[string]uint64{}})
+	s := newTestService(t, cfg, nil, stubFollowers{counts: map[string]socialgraph.Reach{}})
 	s.absorb(found{baseURL: normalizeBaseURL(loud.URL), pubkey: signerA})
-	s.followers = stubFollowers{counts: map[string]uint64{signerA: 1234}}
+	s.followers = stubFollowers{counts: map[string]socialgraph.Reach{signerA: socialgraph.FromGraph(1234, 7)}}
 	s.RunOnce(context.Background())
 
 	directory, _ := s.Directory()
 	row, _ := byURL(directory, normalizeBaseURL(loud.URL))
-	if row.Followers != 1234 {
-		t.Fatalf("followers = %d, want the social-graph count", row.Followers)
+	if row.Followers == nil || *row.Followers != 1234 || row.FollowersSource != socialgraph.SourceGraph {
+		t.Fatalf("followers = %v/%q, want the resolved count and its source", row.Followers, row.FollowersSource)
 	}
 	if directory.Providers[0].BaseURL != normalizeBaseURL(loud.URL) {
 		t.Fatalf("follower count did not break the tie: %v", urls(directory.Providers))
 	}
+	// The seed with no operator pubkey has nobody to count: a real zero, not
+	// an unresolved one, so it publishes 0 rather than null.
+	quietRow, _ := byURL(directory, normalizeBaseURL(quiet.URL))
+	if quietRow.Followers == nil || *quietRow.Followers != 0 {
+		t.Fatalf("a provider with no pubkey = %v, want a known zero", quietRow.Followers)
+	}
 
-	// A deployment whose graph is missing (no nostr module) must still sweep.
+	// A resolver that fails must not erase a count it already established, and
+	// must not invent one for the rows it never answered.
 	s.followers = stubFollowers{err: context.DeadlineExceeded}
 	s.RunOnce(context.Background())
 	directory, ok := s.Directory()
 	if !ok || len(directory.Providers) != 2 {
-		t.Fatalf("a failed follower read broke the sweep: ok=%v %v", ok, urls(directory.Providers))
+		t.Fatalf("a failed reach read broke the sweep: ok=%v %v", ok, urls(directory.Providers))
+	}
+	row, _ = byURL(directory, normalizeBaseURL(loud.URL))
+	if row.Followers == nil || *row.Followers != 1234 {
+		t.Fatalf("a failed reach read erased an established count: %v", row.Followers)
 	}
 }
 

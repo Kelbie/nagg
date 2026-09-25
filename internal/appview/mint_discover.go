@@ -11,6 +11,7 @@ import (
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -61,12 +62,22 @@ type DiscoverMint struct {
 
 	// Operator Nostr account + Vertex social reputation, present when the mint
 	// published a NUT-06 nostr contact nagg could resolve.
-	OperatorPubkey string   `json:"operatorPubkey,omitempty"`
-	OperatorNpub   string   `json:"operatorNpub,omitempty"`
-	Followers      uint64   `json:"followers"`
-	Follows        uint64   `json:"follows"`
-	VertexRank     float64  `json:"vertexRank"`
-	VertexScore    *float64 `json:"vertexScore"`
+	OperatorPubkey string `json:"operatorPubkey,omitempty"`
+	OperatorNpub   string `json:"operatorNpub,omitempty"`
+	Followers      uint64 `json:"followers"`
+	Follows        uint64 `json:"follows"`
+	// FollowersKnown says whether Followers is a measurement. It is additive
+	// rather than making Followers nullable, because this field is already
+	// shipped; false means nagg could not establish the operator's reach and
+	// the 0 above is a placeholder, not a count. Every row on this endpoint
+	// reported 0 in production precisely because the two were spelled alike.
+	FollowersKnown bool `json:"followersKnown"`
+	// FollowersSource is which source answered: "graph" (nagg's kind-3 rollup,
+	// exact), "vertex" (the Vertex DVM cache, exact), or "relays" (a live
+	// kind-3 scan, a LOWER BOUND). Omitted when FollowersKnown is false.
+	FollowersSource string   `json:"followersSource,omitempty"`
+	VertexRank      float64  `json:"vertexRank"`
+	VertexScore     *float64 `json:"vertexScore"`
 }
 
 // DiscoverMintsResponse is the discovery feed plus a profiles map (operator
@@ -238,21 +249,33 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	if perr != nil {
 		profiles = map[string]ProfileInfo{}
 	}
-	followCounts := map[string]chstore.PubkeyStats{}
+	// Operator reach goes through the ONE shared resolver (internal/socialgraph),
+	// which /app/ai-providers reads too. It is cache-only and never blocks on a
+	// relay, and it answers Unknown rather than 0 for a pubkey it has not
+	// resolved — the distinction this endpoint was missing when it reported
+	// every mint operator as having 0 followers.
+	reach := map[string]socialgraph.Reach{}
+	if h.socialReach != nil {
+		if resolved, rerr := h.socialReach.Reach(ctx, operatorPubkeys); rerr == nil {
+			reach = resolved
+		}
+	}
+	// The Vertex profile cache is NOT gated on the nostr module. Its three
+	// tables are declared in every deployment (the DVM plugin registry creates
+	// them regardless of module set), and client-signed profile reads fill
+	// them without a server key — so a mint deployment can and should read
+	// cached operator reputation. Gating it alongside pubkey_stats, which
+	// genuinely needs the nostr firehose, is what left vertexRank/vertexScore
+	// empty on a deployment documented as supporting them.
 	vertexProfiles := map[string]vertex.ProfileResult{}
-	if h.socialEnrichment {
-		if counts, ferr := h.store.BatchPubkeyStats(ctx, operatorPubkeys); ferr == nil {
-			followCounts = counts
-		}
-		if cached, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys); verr == nil {
-			vertexProfiles = cached
-		}
+	if cached, verr := h.store.CachedVertexProfiles(ctx, operatorPubkeys); verr == nil {
+		vertexProfiles = cached
 	}
 
 	// 5) Build rows; stored NUT-06 info fills metadata for review-only mints.
 	mints := make([]DiscoverMint, 0, len(keys))
 	for key := range keys {
-		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, followCounts, vertexProfiles)
+		row := buildDiscoverMint(key, aggByKey[key], auditByKey, operatorByKey, reach, vertexProfiles)
 		row.Testnut = verdicts[key].Testnut
 		mints = append(mints, row)
 	}
@@ -369,6 +392,14 @@ func discoverRankScore(m DiscoverMint) float64 {
 	score := scoreOrZero(m.AverageScore) / 5.0
 	// log10(1+n): ~100 reviews → 1.0; ~10k followers → 1.0.
 	reviewCount := clamp01(math.Log10(1+float64(m.ReviewCount)) / 2.0)
+	// Unresolved reach contributes nothing, the same as a measured zero. That
+	// is deliberate and it is not the conflation this endpoint was fixed for:
+	// the blend is additive over evidence, absent evidence adds nothing, and
+	// inventing a substitute (an average, a renormalised scale) would be a
+	// guess dressed as a measurement. The DIFFERENCE is published instead —
+	// followersKnown says whether the 0 is a count — and the shared
+	// socialgraph.CompareBest ladder is what ranks on it where reach is the
+	// ranking signal rather than one term of four.
 	followers := clamp01(math.Log10(1+float64(m.Followers)) / 4.0)
 	return weightUptime*uptime +
 		weightReviewScore*score +
@@ -413,7 +444,7 @@ func buildDiscoverMint(
 	agg mintReviewAgg,
 	auditByKey map[string]auditor.Mint,
 	operatorByKey map[string]string,
-	followCounts map[string]chstore.PubkeyStats,
+	reach map[string]socialgraph.Reach,
 	vertexProfiles map[string]vertex.ProfileResult,
 ) DiscoverMint {
 	var row DiscoverMint
@@ -441,12 +472,16 @@ func buildDiscoverMint(
 	row.ReviewCount = agg.reviews
 	row.FavouriteCount = agg.favourites
 
-	if pk, ok := operatorByKey[key]; ok {
+	if pk, ok := operatorByKey[key]; !ok {
+		// No NUT-06 nostr contact: there is nobody to count, which is an
+		// established zero rather than an unresolved one.
+		row.FollowersKnown = true
+	} else {
 		row.OperatorPubkey = pk
 		row.OperatorNpub = vertex.Npub(pk)
-		if counts, ok := followCounts[pk]; ok {
-			row.Followers = counts.Followers
-			row.Follows = counts.Follows
+		if r, ok := reach[pk]; ok && r.Known {
+			row.Followers, row.Follows = r.Followers, r.Follows
+			row.FollowersKnown, row.FollowersSource = true, r.Source
 		}
 		if dvm, ok := vertexProfiles[pk]; ok && dvm.PubKey != "" {
 			row.VertexRank = dvm.Rank

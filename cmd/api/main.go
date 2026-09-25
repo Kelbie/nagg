@@ -37,6 +37,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/routstr"
 	"github.com/vertex-lab/nagg/internal/runtimelimits"
 	"github.com/vertex-lab/nagg/internal/safego"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 	"github.com/vertex-lab/nagg/internal/vertex"
 	"github.com/vertex-lab/nagg/internal/wallpapers"
 )
@@ -437,6 +438,34 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		appviewOpts = append(appviewOpts, appview.WithRates(rateService))
 		safego.Go("api.rates", func() { rateService.Run(ctx) })
 	}
+	// ONE operator-reach resolver, shared by /nostr/mint/discover and
+	// /app/ai-providers. Both used to derive it themselves from pubkey_stats,
+	// which a mint deployment never populates (it stores kinds 0 and 38000, so
+	// there are no contact lists to roll up), and both published the emptiness
+	// as "0 followers" on every row. The resolver tries the exact sources
+	// first and falls back to counting kind-3 contact lists on the relays nagg
+	// already dials — no credentials, no Vertex credits — and says Unknown
+	// when none of them can answer.
+	var socialReach *socialgraph.Service
+	if cfg.SocialGraph.Enabled {
+		var stats socialgraph.StatsSource
+		if nostrModule {
+			// Without the nostr module there is no kind-3 firehose and the
+			// rollup has nothing to aggregate, so this source is left out
+			// rather than queried and discarded.
+			stats = pubkeyStatsSource{store: store}
+		}
+		var scanner socialgraph.RelayScanner
+		if len(cfg.SocialGraph.Relays) > 0 {
+			scanner = socialgraph.NewRelayScanner(relayquery.Client{Relays: cfg.SocialGraph.Relays}, cfg.SocialGraph.ScanTimeout)
+		}
+		socialReach = socialgraph.NewService(cfg.SocialGraph.Config, stats, vertexCacheSource{store: store}, scanner, logger)
+		appviewOpts = append(appviewOpts, appview.WithSocialReach(socialReach))
+		safego.Go("api.socialgraph", func() { socialReach.Run(ctx) })
+		slog.Info("social reach resolver enabled",
+			"pubkey_stats", stats != nil, "relay_scan", scanner != nil,
+			"relays", len(cfg.SocialGraph.Relays), "ttl", cfg.SocialGraph.TTL)
+	}
 	appviewOpts = append(appviewOpts, appview.WithAppVersion(cfg.AppVersion.LatestVersion, cfg.AppVersion.UpdateMessage, cfg.AppVersion.MinVersion))
 	if cfg.Routstr.Enabled && cfg.Routstr.URL != "" {
 		routstrClient := routstr.NewHTTPClient(cfg.Routstr.URL, routstr.WithFallbackURLs(cfg.Routstr.FallbackURLs))
@@ -459,20 +488,12 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	// start. Disabled config leaves /app/ai-providers 503 and nothing else
 	// changes.
 	if cfg.AIProviders.Enabled {
-		var followers aiproviders.FollowerCounter
-		// Operator reach comes from nagg's own social graph (pubkey_stats),
-		// the same source /nostr/mint/discover ranks mint operators by. A
-		// deployment without the nostr module has no such graph, so it gets
-		// none rather than a second, contradictory source.
-		if nostrModule {
-			followers = pubkeyFollowers{store: store}
-		}
-		directory := aiproviders.NewService(cfg.AIProviders.Config, relayquery.Client{Relays: cfg.AIProviders.Relays}, followers, logger)
+		directory := aiproviders.NewService(cfg.AIProviders.Config, relayquery.Client{Relays: cfg.AIProviders.Relays}, socialReach, logger)
 		appviewOpts = append(appviewOpts, appview.WithAIProviders(directory))
 		safego.Go("api.ai_providers", func() { directory.Run(ctx) })
 		slog.Info("ai providers enabled",
 			"relays", len(cfg.AIProviders.Relays), "seeds", len(cfg.AIProviders.Seeds),
-			"interval", cfg.AIProviders.Interval, "followers", followers != nil)
+			"interval", cfg.AIProviders.Interval, "followers", socialReach != nil)
 	}
 	if userFeedBackfiller != nil && cfg.OnDemand.UserFeed {
 		appviewOpts = append(appviewOpts, appview.WithUserFeedBackfill(userFeedBackfiller))
@@ -485,19 +506,51 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 	return mux, nil
 }
 
-// pubkeyFollowers adapts the ClickHouse social-graph read to the provider
-// directory's narrow need: follower counts only, batched, for the operator
-// pubkeys the directory found.
-type pubkeyFollowers struct{ store *chstore.Store }
+// pubkeyStatsSource adapts nagg's own kind-3 rollup to the shared resolver.
+//
+// BatchPubkeyStats pre-fills every requested pubkey with a zero row, so an
+// absent row and a genuinely unfollowed pubkey come back identical. That is
+// the exact mechanism by which "the table is empty" became "0 followers" on
+// two live endpoints, so a (0,0) row is treated here as NOT established and
+// falls through to the next source, which can say so honestly.
+type pubkeyStatsSource struct{ store *chstore.Store }
 
-func (p pubkeyFollowers) Followers(ctx context.Context, pubkeys []string) (map[string]uint64, error) {
+func (p pubkeyStatsSource) Followers(ctx context.Context, pubkeys []string) (map[string]socialgraph.Reach, error) {
 	stats, err := p.store.BatchPubkeyStats(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]uint64, len(stats))
+	out := make(map[string]socialgraph.Reach, len(stats))
 	for pubkey, row := range stats {
-		out[pubkey] = row.Followers
+		if row.Followers == 0 && row.Follows == 0 {
+			continue
+		}
+		out[pubkey] = socialgraph.FromGraph(row.Followers, row.Follows)
+	}
+	return out, nil
+}
+
+// vertexCacheSource adapts the local Vertex DVM profile cache. Its tables are
+// declared in every deployment, so this source is always wired even where it
+// is empty today — the moment a client-signed profile read lands, operator
+// reach starts resolving from it for free.
+type vertexCacheSource struct{ store *chstore.Store }
+
+func (v vertexCacheSource) Followers(ctx context.Context, pubkeys []string) (map[string]socialgraph.Reach, error) {
+	profiles, err := v.store.CachedVertexProfiles(ctx, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]socialgraph.Reach, len(profiles))
+	for pubkey, profile := range profiles {
+		if profile.PubKey == "" || profile.Followers == nil {
+			continue
+		}
+		var follows uint64
+		if profile.Follows != nil {
+			follows = *profile.Follows
+		}
+		out[pubkey] = socialgraph.FromVertex(*profile.Followers, follows)
 	}
 	return out, nil
 }

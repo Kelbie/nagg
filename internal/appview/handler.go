@@ -25,6 +25,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/dvm"
 	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/safego"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
@@ -98,6 +99,7 @@ type Handler struct {
 	appMinVersion             string
 	routstrClient             RoutstrClient
 	aiProviderDir             AIProvidersDirectory
+	socialReach               SocialReach
 	aiLineupVendors           []string
 	aiLineupPins              map[string]map[string]string
 	aiLineupAuthMode          string
@@ -306,10 +308,27 @@ func WithModules(mods modules.Set) Option {
 	}
 }
 
+// SocialReach resolves operator Nostr reach. It is the ONE enrichment path
+// /nostr/mint/discover and /app/ai-providers share, so the two endpoints
+// cannot answer the same question differently — they used to, by both reading
+// a table that is empty in a mint deployment and publishing the emptiness as
+// the number zero. Satisfied by *socialgraph.Service; nil leaves every
+// operator's reach unresolved, which the response now says out loud.
+type SocialReach interface {
+	Reach(ctx context.Context, pubkeys []string) (map[string]socialgraph.Reach, error)
+}
+
+// WithSocialReach wires the shared reach resolver.
+func WithSocialReach(resolver SocialReach) Option {
+	return func(h *Handler) { h.socialReach = resolver }
+}
+
 // WithSocialEnrichment toggles the Nostr-graph enrichment on
-// /nostr/mint/discover — operator follower counts and cached Vertex scores.
-// Pass false when the nostr module is off: those tables don't exist, so the two
-// per-request queries can only fail.
+// /nostr/mint/discover. It no longer gates the Vertex profile cache: those
+// three tables are declared in EVERY deployment and client-signed reads fill
+// them without a server key, so gating them alongside pubkey_stats — which
+// genuinely needs the nostr firehose — is what left vertexRank and vertexScore
+// empty on a deployment documented as supporting them.
 func WithSocialEnrichment(enabled bool) Option {
 	return func(h *Handler) {
 		h.socialEnrichment = enabled

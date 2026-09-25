@@ -11,6 +11,7 @@ import (
 
 	"github.com/vertex-lab/nagg/internal/aiproviders"
 	"github.com/vertex-lab/nagg/internal/capabilities"
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 )
 
 var providersCheckedAt = time.Date(2026, 9, 25, 6, 0, 0, 0, time.UTC)
@@ -21,6 +22,8 @@ type stubProviders struct {
 }
 
 func (s stubProviders) Directory() (aiproviders.Directory, bool) { return s.directory, s.ready }
+
+func followers(n uint64) *uint64 { return &n }
 
 func checkedAt(offset time.Duration) *time.Time {
 	at := providersCheckedAt.Add(offset)
@@ -36,7 +39,8 @@ func fixtureDirectory() aiproviders.Directory {
 				BaseURL:             "https://ai.redsh1ft.com",
 				Name:                "redsh1ft",
 				Pubkey:              "aa3f3bf381ac923afcf5a3c16fb2957de94057de84df0c3e84a44c57fa031482",
-				Followers:           1234,
+				Followers:           followers(1234),
+				FollowersSource:     socialgraph.SourceGraph,
 				ModelCount:          564,
 				EncryptedModelCount: 9,
 				TEEModelCount:       13,
@@ -46,6 +50,8 @@ func fixtureDirectory() aiproviders.Directory {
 				LatencyMs:           340,
 			},
 			{
+				// Discovered, never probed, operator reach never resolved:
+				// two different unknowns on one row, both spelled as absence.
 				BaseURL:    "https://new.example",
 				Name:       "new.example",
 				Mints:      []string{},
@@ -53,13 +59,14 @@ func fixtureDirectory() aiproviders.Directory {
 				Status:     aiproviders.StatusUnknown,
 			},
 			{
-				BaseURL:    "https://down.example",
-				Name:       "down.example",
-				Followers:  99,
-				ModelCount: 12,
-				Mints:      []string{},
-				Status:     aiproviders.StatusOffline,
-				CheckedAt:  checkedAt(-time.Minute),
+				BaseURL:         "https://down.example",
+				Name:            "down.example",
+				Followers:       followers(99),
+				FollowersSource: socialgraph.SourceRelays,
+				ModelCount:      12,
+				Mints:           []string{},
+				Status:          aiproviders.StatusOffline,
+				CheckedAt:       checkedAt(-time.Minute),
 			},
 		},
 		CheckedAt:  providersCheckedAt,
@@ -84,7 +91,8 @@ func TestAIProvidersRouteContract(t *testing.T) {
 			BaseURL             string   `json:"baseUrl"`
 			Name                string   `json:"name"`
 			Pubkey              string   `json:"pubkey"`
-			Followers           uint64   `json:"followers"`
+			Followers           *uint64  `json:"followers"`
+			FollowersSource     string   `json:"followersSource"`
 			ModelCount          int      `json:"modelCount"`
 			EncryptedModelCount int      `json:"encryptedModelCount"`
 			TEEModelCount       int      `json:"teeModelCount"`
@@ -107,8 +115,16 @@ func TestAIProvidersRouteContract(t *testing.T) {
 	}
 
 	first := body.Providers[0]
-	if first.BaseURL != "https://ai.redsh1ft.com" || first.Name != "redsh1ft" || first.Followers != 1234 {
+	if first.BaseURL != "https://ai.redsh1ft.com" || first.Name != "redsh1ft" {
 		t.Fatalf("first provider = %+v", first)
+	}
+	if first.Followers == nil || *first.Followers != 1234 || first.FollowersSource != "graph" {
+		t.Fatalf("followers = %v from %q, want 1234 from the exact source", first.Followers, first.FollowersSource)
+	}
+	// An approximate count says so, so the app can render "99+" rather than
+	// presenting a relay floor as a measurement.
+	if offlineRow := body.Providers[2]; offlineRow.FollowersSource != "relays" {
+		t.Fatalf("relay-sourced row = %q, want its source named", offlineRow.FollowersSource)
 	}
 	// A count, never a flag: on this node 9 of 564 priced models are sealed
 	// and the rest are plaintext, so "is this provider E2EE" has no true
@@ -131,6 +147,15 @@ func TestAIProvidersRouteContract(t *testing.T) {
 	}
 	if unknown.CheckedAt != "" {
 		t.Fatalf("unknown row carried checkedAt %q; nothing has been established", unknown.CheckedAt)
+	}
+	// The other unknown on the same row: reach nagg never resolved must be
+	// null, not 0. A zero here would read as "nobody follows this operator",
+	// which is the defect that made every row on two live endpoints report 0.
+	if unknown.Followers != nil {
+		t.Fatalf("unresolved reach rendered as %d; it must be null", *unknown.Followers)
+	}
+	if unknown.FollowersSource != "" {
+		t.Fatalf("unresolved reach named a source %q", unknown.FollowersSource)
 	}
 	if offline.CheckedAt != "2026-09-25T05:59:00Z" {
 		t.Fatalf("offline row checkedAt = %q, want when ITS status was established", offline.CheckedAt)

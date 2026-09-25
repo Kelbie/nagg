@@ -379,6 +379,13 @@ App configuration and operational variables:
 | `NAGG_AI_PROVIDERS_MAX_AGE` | `2h` | How long a probe result stands. Past it a provider reports `unknown` instead of asserting a stale `online`/`offline`. Raised to `2 ×` catalog min-age if set lower. |
 | `NAGG_AI_PROVIDERS_LIMIT` | `100` | Cap on directory size. Announcements are unauthenticated and free to publish. |
 | `NAGG_AI_PROVIDERS_DIRECTORY_SOURCES` | `8` | Cap on nodes asked for their `/v1/providers/` list per sweep: seeds first, then providers already known online. |
+| `NAGG_SOCIAL_REACH_ENABLED` | `mint` or `app` module enabled | Run the shared operator-reach resolver behind the `followers` fields of `/nostr/mint/discover` and `/app/ai-providers`. Disabled leaves every operator's reach unresolved — reported as such, never as 0. No ClickHouse storage. |
+| `NAGG_SOCIAL_REACH_RELAYS` | `NAGG_RELAYS` | Comma-separated relays for the kind-3 follower scan, the fallback source that needs no credentials and no Vertex credits. Empty disables the fallback, leaving only the exact sources. |
+| `NAGG_SOCIAL_REACH_TTL` | `6h` | How long a resolved count stands before it is re-resolved. |
+| `NAGG_SOCIAL_REACH_INTERVAL` | `1m` | How often the worker drains the queue of pubkeys awaiting resolution. |
+| `NAGG_SOCIAL_REACH_CONCURRENCY` | `4` | Simultaneous relay scans. |
+| `NAGG_SOCIAL_REACH_SCAN_TIMEOUT` | `20s` | Budget for one relay scan. |
+| `NAGG_SOCIAL_REACH_MAX_TRACKED` | `500` | Cap on tracked pubkeys. Provider announcements are unauthenticated and free to publish; this bounds the crawl. |
 | `NAGG_RATES_ENABLED` | `app` module enabled | Run the in-memory BTC fiat worker for GET `/app/rates`. No ClickHouse storage. |
 | `NAGG_RATES_INTERVAL` | `1h` | Refresh immediately on startup, then at this positive duration. |
 | `NAGG_RATES_MAX_AGE` | `6h` | Maximum observation age admitted to consensus (positive duration). |

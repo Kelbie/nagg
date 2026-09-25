@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/vertex-lab/nagg/internal/socialgraph"
 )
 
 // Status is a provider's reachability as of CheckedAt.
@@ -49,9 +51,21 @@ type Provider struct {
 	// Pubkey is the operator's Nostr identity, hex. Omitted when neither the
 	// announcement nor the node's own /v1/info gave one.
 	Pubkey string `json:"pubkey,omitempty"`
-	// Followers is the operator's Nostr follower count from nagg's own social
-	// graph. 0 also covers "no pubkey" and "graph not available here".
-	Followers           uint64 `json:"followers"`
+	// Followers is the operator's Nostr reach, or NULL when nagg could not
+	// establish it. Null and 0 are different facts and the app sorts on the
+	// difference, the same way it does for an unknown versus an offline
+	// status: a provider whose operator nobody follows is not a provider we
+	// failed to look up. Publishing the failure as 0 is exactly what made
+	// every row on two endpoints report 0 followers while looking measured.
+	//
+	// A provider that publishes no operator pubkey reports 0, not null: there
+	// is nobody to count, which is an established fact.
+	Followers *uint64 `json:"followers"`
+	// FollowersSource is which source answered — "graph" (nagg's own kind-3
+	// rollup, exact), "vertex" (the Vertex DVM cache, exact) or "relays" (a
+	// live kind-3 scan, a LOWER BOUND, safe to render as "174+" but not as an
+	// exact count). Omitted when Followers is null.
+	FollowersSource     string `json:"followersSource,omitempty"`
 	ModelCount          int    `json:"modelCount"`
 	EncryptedModelCount int    `json:"encryptedModelCount"`
 	// TEEModelCount is how many models the NODE declares it forwards to a
@@ -97,7 +111,9 @@ func statusRank(status string) int {
 //
 //	online, then unknown, then offline
 //	then providers with sealed models first
-//	then operator followers, descending
+//	then operator reach: a known positive count, then an unresolved one, then
+//	a known zero (socialgraph.CompareBest — the same ladder as the statuses,
+//	and the same rule /nostr/mint/discover ranks operators by)
 //	then base URL ascending — a total order, so equal rows never swap places
 //	between two requests the way Go's unstable sort would allow.
 func Sort(providers []Provider) {
@@ -109,8 +125,9 @@ func Sort(providers []Provider) {
 		if ea, eb := a.EncryptedModelCount > 0, b.EncryptedModelCount > 0; ea != eb {
 			return ea
 		}
-		if a.Followers != b.Followers {
-			return a.Followers > b.Followers
+		ra, rb := providerReach(a), providerReach(b)
+		if ra != rb {
+			return socialgraph.CompareBest(ra, rb)
 		}
 		return a.BaseURL < b.BaseURL
 	})
@@ -136,6 +153,21 @@ func normalizeBaseURL(raw string) string {
 	path := strings.TrimRight(parsed.Path, "/")
 	path = strings.TrimSuffix(path, "/v1")
 	return "https://" + host + strings.TrimRight(path, "/")
+}
+
+// providerReach recovers the ranking value from the published fields, so the
+// exported Sort behaves identically whether a caller built the slice from the
+// service or from a fixture.
+func providerReach(p Provider) socialgraph.Reach {
+	if p.Followers == nil {
+		return socialgraph.Unknown()
+	}
+	return socialgraph.Reach{
+		Followers:   *p.Followers,
+		Known:       true,
+		Source:      p.FollowersSource,
+		Approximate: p.FollowersSource == socialgraph.SourceRelays,
+	}
 }
 
 // displayName falls back to the host, which is what the operator is known as
