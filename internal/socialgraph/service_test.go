@@ -254,33 +254,41 @@ func TestNormalizePubkey(t *testing.T) {
 	}
 }
 
-// fakeRelays replays kind-3 contact lists so the scan's counting rule is
-// tested without a relay.
+// fakeRelays replays kind-3 contact lists per relay, so the scan's counting
+// rule and its failure rule are tested without a relay.
 type fakeRelays struct {
-	events []relayquery.Event
-	err    error
-	filter map[string]any
+	mu      sync.Mutex
+	byRelay map[string][]relayquery.Event
+	errs    map[string]error
+	filter  map[string]any
 }
 
-func (f *fakeRelays) Query(_ context.Context, filter map[string]any, _ time.Duration) ([]relayquery.Event, error) {
+func (f *fakeRelays) QueryOne(_ context.Context, relay string, filter map[string]any, _ time.Duration) ([]relayquery.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.filter = filter
-	return f.events, f.err
+	if err, ok := f.errs[relay]; ok {
+		return nil, err
+	}
+	return f.byRelay[relay], nil
 }
 
-func contactList(author, relay string) relayquery.Event {
-	return relayquery.Event{Relay: relay, Event: &nostr.Event{Kind: 3, PubKey: author}}
+func contactList(author string) relayquery.Event {
+	return relayquery.Event{Event: &nostr.Event{Kind: 3, PubKey: author}}
+}
+
+func scannerFor(relays *fakeRelays, names ...string) relayScanner {
+	return relayScanner{client: relays, relays: names, timeout: time.Second}
 }
 
 // TestRelayScanCountsDistinctAuthors: the same contact list served by three
 // relays is one follower, not three.
 func TestRelayScanCountsDistinctAuthors(t *testing.T) {
-	relays := &fakeRelays{events: []relayquery.Event{
-		contactList(alice, "wss://a"),
-		contactList(alice, "wss://b"),
-		contactList(bob, "wss://a"),
-		{Relay: "wss://a"}, // a nil event must not be counted
+	relays := &fakeRelays{byRelay: map[string][]relayquery.Event{
+		"wss://a": {contactList(alice), contactList(bob), {}}, // a nil event must not count
+		"wss://b": {contactList(alice)},                       // the same author again
 	}}
-	n, err := relayScanner{client: relays, timeout: time.Second}.ScanFollowers(context.Background(), carol)
+	n, err := scannerFor(relays, "wss://a", "wss://b").ScanFollowers(context.Background(), carol)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,15 +303,58 @@ func TestRelayScanCountsDistinctAuthors(t *testing.T) {
 	}
 }
 
-func TestRelayScanFailsRatherThanReportingZero(t *testing.T) {
-	relays := &fakeRelays{err: errors.New("every relay down")}
-	if _, err := (relayScanner{client: relays, timeout: time.Second}).ScanFollowers(context.Background(), carol); err == nil {
-		t.Fatal("a total relay failure returned a count; it must return an error so the pubkey stays unknown")
+// TestRelayScanSeparatesNobodyFromNobodyAnswered is the second defect this
+// package hit in production. The shared fan-out Query reports an error
+// whenever it ends up with zero events, so "a relay answered and nobody
+// follows this pubkey" and "every relay fell over" arrived identical — and on
+// a real relay set, where something is always failing, every unfollowed
+// operator stuck at unresolved forever and was rescanned every pass.
+func TestRelayScanSeparatesNobodyFromNobodyAnswered(t *testing.T) {
+	// One relay answers with nothing while the other fails. Somebody looked:
+	// the floor is a measured zero.
+	partial := &fakeRelays{
+		byRelay: map[string][]relayquery.Event{"wss://up": nil},
+		errs:    map[string]error{"wss://down": errors.New("bad handshake")},
 	}
-	// A partial failure still carries real events, and those are a real floor.
-	partial := &fakeRelays{err: errors.New("one relay down"), events: []relayquery.Event{contactList(alice, "wss://a")}}
-	n, err := (relayScanner{client: partial, timeout: time.Second}).ScanFollowers(context.Background(), carol)
-	if err != nil || n != 1 {
+	n, err := scannerFor(partial, "wss://up", "wss://down").ScanFollowers(context.Background(), carol)
+	if err != nil || n != 0 {
+		t.Fatalf("partial failure over an empty result = %d, %v; one relay answered, so zero is the answer", n, err)
+	}
+
+	// A partial failure with real events still yields a floor from the relays
+	// that did answer.
+	mixed := &fakeRelays{
+		byRelay: map[string][]relayquery.Event{"wss://up": {contactList(alice)}},
+		errs:    map[string]error{"wss://down": errors.New("timeout")},
+	}
+	if n, err := scannerFor(mixed, "wss://up", "wss://down").ScanFollowers(context.Background(), carol); err != nil || n != 1 {
 		t.Fatalf("partial scan = %d, %v; the relays that answered still count", n, err)
+	}
+
+	// Nobody answered: that is not a zero, and the pubkey must stay unresolved.
+	down := &fakeRelays{errs: map[string]error{
+		"wss://a": errors.New("bad handshake"),
+		"wss://b": errors.New("timeout"),
+	}}
+	if _, err := scannerFor(down, "wss://a", "wss://b").ScanFollowers(context.Background(), carol); err == nil {
+		t.Fatal("a total relay failure returned a count; it must error so the pubkey stays unknown")
+	}
+
+	// No relays configured at all is the same kind of nothing.
+	if _, err := scannerFor(&fakeRelays{}).ScanFollowers(context.Background(), carol); err == nil {
+		t.Fatal("scanning with no relays returned a count")
+	}
+}
+
+// TestRelayScanZeroIsAnAnswer closes the loop through the service: a measured
+// zero resolves and stops being rescanned, where an unresolved one does not.
+func TestRelayScanZeroIsAnAnswer(t *testing.T) {
+	relays := &fakeRelays{byRelay: map[string][]relayquery.Event{"wss://up": nil}}
+	s := newTestService(t, nil, nil, scannerFor(relays, "wss://up"))
+	s.Reach(context.Background(), []string{alice})
+	s.RunOnce(context.Background())
+	got, _ := s.Reach(context.Background(), []string{alice})
+	if !got[alice].Known || got[alice].Followers != 0 || got[alice].Source != SourceRelays {
+		t.Fatalf("alice = %+v, want a measured zero rather than an unresolved one", got[alice])
 	}
 }

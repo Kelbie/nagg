@@ -2,6 +2,7 @@ package socialgraph
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sort"
 	"sync"
@@ -313,13 +314,25 @@ const followerScanLimit = 2000
 
 // relayQuerier is the one relay call the scan makes, narrowed so the counting
 // rule can be tested without a relay. Satisfied by relayquery.Client.
+//
+// It is the PER-RELAY call on purpose. The fan-out Query folds every relay
+// into one result and reports an error only when it ends up with no events at
+// all (finishQuery), which makes two very different outcomes identical: "one
+// relay answered and nobody follows this pubkey" and "every relay we asked
+// fell over". Against a real relay set, where something is almost always
+// failing, that collapsed every genuinely unfollowed operator into a
+// permanent unresolved — 31 of 38 AI providers stuck at null in production,
+// rescanned every pass and never resolving. Asking each relay separately is
+// what makes "at least one relay answered" observable, which is the whole
+// difference between a measured zero and a failed lookup.
 type relayQuerier interface {
-	Query(ctx context.Context, filter map[string]any, timeout time.Duration) ([]relayquery.Event, error)
+	QueryOne(ctx context.Context, relay string, filter map[string]any, timeout time.Duration) ([]relayquery.Event, error)
 }
 
 // relayScanner counts followers off the relays nagg already dials.
 type relayScanner struct {
 	client  relayQuerier
+	relays  []string
 	timeout time.Duration
 }
 
@@ -331,28 +344,63 @@ type relayScanner struct {
 // operator resolves to 174 distinct authors in about five seconds,
 // mint.mountainlake.io to 77, mint.cubabitcoin.org to 39. Real numbers, no
 // credentials, no Vertex credits — but floors, not counts, which is why the
-// result is marked Approximate.
+// result is marked Approximate. (The Vertex cache, where it has an entry, puts
+// minibits at 2982, which is the measure of how much of a floor this is.)
 func NewRelayScanner(client relayquery.Client, timeout time.Duration) RelayScanner {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	return relayScanner{client: client, timeout: timeout}
+	return relayScanner{client: client, relays: client.Relays, timeout: timeout}
 }
 
+// ScanFollowers asks every relay in parallel and counts the distinct authors
+// whose contact list names the target.
+//
+// It returns an error only when NO relay answered. A relay that answers with
+// nothing is evidence — the pubkey has no followers there — and a partial
+// failure still yields a floor built from the relays that did answer.
 func (r relayScanner) ScanFollowers(ctx context.Context, pubkey string) (uint64, error) {
-	events, err := r.client.Query(ctx, map[string]any{
+	if len(r.relays) == 0 {
+		return 0, errors.New("socialgraph: no relays configured")
+	}
+	filter := map[string]any{
 		"kinds": []int{3},
 		"#p":    []string{pubkey},
 		"limit": followerScanLimit,
-	}, r.timeout)
-	if err != nil && len(events) == 0 {
-		return 0, err
 	}
-	authors := make(map[string]struct{}, len(events))
-	for _, event := range events {
-		if event.Event != nil && event.Event.PubKey != "" {
-			authors[event.Event.PubKey] = struct{}{}
+	type outcome struct {
+		events []relayquery.Event
+		err    error
+	}
+	results := make(chan outcome, len(r.relays))
+	for _, relay := range r.relays {
+		go func(relay string) {
+			events, err := r.client.QueryOne(ctx, relay, filter, r.timeout)
+			results <- outcome{events: events, err: err}
+		}(relay)
+	}
+
+	authors := make(map[string]struct{})
+	answered := 0
+	var lastErr error
+	for range r.relays {
+		res := <-results
+		if res.err != nil {
+			lastErr = res.err
+			continue
 		}
+		answered++
+		for _, event := range res.events {
+			if event.Event != nil && event.Event.PubKey != "" {
+				authors[event.Event.PubKey] = struct{}{}
+			}
+		}
+	}
+	if answered == 0 {
+		if lastErr == nil {
+			lastErr = errors.New("socialgraph: no relay answered")
+		}
+		return 0, lastErr
 	}
 	return uint64(len(authors)), nil
 }
