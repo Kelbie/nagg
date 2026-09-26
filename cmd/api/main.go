@@ -28,6 +28,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/graphqlapi"
 	"github.com/vertex-lab/nagg/internal/ingest"
 	"github.com/vertex-lab/nagg/internal/mintinfo"
+	"github.com/vertex-lab/nagg/internal/mintliveness"
 	"github.com/vertex-lab/nagg/internal/mintprobe"
 	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/rates"
@@ -403,6 +404,23 @@ func buildReadyAPI(ctx context.Context, store *chstore.Store, cfg config.Config,
 		safego.Go("api.mintinfo", func() { snapshotter.Run(ctx) })
 		slog.Info("mint info snapshotter enabled",
 			"interval", cfg.MintInfo.Interval, "min_age", cfg.MintInfo.MinAge, "throttle", cfg.MintInfo.Throttle)
+	}
+	// Mint liveness: the minute-scale "is it answering" behind the status,
+	// checkedAt and latencyMs fields on discover and mint/info rows. It walks
+	// the same work-list as the snapshotter but keeps only memory, so it needs
+	// no worker schema; without it every row reads status unknown.
+	if cfg.RunMintLiveness {
+		var auditorLister mintinfo.AuditorClient
+		if auditorClient != nil {
+			auditorLister = auditorClient
+		}
+		workList := mintinfo.NewWorkList(auditorLister, store, logger)
+		liveness := mintliveness.New(cfg.MintLiveness, nil, workList, logger)
+		appviewOpts = append(appviewOpts, appview.WithMintLiveness(liveness))
+		safego.Go("api.mint_liveness", func() { liveness.Run(ctx) })
+		slog.Info("mint liveness sweep enabled",
+			"interval", cfg.MintLiveness.Interval, "timeout", cfg.MintLiveness.Timeout,
+			"concurrency", cfg.MintLiveness.Concurrency, "max_age", cfg.MintLiveness.MaxAge)
 	}
 	// Unpaid-quote probes: the verdicts are always read (the discover testnut
 	// flag); the weekly prober is gated by NAGG_RUN_MINT_PROBE and the worker

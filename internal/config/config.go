@@ -20,6 +20,7 @@ import (
 	"github.com/vertex-lab/nagg/internal/enrich"
 	"github.com/vertex-lab/nagg/internal/firehose"
 	"github.com/vertex-lab/nagg/internal/ingest"
+	"github.com/vertex-lab/nagg/internal/mintliveness"
 	"github.com/vertex-lab/nagg/internal/modules"
 	"github.com/vertex-lab/nagg/internal/rates"
 	"github.com/vertex-lab/nagg/internal/relayquery"
@@ -65,9 +66,13 @@ type Config struct {
 	SocialGraph SocialGraphConfig
 	MintInfo    MintInfoConfig
 	MintProbe   MintProbeConfig
-	Rates       RatesConfig
-	Wallpapers  WallpapersConfig
-	Btcmap      BtcmapConfig
+	// MintLiveness parameterizes the in-memory liveness sweep
+	// (internal/mintliveness) behind the `status`/`checkedAt`/`latencyMs`
+	// fields of /nostr/mint/discover and /nostr/mint/info rows.
+	MintLiveness mintliveness.Config
+	Rates        RatesConfig
+	Wallpapers   WallpapersConfig
+	Btcmap       BtcmapConfig
 
 	// RunIngester / RunEnricher let the API process host the firehose ingester
 	// and the enrichment runner in-process (alongside the HTTP server + Vertex
@@ -98,6 +103,11 @@ type Config struct {
 	// the API process. Defaults on for the mint module; its verdicts feed the
 	// /nostr/mint/discover testnut flag.
 	RunMintProbe bool
+
+	// RunMintLiveness hosts the mint liveness sweep (internal/mintliveness) in
+	// the API process. Defaults on for the mint module. Off, every discover and
+	// mint/info row reads status "unknown"; it stores nothing.
+	RunMintLiveness bool
 }
 
 type WallpapersConfig struct {
@@ -515,11 +525,12 @@ func Load() (Config, error) {
 		// nostr (the full firehose) and mint (the kind-38000 slice plus its
 		// relay-history walk); the enricher and rollup only maintain
 		// nostr-owned tables; the snapshotter is the mint module's whole point.
-		RunIngester:  parseBool(env("NAGG_RUN_INGESTER", boolText(nostrModule || mintModule))),
-		RunEnricher:  parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
-		RunRollup:    parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
-		RunMintInfo:  parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
-		RunMintProbe: parseBool(env("NAGG_RUN_MINT_PROBE", boolText(mintModule))),
+		RunIngester:     parseBool(env("NAGG_RUN_INGESTER", boolText(nostrModule || mintModule))),
+		RunEnricher:     parseBool(env("NAGG_RUN_ENRICHER", boolText(nostrModule))),
+		RunRollup:       parseBool(env("NAGG_RUN_ROLLUP", boolText(nostrModule))),
+		RunMintInfo:     parseBool(env("NAGG_RUN_MINT_INFO", boolText(mintModule))),
+		RunMintProbe:    parseBool(env("NAGG_RUN_MINT_PROBE", boolText(mintModule))),
+		RunMintLiveness: parseBool(env("NAGG_RUN_MINT_LIVENESS", boolText(mintModule))),
 		Wallpapers: WallpapersConfig{
 			Enabled: parseBool(env("NAGG_WALLPAPERS_ENABLED", boolText(mods.Has(modules.App)))),
 			Relays:  relayquery.SanitizeRelays(splitCSV(env("NAGG_WALLPAPERS_RELAYS", ""))),
@@ -547,6 +558,12 @@ func Load() (Config, error) {
 			MinAge:   parseDuration(env("NAGG_MINT_INFO_MIN_AGE", "24h")),
 			Throttle: parseDuration(env("NAGG_MINT_INFO_THROTTLE", "1.5s")),
 			Timeout:  parseDuration(env("NAGG_MINT_INFO_TIMEOUT", "8s")),
+		},
+		MintLiveness: mintliveness.Config{
+			Interval:    parseDuration(env("NAGG_MINT_LIVENESS_INTERVAL", "5m")),
+			Timeout:     parseDuration(env("NAGG_MINT_LIVENESS_TIMEOUT", "8s")),
+			Concurrency: parseInt(env("NAGG_MINT_LIVENESS_CONCURRENCY", "6")),
+			MaxAge:      parseDuration(env("NAGG_MINT_LIVENESS_MAX_AGE", "2h")),
 		},
 		MintProbe: MintProbeConfig{
 			Interval:  parseDuration(env("NAGG_MINT_PROBE_INTERVAL", "1h")),
