@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
@@ -78,6 +79,19 @@ type DiscoverMint struct {
 	FollowersSource string   `json:"followersSource,omitempty"`
 	VertexRank      float64  `json:"vertexRank"`
 	VertexScore     *float64 `json:"vertexScore"`
+
+	// Liveness, from the in-memory sweep (internal/mintliveness), with the
+	// semantics /app/ai-providers gives its providers. Status is always
+	// present: "online", "offline", or "unknown" when the sweep has not
+	// established this mint's state (not wired, not yet probed, or a probe
+	// older than its MaxAge). CheckedAt is when the status was established,
+	// omitted while unknown. LatencyMs is the last successful probe's round
+	// trip, omitted when the mint has never answered one. This is the
+	// minute-scale "is it answering", distinct from the auditor's daily
+	// Uptime24h and AvgLatencyMs.
+	Status    string     `json:"status"`
+	CheckedAt *time.Time `json:"checkedAt,omitempty"`
+	LatencyMs int        `json:"latencyMs,omitempty"`
 }
 
 // DiscoverMintsResponse is the discovery feed plus a profiles map (operator
@@ -303,6 +317,19 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 				row.Nuts, row.SupportedUnits = info.Nuts, info.Units
 			}
 		}
+	}
+
+	// Liveness is read for the returned rows only; it is a serve-time
+	// decision over the sweep's memory, not a query, and it does not rank.
+	livenessKeys := make([]string, len(mints))
+	for i := range mints {
+		livenessKeys[i] = mints[i].MintURL
+	}
+	liveness := h.mintLivenessFor(livenessKeys)
+	for i := range mints {
+		row := &mints[i]
+		st := liveness[row.MintURL]
+		row.Status, row.CheckedAt, row.LatencyMs = st.Status, st.CheckedAt, st.LatencyMs
 	}
 
 	// Identities reuse the three batched reads above — no second query — and

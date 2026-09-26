@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
 	"github.com/vertex-lab/nagg/internal/vertex"
@@ -39,6 +40,14 @@ type MintInfo struct {
 	// OperatorPubkey is the NUT-06 nostr contact, hex, from the same source
 	// as the metadata; omitted when the mint publishes none.
 	OperatorPubkey string `json:"operatorPubkey,omitempty"`
+	// Liveness, exactly as on a discover row: Status is always present
+	// ("online", "offline", or "unknown" when not established), CheckedAt is
+	// omitted while unknown, LatencyMs only follows a successful probe. It is
+	// independent of Known: a mint outside the work-list is unknown here even
+	// when nagg has stored its info.
+	Status    string     `json:"status"`
+	CheckedAt *time.Time `json:"checkedAt,omitempty"`
+	LatencyMs int        `json:"latencyMs,omitempty"`
 }
 
 type MintInfoResponse struct {
@@ -125,6 +134,11 @@ func (h *Handler) mintInfos(w http.ResponseWriter, r *http.Request) {
 			row.ProbedAt = verdict.ProbedAt.Unix()
 		}
 		rows = append(rows, row)
+	}
+	liveness := h.mintLivenessFor(requested)
+	for i := range rows {
+		st := liveness[rows[i].MintURL]
+		rows[i].Status, rows[i].CheckedAt, rows[i].LatencyMs = st.Status, st.CheckedAt, st.LatencyMs
 	}
 	writeJSON(w, MintInfoResponse{Mints: rows, Identities: h.identities(ctx, operators)})
 }

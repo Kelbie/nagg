@@ -91,6 +91,7 @@ type Handler struct {
 	auditor                   AuditorClient
 	mintInfo                  MintHistoryProvider
 	testnuts                  TestnutProvider
+	mintLiveness              MintLiveness
 	rates                     RatesProvider
 	wallpapers                WallpapersProvider
 	btcmap                    BtcmapClient
