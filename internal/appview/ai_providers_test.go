@@ -23,6 +23,18 @@ type stubProviders struct {
 
 func (s stubProviders) Directory() (aiproviders.Directory, bool) { return s.directory, s.ready }
 
+// Operators derives the reverse index from the fixture rows, the way the
+// real service does from its records.
+func (s stubProviders) Operators() map[string][]string {
+	out := map[string][]string{}
+	for _, p := range s.directory.Providers {
+		if p.Pubkey != "" {
+			out[p.Pubkey] = append(out[p.Pubkey], p.BaseURL)
+		}
+	}
+	return out
+}
+
 func followers(n uint64) *uint64 { return &n }
 
 func checkedAt(offset time.Duration) *time.Time {
@@ -169,10 +181,13 @@ func TestAIProvidersRouteContract(t *testing.T) {
 	// pubkey and latencyMs are omitted rather than zero-valued, so "unknown
 	// operator" never renders as a key of all zeroes.
 	raw := rec.Body.String()
-	if got := strings.Count(raw, `"pubkey"`); got != 1 {
+	// Scope to the providers array: the identities block below it names the
+	// same key on purpose.
+	rowsOnly := raw[:strings.Index(raw, `"identities"`)]
+	if got := strings.Count(rowsOnly, `"pubkey"`); got != 1 {
 		t.Fatalf("pubkey appeared %d times; it must be omitted when unknown: %s", got, raw)
 	}
-	if got := strings.Count(raw, `"latencyMs"`); got != 1 {
+	if got := strings.Count(rowsOnly, `"latencyMs"`); got != 1 {
 		t.Fatalf("latencyMs appeared %d times; it must be omitted without a successful probe: %s", got, raw)
 	}
 	if !json.Valid(rec.Body.Bytes()) {

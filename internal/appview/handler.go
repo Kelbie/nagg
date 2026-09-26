@@ -583,6 +583,9 @@ type ProvidersEnvelope struct {
 	Pubkeys   []string                  `json:"pubkeys"`
 	Providers map[string]map[string]any `json:"providers,omitempty"`
 	FromCache bool                      `json:"fromCache,omitempty"`
+	// Identities is the identity group for every pubkey the response names
+	// (see Identity). The provider payloads above stay for older builds.
+	Identities map[string]Identity `json:"identities,omitempty"`
 }
 
 func (p *ProvidersEnvelope) setProvider(pubkey, provider string, payload map[string]any) {
@@ -1776,6 +1779,21 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		FromCache: fromCache,
 	}
 	followerPubkeys := make([]string, 0, len(dvmProfile.TopFollowers))
+	// The identities carry the SAME Vertex figures as providers[pk].vertex:
+	// the fresh (or deliberately withheld) profile for the target, the
+	// per-follower rank for the references, never a cache row that could
+	// contradict what this response just decided to publish.
+	identityOpts := identityOptions{
+		validateNIP05: true,
+		vertex:        map[string]IdentityVertex{pubkey: identityVertexFromProfile(dvmProfile)},
+		firstEventAt:  map[string]int64{},
+	}
+	if createdAt != nil {
+		identityOpts.firstEventAt[pubkey] = *createdAt
+	}
+	if h.modules.Has(modules.Nostr) {
+		identityOpts.reachFallback = map[string]IdentityReach{pubkey: identityReachFromGraph(counts.Followers, counts.Follows)}
+	}
 	vertexPayload := map[string]any{"rank": dvmProfile.Rank, "vertexFetchedAt": dvmProfile.FetchedAt}
 	if dvmProfile.Score != nil {
 		vertexPayload["score"] = *dvmProfile.Score
@@ -1789,6 +1807,7 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		followerPubkeys = append(followerPubkeys, fp)
+		identityOpts.vertex[fp] = identityVertexFromFollower(follower, dvmProfile.FetchedAt)
 		payload := map[string]any{"rank": follower.Rank, "vertexFetchedAt": dvmProfile.FetchedAt}
 		if follower.Score != nil {
 			payload["score"] = *follower.Score
@@ -1806,16 +1825,21 @@ func (h *Handler) profile(w http.ResponseWriter, r *http.Request) {
 		envelope.setProvider(pubkey, "nip05", map[string]any{"valid": *fields.fields.NIP05Valid})
 	}
 	pubkeyAggregates(&envelope.Envelope, pubkey, counts, 0)
-	if err := h.appendK0EventsTo(ctx, &envelope.Envelope, append([]string{pubkey}, followerPubkeys...)); err != nil {
+	subjects := append([]string{pubkey}, followerPubkeys...)
+	rows, err := h.profileRows(ctx, subjects)
+	if err != nil {
 		writeError(w, err)
 		return
 	}
+	appendK0RowsTo(&envelope.Envelope, rows)
 	for _, event := range envelope.Events {
 		if event.PubKey == pubkey {
 			envelope.Order = append(envelope.Order, event.ID)
 			break
 		}
 	}
+	identityOpts.profiles = rows
+	envelope.Identities = h.identitiesWith(ctx, subjects, identityOpts)
 	writeJSON(w, envelope)
 }
 
@@ -1989,8 +2013,10 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 		Pubkeys:   make([]string, 0, len(results)),
 		FromCache: fromCache,
 	}
+	identityOpts := identityOptions{vertex: make(map[string]IdentityVertex, len(results))}
 	for _, row := range results {
 		envelope.Pubkeys = append(envelope.Pubkeys, row.PubKey)
+		identityOpts.vertex[row.PubKey] = identityVertexFromSearch(row)
 		payload := map[string]any{"vertexFetchedAt": row.FetchedAt}
 		if row.Rank != nil {
 			payload["rank"] = *row.Rank
@@ -2000,16 +2026,24 @@ func (h *Handler) rankedPubkeysEnvelope(ctx context.Context, results []vertex.Se
 		}
 		envelope.setProvider(row.PubKey, h.scoreProviderName(), payload)
 	}
-	if err := h.appendK0EventsTo(ctx, &envelope.Envelope, envelope.Pubkeys); err != nil {
+	rows, err := h.profileRows(ctx, envelope.Pubkeys)
+	if err != nil {
 		return ProvidersEnvelope{}, err
 	}
+	appendK0RowsTo(&envelope.Envelope, rows)
+	identityOpts.profiles = rows
 	if h.modules.Has(modules.Nostr) {
 		if counts, err := h.store.BatchPubkeyStats(ctx, envelope.Pubkeys); err == nil {
+			identityOpts.reachFallback = make(map[string]IdentityReach, len(counts))
 			for _, pubkey := range envelope.Pubkeys {
 				pubkeyAggregates(&envelope.Envelope, pubkey, counts[pubkey], 0)
+				if c, ok := counts[pubkey]; ok {
+					identityOpts.reachFallback[pubkey] = identityReachFromGraph(c.Followers, c.Follows)
+				}
 			}
 		}
 	}
+	envelope.Identities = h.identitiesWith(ctx, envelope.Pubkeys, identityOpts)
 	eventByPubkey := make(map[string]string, len(envelope.Events))
 	for _, event := range envelope.Events {
 		if event.Kind == 0 {
@@ -2082,11 +2116,21 @@ func (h *Handler) eventsByID(ctx context.Context, ids []string) (map[string]chst
 	return out, nil
 }
 
-func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[string]ProfileInfo, error) {
+// profileRows is the ONE kind-0 read: the stored rows for pubkeys, with the
+// on-demand relay backfill for the ones the index lacks. Every route that
+// renders a profile (events, `profiles` maps, identities) goes through it so
+// a request pays for the lookup once and hands the rows around.
+func (h *Handler) profileRows(ctx context.Context, pubkeys []string) (map[string]chstore.K0Row, error) {
 	pubkeys = normalizePubkeys(pubkeys)
+	if len(pubkeys) == 0 {
+		return map[string]chstore.K0Row{}, nil
+	}
 	rows, err := h.store.LatestK0(ctx, pubkeys)
 	if err != nil {
 		return nil, err
+	}
+	if rows == nil {
+		rows = map[string]chstore.K0Row{}
 	}
 	if missing := missingProfiles(pubkeys, rows); len(missing) > 0 && h.tryBackfillProfiles(ctx, missing) {
 		refreshed, err := h.store.LatestK0(ctx, missing)
@@ -2097,6 +2141,20 @@ func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[strin
 			rows[pubkey] = row
 		}
 	}
+	return rows, nil
+}
+
+func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[string]ProfileInfo, error) {
+	rows, err := h.profileRows(ctx, pubkeys)
+	if err != nil {
+		return nil, err
+	}
+	return profileInfosFromRows(rows), nil
+}
+
+// profileInfosFromRows distils rows to the name/picture `profiles` map; rows
+// with neither are dropped so the map only names what can be drawn.
+func profileInfosFromRows(rows map[string]chstore.K0Row) map[string]ProfileInfo {
 	out := make(map[string]ProfileInfo, len(rows))
 	for pubkey, row := range rows {
 		name := row.DisplayName
@@ -2108,7 +2166,7 @@ func (h *Handler) profileInfos(ctx context.Context, pubkeys []string) (map[strin
 		}
 		out[pubkey] = ProfileInfo{Name: name, Picture: row.Picture}
 	}
-	return out, nil
+	return out
 }
 
 func (h *Handler) rootEvents(ctx context.Context, events []chstore.EventView) (map[string]resolvedRootEvent, error) {

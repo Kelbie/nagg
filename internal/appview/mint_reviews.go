@@ -1,6 +1,7 @@
 package appview
 
 import (
+	"context"
 	"net/http"
 	"regexp"
 	"sort"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	chstore "github.com/vertex-lab/nagg/internal/clickhouse"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 // NIP-87 cashu mint reviews. A review is a kind-38000 event tagged k=38172 (the
@@ -57,6 +59,9 @@ type MintReviewsResponse struct {
 	Summary  MintAggregate          `json:"summary"`
 	Reviews  []MintReview           `json:"reviews"`
 	Profiles map[string]ProfileInfo `json:"profiles"`
+	// Identities covers every reviewer and, when the auditor roster names
+	// one, the mint's operator.
+	Identities map[string]Identity `json:"identities"`
 }
 
 func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
@@ -105,11 +110,23 @@ func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 	for _, review := range deduped {
 		reviewers = append(reviewers, review.ReviewerPubkey)
 	}
-	profiles, perr := h.profileInfos(r.Context(), reviewers)
+	rows, perr := h.profileRows(r.Context(), reviewers)
 	if perr != nil {
 		// Identity is best-effort enrichment; never fail the reviews on it.
-		profiles = map[string]ProfileInfo{}
+		rows = map[string]chstore.K0Row{}
 	}
+	profiles := profileInfosFromRows(rows)
+	subjects := reviewers
+	if operator := h.mintOperator(r.Context(), target); operator != "" {
+		subjects = append(subjects, operator)
+	}
+	// Reviewer rows are already read; the operator's kind-0 is fetched inside
+	// the builder when it is not among them.
+	identityOpts := identityOptions{}
+	if len(subjects) == len(reviewers) {
+		identityOpts.profiles = rows
+	}
+	identities := h.identitiesWith(r.Context(), subjects, identityOpts)
 
 	favourites := 0
 	for _, review := range deduped {
@@ -124,9 +141,32 @@ func (h *Handler) mintReviews(w http.ResponseWriter, r *http.Request) {
 			ReviewCount:    len(deduped),
 			FavouriteCount: favourites,
 		},
-		Reviews:  deduped,
-		Profiles: profiles,
+		Reviews:    deduped,
+		Profiles:   profiles,
+		Identities: identities,
 	})
+}
+
+// mintOperator resolves a mint's operator pubkey from the auditor roster's
+// NUT-06 nostr contact; "" when the auditor is unwired or names none.
+func (h *Handler) mintOperator(ctx context.Context, key string) string {
+	if h.auditor == nil {
+		return ""
+	}
+	mints, err := h.auditor.Mints(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, m := range mints {
+		if normalizeMintURL(m.URL) != key {
+			continue
+		}
+		if pk, ok := vertex.NormalizePubkey(m.OperatorContact); ok {
+			return pk
+		}
+		return ""
+	}
+	return ""
 }
 
 // --- parsing / aggregation (mirrors nagg-ts facade/mint-reviews.ts) ---------

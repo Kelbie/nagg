@@ -85,6 +85,9 @@ type DiscoverMint struct {
 type DiscoverMintsResponse struct {
 	Mints    []DiscoverMint         `json:"mints"`
 	Profiles map[string]ProfileInfo `json:"profiles"`
+	// Identities is the identity group of every returned row's operator,
+	// carrying the same reach and Vertex figures as the row's flat fields.
+	Identities map[string]Identity `json:"identities"`
 }
 
 // discoverReviewScanCap bounds how many kind-38000 review events the discovery
@@ -226,8 +229,8 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		if !ok || m.OperatorContact == "" {
 			continue
 		}
-		pk, err := normalizePubkey(m.OperatorContact)
-		if err != nil {
+		pk, ok := vertex.NormalizePubkey(m.OperatorContact)
+		if !ok {
 			continue
 		}
 		operatorByKey[key] = pk
@@ -245,10 +248,11 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 	// operator profiles arrive. The other two read pubkey_stats and the Vertex
 	// cache, which the nostr module owns; without it they are skipped rather
 	// than issued and discarded (see WithSocialEnrichment).
-	profiles, perr := h.profileInfos(ctx, operatorPubkeys)
+	operatorRows, perr := h.profileRows(ctx, operatorPubkeys)
 	if perr != nil {
-		profiles = map[string]ProfileInfo{}
+		operatorRows = map[string]chstore.K0Row{}
 	}
+	profiles := profileInfosFromRows(operatorRows)
 	// Operator reach goes through the ONE shared resolver (internal/socialgraph),
 	// which /app/ai-providers reads too. It is cache-only and never blocks on a
 	// relay, and it answers Unknown rather than 0 for a pubkey it has not
@@ -301,7 +305,24 @@ func (h *Handler) discoverMints(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, DiscoverMintsResponse{Mints: mints, Profiles: profiles})
+	// Identities reuse the three batched reads above — no second query — and
+	// are scoped to the returned rows, like profiles.
+	returned := make([]string, 0, len(mints))
+	identityVertex := make(map[string]IdentityVertex, len(mints))
+	for _, m := range mints {
+		if m.OperatorPubkey == "" {
+			continue
+		}
+		returned = append(returned, m.OperatorPubkey)
+		identityVertex[m.OperatorPubkey] = identityVertexFromProfile(vertexProfiles[m.OperatorPubkey])
+	}
+	identities := h.identitiesWith(ctx, returned, identityOptions{
+		profiles: operatorRows,
+		reach:    reach,
+		vertex:   identityVertex,
+	})
+
+	writeJSON(w, DiscoverMintsResponse{Mints: mints, Profiles: profiles, Identities: identities})
 }
 
 // mintReviewAggregates groups all cashu mint reviews by normalized URL and

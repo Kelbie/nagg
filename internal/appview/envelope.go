@@ -119,19 +119,15 @@ func (h *Handler) latestK0Events(ctx context.Context, pubkeys []string) ([]FeedE
 	if len(pubkeys) == 0 {
 		return nil, nil
 	}
-	rows, err := h.store.LatestK0(ctx, pubkeys)
+	rows, err := h.profileRows(ctx, pubkeys)
 	if err != nil {
 		return nil, err
 	}
-	if missing := missingProfiles(pubkeys, rows); len(missing) > 0 && h.tryBackfillProfiles(ctx, missing) {
-		refreshed, err := h.store.LatestK0(ctx, missing)
-		if err != nil {
-			return nil, err
-		}
-		for pubkey, row := range refreshed {
-			rows[pubkey] = row
-		}
-	}
+	return k0EventsFromRows(rows), nil
+}
+
+// k0EventsFromRows renders the stored kind-0 rows that carry a full event.
+func k0EventsFromRows(rows map[string]chstore.K0Row) []FeedEvent {
 	out := make([]FeedEvent, 0, len(rows))
 	for pubkey, row := range rows {
 		if row.EventID == "" || row.RawJSON == "" {
@@ -146,7 +142,7 @@ func (h *Handler) latestK0Events(ctx context.Context, pubkeys []string) ([]FeedE
 			CreatedAt: row.CreatedAt.Unix(),
 		})
 	}
-	return out, nil
+	return out
 }
 
 // feedEnvelope converts an ordered feed page into the envelope: kind-6/16
@@ -258,10 +254,18 @@ func (h *Handler) appendK0EventsTo(ctx context.Context, env *Envelope, pubkeys [
 	if len(pubkeys) == 0 {
 		return nil
 	}
-	latestK0Events, err := h.latestK0Events(ctx, pubkeys)
+	rows, err := h.profileRows(ctx, pubkeys)
 	if err != nil {
 		return err
 	}
+	appendK0RowsTo(env, rows)
+	return nil
+}
+
+// appendK0RowsTo appends the kind-0 events in rows that the envelope does not
+// already carry, for routes that read the rows once and reuse them.
+func appendK0RowsTo(env *Envelope, rows map[string]chstore.K0Row) {
+	latestK0Events := k0EventsFromRows(rows)
 	seen := make(map[string]struct{}, len(env.Events))
 	for _, event := range env.Events {
 		seen[event.ID] = struct{}{}
@@ -273,7 +277,6 @@ func (h *Handler) appendK0EventsTo(ctx context.Context, env *Envelope, pubkeys [
 		seen[event.ID] = struct{}{}
 		env.Events = append(env.Events, event)
 	}
-	return nil
 }
 
 // setPubkeyAggregate records one pubkey-keyed aggregate value on an envelope,

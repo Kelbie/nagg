@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/vertex-lab/nagg/internal/auditor"
+	"github.com/vertex-lab/nagg/internal/vertex"
 )
 
 // mintInfoMaxURLs bounds one /nostr/mint/info request. A wallet holds a
@@ -35,10 +36,15 @@ type MintInfo struct {
 	// ProbedAt is the newest probe verdict's time, Unix seconds; omitted until
 	// the mint has one.
 	ProbedAt int64 `json:"probedAt,omitempty"`
+	// OperatorPubkey is the NUT-06 nostr contact, hex, from the same source
+	// as the metadata; omitted when the mint publishes none.
+	OperatorPubkey string `json:"operatorPubkey,omitempty"`
 }
 
 type MintInfoResponse struct {
 	Mints []MintInfo `json:"mints"`
+	// Identities is the identity group of every operator the rows name.
+	Identities map[string]Identity `json:"identities"`
 }
 
 // mintInfos serves GET /nostr/mint/info?u=<mintUrl>[&u=<mintUrl>...]: one row
@@ -92,6 +98,7 @@ func (h *Handler) mintInfos(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows := make([]MintInfo, 0, len(requested))
+	operators := make([]string, 0, len(requested))
 	for _, raw := range requested {
 		key := normalizeMintURL(raw)
 		row := MintInfo{MintURL: raw}
@@ -99,13 +106,18 @@ func (h *Handler) mintInfos(w http.ResponseWriter, r *http.Request) {
 			row.Known = true
 			row.Name, row.IconURL, row.Description = audit.Name, audit.IconURL, audit.Description
 			row.SupportedUnits, row.Nuts = audit.Units, audit.Nuts
+			row.OperatorPubkey = operatorPubkey(audit.OperatorContact)
 		} else if h.mintInfo != nil {
 			if document, ierr := h.mintInfo.LatestInfo(ctx, raw); ierr == nil && len(document) > 0 {
 				info := auditor.MintFromInfo(document)
 				row.Known = true
 				row.Name, row.IconURL, row.Description = info.Name, info.IconURL, info.Description
 				row.SupportedUnits, row.Nuts = info.Units, info.Nuts
+				row.OperatorPubkey = operatorPubkey(info.OperatorContact)
 			}
+		}
+		if row.OperatorPubkey != "" {
+			operators = append(operators, row.OperatorPubkey)
 		}
 		if verdict, ok := verdicts[key]; ok {
 			row.Known = true
@@ -114,5 +126,15 @@ func (h *Handler) mintInfos(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, row)
 	}
-	writeJSON(w, MintInfoResponse{Mints: rows})
+	writeJSON(w, MintInfoResponse{Mints: rows, Identities: h.identities(ctx, operators)})
+}
+
+// operatorPubkey decodes a NUT-06 nostr contact (npub or hex) to lowercase
+// hex; "" when absent or malformed.
+func operatorPubkey(contact string) string {
+	pk, ok := vertex.NormalizePubkey(contact)
+	if !ok {
+		return ""
+	}
+	return pk
 }
