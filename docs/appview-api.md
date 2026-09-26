@@ -575,7 +575,7 @@ could draw a picker — which is work a server does once for every client.
 
 Each provider carries `baseUrl`, `name`, `followers`, `modelCount`,
 `encryptedModelCount`, `teeModelCount`, `mints`, `status`, and optionally
-`pubkey`, `followersSource`, `checkedAt` and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
+`pubkey`, `followersSource`, `minMessageSats`, `checkedAt` and `latencyMs`. `baseUrl` is normalized (https only, no trailing slash, no
 trailing `/v1`) so two spellings of one node cannot render as two rows.
 `mints` is always a list — empty means the provider publishes none, which the
 payment path reads as "any mint".
@@ -610,6 +610,16 @@ with `getTinfoilUpstreamModelId` stripping exactly that prefix, so the prefixed
 entry is the sealed route to the model its unprefixed twin serves in the clear.
 A differently cased prefix does not count: the SDK's check is case-sensitive,
 so such a model is sent in the clear.
+
+`minMessageSats` is the smallest balance that pays for one chat message on
+this provider: the cheapest reservation across its enabled text-chat models,
+each priced as `ceil((request + prompt × 8000 + completion × max_tokens) × 1.1)`
+with `max_tokens = min(2000, the model's own completion ceiling)`. That is the
+app's send-gate arithmetic, so a wallet balance at or above it on this
+provider's mints can send at least one message. It is an aggregate on purpose —
+the catalog behind it is up to three quarters of a megabyte, and the app needs
+one number per row, not forty catalogs. Omitted until a catalog read finds a
+priced chat model; carried across outages like the model counts.
 
 `teeModelCount` is the SEPARATE and weaker claim: how many models the node
 itself declares it forwards to a Tinfoil enclave (`upstream_provider_id`). It

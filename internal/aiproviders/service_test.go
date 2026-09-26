@@ -12,6 +12,7 @@ import (
 
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/vertex-lab/nagg/internal/relayquery"
+	"github.com/vertex-lab/nagg/internal/routstr"
 	"github.com/vertex-lab/nagg/internal/socialgraph"
 )
 
@@ -254,6 +255,13 @@ func TestFailedProbeKeepsProviderListed(t *testing.T) {
 	// the best answer to "how big is it" while it is down.
 	if after.ModelCount != 564 || after.EncryptedModelCount != 9 || after.TEEModelCount != 13 {
 		t.Fatalf("outage erased the catalog counts: %+v", after)
+	}
+	// 1 sat per completion token × the 2000-token budget × the 1.1 buffer.
+	if before.MinMessageSats == nil || *before.MinMessageSats != 2200 {
+		t.Fatalf("flaky before outage minMessageSats = %v, want 2200", before.MinMessageSats)
+	}
+	if after.MinMessageSats == nil || *after.MinMessageSats != 2200 {
+		t.Fatalf("outage erased minMessageSats: %v", after.MinMessageSats)
 	}
 	// The healthy node must outrank it.
 	if directory.Providers[0].BaseURL != good.URL {
@@ -522,5 +530,41 @@ func TestOperatorsIsTheReverseIndex(t *testing.T) {
 	}
 	if urls := got[op]; len(urls) != 2 || urls[0] != "https://a.example" || urls[1] != "https://b.example" {
 		t.Fatalf("urls = %v, want both sorted", urls)
+	}
+}
+
+// minMessageSats prices the cheapest message the app's send gate would admit:
+// non-chat and disabled rows never set the floor, and a model's own completion
+// ceiling shrinks the budget the way the request's max_tokens does.
+func TestMinMessageSats(t *testing.T) {
+	chat := func(id string, prompt, completion float64, ceiling int) routstr.Model {
+		return routstr.Model{
+			ID:                  id,
+			Enabled:             true,
+			OutputModalities:    []string{"text"},
+			MaxCompletionTokens: ceiling,
+			Pricing:             routstr.Pricing{Prompt: prompt, Completion: completion, MaxCost: 100},
+		}
+	}
+	image := chat("image", 0, 0.0001, 0)
+	image.OutputModalities = []string{"image"}
+	disabled := chat("disabled", 0, 0.0001, 0)
+	disabled.Enabled = false
+
+	models := []routstr.Model{
+		chat("dear", 0.01, 0.02, 0),     // 80 + 40 = 120 → 132
+		chat("capped", 0.01, 0.05, 100), // 80 + 5 = 85 → 93.5 → 94
+		image,
+		disabled,
+		{ID: "embedding", Enabled: true, OutputModalities: []string{"text"}, Pricing: routstr.Pricing{Prompt: 0.0001}},
+	}
+	if got := minMessageSats(models); got != 94 {
+		t.Fatalf("minMessageSats = %d, want 94", got)
+	}
+	if got := minMessageSats([]routstr.Model{chat("free", 0, 0.00001, 0)}); got != 1 {
+		t.Fatalf("a near-free model = %d, want the 1-sat floor", got)
+	}
+	if got := minMessageSats([]routstr.Model{image, disabled}); got != 0 {
+		t.Fatalf("no chat model = %d, want 0 (unknown)", got)
 	}
 }
