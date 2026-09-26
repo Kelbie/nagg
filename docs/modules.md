@@ -59,6 +59,7 @@ mounted, so a client feature-gating against a mint-only host sees the truth.
 | `NAGG_RUN_ENRICHER` | `nostr` |
 | `NAGG_RUN_ROLLUP` | `nostr` |
 | `NAGG_RUN_MINT_INFO` | `mint` |
+| `NAGG_RUN_MINT_LIVENESS` | `mint` |
 | `NAGG_AUDITOR_ENABLED` | `mint` |
 | `NAGG_ROUTSTR_ENABLED` | `app` |
 | `NAGG_RATES_ENABLED` | `app` |

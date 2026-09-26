@@ -224,6 +224,17 @@ request), `NAGG_MINT_PROBE_PAID_POLLS` (3) and `NAGG_MINT_PROBE_PAID_WAIT` (2s)
 — how many times, how far apart, an unpaid quote is re-read before it counts as
 unpaid.
 
+The same work-list also feeds the **mint liveness sweep** (`internal/mintliveness`),
+which GETs each mint's `/v1/info` every few minutes and keeps the result in
+memory only: `discover` and `mint/info` rows carry `status`
+(`online`/`offline`/`unknown`), `checkedAt` and `latencyMs` with the semantics
+`/app/ai-providers` uses for providers. Configure it with
+`NAGG_RUN_MINT_LIVENESS` (default on for the mint module; off, every row reads
+`unknown`), `NAGG_MINT_LIVENESS_INTERVAL` (5m), `NAGG_MINT_LIVENESS_TIMEOUT` (8s
+per probe), `NAGG_MINT_LIVENESS_CONCURRENCY` (6 simultaneous probes) and
+`NAGG_MINT_LIVENESS_MAX_AGE` (2h — past it a mint reports `unknown` instead of
+a stale `online`/`offline`).
+
 ## Prerequisites
 
 ### ClickHouse

@@ -371,6 +371,24 @@ Audit fields include `hasAudit`, `state`, `nMints`, `nMelts`, and `nErrors`, plu
 | `auditSource` | string, optional | `ucash` or `8333` — which auditor supplied the row (ucash wins when both track the mint); absent for review-only rows. |
 | `testnut` | boolean | The weekly unpaid-quote probe (`internal/mintprobe`) saw this mint mark a never-paid NUT-04 quote as paid — a fake payment backend. `false` also covers mints not yet probed (a new mint is probed on the next hourly pass). A week where the mint is down or refuses the quote leaves the previous verdict standing. |
 | `auditUpdatedAt` | integer, optional | Upstream mint record's update time, Unix seconds; omitted when unknown (including legacy records). It is not nagg's refresh time. |
+| `status` | string | `online`, `offline` or `unknown` — the mint's liveness from nagg's in-memory sweep (`internal/mintliveness`), always present. See below. |
+| `checkedAt` | RFC 3339, optional | When `status` was last established; omitted while `unknown`. |
+| `latencyMs` | integer, optional | Round trip of the last successful liveness probe; omitted when the mint has never answered one. |
+
+`status`, `checkedAt` and `latencyMs` carry exactly the semantics
+[AI provider directory](#ai-provider-directory) gives a provider. The sweep
+GETs each work-list mint's `/v1/info` every `NAGG_MINT_LIVENESS_INTERVAL`
+(5m) and calls it `online` on a 2xx JSON object, `offline` on anything else —
+non-2xx, network error, timeout, unparseable body; it never falls back to
+another endpoint. `unknown` means nagg has not established the mint's state:
+the sweep is off (`NAGG_RUN_MINT_LIVENESS`), the mint joined the work-list
+after the last pass, or its last probe is older than
+`NAGG_MINT_LIVENESS_MAX_AGE` (2h). Status is decided at serve time against that
+age, so a dead worker takes the feed to `unknown` rather than leaving a stale
+`online` standing; `status` is always present so clients can key on it, and
+it does not affect ranking. This is the minute-scale "is it answering",
+distinct from the auditor's daily `uptime24h`/`avgLatencyMs`. Nothing is
+stored: the sweep keeps memory only, and `/nostr/mint/history` is unchanged.
 
 Operator reach comes from the shared resolver described under
 [AI provider directory](#ai-provider-directory) — `followers`/`follows`, plus
@@ -434,6 +452,9 @@ feed. It reads only what nagg has stored and never fetches a mint on demand.
 | `testnut` | boolean | Same verdict as `discover`. It is only a verdict when `probedAt` is present; `false` without `probedAt` means "not probed yet". |
 | `probedAt` | integer, optional | Newest probe verdict's time, Unix seconds; omitted until the mint has one. |
 | `operatorPubkey` | string, optional | The NUT-06 nostr contact as lowercase hex, from the same source as the metadata; omitted when the mint publishes none. |
+| `status` | string | `online`, `offline` or `unknown`, exactly as on a `discover` row (see [Mint discovery](#mint-discovery)); always present. Independent of `known`: a mint outside the work-list is `unknown` here even when nagg has stored its info. |
+| `checkedAt` | RFC 3339, optional | When `status` was last established; omitted while `unknown`. |
+| `latencyMs` | integer, optional | Last successful liveness probe's round trip; omitted when the mint has never answered one. |
 
 The response also carries `identities` for every `operatorPubkey` the rows
 name (see [Identities](#identities)).
