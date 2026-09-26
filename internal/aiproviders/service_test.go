@@ -506,3 +506,21 @@ func TestDecodeNpub(t *testing.T) {
 		}
 	}
 }
+
+// TestOperatorsIsTheReverseIndex: pubkey → every base URL it runs, sorted,
+// and a provider without a pubkey is nobody's.
+func TestOperatorsIsTheReverseIndex(t *testing.T) {
+	const op = "aa3f3bf381ac923afcf5a3c16fb2957de94057de84df0c3e84a44c57fa031482"
+	s := NewService(Config{}, nil, nil, nil)
+	s.absorb(found{baseURL: "https://b.example", pubkey: op})
+	s.absorb(found{baseURL: "https://a.example", pubkey: op})
+	s.absorb(found{baseURL: "https://anonymous.example"})
+
+	got := s.Operators()
+	if len(got) != 1 {
+		t.Fatalf("operators = %+v, want one", got)
+	}
+	if urls := got[op]; len(urls) != 2 || urls[0] != "https://a.example" || urls[1] != "https://b.example" {
+		t.Fatalf("urls = %v, want both sorted", urls)
+	}
+}

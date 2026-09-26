@@ -248,6 +248,27 @@ func (s *Service) Directory() (Directory, bool) {
 	}, true
 }
 
+// Operators is the directory's reverse index: operator pubkey (hex) → the base
+// URLs of every provider it runs, sorted. It walks all known records, not the
+// MaxProviders slice Directory serves, because "which providers does this
+// npub operate" is a fact about the operator and not about the picker's
+// length. Empty when nothing is known.
+func (s *Service) Operators() map[string][]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := map[string][]string{}
+	for _, rec := range s.records {
+		if rec.pubkey == "" {
+			continue
+		}
+		out[rec.pubkey] = append(out[rec.pubkey], rec.baseURL)
+	}
+	for _, urls := range out {
+		sort.Strings(urls)
+	}
+	return out
+}
+
 // render turns one record into a response row. Status is decided HERE, against
 // the serving clock rather than the sweep clock, so a worker that dies takes
 // the directory to unknown instead of leaving a stale "online" standing
