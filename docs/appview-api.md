@@ -236,6 +236,10 @@ mutual = `out && in`):
 Provider payloads are float/context-shaped data from named providers (the DVM
 plugin seam, `internal/dvm`); counts stay in `aggregates`.
 
+These three routes also carry `identities` (see [Identities](#identities)) for
+every pubkey in `pubkeys` — on `/nostr/profile`, for the subject and its
+`vertex.references` too — with the same Vertex figures as `providers[pk]`.
+
 **Client-signed Vertex refresh** — `POST /nostr/vertex/relay` accepts a signed
 5312/5313/5315 event as the JSON body, forwards it unchanged, verifies the
 response signature and correlation, and writes parsed profile/search results
@@ -273,6 +277,52 @@ cached Vertex plus available kind-0 data and omit social counts. No private
 key is required for client relay or cached reads. Read the
 [Vertex client relay guide](vertex-client-relay.md) for wire examples, credits,
 privacy, async cache visibility, and operator settings.
+
+## Identities
+
+Every response that names a Nostr pubkey carries a top-level `identities`
+map, keyed by lowercase hex pubkey, so the app renders score, reach, profile
+and cross-links from any route out of one cache. It is additive: the
+per-route fields it duplicates (`providers[pk].vertex`, a discover row's
+`operatorPubkey`/`followers`/`vertexRank`, the `profiles` maps) are unchanged.
+
+```jsonc
+"identities": {
+  "<hex>": {
+    "pubkey": "<hex>",
+    "npub": "npub1…",
+    "profile": {                       // null when no kind-0 is known
+      "name": "…", "displayName": "…", "picture": "…", "banner": "…", "about": "…",
+      "nip05": "…", "nip05Valid": true, "website": "…", "lud16": "…"   // empty keys omitted
+    },
+    "reach": { "followers": 1234, "follows": 56, "source": "graph" },
+    "vertex": { "rank": 0.0012, "score": 87.2, "fetchedAt": 1710000000 },
+    "operates": { "mints": ["https://mint.example"], "aiProviders": ["https://ai.example"] },
+    "firstEventAt": 1710000000
+  }
+}
+```
+
+Absence is `null`, never `0`. `reach.followers`/`follows` are null when nagg
+could not resolve them (`source` is then omitted); `source` is `graph`,
+`vertex` or `relays` as under [AI provider directory](#ai-provider-directory),
+and a `relays` answer counts followers only, so `follows` is null. `vertex`
+is always an object, each field null when unknown; it is the local cache,
+never a live DVM call, except where the route already holds a fresh result
+(`/nostr/profile` with `svr`, ranked search rows), which the identity then
+repeats so the two cannot disagree. `operates` is always present with both
+lists (empty, never null): the mints whose NUT-06 nostr contact is this
+pubkey, from the auditor roster, and the AI providers the directory attributes
+to it. `firstEventAt` is computed only on `/nostr/profile` and null elsewhere.
+`nip05Valid` is present only on `/nostr/profile`, the one route that validates
+the name; list routes carry the claimed `nip05` unverified.
+
+Routes: `/nostr/profile`, `/nostr/search`, `/nostr/recommended` (every ranked
+pubkey), `/nostr/mint/discover` (returned rows' operators),
+`/nostr/mint/reviews` (reviewers and the mint's operator), `/nostr/mint/info`
+(the rows' operators) and `/app/ai-providers` (the rows' operators). The
+kind-0 read includes the on-demand relay backfill, so a mint-only deployment
+still fills `profile`.
 
 ## 5. DM privacy: bare envelopes
 
@@ -341,7 +391,11 @@ reads without a server key, so they are no longer gated behind
 empty on a deployment documented as supporting them. They stay `0`/`null` until
 something populates the cache.
 
-The `profiles` map retains its existing behavior. Review-only mints use the latest reachable stored mint-info snapshot
+The `profiles` map retains its existing behavior, and `identities` (see
+[Identities](#identities)) covers the returned rows' operators with the same
+reach and Vertex figures as the flat fields. `/nostr/mint/reviews` likewise
+adds `identities` for every reviewer and, when the roster names one, the
+mint's operator, keeping its `profiles` map. Review-only mints use the latest reachable stored mint-info snapshot
 for name, icon, description, nuts, and units when available. This does not set
 `hasAudit` or invent audit measurements; a snapshot lookup failure leaves the
 review row usable.
@@ -379,6 +433,10 @@ feed. It reads only what nagg has stored and never fetches a mint on demand.
 | `name`, `iconUrl`, `description`, `supportedUnits`, `nuts` | optional | Same distilled NUT-06 fields as a `discover` row: the auditor's when it tracks the mint, else the latest stored info snapshot. |
 | `testnut` | boolean | Same verdict as `discover`. It is only a verdict when `probedAt` is present; `false` without `probedAt` means "not probed yet". |
 | `probedAt` | integer, optional | Newest probe verdict's time, Unix seconds; omitted until the mint has one. |
+| `operatorPubkey` | string, optional | The NUT-06 nostr contact as lowercase hex, from the same source as the metadata; omitted when the mint publishes none. |
+
+The response also carries `identities` for every `operatorPubkey` the rows
+name (see [Identities](#identities)).
 
 Callers cache these verdicts, so a failed verdict lookup fails the whole
 request instead of answering `testnut: false`. Only mints on the probe
@@ -487,7 +545,8 @@ this failover sequence. Successful catalog discovery does not verify paid chat.
 ### AI provider directory
 
 `GET /app/ai-providers` takes no parameters and returns
-`{providers, checkedAt, ttlSeconds}`. It is the SIBLING of `/app/ai-lineup`,
+`{providers, checkedAt, ttlSeconds, identities}`; `identities` covers every
+row's `pubkey` (see [Identities](#identities)) and the rows are unchanged. It is the SIBLING of `/app/ai-lineup`,
 not a replacement: that route curates the *models* of one chosen node, this one
 lists the *providers* to choose between. The app used to discover them itself
 on every cold start — a relay round-trip plus a per-node probe fan-out before it
