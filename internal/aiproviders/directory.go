@@ -74,9 +74,16 @@ type Provider struct {
 	// the prompt before forwarding it. Published because it is real
 	// information about where inference runs, and named so it can never be
 	// mistaken for the end-to-end claim.
-	TEEModelCount int      `json:"teeModelCount"`
-	Mints         []string `json:"mints"`
-	Status        string   `json:"status"`
+	TEEModelCount int `json:"teeModelCount"`
+	// MinMessageSats is the smallest balance that pays for one chat message
+	// here: the cheapest reservation across the provider's chat models, priced
+	// the way the app's send gate prices it (see minMessageSats). An aggregate
+	// so the directory can answer "can I afford this provider" without the
+	// client downloading a catalog per row. Omitted until a catalog read has
+	// found at least one priced chat model.
+	MinMessageSats *int     `json:"minMessageSats,omitempty"`
+	Mints          []string `json:"mints"`
+	Status         string   `json:"status"`
 	// CheckedAt is when THIS provider's status was last established. Omitted
 	// while the status is unknown, because nothing has been established yet.
 	CheckedAt *time.Time `json:"checkedAt,omitempty"`

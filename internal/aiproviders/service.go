@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -121,6 +122,9 @@ type record struct {
 	modelCount int
 	encrypted  int
 	tee        int
+	// minMessage is the cheapest one-message reservation, 0 when the last
+	// catalog read found no priced chat model.
+	minMessage int
 	countsAt   time.Time
 
 	// infoUnsupported records that this node answered /v1/info with a non-2xx
@@ -281,6 +285,7 @@ func (rec *record) render(now time.Time, maxAge time.Duration) Provider {
 		ModelCount:          rec.modelCount,
 		EncryptedModelCount: rec.encrypted,
 		TEEModelCount:       rec.tee,
+		MinMessageSats:      positive(rec.minMessage),
 		Mints:               rec.mints,
 		Status:              StatusUnknown,
 	}
@@ -489,7 +494,7 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 
 	catalogDue := countsAt.IsZero() || s.now().Sub(countsAt) >= s.cfg.CatalogMinAge
 	models := -1
-	encrypted, tee := 0, 0
+	encrypted, tee, minMessage := 0, 0, 0
 	if catalogDue || !reachable {
 		body, took, ok := s.get(ctx, rec.baseURL+"/v1/models")
 		if ok {
@@ -498,6 +503,7 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 			// agree on which rows are models and which upstream serves them.
 			if parsed, err := routstr.ParseModels(body); err == nil {
 				models, encrypted, tee = len(parsed), countEncrypted(parsed), countTEEHosted(parsed)
+				minMessage = minMessageSats(parsed)
 			}
 			if !reachable {
 				reachable, latency = true, took
@@ -518,6 +524,7 @@ func (s *Service) probe(ctx context.Context, rec *record) {
 	}
 	if models >= 0 {
 		rec.modelCount, rec.encrypted, rec.tee, rec.countsAt = models, encrypted, tee, probedAt
+		rec.minMessage = minMessage
 	}
 	if info != nil {
 		applyInfo(rec, info)
@@ -549,6 +556,63 @@ func countTEEHosted(models []routstr.Model) int {
 		}
 	}
 	return n
+}
+
+// The app's send gate, mirrored: a typical prompt, the completion budget the
+// request actually carries, and the gate's safety buffer. These are the
+// app's TYPICAL_PROMPT_TOKENS, ROUTSTR_MAX_COMPLETION_TOKENS and
+// AFFORD_BUFFER (features/ai/lib/format.ts); if they drift apart the list
+// calls a provider affordable that the send gate then refuses.
+const (
+	gatePromptTokens     = 8000
+	gateCompletionTokens = 2000
+	gateBuffer           = 1.1
+)
+
+// minMessageSats is the cheapest reservation one chat message needs on this
+// catalog, in whole sats, or 0 when no enabled model is a priced text-chat
+// model. Per model it is ceil((request + prompt×8000 + completion×max_tokens)
+// × 1.1), with max_tokens clamped under the model's own completion ceiling —
+// the same number the app's `maxSpendSats` admits a send against.
+func minMessageSats(models []routstr.Model) int {
+	best := 0
+	for _, m := range models {
+		if !m.Enabled || m.Pricing.Completion <= 0 || !textChat(m) {
+			continue
+		}
+		completion := gateCompletionTokens
+		if m.MaxCompletionTokens > 0 && m.MaxCompletionTokens < completion {
+			completion = m.MaxCompletionTokens
+		}
+		reserve := m.Pricing.Request + m.Pricing.Prompt*gatePromptTokens + m.Pricing.Completion*float64(completion)
+		sats := max(1, int(math.Ceil(reserve*gateBuffer)))
+		if best == 0 || sats < best {
+			best = sats
+		}
+	}
+	return best
+}
+
+// textChat reports whether a model answers in text and only text: image,
+// audio and embedding rows are not a message the user can send.
+func textChat(m routstr.Model) bool {
+	text := false
+	for _, out := range m.OutputModalities {
+		switch out {
+		case "text":
+			text = true
+		case "image", "audio", "embeddings":
+			return false
+		}
+	}
+	return text
+}
+
+func positive(n int) *int {
+	if n <= 0 {
+		return nil
+	}
+	return &n
 }
 
 // applyInfo lets a node's own /v1/info override what third parties said about
